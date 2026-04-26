@@ -28,8 +28,8 @@ class GmgnClient:
 
     def _params(self, extra: dict = None) -> dict:
         p = {
-            "timestamp": str(int(time.time())),  # segundos como string
-            "client_id": str(uuid4()),            # UUID novo por request
+            "timestamp": str(int(time.time())),
+            "client_id": str(uuid4()),
         }
         if extra:
             p.update(extra)
@@ -67,13 +67,22 @@ class GmgnClient:
         return self._handle_response(resp)
 
     def get_trenches(self, types: list = None, chain: str = "sol") -> dict:
-        """POST /v1/trenches — near_completion -> data['pump'], completed -> data['completed']."""
-        body = {
-            "chain": chain,
-            "type": types or ["near_completion", "completed"],
-        }
-        result = self._post("/v1/trenches", body)
-        return result.get("data", {})
+        """
+        Chama /v1/trenches uma vez por tipo (GMGN não aceita array).
+        near_completion -> data['pump']
+        completed       -> data['completed']
+        """
+        combined = {}
+        for t in (types or ["near_completion", "completed"]):
+            try:
+                result = self._post("/v1/trenches", {"chain": chain, "type": t})
+                combined.update(result.get("data", {}))
+                time.sleep(0.5)
+            except RateLimitError:
+                raise
+            except Exception as e:
+                logger.warning("trenches type=%s erro: %s", t, e)
+        return combined
 
     def get_token_info(self, mint: str, chain: str = "sol") -> Optional[dict]:
         for attempt in range(2):
