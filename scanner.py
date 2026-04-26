@@ -23,8 +23,8 @@ HOT_WINDOW_MIN = 60
 class HotMonitor:
     """
     Loop de 30s que monitora todos os tokens migrados na janela quente.
-    0–60 min: poll a cada 30s, atualiza mc_bottom.
-    Saída: captura mc_1h e agenda 4h/24h.
+    0-60 min: poll a cada 30s, atualiza mc_bottom.
+    Saida: captura mc_1h e agenda 4h/24h.
     """
 
     def __init__(self, gmgn: GmgnClient, scheduler: HeapScheduler):
@@ -101,12 +101,10 @@ class HotMonitor:
             mc = _calc_mc(info)
             if not mc:
                 return
-
             if mc < state["mc_migration"] * 0.20:
                 logger.info("Rug %s: queda >=80%%", state["symbol"])
                 self.cancel(mint)
                 return
-
             if mc < state["mc_min"]:
                 state["mc_min"] = mc
                 state["time_min"] = elapsed_min
@@ -170,11 +168,12 @@ class Scanner:
     Poll do trenches a cada 30s.
 
     near_completion (data['pump']):
-        Usa campos do proprio response do trenches para a watchlist.
-        NAO chama token_info (tokens na BC retornam 404).
+        Pre-carrega qualidade diretamente do response do trenches (100+ campos).
+        Sem chamada extra de API — zero delay na watchlist.
 
     completed (data['completed']):
-        Chama token_info (token ja tem pool no DEX) para dados completos.
+        Usa qualidade pre-carregada da watchlist (zero delay).
+        Chama token_info apenas para mc_migration e campos ausentes no trenches.
         Entrega ao HotMonitor.
     """
 
@@ -220,7 +219,7 @@ class Scanner:
                            token.get("address", "?")[:8], e)
 
     # --------------------------------------------------------------------------
-    # Watchlist: extrai dados do proprio response do trenches (sem chamar token_info)
+    # Watchlist: extrai qualidade do response do trenches — sem chamada de API extra
     # --------------------------------------------------------------------------
 
     def _handle_near_completion(self, token: dict):
@@ -236,6 +235,8 @@ class Scanner:
             return
 
         now = datetime.now(timezone.utc)
+        # Todos os campos de qualidade vem do proprio response do trenches.
+        # Nenhuma chamada de API adicional — zero delay na watchlist.
         entry = {
             "mint":                     mint,
             "token_nome":               token.get("symbol"),
@@ -244,10 +245,15 @@ class Scanner:
             "is_wash_trading":          bool(token.get("is_wash_trading")),
             "smart_wallets":            _int(token.get("smart_degen_count")),
             "renowned_wallets":         _int(token.get("renowned_count")),
+            "sniper_wallets":           _int(token.get("sniper_count")),
             "rug_ratio":                _float(token.get("rug_ratio")),
             "top10_holder_rate":        _float(token.get("top_10_holder_rate")),
             "holders_count":            _int(token.get("holder_count")),
+            "volume_1m":                _float(token.get("volume_1m")),
             "volume_5m":                _float(token.get("volume_5m")),
+            "volume_15m":               _float(token.get("volume_15m")),
+            "liq_migration":            _float(token.get("liquidity"), divisor=2),
+            "is_honeypot":              bool(token.get("is_honeypot")) if token.get("is_honeypot") is not None else None,
         }
 
         with self._lock:
@@ -259,7 +265,7 @@ class Scanner:
                     entry["smart_wallets"], entry["is_wash_trading"])
 
     # --------------------------------------------------------------------------
-    # Migrado: chama token_info (ja tem pool) para dados completos
+    # Migracao: usa dados pre-carregados + 1 chamada para mc_migration
     # --------------------------------------------------------------------------
 
     def _handle_completed(self, token: dict):
@@ -272,7 +278,7 @@ class Scanner:
             watchlist_entry = self._watchlist.pop(mint, None)
             self._seen.add(mint)
 
-        # Token ja migrou para Raydium — token_info funciona agora
+        # Unica chamada de API na migracao: pegar mc_migration e campos ausentes no trenches
         info = self.gmgn.get_token_info(mint)
         if not info:
             with self._lock:
@@ -286,13 +292,31 @@ class Scanner:
             return
 
         now = datetime.now(timezone.utc)
-        quality = _extract_quality_from_info(info, self.gmgn.get_token_security(mint))
 
-        # Dados da watchlist tem prioridade (snapshot anterior ao dump e mais limpo)
+        # Base: campos do token_info (post-migration, tem pool)
+        wts  = info.get("wallet_tags_stat") or {}
+        stat = info.get("stat") or {}
+        quality = {
+            "smart_wallets":     _int(wts.get("smart_wallets")),
+            "renowned_wallets":  _int(wts.get("renowned_wallets")),
+            "sniper_wallets":    _int(wts.get("sniper_wallets")),
+            "rug_ratio":         _float(stat.get("top_bundler_trader_percentage")),
+            "top10_holder_rate": _float(stat.get("top_10_holder_rate")),
+            "holders_count":     _int(info.get("holder_count")),
+            "volume_1m":         _float(stat.get("volume_1m")),
+            "volume_5m":         _float(stat.get("volume_5m")),
+            "volume_15m":        _float(stat.get("volume_15m")),
+            "liq_migration":     _float(info.get("liquidity"), divisor=2),
+            "is_wash_trading":   bool(token.get("is_wash_trading")),
+            "is_honeypot":       None,
+        }
+
+        # Watchlist tem prioridade: snapshot ANTES do dump = mais limpo
         if watchlist_entry:
-            for k in ("smart_wallets", "renowned_wallets", "rug_ratio",
-                      "top10_holder_rate", "holders_count", "volume_5m",
-                      "is_wash_trading"):
+            for k in ("smart_wallets", "renowned_wallets", "sniper_wallets",
+                      "rug_ratio", "top10_holder_rate", "holders_count",
+                      "volume_1m", "volume_5m", "volume_15m",
+                      "liq_migration", "is_honeypot", "is_wash_trading"):
                 if watchlist_entry.get(k) is not None:
                     quality[k] = watchlist_entry[k]
 
@@ -308,19 +332,19 @@ class Scanner:
 
         db.upsert_migration(entry)
 
-        symbol  = token.get("symbol") or mint[:8]
-        smart   = entry.get("smart_wallets") or 0
-        rug     = entry.get("rug_ratio") or 0
-        wash    = "⚠️ SIM" if entry.get("is_wash_trading") else "não"
+        symbol = token.get("symbol") or mint[:8]
+        smart  = entry.get("smart_wallets") or 0
+        rug    = entry.get("rug_ratio") or 0
+        wash   = "⚠️ SIM" if entry.get("is_wash_trading") else "nao"
 
         send_alert(
-            f"\U0001f514 *Migração: {symbol}*\n"
+            f"\U0001f514 *Migracao: {symbol}*\n"
             f"MC: ${mc:,.0f}\n"
             f"Smart wallets: {smart}\n"
             f"Wash trading: {wash}\n"
             f"Rug ratio: {rug:.0%}"
         )
-        logger.info("Migração %s (%s) MC=$%.0f smart=%d",
+        logger.info("Migracao %s (%s) MC=$%.0f smart=%d",
                     symbol, mint[:8], mc, smart)
 
         self.hot.add(mint, mc, now, symbol)
@@ -335,28 +359,6 @@ def _calc_mc(info: dict) -> Optional[float]:
         return float(info["price"]) * float(info["circulating_supply"])
     except Exception:
         return None
-
-
-def _extract_quality_from_info(info: dict, security: Optional[dict]) -> dict:
-    wts  = info.get("wallet_tags_stat") or {}
-    stat = info.get("stat") or {}
-    result = {
-        "smart_wallets":     _int(wts.get("smart_wallets")),
-        "renowned_wallets":  _int(wts.get("renowned_wallets")),
-        "sniper_wallets":    _int(wts.get("sniper_wallets")),
-        "rug_ratio":         _float(stat.get("top_bundler_trader_percentage")),
-        "top10_holder_rate": _float(stat.get("top_10_holder_rate")),
-        "holders_count":     _int(info.get("holder_count")),
-        "volume_1m":         _float(stat.get("volume_1m")),
-        "volume_5m":         _float(stat.get("volume_5m")),
-        "volume_15m":        _float(stat.get("volume_15m")),
-        "liq_migration":     _float(info.get("liquidity"), divisor=2),
-        "is_wash_trading":   None,
-    }
-    if security:
-        hp = security.get("is_honeypot")
-        result["is_honeypot"] = hp in (True, "yes", 1, "1")
-    return result
 
 
 def _float(v, divisor: float = 1) -> Optional[float]:
