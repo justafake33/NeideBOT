@@ -3,12 +3,12 @@ import time
 import logging
 import requests
 from typing import Optional
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
-GMGN_HOST = os.getenv("GMGN_HOST", "https://openapi.gmgn.ai")
+GMGN_HOST    = os.getenv("GMGN_HOST", "https://openapi.gmgn.ai")
 GMGN_API_KEY = os.getenv("GMGN_API_KEY", "")
-CLIENT_ID = "neidebot-v1"
 
 
 class RateLimitError(Exception):
@@ -26,11 +26,14 @@ class GmgnClient:
             "Content-Type": "application/json",
         })
 
-    def _params(self) -> dict:
-        return {
-            "timestamp": int(time.time() * 1000),
-            "client_id": CLIENT_ID,
+    def _params(self, extra: dict = None) -> dict:
+        p = {
+            "timestamp": str(int(time.time())),  # segundos como string
+            "client_id": str(uuid4()),            # UUID novo por request
         }
+        if extra:
+            p.update(extra)
+        return p
 
     def _handle_response(self, resp: requests.Response) -> dict:
         if resp.status_code == 429:
@@ -43,14 +46,15 @@ class GmgnClient:
         resp.raise_for_status()
         body = resp.json()
         if body.get("code", 0) != 0:
-            raise Exception(f"GMGN API error {body.get('code')}: {body.get('message')}")
+            raise Exception(f"GMGN error {body.get('code')}: {body.get('message')}")
         return body
 
     def _get(self, path: str, params: dict = None) -> dict:
-        p = self._params()
-        if params:
-            p.update(params)
-        resp = self.session.get(f"{self.host}{path}", params=p, timeout=15)
+        resp = self.session.get(
+            f"{self.host}{path}",
+            params=self._params(params),
+            timeout=15,
+        )
         return self._handle_response(resp)
 
     def _post(self, path: str, body: dict = None) -> dict:
@@ -63,7 +67,7 @@ class GmgnClient:
         return self._handle_response(resp)
 
     def get_trenches(self, types: list = None, chain: str = "sol") -> dict:
-        """POST /v1/trenches — near_completion retorna em data['pump'], completed em data['completed']."""
+        """POST /v1/trenches — near_completion -> data['pump'], completed -> data['completed']."""
         body = {
             "chain": chain,
             "type": types or ["near_completion", "completed"],
@@ -79,7 +83,7 @@ class GmgnClient:
             except RateLimitError as e:
                 if attempt == 0:
                     wait = max(1.0, e.reset_at - time.time()) + 1
-                    logger.warning("Rate limit em token info, aguardando %.1fs", wait)
+                    logger.warning("Rate limit token info, aguardando %.1fs", wait)
                     time.sleep(wait)
                 else:
                     raise
@@ -96,7 +100,7 @@ class GmgnClient:
             except RateLimitError as e:
                 if attempt == 0:
                     wait = max(1.0, e.reset_at - time.time()) + 1
-                    logger.warning("Rate limit em token security, aguardando %.1fs", wait)
+                    logger.warning("Rate limit token security, aguardando %.1fs", wait)
                     time.sleep(wait)
                 else:
                     raise
