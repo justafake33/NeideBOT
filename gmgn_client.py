@@ -10,6 +10,27 @@ logger = logging.getLogger(__name__)
 GMGN_HOST    = os.getenv("GMGN_HOST", "https://openapi.gmgn.ai")
 GMGN_API_KEY = os.getenv("GMGN_API_KEY", "")
 
+# Plataformas e quote address types por chain (fonte: GMGN OpenApiClient.ts)
+_PLATFORMS = {
+    "sol": [
+        "Pump.fun", "pump_mayhem", "pump_mayhem_agent", "pump_agent",
+        "letsbonk", "bonkers", "bags", "memoo", "liquid", "bankr", "zora",
+        "surge", "anoncoin", "moonshot_app", "wendotdev", "heaven", "sugar",
+        "token_mill", "believe", "trendsfun", "trends_fun", "jup_studio",
+        "Moonshot", "boop", "ray_launchpad", "meteora_virtual_curve", "xstocks",
+    ],
+    "bsc":  ["fourmeme", "fourmeme_agent", "bn_fourmeme", "four_xmode_agent",
+             "flap", "clanker", "lunafun"],
+    "base": ["clanker", "bankr", "flaunch", "zora", "zora_creator",
+             "baseapp", "basememe", "virtuals_v2", "klik"],
+}
+
+_QUOTE_ADDRESS_TYPES = {
+    "sol":  [4, 5, 3, 1, 13, 0],
+    "bsc":  [6, 7, 1, 16, 8, 3, 9, 10, 2, 17, 18, 0],
+    "base": [11, 3, 12, 13, 0],
+}
+
 
 class RateLimitError(Exception):
     def __init__(self, reset_at: float):
@@ -57,32 +78,35 @@ class GmgnClient:
         )
         return self._handle_response(resp)
 
-    def _post(self, path: str, body: dict = None) -> dict:
+    def _post(self, path: str, body: dict = None, extra_params: dict = None) -> dict:
         resp = self.session.post(
             f"{self.host}{path}",
             json=body or {},
-            params=self._params(),
+            params=self._params(extra_params),
             timeout=15,
         )
         return self._handle_response(resp)
 
     def get_trenches(self, types: list = None, chain: str = "sol") -> dict:
         """
-        Chama /v1/trenches uma vez por tipo (GMGN não aceita array).
-        near_completion -> data['pump']
-        completed       -> data['completed']
+        POST /v1/trenches — chain como query param, body version=v2.
+        Cada tipo vira chave top-level no body.
+        near_completion -> data['pump'] | completed -> data['completed']
         """
-        combined = {}
-        for t in (types or ["near_completion", "completed"]):
-            try:
-                result = self._post("/v1/trenches", {"chain": chain, "type": t})
-                combined.update(result.get("data", {}))
-                time.sleep(0.5)
-            except RateLimitError:
-                raise
-            except Exception as e:
-                logger.warning("trenches type=%s erro: %s", t, e)
-        return combined
+        selected = types or ["near_completion", "completed"]
+        section = {
+            "filters": ["offchain", "onchain"],
+            "launchpad_platform": _PLATFORMS.get(chain, []),
+            "quote_address_type": _QUOTE_ADDRESS_TYPES.get(chain, []),
+            "launchpad_platform_v2": True,
+            "limit": 80,
+        }
+        body = {"version": "v2"}
+        for t in selected:
+            body[t] = dict(section)
+
+        result = self._post("/v1/trenches", body, extra_params={"chain": chain})
+        return result.get("data", {})
 
     def get_token_info(self, mint: str, chain: str = "sol") -> Optional[dict]:
         for attempt in range(2):
