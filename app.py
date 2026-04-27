@@ -74,6 +74,9 @@ DASHBOARD_HTML = """
   .b-red    { background: #3a1a1a; color: #f85149; }
   .b-yellow { background: #3a2a1a; color: #d29922; }
   .mono { font-size: 11px; color: #8b949e; }
+  .links { display: flex; gap: 6px; margin-top: 3px; }
+  .links a { font-size: 10px; color: #58a6ff; text-decoration: none; opacity: 0.7; }
+  .links a:hover { opacity: 1; text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -104,7 +107,15 @@ DASHBOARD_HTML = """
 {% for r in rows %}
 <tr>
   <td class="muted">{{ r.dt }}</td>
-  <td><strong>{{ r.nome }}</strong><div class="mono">{{ r.mint_short }}</div></td>
+  <td>
+    <strong>{{ r.nome }}</strong>
+    <div class="mono">{{ r.mint_short }}</div>
+    <div class="links">
+      <a href="https://gmgn.ai/sol/token/{{ r.mint }}" target="_blank">GMGN</a>
+      <a href="https://dexscreener.com/solana/{{ r.mint }}" target="_blank">DEX</a>
+      <a href="https://solscan.io/token/{{ r.mint }}" target="_blank">Scan</a>
+    </div>
+  </td>
   <td class="muted">{{ r.bc }}</td>
   <td>{{ r.mc_mig }}</td>
   <td>{{ r.mc_bot }}</td>
@@ -168,6 +179,7 @@ def scanner_dashboard():
         rows.append({
             "dt":         dt,
             "nome":       r.get("token_nome") or "?",
+            "mint":       r.get("mint") or "",
             "mint_short": (r.get("mint") or "")[:12] + "…",
             "bc":         f"{r.get('bc_progress_at_detection'):.0f}%" if r.get("bc_progress_at_detection") else "—",
             "mc_mig":     fmt_mc(r.get("mc_migration")),
