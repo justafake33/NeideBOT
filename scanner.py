@@ -298,16 +298,13 @@ class HotMonitor:
         total_supply = state["total_supply"]
         ts_mig_unix  = state["ts_mig_unix"]
 
-        # Busca kline completo da janela quente para confirmar o bottom absoluto
-        # e capturar o checkpoint de 1h no mesmo request
         candles_1h = self.gmgn.get_token_kline(
             mint, "sol", "1m",
             from_ts=ts_mig_unix,
-            to_ts=ts_mig_unix + 3660,          # +1min de margem
+            to_ts=ts_mig_unix + 3660,
         )
 
         if candles_1h:
-            # Varre todos os candles para confirmar bottom e peak absolutos
             for c in candles_1h:
                 candle_ts   = int(c.get("time", 0)) / 1000
                 elapsed_min = (candle_ts - ts_mig_unix) / 60
@@ -320,7 +317,6 @@ class HotMonitor:
                 if high and high > 0:
                     db.update_peak(mint, high * total_supply, elapsed_min)
 
-            # Checkpoint 1h = close do último candle do período
             last        = candles_1h[-1]
             close_price = _float(last.get("close"))
             if close_price and close_price > 0:
@@ -330,7 +326,19 @@ class HotMonitor:
                 logger.info("Checkpoint 1h %s: $%.0f (%s) [kline]", symbol, mc_1h,
                             f"{var*100:+.1f}%" if var is not None else "N/A")
         else:
-            logger.warning("Graduacao %s: kline 1h indisponivel — checkpoint 1h pulado", symbol)
+            # Fallback: token/info pode estar indexado após 1h
+            info = self.gmgn.get_token_info(mint)
+            if info:
+                try:
+                    mc_1h = float(info["price"]) * float(info["circulating_supply"])
+                    var   = (mc_1h - mc_migration) / mc_migration if mc_migration else None
+                    db.update_checkpoint(mint, "1h", mc_1h, var)
+                    logger.info("Checkpoint 1h %s: $%.0f (%s) [token/info]", symbol, mc_1h,
+                                f"{var*100:+.1f}%" if var is not None else "N/A")
+                except Exception as e:
+                    logger.warning("Checkpoint 1h %s: token/info parse error: %s", symbol, e)
+            else:
+                logger.warning("Graduacao %s: kline e token/info indisponiveis — 1h pulado", symbol)
 
         for delay_min, label in [(240, "4h"), (1440, "24h")]:
             remaining = delay_min * 60 - elapsed_sec
@@ -342,40 +350,45 @@ class HotMonitor:
         logger.info("%s saiu da janela quente (bottom=$%.0f em %.1fmin)",
                     symbol, state["mc_min"], state["time_min"])
 
-    # ------------------------------------------------------------------
-    # Checkpoints 4h / 24h via kline
-    # ------------------------------------------------------------------
-
     def _checkpoint(self, mint: str, mc_migration: float, total_supply: float,
                     label: str, symbol: str, ts_mig_unix: int):
         if mint in self._cancelled:
             return
 
-        delay_sec  = {"1h": 3600, "4h": 14400, "24h": 86400}[label]
-        target_ts  = ts_mig_unix + delay_sec
+        delay_sec = {"1h": 3600, "4h": 14400, "24h": 86400}[label]
+        target_ts = ts_mig_unix + delay_sec
+        mc        = None
+        src       = "?"
 
         candles = self.gmgn.get_token_kline(
             mint, "sol", "1m",
             from_ts=target_ts - 120,
             to_ts=target_ts + 60,
         )
+        if candles:
+            closest     = min(candles, key=lambda c: abs(int(c.get("time", 0)) / 1000 - target_ts))
+            close_price = _float(closest.get("close"))
+            if close_price and close_price > 0:
+                mc  = close_price * total_supply
+                src = "kline"
 
-        if not candles:
-            logger.warning("Checkpoint %s %s: kline indisponivel", symbol, label)
+        if mc is None:
+            info = self.gmgn.get_token_info(mint)
+            if info:
+                try:
+                    mc  = float(info["price"]) * float(info["circulating_supply"])
+                    src = "token/info"
+                except Exception:
+                    pass
+
+        if mc is None:
+            logger.warning("Checkpoint %s %s: kline e token/info indisponiveis", symbol, label)
             return
 
-        closest     = min(candles, key=lambda c: abs(int(c.get("time", 0)) / 1000 - target_ts))
-        close_price = _float(closest.get("close"))
-
-        if not close_price or close_price <= 0:
-            logger.warning("Checkpoint %s %s: preco invalido no kline", symbol, label)
-            return
-
-        mc  = close_price * total_supply
         var = (mc - mc_migration) / mc_migration if mc_migration else None
         db.update_checkpoint(mint, label, mc, var)
-        logger.info("Checkpoint %s %s: $%.0f (%s) [kline]", symbol, label, mc,
-                    f"{var*100:+.1f}%" if var is not None else "N/A")
+        logger.info("Checkpoint %s %s: $%.0f (%s) [%s]", symbol, label, mc,
+                    f"{var*100:+.1f}%" if var is not None else "N/A", src)
 
 
 # ==============================================================================
