@@ -25,7 +25,8 @@ F_TOP10_MAX      = float(os.getenv("FILTER_TOP10_MAX",      "0.80"))
 F_SMART_MIN      = int(os.getenv(  "FILTER_SMART_MIN",      "1"))
 F_WASH_BLOCK     = os.getenv(      "FILTER_WASH_BLOCK",     "true").lower() == "true"
 BC_MIN_WATCHLIST = float(os.getenv("BC_MIN_WATCHLIST",      "80"))
-F_MC_MIN         = float(os.getenv("FILTER_MC_MIN",         "5000"))  # MC minimo em USD
+F_MC_MIN         = float(os.getenv("FILTER_MC_MIN",         "5000"))   # MC minimo em USD
+F_MC_MAX         = float(os.getenv("FILTER_MC_MAX",         "200000")) # MC maximo em USD
 
 
 def _passes_filter(token: dict) -> tuple[bool, str]:
@@ -214,8 +215,8 @@ class Scanner:
         thread = threading.Thread(target=self._loop, daemon=True, name="scanner")
         thread.start()
         logger.info(
-            "Scanner iniciado (poll=%ds) | bc_min=%.0f%% | mc_min=$%.0f | filtros: rug<%.0f%% rat<%.0f%% top10<%.0f%% smart>=%d wash=%s",
-            POLL_INTERVAL, BC_MIN_WATCHLIST, F_MC_MIN,
+            "Scanner iniciado (poll=%ds) | bc_min=%.0f%% | mc=$%.0f-$%.0f | filtros: rug<%.0f%% rat<%.0f%% top10<%.0f%% smart>=%d wash=%s",
+            POLL_INTERVAL, BC_MIN_WATCHLIST, F_MC_MIN, F_MC_MAX,
             F_RUG_MAX*100, F_RAT_MAX*100, F_TOP10_MAX*100,
             F_SMART_MIN, F_WASH_BLOCK,
         )
@@ -325,10 +326,11 @@ class Scanner:
 
         # MC direto do trenches — sem chamada de API
         mc = _float(token.get("usd_market_cap")) or _float(token.get("market_cap"))
-        if not mc or mc < F_MC_MIN:
+        if not mc or mc < F_MC_MIN or mc > F_MC_MAX:
             if mc:
-                logger.info("Migracao descartada %s (%s): mc=$%.0f<$%.0f",
-                            token.get("symbol"), mint[:8], mc, F_MC_MIN)
+                motivo = f"mc=$%.0f<$%.0f" % (mc, F_MC_MIN) if mc < F_MC_MIN else f"mc=$%.0f>$%.0f" % (mc, F_MC_MAX)
+                logger.info("Migracao descartada %s (%s): %s",
+                            token.get("symbol"), mint[:8], motivo)
             with self._lock:
                 self._seen.discard(mint)
             return
