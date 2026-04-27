@@ -202,6 +202,7 @@ class Scanner:
         self._watchlist: dict = {}
         self._seen: set = set()
         self._lock = threading.Lock()
+        self._debug_logged = 0  # loga campos raw dos primeiros completed tokens
 
     def start(self):
         thread = threading.Thread(target=self._loop, daemon=True, name="scanner")
@@ -317,6 +318,12 @@ class Scanner:
                 with self._lock:
                     self._seen.discard(mint)
                 return
+
+        # Log temporario: mostra todos os campos do trenches para os primeiros 3 tokens
+        if self._debug_logged < 3:
+            self._debug_logged += 1
+            logger.info("DEBUG campos completed #%d %s: %s",
+                        self._debug_logged, token.get("symbol"), dict(token))
 
         # 1 chamada de API: pegar mc_migration (token ja tem pool no DEX)
         info = self.gmgn.get_token_info(mint)
