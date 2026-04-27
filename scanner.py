@@ -24,6 +24,7 @@ F_RAT_MAX        = float(os.getenv("FILTER_RAT_MAX",        "0.20"))  # rat trad
 F_TOP10_MAX      = float(os.getenv("FILTER_TOP10_MAX",      "0.80"))  # concentracao holders
 F_SMART_MIN      = int(os.getenv(  "FILTER_SMART_MIN",      "1"))     # minimo smart wallets
 F_WASH_BLOCK     = os.getenv(      "FILTER_WASH_BLOCK",     "true").lower() == "true"
+BC_MIN_WATCHLIST = float(os.getenv("BC_MIN_WATCHLIST",      "80"))    # % bc para entrar na watchlist
 
 
 def _passes_filter(token: dict) -> tuple[bool, str]:
@@ -206,8 +207,9 @@ class Scanner:
         thread = threading.Thread(target=self._loop, daemon=True, name="scanner")
         thread.start()
         logger.info(
-            "Scanner iniciado (poll=%ds) | filtros: rug<%.0f%% rat<%.0f%% top10<%.0f%% smart>=%d wash=%s",
-            POLL_INTERVAL, F_RUG_MAX*100, F_RAT_MAX*100, F_TOP10_MAX*100,
+            "Scanner iniciado (poll=%ds) | bc_min=%.0f%% | filtros: rug<%.0f%% rat<%.0f%% top10<%.0f%% smart>=%d wash=%s",
+            POLL_INTERVAL, BC_MIN_WATCHLIST,
+            F_RUG_MAX*100, F_RAT_MAX*100, F_TOP10_MAX*100,
             F_SMART_MIN, F_WASH_BLOCK,
         )
 
@@ -253,7 +255,7 @@ class Scanner:
                 return
 
         bc = float(token.get("bc_progress") or 0)
-        if bc < 90:
+        if bc < BC_MIN_WATCHLIST:
             return
 
         # Filtro pre-watchlist: descarta lixo antes de qualquer processamento
