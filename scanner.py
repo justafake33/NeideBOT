@@ -259,8 +259,8 @@ class Scanner:
         # Filtro pre-watchlist: descarta lixo antes de qualquer processamento
         ok, motivo = _passes_filter(token)
         if not ok:
-            logger.debug("Descartado %s (%s): %s",
-                         token.get("symbol"), mint[:8], motivo)
+            logger.info("Descartado %s (%s): %s",
+                        token.get("symbol"), mint[:8], motivo)
             return
 
         now = datetime.now(timezone.utc)
@@ -310,7 +310,8 @@ class Scanner:
         if not watchlist_entry:
             ok, motivo = _passes_filter(token)
             if not ok:
-                logger.debug("Migracao descartada %s: %s", mint[:8], motivo)
+                logger.info("Migracao descartada %s (%s): %s",
+                            token.get("symbol"), mint[:8], motivo)
                 with self._lock:
                     self._seen.discard(mint)
                 return
