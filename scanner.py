@@ -17,7 +17,7 @@ HOT_INTERVAL   = 30
 HOT_WINDOW_MIN = 60
 
 # ------------------------------------------------------------------
-# Filtros pre-watchlist (configuraveis via env sem redeploy)
+# Filtros (configuráveis via env vars no Railway sem redeploy)
 # ------------------------------------------------------------------
 F_RUG_MAX        = float(os.getenv("FILTER_RUG_MAX",        "0.15"))
 F_RAT_MAX        = float(os.getenv("FILTER_RAT_MAX",        "0.20"))
@@ -25,8 +25,10 @@ F_TOP10_MAX      = float(os.getenv("FILTER_TOP10_MAX",      "0.80"))
 F_SMART_MIN      = int(os.getenv(  "FILTER_SMART_MIN",      "1"))
 F_WASH_BLOCK     = os.getenv(      "FILTER_WASH_BLOCK",     "true").lower() == "true"
 BC_MIN_WATCHLIST = float(os.getenv("BC_MIN_WATCHLIST",      "80"))
-F_MC_MIN         = float(os.getenv("FILTER_MC_MIN",         "5000"))   # MC minimo em USD
-F_MC_MAX         = float(os.getenv("FILTER_MC_MAX",         "200000")) # MC maximo em USD
+F_MC_MIN         = float(os.getenv("FILTER_MC_MIN",         "5000"))
+F_MC_MAX         = float(os.getenv("FILTER_MC_MAX",         "200000"))
+F_LIQ_MIN        = float(os.getenv("FILTER_LIQ_MIN",        "10000"))  # liquidez minima em USD
+F_FEE_MIN        = float(os.getenv("FILTER_FEE_MIN",        "1.0"))    # total_fee minimo em SOL
 
 
 def _passes_filter(token: dict) -> tuple[bool, str]:
@@ -53,7 +55,7 @@ def _passes_filter(token: dict) -> tuple[bool, str]:
 
 
 # ==============================================================================
-# HotMonitor — polling de 30s para tracking de fundo pós-migração
+# HotMonitor — tracking de fundo pós-migração via push do Scanner
 # ==============================================================================
 
 class HotMonitor:
@@ -82,6 +84,31 @@ class HotMonitor:
             self._cancelled.add(mint)
             self._tokens.pop(mint, None)
 
+    def push_mc(self, mint: str, mc: float):
+        """
+        Chamado pelo Scanner a cada poll (30s) para tokens que ainda aparecem
+        na lista completed do trenches. Zero chamadas extra de API.
+        """
+        with self._lock:
+            state = self._tokens.get(mint)
+            if not state or mint in self._cancelled:
+                return
+
+        elapsed_min = (datetime.now(timezone.utc) - state["ts_migration"]).total_seconds() / 60
+
+        if mc < state["mc_migration"] * 0.20:
+            logger.info("Rug %s: queda >=80%%", state["symbol"])
+            self.cancel(mint)
+            return
+
+        if mc < state["mc_min"]:
+            state["mc_min"] = mc
+            state["time_min"] = elapsed_min
+            db.update_bottom(mint, mc, elapsed_min)
+            logger.info("Fundo %s: $%.0f em %.1fmin (%.0f%% abaixo ATH)",
+                        state["symbol"], mc, elapsed_min,
+                        (1 - mc / state["mc_migration"]) * 100)
+
     def start(self):
         thread = threading.Thread(target=self._loop, daemon=True, name="hot-monitor")
         thread.start()
@@ -96,6 +123,7 @@ class HotMonitor:
             time.sleep(HOT_INTERVAL)
 
     def _tick(self):
+        """Apenas controla graduação — MC vem via push_mc() do Scanner."""
         with self._lock:
             snapshot = list(self._tokens.items())
         if not snapshot:
@@ -109,88 +137,50 @@ class HotMonitor:
                 with self._lock:
                     self._tokens.pop(mint, None)
                 continue
-
             elapsed_sec = (now - state["ts_migration"]).total_seconds()
-            elapsed_min = elapsed_sec / 60
-
-            if elapsed_min >= HOT_WINDOW_MIN:
+            if elapsed_sec / 60 >= HOT_WINDOW_MIN:
                 to_graduate.append((mint, state, elapsed_sec))
-                continue
-
-            self._poll_token(mint, state, elapsed_min)
-            time.sleep(0.5)
 
         for mint, state, elapsed_sec in to_graduate:
             with self._lock:
                 self._tokens.pop(mint, None)
             self._graduate(mint, state, elapsed_sec)
 
-    def _get_current_mc(self, mint: str, total_supply: float) -> Optional[float]:
-        """Tenta kline primeiro; fallback para token/info (funciona para tokens Raydium)."""
-        price = self.gmgn.get_price_from_kline(mint)
-        if price and price > 0:
-            return price * total_supply
-
-        info = self.gmgn.get_token_info(mint)
-        if info:
-            try:
-                return float(info["price"]) * float(info["circulating_supply"])
-            except Exception:
-                pass
-        return None
-
-    def _poll_token(self, mint: str, state: dict, elapsed_min: float):
-        try:
-            mc = self._get_current_mc(mint, state["total_supply"])
-            if not mc:
-                return
-            if mc < state["mc_migration"] * 0.20:
-                logger.info("Rug %s: queda >=80%%", state["symbol"])
-                self.cancel(mint)
-                return
-            if mc < state["mc_min"]:
-                state["mc_min"] = mc
-                state["time_min"] = elapsed_min
-                db.update_bottom(mint, mc, elapsed_min)
-                logger.info("Fundo %s: $%.0f em %.1fmin (%.0f%% abaixo ATH)",
-                            state["symbol"], mc, elapsed_min,
-                            (1 - mc / state["mc_migration"]) * 100)
-        except RateLimitError as e:
-            wait = max(1.0, e.reset_at - time.time()) + 1
-            logger.warning("Rate limit hot monitor, aguardando %.1fs", wait)
-            time.sleep(wait)
-        except Exception as e:
-            logger.warning("Erro poll %s: %s", mint[:8], e)
-
     def _graduate(self, mint: str, state: dict, elapsed_sec: float):
         symbol       = state["symbol"]
         mc_migration = state["mc_migration"]
         total_supply = state["total_supply"]
-        try:
-            mc = self._get_current_mc(mint, total_supply)
-            if mc:
+
+        # Após 1h token/info pode já estar indexado pelo GMGN
+        info = self.gmgn.get_token_info(mint)
+        if info:
+            try:
+                mc  = float(info["price"]) * float(info["circulating_supply"])
                 var = (mc - mc_migration) / mc_migration if mc_migration else None
                 db.update_checkpoint(mint, "1h", mc, var)
                 logger.info("Checkpoint 1h %s: $%.0f (%s)", symbol, mc,
                             f"{var*100:+.1f}%" if var is not None else "N/A")
-        except Exception as e:
-            logger.warning("Erro checkpoint 1h %s: %s", symbol, e)
+            except Exception as e:
+                logger.warning("Erro checkpoint 1h %s: %s", symbol, e)
 
         for delay_min, label in [(240, "4h"), (1440, "24h")]:
             remaining = delay_min * 60 - elapsed_sec
             if remaining > 0:
                 self.scheduler.schedule(remaining, self._checkpoint,
                                         mint, mc_migration, total_supply, label, symbol)
-        logger.info("%s saiu da janela quente", symbol)
+        logger.info("%s saiu da janela quente (bottom=$%.0f em %.1fmin)",
+                    symbol, state["mc_min"], state["time_min"])
 
     def _checkpoint(self, mint: str, mc_migration: float, total_supply: float,
                     label: str, symbol: str):
         if mint in self._cancelled:
             return
+        info = self.gmgn.get_token_info(mint)
+        if not info:
+            logger.info("Checkpoint %s %s: token/info indisponivel", symbol, label)
+            return
         try:
-            mc = self._get_current_mc(mint, total_supply)
-            if not mc:
-                return
+            mc  = float(info["price"]) * float(info["circulating_supply"])
             var = (mc - mc_migration) / mc_migration if mc_migration else None
             db.update_checkpoint(mint, label, mc, var)
             logger.info("Checkpoint %s %s: $%.0f (%s)", symbol, label, mc,
@@ -215,8 +205,9 @@ class Scanner:
         thread = threading.Thread(target=self._loop, daemon=True, name="scanner")
         thread.start()
         logger.info(
-            "Scanner iniciado (poll=%ds) | bc_min=%.0f%% | mc=$%.0f-$%.0f | filtros: rug<%.0f%% rat<%.0f%% top10<%.0f%% smart>=%d wash=%s",
-            POLL_INTERVAL, BC_MIN_WATCHLIST, F_MC_MIN, F_MC_MAX,
+            "Scanner iniciado (poll=%ds) | bc_min=%.0f%% | mc=$%.0f-$%.0f | liq>=$%.0f | fee>=%.1fSOL | "
+            "filtros: rug<%.0f%% rat<%.0f%% top10<%.0f%% smart>=%d wash=%s",
+            POLL_INTERVAL, BC_MIN_WATCHLIST, F_MC_MIN, F_MC_MAX, F_LIQ_MIN, F_FEE_MIN,
             F_RUG_MAX*100, F_RAT_MAX*100, F_TOP10_MAX*100,
             F_SMART_MIN, F_WASH_BLOCK,
         )
@@ -239,6 +230,11 @@ class Scanner:
             self._safe(self._handle_near_completion, token)
         for token in data.get("completed", []):
             self._safe(self._handle_completed, token)
+            # Passa MC atualizado ao HotMonitor — trenches já tem market_cap em tempo real
+            mint = token.get("address")
+            mc   = _float(token.get("usd_market_cap")) or _float(token.get("market_cap"))
+            if mint and mc and F_MC_MIN <= mc <= F_MC_MAX:
+                self.hot.push_mc(mint, mc)
 
     def _safe(self, fn, token: dict):
         try:
@@ -251,7 +247,7 @@ class Scanner:
                            token.get("address", "?")[:8], e)
 
     # --------------------------------------------------------------------------
-    # Watchlist: filtra ANTES de entrar + extrai qualidade do trenches
+    # Watchlist
     # --------------------------------------------------------------------------
 
     def _handle_near_completion(self, token: dict):
@@ -298,11 +294,10 @@ class Scanner:
         db.upsert_watchlist(entry)
         logger.info("Watchlist +%s (%s) bc=%.0f%% smart=%s rug=%.0f%%",
                     token.get("symbol"), mint[:8], bc,
-                    entry["smart_wallets"],
-                    (entry["rug_ratio"] or 0) * 100)
+                    entry["smart_wallets"], (entry["rug_ratio"] or 0) * 100)
 
     # --------------------------------------------------------------------------
-    # Migracao: MC e qualidade vem do trenches diretamente — zero chamadas API
+    # Migração — MC e qualidade do trenches, zero chamadas de API
     # --------------------------------------------------------------------------
 
     def _handle_completed(self, token: dict):
@@ -324,19 +319,34 @@ class Scanner:
                     self._seen.discard(mint)
                 return
 
-        # MC direto do trenches — sem chamada de API
-        mc = _float(token.get("usd_market_cap")) or _float(token.get("market_cap"))
+        mc  = _float(token.get("usd_market_cap")) or _float(token.get("market_cap"))
+        liq = _float(token.get("liquidity")) or 0
+
         if not mc or mc < F_MC_MIN or mc > F_MC_MAX:
-            if mc:
-                motivo = f"mc=$%.0f<$%.0f" % (mc, F_MC_MIN) if mc < F_MC_MIN else f"mc=$%.0f>$%.0f" % (mc, F_MC_MAX)
-                logger.info("Migracao descartada %s (%s): %s",
-                            token.get("symbol"), mint[:8], motivo)
+            motivo = (f"mc=${mc:.0f}<${F_MC_MIN:.0f}" if mc and mc < F_MC_MIN
+                      else f"mc=${mc:.0f}>${F_MC_MAX:.0f}" if mc else "mc=0")
+            logger.info("Migracao descartada %s (%s): %s",
+                        token.get("symbol"), mint[:8], motivo)
+            with self._lock:
+                self._seen.discard(mint)
+            return
+
+        if liq < F_LIQ_MIN:
+            logger.info("Migracao descartada %s (%s): liq=$%.0f<$%.0f",
+                        token.get("symbol"), mint[:8], liq, F_LIQ_MIN)
+            with self._lock:
+                self._seen.discard(mint)
+            return
+
+        fee = _float(token.get("total_fee")) or 0
+        if fee < F_FEE_MIN:
+            logger.info("Migracao descartada %s (%s): total_fee=%.4f<%.1f SOL",
+                        token.get("symbol"), mint[:8], fee, F_FEE_MIN)
             with self._lock:
                 self._seen.discard(mint)
             return
 
         total_supply = _float(token.get("total_supply")) or 1_000_000_000
-
         now   = datetime.now(timezone.utc)
         quality = {
             "smart_wallets":     _int(token.get("smart_degen_count")),
@@ -348,12 +358,11 @@ class Scanner:
             "volume_1m":         _float(token.get("volume_1m")),
             "volume_5m":         _float(token.get("volume_5m")),
             "volume_15m":        _float(token.get("volume_15m")),
-            "liq_migration":     _float(token.get("liquidity")),
+            "liq_migration":     liq,
             "is_wash_trading":   bool(token.get("is_wash_trading")),
             "is_honeypot":       None,
         }
 
-        # Watchlist tem prioridade: snapshot pre-dump e mais limpo
         if watchlist_entry:
             for k in ("smart_wallets", "renowned_wallets", "sniper_wallets",
                       "rug_ratio", "top10_holder_rate", "holders_count",
@@ -377,19 +386,16 @@ class Scanner:
         symbol = token.get("symbol") or mint[:8]
         smart  = entry.get("smart_wallets") or 0
         rug    = entry.get("rug_ratio") or 0
-        wash   = "⚠️ SIM" if entry.get("is_wash_trading") else "nao"
         exch   = token.get("exchange") or "?"
 
         send_alert(
             f"\U0001f514 *Migracao: {symbol}*\n"
-            f"MC: ${mc:,.0f}\n"
+            f"MC: ${mc:,.0f} | Liq: ${liq:,.0f}\n"
             f"Exchange: {exch}\n"
-            f"Smart wallets: {smart}\n"
-            f"Wash trading: {wash}\n"
-            f"Rug ratio: {rug:.0%}"
+            f"Smart: {smart} | Rug: {rug:.0%}"
         )
-        logger.info("Migracao %s (%s) MC=$%.0f exch=%s smart=%d rug=%.0f%%",
-                    symbol, mint[:8], mc, exch, smart, rug * 100)
+        logger.info("Migracao %s (%s) MC=$%.0f liq=$%.0f exch=%s smart=%d",
+                    symbol, mint[:8], mc, liq, exch, smart)
 
         self.hot.add(mint, mc, now, symbol, total_supply)
 
