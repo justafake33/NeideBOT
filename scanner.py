@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
+import requests
 from gmgn_client import GmgnClient, RateLimitError
 import db
 from scheduler import HeapScheduler
@@ -126,11 +127,12 @@ class HotMonitor:
             self._graduate(mint, state, elapsed_sec)
 
     def _get_current_mc(self, mint: str, total_supply: float) -> Optional[float]:
-        """Tenta kline primeiro; fallback para token/info (funciona para tokens Raydium)."""
-        price = self.gmgn.get_price_from_kline(mint)
+        """Jupiter Price API — suporta todos os tokens Solana (Meteora, PumpSwap, Raydium)."""
+        price = _jupiter_price(mint)
         if price and price > 0:
             return price * total_supply
 
+        # Fallback: token/info do GMGN (funciona para tokens Raydium antigos)
         info = self.gmgn.get_token_info(mint)
         if info:
             try:
@@ -397,6 +399,22 @@ class Scanner:
 # ==============================================================================
 # Helpers
 # ==============================================================================
+
+def _jupiter_price(mint: str) -> Optional[float]:
+    """Jupiter Price API v2 — gratis, sem auth, cobre Meteora/PumpSwap/Raydium."""
+    try:
+        resp = requests.get(
+            "https://api.jup.ag/price/v2",
+            params={"ids": mint},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        price_str = resp.json().get("data", {}).get(mint, {}).get("price")
+        return float(price_str) if price_str else None
+    except Exception as e:
+        logger.debug("jupiter price %s: %s", mint[:8], e)
+        return None
+
 
 def _float(v, divisor: float = 1) -> Optional[float]:
     try:
