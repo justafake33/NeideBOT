@@ -60,8 +60,13 @@ def init_db():
                 recovery                  BOOL,
                 comprado                  BOOL DEFAULT FALSE,
                 resultado_pct             FLOAT,
+                capture_delay_sec         INT,
                 created_at                TIMESTAMPTZ DEFAULT NOW()
             )
+        """)
+        cur.execute("""
+            ALTER TABLE migrations
+            ADD COLUMN IF NOT EXISTS capture_delay_sec INT
         """)
     logger.info("DB inicializado")
 
@@ -114,18 +119,21 @@ def upsert_migration(data: dict):
                 smart_wallets, renowned_wallets, sniper_wallets,
                 rug_ratio, top10_holder_rate, holders_count,
                 volume_1m, volume_5m, volume_15m,
-                is_wash_trading, liq_migration, is_honeypot
+                is_wash_trading, liq_migration, is_honeypot,
+                capture_delay_sec
             ) VALUES (
                 %(mint)s, %(token_nome)s, %(ts_detected)s, %(bc_progress_at_detection)s,
                 %(ts_migration)s, %(mc_migration)s,
                 %(smart_wallets)s, %(renowned_wallets)s, %(sniper_wallets)s,
                 %(rug_ratio)s, %(top10_holder_rate)s, %(holders_count)s,
                 %(volume_1m)s, %(volume_5m)s, %(volume_15m)s,
-                %(is_wash_trading)s, %(liq_migration)s, %(is_honeypot)s
+                %(is_wash_trading)s, %(liq_migration)s, %(is_honeypot)s,
+                %(capture_delay_sec)s
             )
             ON CONFLICT (mint) DO UPDATE SET
                 ts_migration      = EXCLUDED.ts_migration,
                 mc_migration      = EXCLUDED.mc_migration,
+                capture_delay_sec = EXCLUDED.capture_delay_sec,
                 smart_wallets     = COALESCE(migrations.smart_wallets, EXCLUDED.smart_wallets),
                 renowned_wallets  = COALESCE(migrations.renowned_wallets, EXCLUDED.renowned_wallets),
                 sniper_wallets    = COALESCE(migrations.sniper_wallets, EXCLUDED.sniper_wallets),
@@ -157,6 +165,7 @@ def upsert_migration(data: dict):
             "is_wash_trading": data.get("is_wash_trading"),
             "liq_migration": data.get("liq_migration"),
             "is_honeypot": data.get("is_honeypot"),
+            "capture_delay_sec": data.get("capture_delay_sec"),
         })
 
 

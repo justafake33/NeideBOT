@@ -107,6 +107,22 @@ class GmgnClient:
         result = self._post("/v1/trenches", body, extra_params={"chain": chain})
         return result.get("data", {})
 
+    def get_token_kline(self, mint: str, chain: str = "sol",
+                        resolution: str = "1m",
+                        from_ts: int = None, to_ts: int = None) -> list:
+        """Retorna lista de candles OHLCV. time em ms, open/close/high/low/volume em str."""
+        params: dict = {"chain": chain, "address": mint, "resolution": resolution}
+        if from_ts is not None:
+            params["from"] = str(from_ts)
+        if to_ts is not None:
+            params["to"] = str(to_ts)
+        try:
+            result = self._get("/v1/market/token_kline", params)
+            return result.get("data", {}).get("list", []) or []
+        except Exception as e:
+            logger.debug("kline %s: %s", mint[:8], e)
+            return []
+
     def get_token_info(self, mint: str, chain: str = "sol") -> Optional[dict]:
         for attempt in range(2):
             try:
