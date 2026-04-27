@@ -81,6 +81,7 @@ class HotMonitor:
                     "time_min":     0.0,
                     "mc_max":       mc_migration,
                     "time_max":     0.0,
+                    "mc_last":      mc_migration,
                     "total_supply": total_supply,
                 }
 
@@ -97,6 +98,8 @@ class HotMonitor:
                 return
 
         elapsed_min = (datetime.now(timezone.utc) - state["ts_migration"]).total_seconds() / 60
+
+        state["mc_last"] = mc
 
         if mc < state["mc_migration"] * 0.20:
             logger.info("Rug %s: queda >=80%%", state["symbol"])
@@ -326,19 +329,30 @@ class HotMonitor:
                 logger.info("Checkpoint 1h %s: $%.0f (%s) [kline]", symbol, mc_1h,
                             f"{var*100:+.1f}%" if var is not None else "N/A")
         else:
-            # Fallback: token/info pode estar indexado após 1h
+            mc_1h = None
+            src   = None
+
+            # Fallback 1: token/info (pode estar indexado após 1h)
             info = self.gmgn.get_token_info(mint)
             if info:
                 try:
                     mc_1h = float(info["price"]) * float(info["circulating_supply"])
-                    var   = (mc_1h - mc_migration) / mc_migration if mc_migration else None
-                    db.update_checkpoint(mint, "1h", mc_1h, var)
-                    logger.info("Checkpoint 1h %s: $%.0f (%s) [token/info]", symbol, mc_1h,
-                                f"{var*100:+.1f}%" if var is not None else "N/A")
-                except Exception as e:
-                    logger.warning("Checkpoint 1h %s: token/info parse error: %s", symbol, e)
+                    src   = "token/info"
+                except Exception:
+                    pass
+
+            # Fallback 2: último MC do push_mc — máximo 5s de defasagem
+            if mc_1h is None and state.get("mc_last"):
+                mc_1h = state["mc_last"]
+                src   = "push_mc"
+
+            if mc_1h:
+                var = (mc_1h - mc_migration) / mc_migration if mc_migration else None
+                db.update_checkpoint(mint, "1h", mc_1h, var)
+                logger.info("Checkpoint 1h %s: $%.0f (%s) [%s]", symbol, mc_1h,
+                            f"{var*100:+.1f}%" if var is not None else "N/A", src)
             else:
-                logger.warning("Graduacao %s: kline e token/info indisponiveis — 1h pulado", symbol)
+                logger.warning("Graduacao %s: todas as fontes falharam — 1h pulado", symbol)
 
         for delay_min, label in [(240, "4h"), (1440, "24h")]:
             remaining = delay_min * 60 - elapsed_sec
@@ -372,17 +386,22 @@ class HotMonitor:
                 mc  = close_price * total_supply
                 src = "kline"
 
+        # Fallback: token/info com até 3 tentativas (indexação pode demorar)
         if mc is None:
-            info = self.gmgn.get_token_info(mint)
-            if info:
-                try:
-                    mc  = float(info["price"]) * float(info["circulating_supply"])
-                    src = "token/info"
-                except Exception:
-                    pass
+            for attempt in range(3):
+                info = self.gmgn.get_token_info(mint)
+                if info:
+                    try:
+                        mc  = float(info["price"]) * float(info["circulating_supply"])
+                        src = "token/info"
+                    except Exception:
+                        pass
+                    break
+                if attempt < 2:
+                    time.sleep(300)  # aguarda 5min e tenta novamente
 
         if mc is None:
-            logger.warning("Checkpoint %s %s: kline e token/info indisponiveis", symbol, label)
+            logger.warning("Checkpoint %s %s: todas as fontes falharam", symbol, label)
             return
 
         var = (mc - mc_migration) / mc_migration if mc_migration else None
