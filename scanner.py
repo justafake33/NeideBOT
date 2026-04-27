@@ -346,8 +346,17 @@ class Scanner:
                 self._seen.discard(mint)
             return
 
-        total_supply = _float(token.get("total_supply")) or 1_000_000_000
-        now   = datetime.now(timezone.utc)
+        total_supply      = _float(token.get("total_supply")) or 1_000_000_000
+        complete_ts       = int(token.get("complete_timestamp") or 0)
+        now               = datetime.now(timezone.utc)
+        now_ts            = int(now.timestamp())
+        capture_delay_sec = (now_ts - complete_ts) if complete_ts > 0 else None
+
+        if capture_delay_sec is not None and capture_delay_sec > 90:
+            logger.warning(
+                "Migracao %s (%s): MC capturado %ds apos migracao — dado pode estar impreciso",
+                token.get("symbol"), mint[:8], capture_delay_sec,
+            )
         quality = {
             "smart_wallets":     _int(token.get("smart_degen_count")),
             "renowned_wallets":  _int(token.get("renowned_count")),
@@ -378,6 +387,7 @@ class Scanner:
             "bc_progress_at_detection": watchlist_entry.get("bc_progress_at_detection") if watchlist_entry else None,
             "ts_migration":             now,
             "mc_migration":             mc,
+            "capture_delay_sec":        capture_delay_sec,
             **quality,
         }
 
@@ -394,8 +404,9 @@ class Scanner:
             f"Exchange: {exch}\n"
             f"Smart: {smart} | Rug: {rug:.0%}"
         )
-        logger.info("Migracao %s (%s) MC=$%.0f liq=$%.0f exch=%s smart=%d",
-                    symbol, mint[:8], mc, liq, exch, smart)
+        delay_str = f" delay={capture_delay_sec}s" if capture_delay_sec is not None else ""
+        logger.info("Migracao %s (%s) MC=$%.0f liq=$%.0f exch=%s smart=%d%s",
+                    symbol, mint[:8], mc, liq, exch, smart, delay_str)
 
         self.hot.add(mint, mc, now, symbol, total_supply)
 
