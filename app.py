@@ -47,7 +47,7 @@ DASHBOARD_HTML = """
 <html lang="pt-BR">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="refresh" content="30">
+<meta http-equiv="refresh" content="15">
 <title>NeideBOT — Scanner</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -81,7 +81,7 @@ DASHBOARD_HTML = """
 </head>
 <body>
 <h1>NeideBOT — Scanner de Migrações</h1>
-<p class="sub">Fase 1 — Coleta pura • hot monitor 30s • horário BRT • atualiza a cada 30s</p>
+<p class="sub">Fase 1 — Coleta pura • poll 5s • kline 1m • horário BRT • atualiza a cada 15s</p>
 
 <div class="stats">
   <div class="stat"><div class="stat-label">Observadas</div>
@@ -98,7 +98,8 @@ DASHBOARD_HTML = """
 <table>
 <thead><tr>
   <th>Data BRT</th><th>Token</th><th>BC%</th>
-  <th>MC Mig</th><th>Fundo</th><th>Queda</th><th>T/Fundo</th>
+  <th>MC Mig</th><th>Pico</th><th>Ganho</th><th>T/Pico</th>
+  <th>Fundo</th><th>Queda</th><th>T/Fundo</th>
   <th>1h</th><th>4h</th><th>24h</th>
   <th>Smart</th><th>Sniper</th><th>Rug%</th><th>Top10</th>
   <th>Wash</th><th>HP</th><th>Recovery</th>
@@ -118,6 +119,9 @@ DASHBOARD_HTML = """
   </td>
   <td class="muted">{{ r.bc }}</td>
   <td>{{ r.mc_mig }}</td>
+  <td class="{{ 'green' if r.gain_raw and r.gain_raw > 0 else 'muted' }}">{{ r.mc_peak }}</td>
+  <td class="{{ 'green' if r.gain_raw and r.gain_raw > 0.1 else 'muted' }}">{{ r.gain }}</td>
+  <td class="muted">{{ r.ttp }}</td>
   <td>{{ r.mc_bot }}</td>
   <td class="{{ 'red' if r.drop_raw and r.drop_raw > 0.2 else 'muted' }}">{{ r.drop }}</td>
   <td class="muted">{{ r.ttb }}</td>
@@ -168,12 +172,14 @@ def scanner_dashboard():
             dt = "—"
 
         pct_drop = r.get("pct_drop")
+        pct_gain = r.get("pct_gain")
         v1  = r.get("var_1h")
         v4  = r.get("var_4h")
         v24 = r.get("var_24h")
         rug   = r.get("rug_ratio")
         top10 = r.get("top10_holder_rate")
         ttb   = r.get("time_to_bottom")
+        ttp   = r.get("time_to_peak")
         wash  = r.get("is_wash_trading")
 
         rows.append({
@@ -183,6 +189,9 @@ def scanner_dashboard():
             "mint_short": (r.get("mint") or "")[:12] + "…",
             "bc":         f"{r.get('bc_progress_at_detection'):.0f}%" if r.get("bc_progress_at_detection") else "—",
             "mc_mig":     fmt_mc(r.get("mc_migration")),
+            "mc_peak":    fmt_mc(r.get("mc_peak")),
+            "gain":       fmt_pct(pct_gain), "gain_raw": pct_gain,
+            "ttp":        f"{ttp:.1f}min" if ttp is not None else "—",
             "mc_bot":     fmt_mc(r.get("mc_bottom")),
             "drop":       fmt_pct(pct_drop), "drop_raw": pct_drop,
             "ttb":        f"{ttb:.1f}min" if ttb is not None else "—",

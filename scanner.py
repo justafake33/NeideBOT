@@ -78,6 +78,8 @@ class HotMonitor:
                     "symbol":       symbol,
                     "mc_min":       mc_migration,
                     "time_min":     0.0,
+                    "mc_max":       mc_migration,
+                    "time_max":     0.0,
                     "total_supply": total_supply,
                 }
 
@@ -107,6 +109,14 @@ class HotMonitor:
             logger.info("Fundo(poll) %s: $%.0f em %.1fmin (%.0f%% abaixo ATH)",
                         state["symbol"], mc, elapsed_min,
                         (1 - mc / state["mc_migration"]) * 100)
+
+        if mc > state["mc_max"]:
+            state["mc_max"] = mc
+            state["time_max"] = elapsed_min
+            db.update_peak(mint, mc, elapsed_min)
+            logger.info("Pico(poll)  %s: $%.0f em %.1fmin (+%.0f%% vs mig)",
+                        state["symbol"], mc, elapsed_min,
+                        (mc / state["mc_migration"] - 1) * 100)
 
     # ------------------------------------------------------------------
     # Threads
@@ -182,25 +192,40 @@ class HotMonitor:
                     to_ts=now_ts,
                 )
                 for c in candles:
-                    low_price = _float(c.get("low"))
-                    if not low_price or low_price <= 0:
-                        continue
-                    mc_low = low_price * state["total_supply"]
-                    candle_ts    = int(c.get("time", 0)) / 1000
-                    elapsed_min  = (candle_ts - state["ts_mig_unix"]) / 60
+                    candle_ts   = int(c.get("time", 0)) / 1000
+                    elapsed_min = (candle_ts - state["ts_mig_unix"]) / 60
                     if elapsed_min < 0:
                         continue
-                    if mc_low < state["mc_min"]:
-                        with self._lock:
-                            inner = self._tokens.get(mint)
-                            if inner and mc_low < inner["mc_min"]:
-                                inner["mc_min"] = mc_low
-                                inner["time_min"] = elapsed_min
-                        db.update_bottom(mint, mc_low, elapsed_min)
-                        logger.info("Fundo(kline) %s: $%.0f em %.1fmin (%.0f%% abaixo ATH)",
-                                    state["symbol"], mc_low, elapsed_min,
-                                    (1 - mc_low / state["mc_migration"]) * 100)
-                        state["mc_min"] = mc_low  # atualiza snapshot local para comparações
+
+                    low_price = _float(c.get("low"))
+                    if low_price and low_price > 0:
+                        mc_low = low_price * state["total_supply"]
+                        if mc_low < state["mc_min"]:
+                            with self._lock:
+                                inner = self._tokens.get(mint)
+                                if inner and mc_low < inner["mc_min"]:
+                                    inner["mc_min"] = mc_low
+                                    inner["time_min"] = elapsed_min
+                            db.update_bottom(mint, mc_low, elapsed_min)
+                            logger.info("Fundo(kline) %s: $%.0f em %.1fmin (%.0f%% abaixo ATH)",
+                                        state["symbol"], mc_low, elapsed_min,
+                                        (1 - mc_low / state["mc_migration"]) * 100)
+                            state["mc_min"] = mc_low
+
+                    high_price = _float(c.get("high"))
+                    if high_price and high_price > 0:
+                        mc_high = high_price * state["total_supply"]
+                        if mc_high > state["mc_max"]:
+                            with self._lock:
+                                inner = self._tokens.get(mint)
+                                if inner and mc_high > inner["mc_max"]:
+                                    inner["mc_max"] = mc_high
+                                    inner["time_max"] = elapsed_min
+                            db.update_peak(mint, mc_high, elapsed_min)
+                            logger.info("Pico(kline)  %s: $%.0f em %.1fmin (+%.0f%% vs mig)",
+                                        state["symbol"], mc_high, elapsed_min,
+                                        (mc_high / state["mc_migration"] - 1) * 100)
+                            state["mc_max"] = mc_high
             except Exception as e:
                 logger.debug("precise bottom %s: %s", mint[:8], e)
             time.sleep(0.5)
@@ -224,16 +249,18 @@ class HotMonitor:
         )
 
         if candles_1h:
-            # Varre todos os lows para encontrar o mínimo absoluto
+            # Varre todos os candles para confirmar bottom e peak absolutos
             for c in candles_1h:
-                low = _float(c.get("low"))
-                if not low or low <= 0:
-                    continue
-                mc_low      = low * total_supply
                 candle_ts   = int(c.get("time", 0)) / 1000
                 elapsed_min = (candle_ts - ts_mig_unix) / 60
-                if elapsed_min >= 0:
-                    db.update_bottom(mint, mc_low, elapsed_min)
+                if elapsed_min < 0:
+                    continue
+                low = _float(c.get("low"))
+                if low and low > 0:
+                    db.update_bottom(mint, low * total_supply, elapsed_min)
+                high = _float(c.get("high"))
+                if high and high > 0:
+                    db.update_peak(mint, high * total_supply, elapsed_min)
 
             # Checkpoint 1h = close do último candle do período
             last        = candles_1h[-1]
