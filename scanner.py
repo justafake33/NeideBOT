@@ -19,19 +19,15 @@ HOT_WINDOW_MIN = 60
 # ------------------------------------------------------------------
 # Filtros pre-watchlist (configuraveis via env sem redeploy)
 # ------------------------------------------------------------------
-F_RUG_MAX        = float(os.getenv("FILTER_RUG_MAX",        "0.15"))  # bundler ratio
-F_RAT_MAX        = float(os.getenv("FILTER_RAT_MAX",        "0.20"))  # rat trader ratio
-F_TOP10_MAX      = float(os.getenv("FILTER_TOP10_MAX",      "0.80"))  # concentracao holders
-F_SMART_MIN      = int(os.getenv(  "FILTER_SMART_MIN",      "1"))     # minimo smart wallets
+F_RUG_MAX        = float(os.getenv("FILTER_RUG_MAX",        "0.15"))
+F_RAT_MAX        = float(os.getenv("FILTER_RAT_MAX",        "0.20"))
+F_TOP10_MAX      = float(os.getenv("FILTER_TOP10_MAX",      "0.80"))
+F_SMART_MIN      = int(os.getenv(  "FILTER_SMART_MIN",      "1"))
 F_WASH_BLOCK     = os.getenv(      "FILTER_WASH_BLOCK",     "true").lower() == "true"
-BC_MIN_WATCHLIST = float(os.getenv("BC_MIN_WATCHLIST",      "80"))    # % bc para entrar na watchlist
+BC_MIN_WATCHLIST = float(os.getenv("BC_MIN_WATCHLIST",      "80"))
 
 
 def _passes_filter(token: dict) -> tuple[bool, str]:
-    """
-    Retorna (True, '') se o token passa, ou (False, motivo) se deve ser descartado.
-    Aplicado antes de entrar na watchlist (90% BC).
-    """
     if F_WASH_BLOCK and token.get("is_wash_trading"):
         return False, "wash_trading"
 
@@ -55,7 +51,7 @@ def _passes_filter(token: dict) -> tuple[bool, str]:
 
 
 # ==============================================================================
-# HotMonitor
+# HotMonitor — polling de 30s para tracking de fundo pós-migração
 # ==============================================================================
 
 class HotMonitor:
@@ -66,15 +62,17 @@ class HotMonitor:
         self._cancelled: set = set()
         self._lock = threading.Lock()
 
-    def add(self, mint: str, mc_migration: float, ts_migration: datetime, symbol: str):
+    def add(self, mint: str, mc_migration: float, ts_migration: datetime,
+            symbol: str, total_supply: float = 1_000_000_000):
         with self._lock:
             if mint not in self._tokens and mint not in self._cancelled:
                 self._tokens[mint] = {
                     "mc_migration": mc_migration,
                     "ts_migration": ts_migration,
-                    "symbol": symbol,
-                    "mc_min": mc_migration,
-                    "time_min": 0.0,
+                    "symbol":       symbol,
+                    "mc_min":       mc_migration,
+                    "time_min":     0.0,
+                    "total_supply": total_supply,
                 }
 
     def cancel(self, mint: str):
@@ -125,12 +123,23 @@ class HotMonitor:
                 self._tokens.pop(mint, None)
             self._graduate(mint, state, elapsed_sec)
 
+    def _get_current_mc(self, mint: str, total_supply: float) -> Optional[float]:
+        """Tenta kline primeiro; fallback para token/info (funciona para tokens Raydium)."""
+        price = self.gmgn.get_price_from_kline(mint)
+        if price and price > 0:
+            return price * total_supply
+
+        info = self.gmgn.get_token_info(mint)
+        if info:
+            try:
+                return float(info["price"]) * float(info["circulating_supply"])
+            except Exception:
+                pass
+        return None
+
     def _poll_token(self, mint: str, state: dict, elapsed_min: float):
         try:
-            info = self.gmgn.get_token_info(mint)
-            if not info:
-                return
-            mc = _calc_mc(info)
+            mc = self._get_current_mc(mint, state["total_supply"])
             if not mc:
                 return
             if mc < state["mc_migration"] * 0.20:
@@ -152,17 +161,16 @@ class HotMonitor:
             logger.warning("Erro poll %s: %s", mint[:8], e)
 
     def _graduate(self, mint: str, state: dict, elapsed_sec: float):
-        symbol = state["symbol"]
+        symbol       = state["symbol"]
         mc_migration = state["mc_migration"]
+        total_supply = state["total_supply"]
         try:
-            info = self.gmgn.get_token_info(mint)
-            if info:
-                mc = _calc_mc(info)
-                if mc:
-                    var = (mc - mc_migration) / mc_migration if mc_migration else None
-                    db.update_checkpoint(mint, "1h", mc, var)
-                    logger.info("Checkpoint 1h %s: $%.0f (%s)", symbol, mc,
-                                f"{var*100:+.1f}%" if var is not None else "N/A")
+            mc = self._get_current_mc(mint, total_supply)
+            if mc:
+                var = (mc - mc_migration) / mc_migration if mc_migration else None
+                db.update_checkpoint(mint, "1h", mc, var)
+                logger.info("Checkpoint 1h %s: $%.0f (%s)", symbol, mc,
+                            f"{var*100:+.1f}%" if var is not None else "N/A")
         except Exception as e:
             logger.warning("Erro checkpoint 1h %s: %s", symbol, e)
 
@@ -170,17 +178,15 @@ class HotMonitor:
             remaining = delay_min * 60 - elapsed_sec
             if remaining > 0:
                 self.scheduler.schedule(remaining, self._checkpoint,
-                                        mint, mc_migration, label, symbol)
+                                        mint, mc_migration, total_supply, label, symbol)
         logger.info("%s saiu da janela quente", symbol)
 
-    def _checkpoint(self, mint: str, mc_migration: float, label: str, symbol: str):
+    def _checkpoint(self, mint: str, mc_migration: float, total_supply: float,
+                    label: str, symbol: str):
         if mint in self._cancelled:
             return
         try:
-            info = self.gmgn.get_token_info(mint)
-            if not info:
-                return
-            mc = _calc_mc(info)
+            mc = self._get_current_mc(mint, total_supply)
             if not mc:
                 return
             var = (mc - mc_migration) / mc_migration if mc_migration else None
@@ -198,11 +204,10 @@ class HotMonitor:
 class Scanner:
     def __init__(self, gmgn: GmgnClient, hot: HotMonitor):
         self.gmgn = gmgn
-        self.hot = hot
+        self.hot  = hot
         self._watchlist: dict = {}
         self._seen: set = set()
         self._lock = threading.Lock()
-        self._debug_logged = 0  # loga campos raw dos primeiros completed tokens
 
     def start(self):
         thread = threading.Thread(target=self._loop, daemon=True, name="scanner")
@@ -259,7 +264,6 @@ class Scanner:
         if bc < BC_MIN_WATCHLIST:
             return
 
-        # Filtro pre-watchlist: descarta lixo antes de qualquer processamento
         ok, motivo = _passes_filter(token)
         if not ok:
             logger.info("Descartado %s (%s): %s",
@@ -282,7 +286,7 @@ class Scanner:
             "volume_1m":                _float(token.get("volume_1m")),
             "volume_5m":                _float(token.get("volume_5m")),
             "volume_15m":               _float(token.get("volume_15m")),
-            "liq_migration":            _float(token.get("liquidity"), divisor=2),
+            "liq_migration":            _float(token.get("liquidity")),
             "is_honeypot":              bool(token.get("is_honeypot")) if token.get("is_honeypot") is not None else None,
         }
 
@@ -296,7 +300,7 @@ class Scanner:
                     (entry["rug_ratio"] or 0) * 100)
 
     # --------------------------------------------------------------------------
-    # Migracao: usa pre-fetch da watchlist + 1 chamada para mc_migration
+    # Migracao: MC e qualidade vem do trenches diretamente — zero chamadas API
     # --------------------------------------------------------------------------
 
     def _handle_completed(self, token: dict):
@@ -309,7 +313,6 @@ class Scanner:
             watchlist_entry = self._watchlist.pop(mint, None)
             self._seen.add(mint)
 
-        # Se nao estava na watchlist, aplica filtro agora (token que nao passamos pelo near_completion)
         if not watchlist_entry:
             ok, motivo = _passes_filter(token)
             if not ok:
@@ -319,39 +322,27 @@ class Scanner:
                     self._seen.discard(mint)
                 return
 
-        # Log temporario: mostra todos os campos do trenches para os primeiros 3 tokens
-        if self._debug_logged < 3:
-            self._debug_logged += 1
-            logger.info("DEBUG campos completed #%d %s: %s",
-                        self._debug_logged, token.get("symbol"), dict(token))
-
-        # 1 chamada de API: pegar mc_migration (token ja tem pool no DEX)
-        info = self.gmgn.get_token_info(mint)
-        if not info:
-            with self._lock:
-                self._seen.discard(mint)
-            return
-
-        mc = _calc_mc(info)
+        # MC direto do trenches — sem chamada de API
+        mc = _float(token.get("usd_market_cap")) or _float(token.get("market_cap"))
         if not mc:
             with self._lock:
                 self._seen.discard(mint)
             return
 
-        now = datetime.now(timezone.utc)
-        wts  = info.get("wallet_tags_stat") or {}
-        stat = info.get("stat") or {}
+        total_supply = _float(token.get("total_supply")) or 1_000_000_000
+
+        now   = datetime.now(timezone.utc)
         quality = {
-            "smart_wallets":     _int(wts.get("smart_wallets")),
-            "renowned_wallets":  _int(wts.get("renowned_wallets")),
-            "sniper_wallets":    _int(wts.get("sniper_wallets")),
-            "rug_ratio":         _float(stat.get("top_bundler_trader_percentage")),
-            "top10_holder_rate": _float(stat.get("top_10_holder_rate")),
-            "holders_count":     _int(info.get("holder_count")),
-            "volume_1m":         _float(stat.get("volume_1m")),
-            "volume_5m":         _float(stat.get("volume_5m")),
-            "volume_15m":        _float(stat.get("volume_15m")),
-            "liq_migration":     _float(info.get("liquidity"), divisor=2),
+            "smart_wallets":     _int(token.get("smart_degen_count")),
+            "renowned_wallets":  _int(token.get("renowned_count")),
+            "sniper_wallets":    _int(token.get("sniper_count")),
+            "rug_ratio":         _float(token.get("bundler_trader_amount_rate")),
+            "top10_holder_rate": _float(token.get("top_10_holder_rate")),
+            "holders_count":     _int(token.get("holder_count")),
+            "volume_1m":         _float(token.get("volume_1m")),
+            "volume_5m":         _float(token.get("volume_5m")),
+            "volume_15m":        _float(token.get("volume_15m")),
+            "liq_migration":     _float(token.get("liquidity")),
             "is_wash_trading":   bool(token.get("is_wash_trading")),
             "is_honeypot":       None,
         }
@@ -381,30 +372,25 @@ class Scanner:
         smart  = entry.get("smart_wallets") or 0
         rug    = entry.get("rug_ratio") or 0
         wash   = "⚠️ SIM" if entry.get("is_wash_trading") else "nao"
+        exch   = token.get("exchange") or "?"
 
         send_alert(
             f"\U0001f514 *Migracao: {symbol}*\n"
             f"MC: ${mc:,.0f}\n"
+            f"Exchange: {exch}\n"
             f"Smart wallets: {smart}\n"
             f"Wash trading: {wash}\n"
             f"Rug ratio: {rug:.0%}"
         )
-        logger.info("Migracao %s (%s) MC=$%.0f smart=%d rug=%.0f%%",
-                    symbol, mint[:8], mc, smart, rug * 100)
+        logger.info("Migracao %s (%s) MC=$%.0f exch=%s smart=%d rug=%.0f%%",
+                    symbol, mint[:8], mc, exch, smart, rug * 100)
 
-        self.hot.add(mint, mc, now, symbol)
+        self.hot.add(mint, mc, now, symbol, total_supply)
 
 
 # ==============================================================================
 # Helpers
 # ==============================================================================
-
-def _calc_mc(info: dict) -> Optional[float]:
-    try:
-        return float(info["price"]) * float(info["circulating_supply"])
-    except Exception:
-        return None
-
 
 def _float(v, divisor: float = 1) -> Optional[float]:
     try:

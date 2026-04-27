@@ -90,7 +90,6 @@ class GmgnClient:
     def get_trenches(self, types: list = None, chain: str = "sol") -> dict:
         """
         POST /v1/trenches — chain como query param, body version=v2.
-        Cada tipo vira chave top-level no body.
         near_completion -> data['pump'] | completed -> data['completed']
         """
         selected = types or ["near_completion", "completed"]
@@ -108,6 +107,48 @@ class GmgnClient:
         result = self._post("/v1/trenches", body, extra_params={"chain": chain})
         return result.get("data", {})
 
+    def get_token_kline(self, mint: str, chain: str = "sol",
+                        resolution: str = "1", limit: int = 3) -> Optional[list]:
+        """
+        GET /v1/market/token_kline — OHLCV por mint.
+        Retorna lista de candles. Formato: list of dicts ou list of lists.
+        Usado pelo HotMonitor para preco atual quando token/info retorna 404.
+        """
+        try:
+            result = self._get("/v1/market/token_kline", {
+                "chain": chain,
+                "address": mint,
+                "resolution": resolution,
+                "limit": str(limit),
+            })
+            data = result.get("data")
+            return data if isinstance(data, list) else None
+        except RateLimitError:
+            raise
+        except Exception as e:
+            if "404" in str(e):
+                logger.debug("Kline 404 %s", mint[:8])
+            else:
+                logger.warning("kline %s: %s", mint[:8], e)
+            return None
+
+    def get_price_from_kline(self, mint: str, chain: str = "sol") -> Optional[float]:
+        """Retorna close price do ultimo candle de 1 minuto."""
+        candles = self.get_token_kline(mint, chain=chain, resolution="1", limit=3)
+        if not candles:
+            return None
+        latest = candles[-1]
+        try:
+            if isinstance(latest, (list, tuple)) and len(latest) >= 5:
+                return float(latest[4])  # [ts, open, high, low, close, ...]
+            if isinstance(latest, dict):
+                for key in ("close", "c", "Close"):
+                    if latest.get(key) is not None:
+                        return float(latest[key])
+        except Exception:
+            pass
+        return None
+
     def get_token_info(self, mint: str, chain: str = "sol") -> Optional[dict]:
         for attempt in range(2):
             try:
@@ -121,26 +162,7 @@ class GmgnClient:
                 else:
                     raise
             except Exception as e:
-                if "404" in str(e):
-                    logger.info("Pool nao indexado ainda %s — retentativa em 30s", mint[:8])
-                else:
+                if "404" not in str(e):
                     logger.warning("token info %s: %s", mint[:8], e)
-                return None
-        return None
-
-    def get_token_security(self, mint: str, chain: str = "sol") -> Optional[dict]:
-        for attempt in range(2):
-            try:
-                result = self._get(f"/v1/token/security/{chain}/{mint}")
-                return result.get("data")
-            except RateLimitError as e:
-                if attempt == 0:
-                    wait = max(1.0, e.reset_at - time.time()) + 1
-                    logger.warning("Rate limit token security, aguardando %.1fs", wait)
-                    time.sleep(wait)
-                else:
-                    raise
-            except Exception as e:
-                logger.warning("token security %s: %s", mint[:8], e)
                 return None
         return None
