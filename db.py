@@ -36,6 +36,9 @@ def init_db():
                 bc_progress_at_detection  FLOAT,
                 ts_migration              TIMESTAMPTZ,
                 mc_migration              FLOAT,
+                mc_peak                   FLOAT,
+                time_to_peak              FLOAT,
+                pct_gain                  FLOAT,
                 mc_bottom                 FLOAT,
                 time_to_bottom            FLOAT,
                 pct_drop                  FLOAT,
@@ -64,10 +67,13 @@ def init_db():
                 created_at                TIMESTAMPTZ DEFAULT NOW()
             )
         """)
-        cur.execute("""
-            ALTER TABLE migrations
-            ADD COLUMN IF NOT EXISTS capture_delay_sec INT
-        """)
+        for col in [
+            "ADD COLUMN IF NOT EXISTS capture_delay_sec INT",
+            "ADD COLUMN IF NOT EXISTS mc_peak           FLOAT",
+            "ADD COLUMN IF NOT EXISTS time_to_peak      FLOAT",
+            "ADD COLUMN IF NOT EXISTS pct_gain          FLOAT",
+        ]:
+            cur.execute(f"ALTER TABLE migrations {col}")
     logger.info("DB inicializado")
 
 
@@ -167,6 +173,22 @@ def upsert_migration(data: dict):
             "is_honeypot": data.get("is_honeypot"),
             "capture_delay_sec": data.get("capture_delay_sec"),
         })
+
+
+def update_peak(mint: str, mc: float, time_to_peak: float):
+    """Atualiza mc_peak apenas se o novo MC for maior que o atual registrado."""
+    with _cursor() as cur:
+        cur.execute("""
+            UPDATE migrations
+            SET
+                mc_peak      = %(mc)s,
+                time_to_peak = %(ttp)s,
+                pct_gain     = CASE WHEN mc_migration > 0
+                                   THEN (%(mc)s - mc_migration) / mc_migration
+                                   ELSE NULL END
+            WHERE mint = %(mint)s
+              AND (mc_peak IS NULL OR mc_peak < %(mc)s)
+        """, {"mint": mint, "mc": mc, "ttp": time_to_peak})
 
 
 def update_bottom(mint: str, mc: float, time_to_bottom: float):
