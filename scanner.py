@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -15,18 +16,48 @@ POLL_INTERVAL  = 30
 HOT_INTERVAL   = 30
 HOT_WINDOW_MIN = 60
 
+# ------------------------------------------------------------------
+# Filtros pre-watchlist (configuraveis via env sem redeploy)
+# ------------------------------------------------------------------
+F_RUG_MAX        = float(os.getenv("FILTER_RUG_MAX",        "0.15"))  # bundler ratio
+F_RAT_MAX        = float(os.getenv("FILTER_RAT_MAX",        "0.20"))  # rat trader ratio
+F_TOP10_MAX      = float(os.getenv("FILTER_TOP10_MAX",      "0.80"))  # concentracao holders
+F_SMART_MIN      = int(os.getenv(  "FILTER_SMART_MIN",      "1"))     # minimo smart wallets
+F_WASH_BLOCK     = os.getenv(      "FILTER_WASH_BLOCK",     "true").lower() == "true"
+
+
+def _passes_filter(token: dict) -> tuple[bool, str]:
+    """
+    Retorna (True, '') se o token passa, ou (False, motivo) se deve ser descartado.
+    Aplicado antes de entrar na watchlist (90% BC).
+    """
+    if F_WASH_BLOCK and token.get("is_wash_trading"):
+        return False, "wash_trading"
+
+    rug = _float(token.get("rug_ratio"))
+    if rug is not None and rug > F_RUG_MAX:
+        return False, f"rug_ratio={rug:.0%}>{F_RUG_MAX:.0%}"
+
+    rat = _float(token.get("rat_trader_amount_rate"))
+    if rat is not None and rat > F_RAT_MAX:
+        return False, f"rat_trader={rat:.0%}>{F_RAT_MAX:.0%}"
+
+    top10 = _float(token.get("top_10_holder_rate"))
+    if top10 is not None and top10 > F_TOP10_MAX:
+        return False, f"top10={top10:.0%}>{F_TOP10_MAX:.0%}"
+
+    smart = _int(token.get("smart_degen_count")) or 0
+    if smart < F_SMART_MIN:
+        return False, f"smart={smart}<{F_SMART_MIN}"
+
+    return True, ""
+
 
 # ==============================================================================
 # HotMonitor
 # ==============================================================================
 
 class HotMonitor:
-    """
-    Loop de 30s que monitora todos os tokens migrados na janela quente.
-    0-60 min: poll a cada 30s, atualiza mc_bottom.
-    Saida: captura mc_1h e agenda 4h/24h.
-    """
-
     def __init__(self, gmgn: GmgnClient, scheduler: HeapScheduler):
         self.gmgn = gmgn
         self.scheduler = scheduler
@@ -164,19 +195,6 @@ class HotMonitor:
 # ==============================================================================
 
 class Scanner:
-    """
-    Poll do trenches a cada 30s.
-
-    near_completion (data['pump']):
-        Pre-carrega qualidade diretamente do response do trenches (100+ campos).
-        Sem chamada extra de API — zero delay na watchlist.
-
-    completed (data['completed']):
-        Usa qualidade pre-carregada da watchlist (zero delay).
-        Chama token_info apenas para mc_migration e campos ausentes no trenches.
-        Entrega ao HotMonitor.
-    """
-
     def __init__(self, gmgn: GmgnClient, hot: HotMonitor):
         self.gmgn = gmgn
         self.hot = hot
@@ -187,7 +205,11 @@ class Scanner:
     def start(self):
         thread = threading.Thread(target=self._loop, daemon=True, name="scanner")
         thread.start()
-        logger.info("Scanner iniciado (poll=%ds)", POLL_INTERVAL)
+        logger.info(
+            "Scanner iniciado (poll=%ds) | filtros: rug<%.0f%% rat<%.0f%% top10<%.0f%% smart>=%d wash=%s",
+            POLL_INTERVAL, F_RUG_MAX*100, F_RAT_MAX*100, F_TOP10_MAX*100,
+            F_SMART_MIN, F_WASH_BLOCK,
+        )
 
     def _loop(self):
         while True:
@@ -219,7 +241,7 @@ class Scanner:
                            token.get("address", "?")[:8], e)
 
     # --------------------------------------------------------------------------
-    # Watchlist: extrai qualidade do response do trenches — sem chamada de API extra
+    # Watchlist: filtra ANTES de entrar + extrai qualidade do trenches
     # --------------------------------------------------------------------------
 
     def _handle_near_completion(self, token: dict):
@@ -234,9 +256,14 @@ class Scanner:
         if bc < 90:
             return
 
+        # Filtro pre-watchlist: descarta lixo antes de qualquer processamento
+        ok, motivo = _passes_filter(token)
+        if not ok:
+            logger.debug("Descartado %s (%s): %s",
+                         token.get("symbol"), mint[:8], motivo)
+            return
+
         now = datetime.now(timezone.utc)
-        # Todos os campos de qualidade vem do proprio response do trenches.
-        # Nenhuma chamada de API adicional — zero delay na watchlist.
         entry = {
             "mint":                     mint,
             "token_nome":               token.get("symbol"),
@@ -260,12 +287,13 @@ class Scanner:
             self._watchlist[mint] = entry
 
         db.upsert_watchlist(entry)
-        logger.info("Watchlist +%s (%s) bc=%.0f%% smart=%s wash=%s",
+        logger.info("Watchlist +%s (%s) bc=%.0f%% smart=%s rug=%.0f%%",
                     token.get("symbol"), mint[:8], bc,
-                    entry["smart_wallets"], entry["is_wash_trading"])
+                    entry["smart_wallets"],
+                    (entry["rug_ratio"] or 0) * 100)
 
     # --------------------------------------------------------------------------
-    # Migracao: usa dados pre-carregados + 1 chamada para mc_migration
+    # Migracao: usa pre-fetch da watchlist + 1 chamada para mc_migration
     # --------------------------------------------------------------------------
 
     def _handle_completed(self, token: dict):
@@ -278,7 +306,16 @@ class Scanner:
             watchlist_entry = self._watchlist.pop(mint, None)
             self._seen.add(mint)
 
-        # Unica chamada de API na migracao: pegar mc_migration e campos ausentes no trenches
+        # Se nao estava na watchlist, aplica filtro agora (token que nao passamos pelo near_completion)
+        if not watchlist_entry:
+            ok, motivo = _passes_filter(token)
+            if not ok:
+                logger.debug("Migracao descartada %s: %s", mint[:8], motivo)
+                with self._lock:
+                    self._seen.discard(mint)
+                return
+
+        # 1 chamada de API: pegar mc_migration (token ja tem pool no DEX)
         info = self.gmgn.get_token_info(mint)
         if not info:
             with self._lock:
@@ -292,8 +329,6 @@ class Scanner:
             return
 
         now = datetime.now(timezone.utc)
-
-        # Base: campos do token_info (post-migration, tem pool)
         wts  = info.get("wallet_tags_stat") or {}
         stat = info.get("stat") or {}
         quality = {
@@ -311,7 +346,7 @@ class Scanner:
             "is_honeypot":       None,
         }
 
-        # Watchlist tem prioridade: snapshot ANTES do dump = mais limpo
+        # Watchlist tem prioridade: snapshot pre-dump e mais limpo
         if watchlist_entry:
             for k in ("smart_wallets", "renowned_wallets", "sniper_wallets",
                       "rug_ratio", "top10_holder_rate", "holders_count",
@@ -344,8 +379,8 @@ class Scanner:
             f"Wash trading: {wash}\n"
             f"Rug ratio: {rug:.0%}"
         )
-        logger.info("Migracao %s (%s) MC=$%.0f smart=%d",
-                    symbol, mint[:8], mc, smart)
+        logger.info("Migracao %s (%s) MC=$%.0f smart=%d rug=%.0f%%",
+                    symbol, mint[:8], mc, smart, rug * 100)
 
         self.hot.add(mint, mc, now, symbol)
 
