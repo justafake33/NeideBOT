@@ -12,9 +12,10 @@ from telegram_bot import send_alert
 
 logger = logging.getLogger(__name__)
 
-POLL_INTERVAL  = 30
-HOT_INTERVAL   = 30
-HOT_WINDOW_MIN = 60
+POLL_INTERVAL      = int(os.getenv("POLL_INTERVAL_SEC",    "15"))
+HOT_INTERVAL       = 30
+HOT_PRECISE_SEC    = int(os.getenv("HOT_PRECISE_SEC",      "60"))   # kline bottom scan
+HOT_WINDOW_MIN     = 60
 
 # ------------------------------------------------------------------
 # Filtros (configuráveis via env vars no Railway sem redeploy)
@@ -55,7 +56,7 @@ def _passes_filter(token: dict) -> tuple[bool, str]:
 
 
 # ==============================================================================
-# HotMonitor — tracking de fundo pós-migração via push do Scanner
+# HotMonitor — tracking de fundo pós-migração
 # ==============================================================================
 
 class HotMonitor:
@@ -72,6 +73,7 @@ class HotMonitor:
             if mint not in self._tokens and mint not in self._cancelled:
                 self._tokens[mint] = {
                     "mc_migration": mc_migration,
+                    "ts_mig_unix":  int(ts_migration.timestamp()),
                     "ts_migration": ts_migration,
                     "symbol":       symbol,
                     "mc_min":       mc_migration,
@@ -85,10 +87,7 @@ class HotMonitor:
             self._tokens.pop(mint, None)
 
     def push_mc(self, mint: str, mc: float):
-        """
-        Chamado pelo Scanner a cada poll (30s) para tokens que ainda aparecem
-        na lista completed do trenches. Zero chamadas extra de API.
-        """
+        """Chamado pelo Scanner a cada poll — detecção rápida de rug e bottom aproximado."""
         with self._lock:
             state = self._tokens.get(mint)
             if not state or mint in self._cancelled:
@@ -105,14 +104,19 @@ class HotMonitor:
             state["mc_min"] = mc
             state["time_min"] = elapsed_min
             db.update_bottom(mint, mc, elapsed_min)
-            logger.info("Fundo %s: $%.0f em %.1fmin (%.0f%% abaixo ATH)",
+            logger.info("Fundo(poll) %s: $%.0f em %.1fmin (%.0f%% abaixo ATH)",
                         state["symbol"], mc, elapsed_min,
                         (1 - mc / state["mc_migration"]) * 100)
 
+    # ------------------------------------------------------------------
+    # Threads
+    # ------------------------------------------------------------------
+
     def start(self):
-        thread = threading.Thread(target=self._loop, daemon=True, name="hot-monitor")
-        thread.start()
-        logger.info("HotMonitor iniciado (loop=%ds, janela=%dmin)", HOT_INTERVAL, HOT_WINDOW_MIN)
+        threading.Thread(target=self._loop,         daemon=True, name="hot-monitor").start()
+        threading.Thread(target=self._precise_loop, daemon=True, name="hot-precise").start()
+        logger.info("HotMonitor iniciado (grad=%ds precise=%ds janela=%dmin)",
+                    HOT_INTERVAL, HOT_PRECISE_SEC, HOT_WINDOW_MIN)
 
     def _loop(self):
         while True:
@@ -122,8 +126,20 @@ class HotMonitor:
                 logger.exception("HotMonitor erro: %s", e)
             time.sleep(HOT_INTERVAL)
 
+    def _precise_loop(self):
+        """A cada HOT_PRECISE_SEC busca kline 1m por token quente e aplica o low real da vela."""
+        while True:
+            time.sleep(HOT_PRECISE_SEC)
+            try:
+                self._precise_bottom_tick()
+            except Exception as e:
+                logger.exception("PreciseBottom erro: %s", e)
+
+    # ------------------------------------------------------------------
+    # Tick de graduação
+    # ------------------------------------------------------------------
+
     def _tick(self):
-        """Apenas controla graduação — MC vem via push_mc() do Scanner."""
         with self._lock:
             snapshot = list(self._tokens.items())
         if not snapshot:
@@ -146,47 +162,135 @@ class HotMonitor:
                 self._tokens.pop(mint, None)
             self._graduate(mint, state, elapsed_sec)
 
+    # ------------------------------------------------------------------
+    # Tick preciso — kline low real por token quente
+    # ------------------------------------------------------------------
+
+    def _precise_bottom_tick(self):
+        with self._lock:
+            snapshot = [(m, dict(s)) for m, s in self._tokens.items()
+                        if m not in self._cancelled]
+        if not snapshot:
+            return
+
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        for mint, state in snapshot:
+            try:
+                candles = self.gmgn.get_token_kline(
+                    mint, "sol", "1m",
+                    from_ts=now_ts - 120,
+                    to_ts=now_ts,
+                )
+                for c in candles:
+                    low_price = _float(c.get("low"))
+                    if not low_price or low_price <= 0:
+                        continue
+                    mc_low = low_price * state["total_supply"]
+                    candle_ts    = int(c.get("time", 0)) / 1000
+                    elapsed_min  = (candle_ts - state["ts_mig_unix"]) / 60
+                    if elapsed_min < 0:
+                        continue
+                    if mc_low < state["mc_min"]:
+                        with self._lock:
+                            inner = self._tokens.get(mint)
+                            if inner and mc_low < inner["mc_min"]:
+                                inner["mc_min"] = mc_low
+                                inner["time_min"] = elapsed_min
+                        db.update_bottom(mint, mc_low, elapsed_min)
+                        logger.info("Fundo(kline) %s: $%.0f em %.1fmin (%.0f%% abaixo ATH)",
+                                    state["symbol"], mc_low, elapsed_min,
+                                    (1 - mc_low / state["mc_migration"]) * 100)
+                        state["mc_min"] = mc_low  # atualiza snapshot local para comparações
+            except Exception as e:
+                logger.debug("precise bottom %s: %s", mint[:8], e)
+            time.sleep(0.5)
+
+    # ------------------------------------------------------------------
+    # Graduação — scan completo do kline 1h + agenda 4h/24h
+    # ------------------------------------------------------------------
+
     def _graduate(self, mint: str, state: dict, elapsed_sec: float):
         symbol       = state["symbol"]
         mc_migration = state["mc_migration"]
         total_supply = state["total_supply"]
+        ts_mig_unix  = state["ts_mig_unix"]
 
-        # Após 1h token/info pode já estar indexado pelo GMGN
-        info = self.gmgn.get_token_info(mint)
-        if info:
-            try:
-                mc  = float(info["price"]) * float(info["circulating_supply"])
-                var = (mc - mc_migration) / mc_migration if mc_migration else None
-                db.update_checkpoint(mint, "1h", mc, var)
-                logger.info("Checkpoint 1h %s: $%.0f (%s)", symbol, mc,
+        # Busca kline completo da janela quente para confirmar o bottom absoluto
+        # e capturar o checkpoint de 1h no mesmo request
+        candles_1h = self.gmgn.get_token_kline(
+            mint, "sol", "1m",
+            from_ts=ts_mig_unix,
+            to_ts=ts_mig_unix + 3660,          # +1min de margem
+        )
+
+        if candles_1h:
+            # Varre todos os lows para encontrar o mínimo absoluto
+            for c in candles_1h:
+                low = _float(c.get("low"))
+                if not low or low <= 0:
+                    continue
+                mc_low      = low * total_supply
+                candle_ts   = int(c.get("time", 0)) / 1000
+                elapsed_min = (candle_ts - ts_mig_unix) / 60
+                if elapsed_min >= 0:
+                    db.update_bottom(mint, mc_low, elapsed_min)
+
+            # Checkpoint 1h = close do último candle do período
+            last        = candles_1h[-1]
+            close_price = _float(last.get("close"))
+            if close_price and close_price > 0:
+                mc_1h = close_price * total_supply
+                var   = (mc_1h - mc_migration) / mc_migration if mc_migration else None
+                db.update_checkpoint(mint, "1h", mc_1h, var)
+                logger.info("Checkpoint 1h %s: $%.0f (%s) [kline]", symbol, mc_1h,
                             f"{var*100:+.1f}%" if var is not None else "N/A")
-            except Exception as e:
-                logger.warning("Erro checkpoint 1h %s: %s", symbol, e)
+        else:
+            logger.warning("Graduacao %s: kline 1h indisponivel — checkpoint 1h pulado", symbol)
 
         for delay_min, label in [(240, "4h"), (1440, "24h")]:
             remaining = delay_min * 60 - elapsed_sec
             if remaining > 0:
                 self.scheduler.schedule(remaining, self._checkpoint,
-                                        mint, mc_migration, total_supply, label, symbol)
+                                        mint, mc_migration, total_supply,
+                                        label, symbol, ts_mig_unix)
+
         logger.info("%s saiu da janela quente (bottom=$%.0f em %.1fmin)",
                     symbol, state["mc_min"], state["time_min"])
 
+    # ------------------------------------------------------------------
+    # Checkpoints 4h / 24h via kline
+    # ------------------------------------------------------------------
+
     def _checkpoint(self, mint: str, mc_migration: float, total_supply: float,
-                    label: str, symbol: str):
+                    label: str, symbol: str, ts_mig_unix: int):
         if mint in self._cancelled:
             return
-        info = self.gmgn.get_token_info(mint)
-        if not info:
-            logger.info("Checkpoint %s %s: token/info indisponivel", symbol, label)
+
+        delay_sec  = {"4h": 14400, "24h": 86400}[label]
+        target_ts  = ts_mig_unix + delay_sec
+
+        candles = self.gmgn.get_token_kline(
+            mint, "sol", "1m",
+            from_ts=target_ts - 120,
+            to_ts=target_ts + 60,
+        )
+
+        if not candles:
+            logger.warning("Checkpoint %s %s: kline indisponivel", symbol, label)
             return
-        try:
-            mc  = float(info["price"]) * float(info["circulating_supply"])
-            var = (mc - mc_migration) / mc_migration if mc_migration else None
-            db.update_checkpoint(mint, label, mc, var)
-            logger.info("Checkpoint %s %s: $%.0f (%s)", symbol, label, mc,
-                        f"{var*100:+.1f}%" if var is not None else "N/A")
-        except Exception as e:
-            logger.warning("Erro checkpoint %s %s: %s", symbol, label, e)
+
+        closest     = min(candles, key=lambda c: abs(int(c.get("time", 0)) / 1000 - target_ts))
+        close_price = _float(closest.get("close"))
+
+        if not close_price or close_price <= 0:
+            logger.warning("Checkpoint %s %s: preco invalido no kline", symbol, label)
+            return
+
+        mc  = close_price * total_supply
+        var = (mc - mc_migration) / mc_migration if mc_migration else None
+        db.update_checkpoint(mint, label, mc, var)
+        logger.info("Checkpoint %s %s: $%.0f (%s) [kline]", symbol, label, mc,
+                    f"{var*100:+.1f}%" if var is not None else "N/A")
 
 
 # ==============================================================================
