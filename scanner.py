@@ -351,7 +351,7 @@ class HotMonitor:
         if mint in self._cancelled:
             return
 
-        delay_sec  = {"4h": 14400, "24h": 86400}[label]
+        delay_sec  = {"1h": 3600, "4h": 14400, "24h": 86400}[label]
         target_ts  = ts_mig_unix + delay_sec
 
         candles = self.gmgn.get_token_kline(
