@@ -30,6 +30,7 @@ F_MC_MIN         = float(os.getenv("FILTER_MC_MIN",         "5000"))
 F_MC_MAX         = float(os.getenv("FILTER_MC_MAX",         "200000"))
 F_LIQ_MIN        = float(os.getenv("FILTER_LIQ_MIN",        "10000"))  # liquidez minima em USD
 F_FEE_MIN        = float(os.getenv("FILTER_FEE_MIN",        "1.0"))    # total_fee minimo em SOL
+MAX_MIG_AGE_SEC  = int(os.getenv(  "MAX_MIG_AGE_SEC",       "600"))    # max 10min desde complete_timestamp
 
 
 def _passes_filter(token: dict) -> tuple[bool, str]:
@@ -449,6 +450,18 @@ class Scanner:
         mint = token.get("address")
         if not mint:
             return
+
+        # Rejeita migrações antigas — evita inundar o dashboard após reinício do bot
+        complete_ts = int(token.get("complete_timestamp") or 0)
+        if complete_ts > 0:
+            age_sec = int(datetime.now(timezone.utc).timestamp()) - complete_ts
+            if age_sec > MAX_MIG_AGE_SEC:
+                with self._lock:
+                    self._seen.add(mint)  # marca como visto para não checar mais
+                logger.debug("Migracao antiga %s (%s): %ds — ignorada",
+                             token.get("symbol"), mint[:8], age_sec)
+                return
+
         with self._lock:
             if mint in self._seen:
                 return
