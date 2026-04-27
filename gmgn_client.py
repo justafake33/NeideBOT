@@ -121,7 +121,10 @@ class GmgnClient:
                 else:
                     raise
             except Exception as e:
-                logger.warning("token info %s: %s", mint[:8], e)
+                if "404" in str(e):
+                    logger.info("Pool nao indexado ainda %s — retentativa em 30s", mint[:8])
+                else:
+                    logger.warning("token info %s: %s", mint[:8], e)
                 return None
         return None
 
