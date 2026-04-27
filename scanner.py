@@ -352,10 +352,30 @@ class Scanner:
         now_ts            = int(now.timestamp())
         capture_delay_sec = (now_ts - complete_ts) if complete_ts > 0 else None
 
+        # Tenta obter o preço exato no momento da migração via kline de 1m.
+        # A abertura do candle mais próximo de complete_timestamp é a melhor
+        # aproximação do MC real de migração, sem distorção do dump/pump pós-migração.
+        mc_kline = None
+        if complete_ts > 0:
+            candles = self.gmgn.get_token_kline(
+                mint, "sol", "1m",
+                from_ts=complete_ts - 30,
+                to_ts=complete_ts + 90,
+            )
+            if candles:
+                closest = min(candles,
+                              key=lambda c: abs(int(c.get("time", 0)) / 1000 - complete_ts))
+                open_price = _float(closest.get("open"))
+                if open_price and open_price > 0:
+                    mc_kline = open_price * total_supply
+
+        mc_migration = mc_kline if mc_kline else mc
+        src = "kline" if mc_kline else "trenches"
+
         if capture_delay_sec is not None and capture_delay_sec > 90:
             logger.warning(
-                "Migracao %s (%s): MC capturado %ds apos migracao — dado pode estar impreciso",
-                token.get("symbol"), mint[:8], capture_delay_sec,
+                "Migracao %s (%s): %ds apos migracao — MC via %s: $%.0f",
+                token.get("symbol"), mint[:8], capture_delay_sec, src, mc_migration,
             )
         quality = {
             "smart_wallets":     _int(token.get("smart_degen_count")),
@@ -386,7 +406,7 @@ class Scanner:
             "ts_detected":              watchlist_entry.get("ts_detected") if watchlist_entry else None,
             "bc_progress_at_detection": watchlist_entry.get("bc_progress_at_detection") if watchlist_entry else None,
             "ts_migration":             now,
-            "mc_migration":             mc,
+            "mc_migration":             mc_migration,
             "capture_delay_sec":        capture_delay_sec,
             **quality,
         }
@@ -400,15 +420,15 @@ class Scanner:
 
         send_alert(
             f"\U0001f514 *Migracao: {symbol}*\n"
-            f"MC: ${mc:,.0f} | Liq: ${liq:,.0f}\n"
+            f"MC: ${mc_migration:,.0f} | Liq: ${liq:,.0f}\n"
             f"Exchange: {exch}\n"
             f"Smart: {smart} | Rug: {rug:.0%}"
         )
         delay_str = f" delay={capture_delay_sec}s" if capture_delay_sec is not None else ""
-        logger.info("Migracao %s (%s) MC=$%.0f liq=$%.0f exch=%s smart=%d%s",
-                    symbol, mint[:8], mc, liq, exch, smart, delay_str)
+        logger.info("Migracao %s (%s) MC=$%.0f[%s] liq=$%.0f exch=%s smart=%d%s",
+                    symbol, mint[:8], mc_migration, src, liq, exch, smart, delay_str)
 
-        self.hot.add(mint, mc, now, symbol, total_supply)
+        self.hot.add(mint, mc_migration, now, symbol, total_supply)
 
 
 # ==============================================================================
