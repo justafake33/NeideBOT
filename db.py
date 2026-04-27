@@ -248,6 +248,21 @@ def update_checkpoint(mint: str, label: str, mc: float, var: Optional[float]):
             """, {"mint": mint})
 
 
+def get_tokens_for_backfill() -> list:
+    """Retorna tokens que precisam de re-monitoramento ou backfill de checkpoints após restart."""
+    with _cursor() as cur:
+        cur.execute("""
+            SELECT mint, token_nome, mc_migration, ts_migration,
+                   mc_1h, mc_4h, mc_24h
+            FROM migrations
+            WHERE ts_migration IS NOT NULL
+              AND ts_migration > NOW() - INTERVAL '25 hours'
+              AND (mc_1h IS NULL OR mc_4h IS NULL OR mc_24h IS NULL)
+            ORDER BY ts_migration ASC
+        """)
+        return [dict(row) for row in cur.fetchall()]
+
+
 def get_all_migrations(limit: int = 200) -> list:
     with _cursor() as cur:
         cur.execute("""
