@@ -97,7 +97,7 @@ DASHBOARD_HTML = """
 <div class="wrap">
 <table>
 <thead><tr>
-  <th>Data BRT</th><th>Token</th><th>BC%</th>
+  <th>Data BRT</th><th>Token</th><th>BC%</th><th>T/Migração</th>
   <th>MC Mig</th><th>Pico</th><th>Ganho</th><th>T/Pico</th>
   <th>Fundo</th><th>Queda</th><th>T/Fundo</th>
   <th>1h</th><th>4h</th><th>24h</th>
@@ -118,6 +118,7 @@ DASHBOARD_HTML = """
     </div>
   </td>
   <td class="muted">{{ r.bc }}</td>
+  <td class="muted">{{ r.t_migrate }}</td>
   <td>{{ r.mc_mig }}</td>
   <td class="{{ 'green' if r.gain_raw and r.gain_raw > 0 else 'muted' }}">{{ r.mc_peak }}</td>
   <td class="{{ 'green' if r.gain_raw and r.gain_raw > 0.1 else 'muted' }}">{{ r.gain }}</td>
@@ -180,6 +181,7 @@ def scanner_dashboard():
         top10 = r.get("top10_holder_rate")
         ttb   = r.get("time_to_bottom")
         ttp   = r.get("time_to_peak")
+        ttm   = r.get("time_to_migrate_sec")
         wash  = r.get("is_wash_trading")
 
         rows.append({
@@ -188,6 +190,7 @@ def scanner_dashboard():
             "mint":       r.get("mint") or "",
             "mint_short": (r.get("mint") or "")[:12] + "…",
             "bc":         f"{r.get('bc_progress_at_detection'):.0f}%" if r.get("bc_progress_at_detection") else "—",
+            "t_migrate":  (f"{ttm//60}min" if ttm and ttm < 3600 else f"{ttm//3600}h{(ttm%3600)//60}min" if ttm else "—"),
             "mc_mig":     fmt_mc(r.get("mc_migration")),
             "mc_peak":    fmt_mc(r.get("mc_peak")),
             "gain":       fmt_pct(pct_gain), "gain_raw": pct_gain,

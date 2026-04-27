@@ -415,6 +415,7 @@ class Scanner:
             return
 
         now = datetime.now(timezone.utc)
+        created_ts = _int(token.get("created_timestamp"))
         entry = {
             "mint":                     mint,
             "token_nome":               token.get("symbol"),
@@ -432,6 +433,8 @@ class Scanner:
             "volume_15m":               _float(token.get("volume_15m")),
             "liq_migration":            _float(token.get("liquidity")),
             "is_honeypot":              bool(token.get("is_honeypot")) if token.get("is_honeypot") is not None else None,
+            "token_created_at":         datetime.fromtimestamp(created_ts, tz=timezone.utc) if created_ts else None,
+            "time_to_migrate_sec":      _int(token.get("complete_cost_time")),
         }
 
         with self._lock:
@@ -530,6 +533,10 @@ class Scanner:
         mc_migration = mc_kline if mc_kline else mc
         src = "kline" if mc_kline else "trenches"
 
+        created_ts          = _int(token.get("created_timestamp"))
+        token_created_at    = datetime.fromtimestamp(created_ts, tz=timezone.utc) if created_ts else None
+        time_to_migrate_sec = _int(token.get("complete_cost_time"))
+
         if capture_delay_sec is not None and capture_delay_sec > 90:
             logger.warning(
                 "Migracao %s (%s): %ds apos migracao — MC via %s: $%.0f",
@@ -566,6 +573,8 @@ class Scanner:
             "ts_migration":             now,
             "mc_migration":             mc_migration,
             "capture_delay_sec":        capture_delay_sec,
+            "token_created_at":         token_created_at,
+            "time_to_migrate_sec":      time_to_migrate_sec,
             **quality,
         }
 
