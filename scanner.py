@@ -126,8 +126,65 @@ class HotMonitor:
     def start(self):
         threading.Thread(target=self._loop,         daemon=True, name="hot-monitor").start()
         threading.Thread(target=self._precise_loop, daemon=True, name="hot-precise").start()
+        threading.Thread(target=self.startup_backfill, daemon=True, name="hot-backfill").start()
         logger.info("HotMonitor iniciado (grad=%ds precise=%ds janela=%dmin)",
                     HOT_INTERVAL, HOT_PRECISE_SEC, HOT_WINDOW_MIN)
+
+    def startup_backfill(self):
+        """
+        Ao reiniciar, re-popula _tokens para tokens ainda na janela quente e
+        reagenda/executa checkpoints ausentes para tokens já graduados.
+        Usa total_supply=1B (padrão para tokens pump-style Solana).
+        """
+        time.sleep(5)  # aguarda scheduler e conexões estabilizarem
+        tokens = db.get_tokens_for_backfill()
+        if not tokens:
+            logger.info("Backfill startup: nenhum token pendente")
+            return
+
+        now = datetime.now(timezone.utc)
+        logger.info("Backfill startup: %d tokens com checkpoints pendentes", len(tokens))
+
+        for row in tokens:
+            mint         = row["mint"]
+            symbol       = row.get("token_nome") or mint[:8]
+            mc_migration = row.get("mc_migration") or 0
+            ts_migration = row["ts_migration"]
+            ts_mig_unix  = int(ts_migration.timestamp())
+            elapsed_sec  = (now - ts_migration).total_seconds()
+            total_supply = 1_000_000_000
+
+            if elapsed_sec < HOT_WINDOW_MIN * 60:
+                # Ainda na janela quente — re-adiciona ao _tokens
+                self.add(mint, mc_migration, ts_migration, symbol, total_supply)
+                logger.info("Backfill: hot re-add %s (%.0fmin restantes)",
+                            symbol, (HOT_WINDOW_MIN * 60 - elapsed_sec) / 60)
+                continue
+
+            # Já passou da janela — backfill de checkpoints ausentes
+            for delay_min, label, already_done in [
+                (60,   "1h",  row.get("mc_1h")  is not None),
+                (240,  "4h",  row.get("mc_4h")  is not None),
+                (1440, "24h", row.get("mc_24h") is not None),
+            ]:
+                if already_done:
+                    continue
+                target_ts = ts_mig_unix + delay_min * 60
+                remaining = target_ts - now.timestamp()
+                if remaining <= 0:
+                    # Tempo já passou — busca imediata em thread separada
+                    threading.Thread(
+                        target=self._checkpoint,
+                        args=(mint, mc_migration, total_supply, label, symbol, ts_mig_unix),
+                        daemon=True,
+                    ).start()
+                    time.sleep(1.0)  # stagger entre tokens
+                else:
+                    self.scheduler.schedule(remaining, self._checkpoint,
+                                            mint, mc_migration, total_supply,
+                                            label, symbol, ts_mig_unix)
+                    logger.info("Backfill: agendado %s %s em %.0fmin",
+                                symbol, label, remaining / 60)
 
     def _loop(self):
         while True:
