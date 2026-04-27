@@ -12,7 +12,7 @@ from telegram_bot import send_alert
 
 logger = logging.getLogger(__name__)
 
-POLL_INTERVAL      = int(os.getenv("POLL_INTERVAL_SEC",    "15"))
+POLL_INTERVAL      = int(os.getenv("POLL_INTERVAL_SEC",    "5"))
 HOT_INTERVAL       = 30
 HOT_PRECISE_SEC    = int(os.getenv("HOT_PRECISE_SEC",      "60"))   # kline bottom scan
 HOT_WINDOW_MIN     = 60
@@ -330,15 +330,29 @@ class Scanner:
 
     def _tick(self):
         data = self.gmgn.get_trenches(types=["near_completion", "completed"])
+
+        # near_completion: ignora tokens já conhecidos sem chamar _safe (sem sleep)
         for token in data.get("pump", []):
+            mint = token.get("address")
+            with self._lock:
+                if mint and (mint in self._watchlist or mint in self._seen):
+                    continue
             self._safe(self._handle_near_completion, token)
+
+        # completed: tokens já vistos → apenas push_mc (sem sleep)
+        #            tokens novos → _safe com stagger normal
         for token in data.get("completed", []):
-            self._safe(self._handle_completed, token)
-            # Passa MC atualizado ao HotMonitor — trenches já tem market_cap em tempo real
             mint = token.get("address")
             mc   = _float(token.get("usd_market_cap")) or _float(token.get("market_cap"))
-            if mint and mc and F_MC_MIN <= mc <= F_MC_MAX:
-                self.hot.push_mc(mint, mc)
+            with self._lock:
+                already_seen = bool(mint and mint in self._seen)
+            if already_seen:
+                if mint and mc and F_MC_MIN <= mc <= F_MC_MAX:
+                    self.hot.push_mc(mint, mc)
+            else:
+                self._safe(self._handle_completed, token)
+                if mint and mc and F_MC_MIN <= mc <= F_MC_MAX:
+                    self.hot.push_mc(mint, mc)
 
     def _safe(self, fn, token: dict):
         try:
