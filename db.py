@@ -64,14 +64,18 @@ def init_db():
                 comprado                  BOOL DEFAULT FALSE,
                 resultado_pct             FLOAT,
                 capture_delay_sec         INT,
+                token_created_at          TIMESTAMPTZ,
+                time_to_migrate_sec       INT,
                 created_at                TIMESTAMPTZ DEFAULT NOW()
             )
         """)
         for col in [
-            "ADD COLUMN IF NOT EXISTS capture_delay_sec INT",
-            "ADD COLUMN IF NOT EXISTS mc_peak           FLOAT",
-            "ADD COLUMN IF NOT EXISTS time_to_peak      FLOAT",
-            "ADD COLUMN IF NOT EXISTS pct_gain          FLOAT",
+            "ADD COLUMN IF NOT EXISTS capture_delay_sec  INT",
+            "ADD COLUMN IF NOT EXISTS mc_peak            FLOAT",
+            "ADD COLUMN IF NOT EXISTS time_to_peak       FLOAT",
+            "ADD COLUMN IF NOT EXISTS pct_gain           FLOAT",
+            "ADD COLUMN IF NOT EXISTS token_created_at   TIMESTAMPTZ",
+            "ADD COLUMN IF NOT EXISTS time_to_migrate_sec INT",
         ]:
             cur.execute(f"ALTER TABLE migrations {col}")
     logger.info("DB inicializado")
@@ -86,13 +90,15 @@ def upsert_watchlist(data: dict):
                 smart_wallets, renowned_wallets, sniper_wallets,
                 rug_ratio, top10_holder_rate, holders_count,
                 volume_1m, volume_5m, volume_15m,
-                is_wash_trading, liq_migration, is_honeypot
+                is_wash_trading, liq_migration, is_honeypot,
+                token_created_at, time_to_migrate_sec
             ) VALUES (
                 %(mint)s, %(token_nome)s, %(ts_detected)s, %(bc_progress_at_detection)s,
                 %(smart_wallets)s, %(renowned_wallets)s, %(sniper_wallets)s,
                 %(rug_ratio)s, %(top10_holder_rate)s, %(holders_count)s,
                 %(volume_1m)s, %(volume_5m)s, %(volume_15m)s,
-                %(is_wash_trading)s, %(liq_migration)s, %(is_honeypot)s
+                %(is_wash_trading)s, %(liq_migration)s, %(is_honeypot)s,
+                %(token_created_at)s, %(time_to_migrate_sec)s
             )
             ON CONFLICT (mint) DO NOTHING
         """, {
@@ -109,9 +115,11 @@ def upsert_watchlist(data: dict):
             "volume_1m": data.get("volume_1m"),
             "volume_5m": data.get("volume_5m"),
             "volume_15m": data.get("volume_15m"),
-            "is_wash_trading": data.get("is_wash_trading"),
-            "liq_migration": data.get("liq_migration"),
-            "is_honeypot": data.get("is_honeypot"),
+            "is_wash_trading":      data.get("is_wash_trading"),
+            "liq_migration":        data.get("liq_migration"),
+            "is_honeypot":          data.get("is_honeypot"),
+            "token_created_at":     data.get("token_created_at"),
+            "time_to_migrate_sec":  data.get("time_to_migrate_sec"),
         })
 
 
@@ -126,7 +134,7 @@ def upsert_migration(data: dict):
                 rug_ratio, top10_holder_rate, holders_count,
                 volume_1m, volume_5m, volume_15m,
                 is_wash_trading, liq_migration, is_honeypot,
-                capture_delay_sec
+                capture_delay_sec, token_created_at, time_to_migrate_sec
             ) VALUES (
                 %(mint)s, %(token_nome)s, %(ts_detected)s, %(bc_progress_at_detection)s,
                 %(ts_migration)s, %(mc_migration)s,
@@ -134,12 +142,14 @@ def upsert_migration(data: dict):
                 %(rug_ratio)s, %(top10_holder_rate)s, %(holders_count)s,
                 %(volume_1m)s, %(volume_5m)s, %(volume_15m)s,
                 %(is_wash_trading)s, %(liq_migration)s, %(is_honeypot)s,
-                %(capture_delay_sec)s
+                %(capture_delay_sec)s, %(token_created_at)s, %(time_to_migrate_sec)s
             )
             ON CONFLICT (mint) DO UPDATE SET
-                ts_migration      = EXCLUDED.ts_migration,
-                mc_migration      = EXCLUDED.mc_migration,
-                capture_delay_sec = EXCLUDED.capture_delay_sec,
+                ts_migration         = EXCLUDED.ts_migration,
+                mc_migration         = EXCLUDED.mc_migration,
+                capture_delay_sec    = EXCLUDED.capture_delay_sec,
+                token_created_at     = COALESCE(migrations.token_created_at, EXCLUDED.token_created_at),
+                time_to_migrate_sec  = COALESCE(migrations.time_to_migrate_sec, EXCLUDED.time_to_migrate_sec),
                 smart_wallets     = COALESCE(migrations.smart_wallets, EXCLUDED.smart_wallets),
                 renowned_wallets  = COALESCE(migrations.renowned_wallets, EXCLUDED.renowned_wallets),
                 sniper_wallets    = COALESCE(migrations.sniper_wallets, EXCLUDED.sniper_wallets),
@@ -168,10 +178,12 @@ def upsert_migration(data: dict):
             "volume_1m": data.get("volume_1m"),
             "volume_5m": data.get("volume_5m"),
             "volume_15m": data.get("volume_15m"),
-            "is_wash_trading": data.get("is_wash_trading"),
-            "liq_migration": data.get("liq_migration"),
-            "is_honeypot": data.get("is_honeypot"),
-            "capture_delay_sec": data.get("capture_delay_sec"),
+            "is_wash_trading":     data.get("is_wash_trading"),
+            "liq_migration":       data.get("liq_migration"),
+            "is_honeypot":         data.get("is_honeypot"),
+            "capture_delay_sec":   data.get("capture_delay_sec"),
+            "token_created_at":    data.get("token_created_at"),
+            "time_to_migrate_sec": data.get("time_to_migrate_sec"),
         })
 
 
