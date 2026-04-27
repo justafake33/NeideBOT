@@ -28,6 +28,7 @@ BC_MIN_WATCHLIST = float(os.getenv("BC_MIN_WATCHLIST",      "80"))
 F_MC_MIN         = float(os.getenv("FILTER_MC_MIN",         "5000"))
 F_MC_MAX         = float(os.getenv("FILTER_MC_MAX",         "200000"))
 F_LIQ_MIN        = float(os.getenv("FILTER_LIQ_MIN",        "10000"))  # liquidez minima em USD
+F_FEE_MIN        = float(os.getenv("FILTER_FEE_MIN",        "1.0"))    # total_fee minimo em SOL
 
 
 def _passes_filter(token: dict) -> tuple[bool, str]:
@@ -204,9 +205,9 @@ class Scanner:
         thread = threading.Thread(target=self._loop, daemon=True, name="scanner")
         thread.start()
         logger.info(
-            "Scanner iniciado (poll=%ds) | bc_min=%.0f%% | mc=$%.0f-$%.0f | liq>=$%.0f | "
+            "Scanner iniciado (poll=%ds) | bc_min=%.0f%% | mc=$%.0f-$%.0f | liq>=$%.0f | fee>=%.1fSOL | "
             "filtros: rug<%.0f%% rat<%.0f%% top10<%.0f%% smart>=%d wash=%s",
-            POLL_INTERVAL, BC_MIN_WATCHLIST, F_MC_MIN, F_MC_MAX, F_LIQ_MIN,
+            POLL_INTERVAL, BC_MIN_WATCHLIST, F_MC_MIN, F_MC_MAX, F_LIQ_MIN, F_FEE_MIN,
             F_RUG_MAX*100, F_RAT_MAX*100, F_TOP10_MAX*100,
             F_SMART_MIN, F_WASH_BLOCK,
         )
@@ -333,6 +334,14 @@ class Scanner:
         if liq < F_LIQ_MIN:
             logger.info("Migracao descartada %s (%s): liq=$%.0f<$%.0f",
                         token.get("symbol"), mint[:8], liq, F_LIQ_MIN)
+            with self._lock:
+                self._seen.discard(mint)
+            return
+
+        fee = _float(token.get("total_fee")) or 0
+        if fee < F_FEE_MIN:
+            logger.info("Migracao descartada %s (%s): total_fee=%.4f<%.1f SOL",
+                        token.get("symbol"), mint[:8], fee, F_FEE_MIN)
             with self._lock:
                 self._seen.discard(mint)
             return
