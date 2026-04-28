@@ -2,7 +2,9 @@ import os
 import logging
 from datetime import timezone, timedelta
 
-from flask import Flask, render_template_string, redirect
+import csv
+import io
+from flask import Flask, render_template_string, redirect, Response
 
 import db
 from gmgn_client import GmgnClient
@@ -216,6 +218,22 @@ def scanner_dashboard():
     return render_template_string(
         DASHBOARD_HTML, rows=rows, total=total,
         recovered=recovered, not_recovered=not_recovered, pending=pending,
+    )
+
+
+@app.route("/export/csv")
+def export_csv():
+    rows = db.get_all_migrations(limit=10000)
+    if not rows:
+        return "Sem dados", 404
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=rows[0].keys())
+    writer.writeheader()
+    writer.writerows(rows)
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=migrations.csv"},
     )
 
 
