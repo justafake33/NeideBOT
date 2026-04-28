@@ -2,10 +2,6 @@ import os
 import logging
 from datetime import timezone, timedelta
 
-from monitoring import init_sentry
-
-init_sentry()
-
 from flask import Flask, render_template_string, redirect
 
 import db
@@ -17,7 +13,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
