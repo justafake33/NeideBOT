@@ -135,8 +135,8 @@ def _safe_thread(self, target, *args):
         sentry_sdk.capture_exception(e)
 
 
-def start(self):
-    threading.Thread(
+    def start(self):
+      threading.Thread(
         target=self._safe_thread,
         args=(self._loop,),
         daemon=True,
