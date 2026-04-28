@@ -2,6 +2,7 @@ import logging
 import os
 import threading
 import time
+import sentry_sdk
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -122,90 +123,151 @@ class HotMonitor:
                         state["symbol"], mc, elapsed_min,
                         (mc / state["mc_migration"] - 1) * 100)
 
-    # ------------------------------------------------------------------
-    # Threads
-    # ------------------------------------------------------------------
+   # ------------------------------------------------------------------
+# Threads
+# ------------------------------------------------------------------
 
-    def start(self):
-        threading.Thread(target=self._loop,         daemon=True, name="hot-monitor").start()
-        threading.Thread(target=self._precise_loop, daemon=True, name="hot-precise").start()
-        threading.Thread(target=self.startup_backfill, daemon=True, name="hot-backfill").start()
-        logger.info("HotMonitor iniciado (grad=%ds precise=%ds janela=%dmin)",
-                    HOT_INTERVAL, HOT_PRECISE_SEC, HOT_WINDOW_MIN)
+def _safe_thread(self, target, *args):
+    try:
+        target(*args)
+    except Exception as e:
+        logger.exception("Erro em thread do HotMonitor")
+        sentry_sdk.capture_exception(e)
 
-    def startup_backfill(self):
-        """
-        Ao reiniciar, re-popula _tokens para tokens ainda na janela quente e
-        reagenda/executa checkpoints ausentes para tokens já graduados.
-        Usa total_supply=1B (padrão para tokens pump-style Solana).
-        """
-        time.sleep(5)  # aguarda scheduler e conexões estabilizarem
-        tokens = db.get_tokens_for_backfill()
-        if not tokens:
-            logger.info("Backfill startup: nenhum token pendente")
-            return
 
-        now = datetime.now(timezone.utc)
-        logger.info("Backfill startup: %d tokens com checkpoints pendentes", len(tokens))
+def start(self):
+    threading.Thread(
+        target=self._safe_thread,
+        args=(self._loop,),
+        daemon=True,
+        name="hot-monitor"
+    ).start()
 
-        for row in tokens:
-            mint         = row["mint"]
-            symbol       = row.get("token_nome") or mint[:8]
-            mc_migration = row.get("mc_migration") or 0
-            ts_migration = row["ts_migration"]
-            ts_mig_unix  = int(ts_migration.timestamp())
-            elapsed_sec  = (now - ts_migration).total_seconds()
-            total_supply = 1_000_000_000
+    threading.Thread(
+        target=self._safe_thread,
+        args=(self._precise_loop,),
+        daemon=True,
+        name="hot-precise"
+    ).start()
 
-            if elapsed_sec < HOT_WINDOW_MIN * 60:
-                # Ainda na janela quente — re-adiciona ao _tokens
-                self.add(mint, mc_migration, ts_migration, symbol, total_supply)
-                logger.info("Backfill: hot re-add %s (%.0fmin restantes)",
-                            symbol, (HOT_WINDOW_MIN * 60 - elapsed_sec) / 60)
+    threading.Thread(
+        target=self._safe_thread,
+        args=(self.startup_backfill,),
+        daemon=True,
+        name="hot-backfill"
+    ).start()
+
+    logger.info(
+        "HotMonitor iniciado (grad=%ds precise=%ds janela=%dmin)",
+        HOT_INTERVAL,
+        HOT_PRECISE_SEC,
+        HOT_WINDOW_MIN
+    )
+
+
+def startup_backfill(self):
+    """
+    Ao reiniciar, re-popula _tokens para tokens ainda na janela quente e
+    reagenda/executa checkpoints ausentes para tokens já graduados.
+    Usa total_supply=1B (padrão para tokens pump-style Solana).
+    """
+    time.sleep(5)
+    tokens = db.get_tokens_for_backfill()
+
+    if not tokens:
+        logger.info("Backfill startup: nenhum token pendente")
+        return
+
+    now = datetime.now(timezone.utc)
+    logger.info("Backfill startup: %d tokens com checkpoints pendentes", len(tokens))
+
+    for row in tokens:
+        mint         = row["mint"]
+        symbol       = row.get("token_nome") or mint[:8]
+        mc_migration = row.get("mc_migration") or 0
+        ts_migration = row["ts_migration"]
+        ts_mig_unix  = int(ts_migration.timestamp())
+        elapsed_sec  = (now - ts_migration).total_seconds()
+        total_supply = 1_000_000_000
+
+        if elapsed_sec < HOT_WINDOW_MIN * 60:
+            self.add(mint, mc_migration, ts_migration, symbol, total_supply)
+            logger.info(
+                "Backfill: hot re-add %s (%.0fmin restantes)",
+                symbol,
+                (HOT_WINDOW_MIN * 60 - elapsed_sec) / 60
+            )
+            continue
+
+        for delay_min, label, already_done in [
+            (60, "1h", row.get("mc_1h") is not None),
+            (240, "4h", row.get("mc_4h") is not None),
+            (1440, "24h", row.get("mc_24h") is not None),
+        ]:
+            if already_done:
                 continue
 
-            # Já passou da janela — backfill de checkpoints ausentes
-            for delay_min, label, already_done in [
-                (60,   "1h",  row.get("mc_1h")  is not None),
-                (240,  "4h",  row.get("mc_4h")  is not None),
-                (1440, "24h", row.get("mc_24h") is not None),
-            ]:
-                if already_done:
-                    continue
-                target_ts = ts_mig_unix + delay_min * 60
-                remaining = target_ts - now.timestamp()
-                if remaining <= 0:
-                    # Tempo já passou — busca imediata em thread separada
-                    threading.Thread(
-                        target=self._checkpoint,
-                        args=(mint, mc_migration, total_supply, label, symbol, ts_mig_unix),
-                        daemon=True,
-                    ).start()
-                    time.sleep(1.0)  # stagger entre tokens
-                else:
-                    self.scheduler.schedule(remaining, self._checkpoint,
-                                            mint, mc_migration, total_supply,
-                                            label, symbol, ts_mig_unix)
-                    logger.info("Backfill: agendado %s %s em %.0fmin",
-                                symbol, label, remaining / 60)
+            target_ts = ts_mig_unix + delay_min * 60
+            remaining = target_ts - now.timestamp()
 
-    def _loop(self):
-        while True:
-            try:
-                self._tick()
-            except Exception as e:
-                logger.exception("HotMonitor erro: %s", e)
-            time.sleep(HOT_INTERVAL)
+            if remaining <= 0:
+                threading.Thread(
+                    target=self._safe_thread,
+                    args=(
+                        self._checkpoint,
+                        mint,
+                        mc_migration,
+                        total_supply,
+                        label,
+                        symbol,
+                        ts_mig_unix
+                    ),
+                    daemon=True,
+                ).start()
 
-    def _precise_loop(self):
-        """A cada HOT_PRECISE_SEC busca kline 1m por token quente e aplica o low real da vela."""
-        while True:
-            time.sleep(HOT_PRECISE_SEC)
-            try:
-                self._precise_bottom_tick()
-            except Exception as e:
-                logger.exception("PreciseBottom erro: %s", e)
+                time.sleep(1.0)
 
+            else:
+                self.scheduler.schedule(
+                    remaining,
+                    self._checkpoint,
+                    mint,
+                    mc_migration,
+                    total_supply,
+                    label,
+                    symbol,
+                    ts_mig_unix
+                )
+
+                logger.info(
+                    "Backfill: agendado %s %s em %.0fmin",
+                    symbol,
+                    label,
+                    remaining / 60
+                )
+
+
+def _loop(self):
+    while True:
+        try:
+            self._tick()
+        except Exception as e:
+            logger.exception("HotMonitor erro")
+            sentry_sdk.capture_exception(e)
+
+        time.sleep(HOT_INTERVAL)
+
+
+def _precise_loop(self):
+    """A cada HOT_PRECISE_SEC busca kline 1m por token quente e aplica o low real da vela."""
+    while True:
+        time.sleep(HOT_PRECISE_SEC)
+
+        try:
+            self._precise_bottom_tick()
+        except Exception as e:
+            logger.exception("PreciseBottom erro")
+            sentry_sdk.capture_exception(e)
     # ------------------------------------------------------------------
     # Tick de graduação
     # ------------------------------------------------------------------
@@ -422,15 +484,37 @@ class Scanner:
         self._seen: set = set()
         self._lock = threading.Lock()
 
+    def _safe_thread(self, target):
+        try:
+            target()
+        except Exception as e:
+            logger.exception("Erro em thread do Scanner")
+            sentry_sdk.capture_exception(e)
+
     def start(self):
-        thread = threading.Thread(target=self._loop, daemon=True, name="scanner")
+        thread = threading.Thread(
+            target=self._safe_thread,
+            args=(self._loop,),
+            daemon=True,
+            name="scanner"
+        )
+
         thread.start()
+
         logger.info(
             "Scanner iniciado (poll=%ds) | bc_min=%.0f%% | mc=$%.0f-$%.0f | liq>=$%.0f | fee>=%.1fSOL | "
             "filtros: rug<%.0f%% rat<%.0f%% top10<%.0f%% smart>=%d wash=%s",
-            POLL_INTERVAL, BC_MIN_WATCHLIST, F_MC_MIN, F_MC_MAX, F_LIQ_MIN, F_FEE_MIN,
-            F_RUG_MAX*100, F_RAT_MAX*100, F_TOP10_MAX*100,
-            F_SMART_MIN, F_WASH_BLOCK,
+            POLL_INTERVAL,
+            BC_MIN_WATCHLIST,
+            F_MC_MIN,
+            F_MC_MAX,
+            F_LIQ_MIN,
+            F_FEE_MIN,
+            F_RUG_MAX * 100,
+            F_RAT_MAX * 100,
+            F_TOP10_MAX * 100,
+            F_SMART_MIN,
+            F_WASH_BLOCK,
         )
 
     def _loop(self):
