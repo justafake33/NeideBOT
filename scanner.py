@@ -136,12 +136,12 @@ def _safe_thread(self, target, *args):
 
 
     def start(self):
-      threading.Thread(
-        target=self._safe_thread,
-        args=(self._loop,),
-        daemon=True,
-        name="hot-monitor"
-    ).start()
+        threading.Thread(
+            target=self._safe_thread,
+            args=(self._loop,),
+            daemon=True,
+            name="hot-monitor"
+        ).start()
 
     threading.Thread(
         target=self._safe_thread,
@@ -497,6 +497,9 @@ class Scanner:
             args=(self._loop,),
             daemon=True,
             name="scanner"
+        )
+        thread.start()
+        logger.info("Scanner iniciado")
         )
 
         thread.start()
