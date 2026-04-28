@@ -263,7 +263,7 @@ def get_tokens_for_backfill() -> list:
         return [dict(row) for row in cur.fetchall()]
 
 
-def get_all_migrations(limit: int = 200) -> list:
+def get_all_migrations(limit: int = 2000) -> list:
     with _cursor() as cur:
         cur.execute("""
             SELECT * FROM migrations

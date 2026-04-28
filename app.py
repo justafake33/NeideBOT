@@ -157,7 +157,7 @@ def index():
 
 @app.route("/scanner")
 def scanner_dashboard():
-    rows_raw = db.get_all_migrations(200)
+    rows_raw = db.get_all_migrations()
 
     total        = len(rows_raw)
     recovered    = sum(1 for r in rows_raw if r.get("recovery") is True)
