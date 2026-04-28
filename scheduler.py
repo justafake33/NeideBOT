@@ -3,8 +3,6 @@ import threading
 import time
 import logging
 
-import sentry_sdk
-
 logger = logging.getLogger(__name__)
 
 
