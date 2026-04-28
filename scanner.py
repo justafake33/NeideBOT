@@ -83,28 +83,28 @@ class HotMonitor:
             target=self._safe_thread,
             args=(self._loop,),
             daemon=True,
-            name="hot-monitor"
+            name="hot-monitor",
         ).start()
 
         threading.Thread(
             target=self._safe_thread,
             args=(self._precise_loop,),
             daemon=True,
-            name="hot-precise"
+            name="hot-precise",
         ).start()
 
         threading.Thread(
             target=self._safe_thread,
             args=(self.startup_backfill,),
             daemon=True,
-            name="hot-backfill"
+            name="hot-backfill",
         ).start()
 
         logger.info(
             "HotMonitor iniciado (grad=%ds precise=%ds janela=%dmin)",
             HOT_INTERVAL,
             HOT_PRECISE_SEC,
-            HOT_WINDOW_MIN
+            HOT_WINDOW_MIN,
         )
 
     def add(
@@ -113,7 +113,7 @@ class HotMonitor:
         mc_migration: float,
         ts_migration: datetime,
         symbol: str,
-        total_supply: float = 1_000_000_000
+        total_supply: float = 1_000_000_000,
     ):
         with self._lock:
             if mint not in self._tokens and mint not in self._cancelled:
@@ -182,13 +182,7 @@ class HotMonitor:
             total_supply = 1_000_000_000
 
             if elapsed_sec < HOT_WINDOW_MIN * 60:
-                self.add(
-                    mint,
-                    mc_migration,
-                    ts_migration,
-                    symbol,
-                    total_supply
-                )
+                self.add(mint, mc_migration, ts_migration, symbol, total_supply)
                 continue
 
             for delay_min, label, already_done in [
@@ -216,9 +210,7 @@ class HotMonitor:
                         ),
                         daemon=True,
                     ).start()
-
                     time.sleep(1.0)
-
                 else:
                     self.scheduler.schedule(
                         remaining,
@@ -311,6 +303,7 @@ class HotMonitor:
                     low_price = _float(c.get("low"))
                     if low_price and low_price > 0:
                         mc_low = low_price * state["total_supply"]
+
                         if mc_low < state["mc_min"]:
                             with self._lock:
                                 inner = self._tokens.get(mint)
@@ -324,6 +317,7 @@ class HotMonitor:
                     high_price = _float(c.get("high"))
                     if high_price and high_price > 0:
                         mc_high = high_price * state["total_supply"]
+
                         if mc_high > state["mc_max"]:
                             with self._lock:
                                 inner = self._tokens.get(mint)
@@ -402,7 +396,7 @@ class HotMonitor:
         total_supply: float,
         label: str,
         symbol: str,
-        ts_mig_unix: int
+        ts_mig_unix: int,
     ):
         if mint in self._cancelled:
             return
@@ -424,7 +418,7 @@ class HotMonitor:
                 candles,
                 key=lambda c: abs(
                     int(c.get("time", 0)) / 1000 - target_ts
-                )
+                ),
             )
 
             close_price = _float(closest.get("close"))
@@ -484,7 +478,7 @@ class Scanner:
             target=self._safe_thread,
             args=(self._loop,),
             daemon=True,
-            name="scanner"
+            name="scanner",
         )
 
         thread.start()
@@ -512,9 +506,202 @@ class Scanner:
 
             time.sleep(POLL_INTERVAL)
 
-    # resto da lógica permanece igual...
-    # cole daqui para baixo exatamente como já está no seu arquivo
-    # (_tick, _safe, _handle_near_completion, _handle_completed)
+    def _tick(self):
+        data = self.gmgn.get_trenches(types=["near_completion", "completed"])
+
+        for token in data.get("pump", []):
+            mint = token.get("address")
+
+            with self._lock:
+                if mint and (mint in self._watchlist or mint in self._seen):
+                    continue
+
+            self._safe(self._handle_near_completion, token)
+
+        for token in data.get("completed", []):
+            mint = token.get("address")
+            mc = _float(token.get("usd_market_cap")) or _float(
+                token.get("market_cap")
+            )
+
+            with self._lock:
+                already_seen = bool(mint and mint in self._seen)
+
+            if already_seen:
+                if mint and mc and F_MC_MIN <= mc <= F_MC_MAX:
+                    self.hot.push_mc(mint, mc)
+            else:
+                self._safe(self._handle_completed, token)
+
+                if mint and mc and F_MC_MIN <= mc <= F_MC_MAX:
+                    self.hot.push_mc(mint, mc)
+
+    def _safe(self, fn, token: dict):
+        try:
+            fn(token)
+            time.sleep(0.3)
+        except RateLimitError:
+            raise
+        except Exception as e:
+            logger.warning(
+                "%s erro %s: %s",
+                fn.__name__,
+                token.get("address", "?")[:8],
+                e,
+            )
+
+    def _handle_near_completion(self, token: dict):
+        mint = token.get("address")
+
+        if not mint:
+            return
+
+        with self._lock:
+            if mint in self._watchlist or mint in self._seen:
+                return
+
+        bc = float(token.get("bc_progress") or 0)
+
+        if bc < BC_MIN_WATCHLIST:
+            return
+
+        ok, motivo = _passes_filter(token)
+
+        if not ok:
+            logger.info(
+                "Descartado %s (%s): %s",
+                token.get("symbol"),
+                mint[:8],
+                motivo,
+            )
+            return
+
+        now = datetime.now(timezone.utc)
+        created_ts = _int(token.get("created_timestamp"))
+
+        entry = {
+            "mint": mint,
+            "token_nome": token.get("symbol"),
+            "ts_detected": now,
+            "bc_progress_at_detection": bc,
+            "is_wash_trading": bool(token.get("is_wash_trading")),
+            "smart_wallets": _int(token.get("smart_degen_count")),
+            "renowned_wallets": _int(token.get("renowned_count")),
+            "sniper_wallets": _int(token.get("sniper_count")),
+            "rug_ratio": _float(token.get("rug_ratio")),
+            "top10_holder_rate": _float(token.get("top_10_holder_rate")),
+            "holders_count": _int(token.get("holder_count")),
+            "volume_1m": _float(token.get("volume_1m")),
+            "volume_5m": _float(token.get("volume_5m")),
+            "volume_15m": _float(token.get("volume_15m")),
+            "liq_migration": _float(token.get("liquidity")),
+            "is_honeypot": (
+                bool(token.get("is_honeypot"))
+                if token.get("is_honeypot") is not None
+                else None
+            ),
+            "token_created_at": (
+                datetime.fromtimestamp(created_ts, tz=timezone.utc)
+                if created_ts
+                else None
+            ),
+            "time_to_migrate_sec": _int(token.get("complete_cost_time")),
+        }
+
+        with self._lock:
+            self._watchlist[mint] = entry
+
+        db.upsert_watchlist(entry)
+
+    def _handle_completed(self, token: dict):
+        mint = token.get("address")
+
+        if not mint:
+            return
+
+        complete_ts = int(token.get("complete_timestamp") or 0)
+
+        if complete_ts > 0:
+            age_sec = int(datetime.now(timezone.utc).timestamp()) - complete_ts
+
+            if age_sec > MAX_MIG_AGE_SEC:
+                with self._lock:
+                    self._seen.add(mint)
+                return
+
+        with self._lock:
+            if mint in self._seen:
+                return
+
+            watchlist_entry = self._watchlist.pop(mint, None)
+            self._seen.add(mint)
+
+        if not watchlist_entry:
+            ok, _ = _passes_filter(token)
+
+            if not ok:
+                with self._lock:
+                    self._seen.discard(mint)
+                return
+
+        mc = _float(token.get("usd_market_cap")) or _float(
+            token.get("market_cap")
+        )
+        liq = _float(token.get("liquidity")) or 0
+
+        if not mc or mc < F_MC_MIN or mc > F_MC_MAX:
+            with self._lock:
+                self._seen.discard(mint)
+            return
+
+        if liq < F_LIQ_MIN:
+            with self._lock:
+                self._seen.discard(mint)
+            return
+
+        fee = _float(token.get("total_fee")) or 0
+
+        if fee < F_FEE_MIN:
+            with self._lock:
+                self._seen.discard(mint)
+            return
+
+        total_supply = _float(token.get("total_supply")) or 1_000_000_000
+        now = datetime.now(timezone.utc)
+
+        entry = {
+            "mint": mint,
+            "token_nome": token.get("symbol"),
+            "ts_detected": (
+                watchlist_entry.get("ts_detected")
+                if watchlist_entry
+                else None
+            ),
+            "bc_progress_at_detection": (
+                watchlist_entry.get("bc_progress_at_detection")
+                if watchlist_entry
+                else None
+            ),
+            "ts_migration": now,
+            "mc_migration": mc,
+        }
+
+        db.upsert_migration(entry)
+
+        symbol = token.get("symbol") or mint[:8]
+
+        send_alert(
+            f"🔔 *Migracao: {symbol}*\n"
+            f"MC: ${mc:,.0f} | Liq: ${liq:,.0f}"
+        )
+
+        self.hot.add(
+            mint,
+            mc,
+            now,
+            symbol,
+            total_supply,
+        )
 
 
 # ==============================================================================
