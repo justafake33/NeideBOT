@@ -474,6 +474,54 @@ def _run_analysis(rows):
     else:
         r["h2_no_n"] = 0
 
+    # ── Fase 1 — cobertura dos novos campos ───────────────────────────────────
+    fase1_fields = [
+        ("creator_token_status",  "Creator status"),
+        ("creator_balance_rate",  "Creator balance rate"),
+        ("dev_team_hold_rate",    "Dev team hold rate"),
+        ("suspected_insider_rate","Insider hold rate"),
+        ("top70_sniper_hold_rate","Top70 sniper hold rate"),
+        ("bluechip_owner_pct",    "Bluechip owner %"),
+        ("bot_degen_rate",        "Bot degen rate"),
+        ("entrapment_ratio",      "Entrapment ratio"),
+        ("lock_percent",          "Lock %"),
+        ("burn_status",           "Burn status"),
+        ("cto_flag",              "CTO flag"),
+        ("has_social",            "Has social"),
+        ("x_follower_count",      "X followers"),
+    ]
+    fase1_rows = []
+    total_mig = [x for x in rows if x.get("ts_migration") is not None]
+    for col, label in fase1_fields:
+        filled = [x for x in total_mig if x.get(col) is not None]
+        fase1_rows.append({
+            "label": label,
+            "filled": len(filled),
+            "total":  len(total_mig),
+            "pct":    _pct(len(filled), len(total_mig)),
+            "ok":     len(filled) > 0,
+        })
+    r["fase1_rows"]  = fase1_rows
+    r["fase1_total"] = len(total_mig)
+
+    # creator_token_status distribuição
+    cts = [x["creator_token_status"] for x in total_mig if x.get("creator_token_status")]
+    r["cts_hold"]  = cts.count("creator_hold")
+    r["cts_close"] = cts.count("creator_close")
+    r["cts_total"] = len(cts)
+
+    # creator_close vs recovery
+    scored = [x for x in rows if x["recovery"] is not None and x.get("mc_bottom") and x.get("mc_1h") and x["mc_bottom"] > 0]
+    close_grp = [x for x in scored if x.get("creator_token_status") == "creator_close"]
+    hold_grp  = [x for x in scored if x.get("creator_token_status") == "creator_hold"]
+    def _wr_simple(grp):
+        if not grp: return None
+        return sum(1 for x in grp if x["mc_1h"] > x["mc_bottom"]) / len(grp)
+    r["cts_close_wr"] = f"{_wr_simple(close_grp)*100:.1f}%" if _wr_simple(close_grp) else "—"
+    r["cts_hold_wr"]  = f"{_wr_simple(hold_grp)*100:.1f}%"  if _wr_simple(hold_grp)  else "—"
+    r["cts_close_n"]  = len(close_grp)
+    r["cts_hold_n"]   = len(hold_grp)
+
     return r
 
 
@@ -648,6 +696,38 @@ tr:hover td { background: #161b22; }
 {% endif %}
 {% if d.h2_ok_n == 0 and d.h2_no_n == 0 %}
 <p class="muted">Dados insuficientes.</p>
+{% endif %}
+
+<!-- Seção 7: Fase 1 — cobertura -->
+<h2>7 — Fase 1: Cobertura dos Novos Campos ({{ d.fase1_total }} migrações)</h2>
+<p class="note" style="margin-bottom:10px">Campos coletados desde o último deploy, sem custo de API extra.</p>
+<table>
+<thead><tr><th>Campo</th><th>Preenchidos</th><th>Total</th><th>Cobertura</th></tr></thead>
+<tbody>
+{% for f in d.fase1_rows %}
+<tr>
+  <td>{{ f.label }}</td>
+  <td>{{ f.filled }}</td>
+  <td>{{ f.total }}</td>
+  <td><span class="tag {{ 't-green' if f.ok else 't-red' }}">{{ f.pct }}</span></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+
+{% if d.cts_total > 0 %}
+<h2 style="margin-top:24px">7.1 — Creator Token Status (n={{ d.cts_total }})</h2>
+<div class="grid" style="margin-bottom:12px">
+  <div class="card"><div class="card-label">creator_close (dev vendeu)</div><div class="card-value green">{{ d.cts_close }}</div></div>
+  <div class="card"><div class="card-label">creator_hold (dev segura)</div><div class="card-value red">{{ d.cts_hold }}</div></div>
+</div>
+{% if d.cts_close_n > 0 or d.cts_hold_n > 0 %}
+<p class="note" style="margin-bottom:6px">Win rate (mc_1h &gt; bottom) por status do dev:</p>
+<div class="row">
+  <div class="kv"><span>creator_close (n={{ d.cts_close_n }})</span><span class="green">{{ d.cts_close_wr }}</span></div>
+  <div class="kv"><span>creator_hold (n={{ d.cts_hold_n }})</span><span class="red">{{ d.cts_hold_wr }}</span></div>
+</div>
+{% endif %}
 {% endif %}
 
 </body>
