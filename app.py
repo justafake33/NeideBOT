@@ -12,13 +12,13 @@ from gmgn_client import GmgnClient
 from scheduler import HeapScheduler
 from scanner import Scanner, HotMonitor
 
-init_sentry()
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+init_sentry()
 
 app = Flask(__name__)
 BRT = timedelta(hours=-3)
