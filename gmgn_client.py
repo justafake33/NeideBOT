@@ -1,6 +1,7 @@
 import os
 import time
 import logging
+import threading
 import requests
 from typing import Optional
 from uuid import uuid4
@@ -155,4 +156,74 @@ class GmgnClient:
                     return float(v)
             except Exception:
                 continue
+        return None
+
+
+_sol_usd_lock      = threading.Lock()
+_sol_usd_value:    Optional[float] = None
+_sol_usd_ts:       float           = 0.0
+_SOL_USD_TTL       = 300  # 5 minutes
+
+
+def get_sol_usd() -> Optional[float]:
+    """Retorna preço SOL/USD com cache de 5min. Tenta CoinGecko, fallback GMGN."""
+    global _sol_usd_value, _sol_usd_ts
+
+    with _sol_usd_lock:
+        if _sol_usd_value and (time.time() - _sol_usd_ts) < _SOL_USD_TTL:
+            return _sol_usd_value
+
+    price = _fetch_sol_usd_coingecko()
+    if not price:
+        price = _fetch_sol_usd_gmgn()
+
+    if price and price > 0:
+        with _sol_usd_lock:
+            _sol_usd_value = price
+            _sol_usd_ts    = time.time()
+        logger.debug("SOL/USD atualizado: $%.2f", price)
+    else:
+        logger.warning("Não foi possível obter preço SOL/USD — usando último conhecido")
+        with _sol_usd_lock:
+            price = _sol_usd_value
+
+    return price
+
+
+def _fetch_sol_usd_coingecko() -> Optional[float]:
+    try:
+        resp = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "solana", "vs_currencies": "usd"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return float(resp.json()["solana"]["usd"])
+    except Exception as e:
+        logger.debug("CoinGecko SOL/USD falhou: %s", e)
+        return None
+
+
+def _fetch_sol_usd_gmgn() -> Optional[float]:
+    try:
+        resp = requests.get(
+            f"{GMGN_HOST.rstrip('/')}/v1/token/info/sol/So11111111111111111111111111111111111111112",
+            headers={"X-APIKEY": GMGN_API_KEY},
+            params={"timestamp": str(int(time.time())), "client_id": str(uuid4())},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data") or {}
+        for key in ("price", "price_usd", "usd_price", "last_price"):
+            v = data.get(key)
+            if v is not None:
+                try:
+                    f = float(v)
+                    if f > 0:
+                        return f
+                except Exception:
+                    pass
+        return None
+    except Exception as e:
+        logger.debug("GMGN SOL/USD falhou: %s", e)
         return None

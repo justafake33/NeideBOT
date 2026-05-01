@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from gmgn_client import GmgnClient, RateLimitError
+from gmgn_client import GmgnClient, RateLimitError, get_sol_usd
 import db
 from scheduler import HeapScheduler
 from telegram_bot import send_alert
@@ -32,7 +32,6 @@ F_LIQ_MIN        = float(os.getenv("FILTER_LIQ_MIN",        "10000"))  # liquide
 F_FEE_MIN        = float(os.getenv("FILTER_FEE_MIN",        "1.0"))    # total_fee minimo em SOL
 MAX_MIG_AGE_SEC  = int(os.getenv(  "MAX_MIG_AGE_SEC",       "600"))    # max 10min desde complete_timestamp
 MIGRATION_SOL_UNITS = float(os.getenv("MIGRATION_SOL_UNITS", "410"))
-MIGRATION_SOL_USD   = float(os.getenv("MIGRATION_SOL_USD", "0"))
 
 
 def _passes_filter(token: dict) -> tuple[bool, str]:
@@ -639,8 +638,9 @@ class Scanner:
         mc_observed = mc_kline if mc_kline else mc
         src_observed = "kline" if mc_kline else "trenches"
         mc_bc_ref = None
-        if MIGRATION_SOL_USD > 0 and MIGRATION_SOL_UNITS > 0:
-            mc_bc_ref = MIGRATION_SOL_USD * MIGRATION_SOL_UNITS
+        sol_usd = get_sol_usd()
+        if sol_usd and sol_usd > 0 and MIGRATION_SOL_UNITS > 0:
+            mc_bc_ref = sol_usd * MIGRATION_SOL_UNITS
         mc_migration = mc_bc_ref if mc_bc_ref else mc_observed
         src = "bonding_curve" if mc_bc_ref else src_observed
 
