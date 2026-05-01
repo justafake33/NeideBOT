@@ -33,26 +33,40 @@ class HeapScheduler:
             heapq.heappush(self._heap, (fire_at, self._seq, callback, args))
         self._event.set()
 
+    def _safe_callback(self, callback, args):
+        try:
+            callback(*args)
+        except Exception as e:
+            logger.exception("Erro no callback agendado")
+            sentry_sdk.capture_exception(e)
+
     def _run(self):
         while self._running:
-            self._event.clear()
-            fired = []
+            try:
+                self._event.clear()
+                fired = []
 
-            with self._lock:
-                now = time.monotonic()
-                while self._heap and self._heap[0][0] <= now:
-                    _, _, callback, args = heapq.heappop(self._heap)
-                    fired.append((callback, args))
-                next_fire = self._heap[0][0] if self._heap else None
+                with self._lock:
+                    now = time.monotonic()
+                    while self._heap and self._heap[0][0] <= now:
+                        _, _, callback, args = heapq.heappop(self._heap)
+                        fired.append((callback, args))
 
-            for callback, args in fired:
-                try:
-                    threading.Thread(target=callback, args=args, daemon=True).start()
-                except Exception as e:
-                    logger.error("Scheduler dispatch error: %s", e)
+                    next_fire = self._heap[0][0] if self._heap else None
 
-            if next_fire is not None:
-                wait = max(0.0, next_fire - time.monotonic())
-                self._event.wait(timeout=wait)
-            else:
-                self._event.wait(timeout=60.0)
+                for callback, args in fired:
+                    threading.Thread(
+                        target=self._safe_callback,
+                        args=(callback, args),
+                        daemon=True
+                    ).start()
+
+                if next_fire is not None:
+                    wait = max(0.0, next_fire - time.monotonic())
+                    self._event.wait(timeout=wait)
+                else:
+                    self._event.wait(timeout=60.0)
+
+            except Exception as e:
+                logger.exception("Erro no loop principal do scheduler")
+                sentry_sdk.capture_exception(e)
