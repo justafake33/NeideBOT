@@ -374,11 +374,20 @@ class HotMonitor:
         mc        = None
         src       = "?"
 
+        # Janela estreita ao redor do mark exato (token ativo)
         candles = self.gmgn.get_token_kline(
             mint, "sol", "1m",
             from_ts=target_ts - 120,
             to_ts=target_ts + 60,
         )
+        # Fallback: range completo desde a migração — captura último preço de token morto
+        if not candles:
+            candles = self.gmgn.get_token_kline(
+                mint, "sol", "1m",
+                from_ts=ts_mig_unix,
+                to_ts=target_ts + 60,
+            )
+
         if candles:
             closest     = min(candles, key=lambda c: abs(int(c.get("time", 0)) / 1000 - target_ts))
             close_price = _float(closest.get("close"))
@@ -386,19 +395,15 @@ class HotMonitor:
                 mc  = close_price * total_supply
                 src = "kline"
 
-        # Fallback: token/info com até 3 tentativas (indexação pode demorar)
+        # Fallback: token/info (1 tentativa)
         if mc is None:
-            for attempt in range(3):
-                info = self.gmgn.get_token_info(mint)
-                if info:
-                    try:
-                        mc  = float(info["price"]) * float(info["circulating_supply"])
-                        src = "token/info"
-                    except Exception:
-                        pass
-                    break
-                if attempt < 2:
-                    time.sleep(300)  # aguarda 5min e tenta novamente
+            info = self.gmgn.get_token_info(mint)
+            if info:
+                try:
+                    mc  = float(info["price"]) * float(info["circulating_supply"])
+                    src = "token/info"
+                except Exception:
+                    pass
 
         if mc is None:
             logger.warning("Checkpoint %s %s: todas as fontes falharam", symbol, label)

@@ -256,7 +256,7 @@ def get_tokens_for_backfill() -> list:
                    mc_1h, mc_4h, mc_24h
             FROM migrations
             WHERE ts_migration IS NOT NULL
-              AND ts_migration > NOW() - INTERVAL '25 hours'
+              AND ts_migration > NOW() - INTERVAL '26 hours'
               AND (mc_1h IS NULL OR mc_4h IS NULL OR mc_24h IS NULL)
             ORDER BY ts_migration ASC
         """)
