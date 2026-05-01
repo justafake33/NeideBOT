@@ -36,6 +36,9 @@ def init_db():
                 bc_progress_at_detection  FLOAT,
                 ts_migration              TIMESTAMPTZ,
                 mc_migration              FLOAT,
+                mc_migration_observed     FLOAT,
+                mc_migration_bc_ref       FLOAT,
+                mc_migration_source       TEXT,
                 mc_peak                   FLOAT,
                 time_to_peak              FLOAT,
                 pct_gain                  FLOAT,
@@ -76,6 +79,9 @@ def init_db():
             "ADD COLUMN IF NOT EXISTS pct_gain           FLOAT",
             "ADD COLUMN IF NOT EXISTS token_created_at   TIMESTAMPTZ",
             "ADD COLUMN IF NOT EXISTS time_to_migrate_sec INT",
+            "ADD COLUMN IF NOT EXISTS mc_migration_observed FLOAT",
+            "ADD COLUMN IF NOT EXISTS mc_migration_bc_ref   FLOAT",
+            "ADD COLUMN IF NOT EXISTS mc_migration_source   TEXT",
         ]:
             cur.execute(f"ALTER TABLE migrations {col}")
     logger.info("DB inicializado")
@@ -130,6 +136,7 @@ def upsert_migration(data: dict):
             INSERT INTO migrations (
                 mint, token_nome, ts_detected, bc_progress_at_detection,
                 ts_migration, mc_migration,
+                mc_migration_observed, mc_migration_bc_ref, mc_migration_source,
                 smart_wallets, renowned_wallets, sniper_wallets,
                 rug_ratio, top10_holder_rate, holders_count,
                 volume_1m, volume_5m, volume_15m,
@@ -138,6 +145,7 @@ def upsert_migration(data: dict):
             ) VALUES (
                 %(mint)s, %(token_nome)s, %(ts_detected)s, %(bc_progress_at_detection)s,
                 %(ts_migration)s, %(mc_migration)s,
+                %(mc_migration_observed)s, %(mc_migration_bc_ref)s, %(mc_migration_source)s,
                 %(smart_wallets)s, %(renowned_wallets)s, %(sniper_wallets)s,
                 %(rug_ratio)s, %(top10_holder_rate)s, %(holders_count)s,
                 %(volume_1m)s, %(volume_5m)s, %(volume_15m)s,
@@ -147,6 +155,9 @@ def upsert_migration(data: dict):
             ON CONFLICT (mint) DO UPDATE SET
                 ts_migration         = EXCLUDED.ts_migration,
                 mc_migration         = EXCLUDED.mc_migration,
+                mc_migration_observed= EXCLUDED.mc_migration_observed,
+                mc_migration_bc_ref  = EXCLUDED.mc_migration_bc_ref,
+                mc_migration_source  = EXCLUDED.mc_migration_source,
                 capture_delay_sec    = EXCLUDED.capture_delay_sec,
                 token_created_at     = COALESCE(migrations.token_created_at, EXCLUDED.token_created_at),
                 time_to_migrate_sec  = COALESCE(migrations.time_to_migrate_sec, EXCLUDED.time_to_migrate_sec),
@@ -169,6 +180,9 @@ def upsert_migration(data: dict):
             "bc_progress_at_detection": data.get("bc_progress_at_detection"),
             "ts_migration": data.get("ts_migration"),
             "mc_migration": data.get("mc_migration"),
+            "mc_migration_observed": data.get("mc_migration_observed"),
+            "mc_migration_bc_ref": data.get("mc_migration_bc_ref"),
+            "mc_migration_source": data.get("mc_migration_source"),
             "smart_wallets": data.get("smart_wallets"),
             "renowned_wallets": data.get("renowned_wallets"),
             "sniper_wallets": data.get("sniper_wallets"),

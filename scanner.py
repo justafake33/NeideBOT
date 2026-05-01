@@ -31,6 +31,8 @@ F_MC_MAX         = float(os.getenv("FILTER_MC_MAX",         "200000"))
 F_LIQ_MIN        = float(os.getenv("FILTER_LIQ_MIN",        "10000"))  # liquidez minima em USD
 F_FEE_MIN        = float(os.getenv("FILTER_FEE_MIN",        "1.0"))    # total_fee minimo em SOL
 MAX_MIG_AGE_SEC  = int(os.getenv(  "MAX_MIG_AGE_SEC",       "600"))    # max 10min desde complete_timestamp
+MIGRATION_SOL_UNITS = float(os.getenv("MIGRATION_SOL_UNITS", "410"))
+MIGRATION_SOL_USD   = float(os.getenv("MIGRATION_SOL_USD", "0"))
 
 
 def _passes_filter(token: dict) -> tuple[bool, str]:
@@ -634,8 +636,13 @@ class Scanner:
                 if open_price and open_price > 0:
                     mc_kline = open_price * total_supply
 
-        mc_migration = mc_kline if mc_kline else mc
-        src = "kline" if mc_kline else "trenches"
+        mc_observed = mc_kline if mc_kline else mc
+        src_observed = "kline" if mc_kline else "trenches"
+        mc_bc_ref = None
+        if MIGRATION_SOL_USD > 0 and MIGRATION_SOL_UNITS > 0:
+            mc_bc_ref = MIGRATION_SOL_USD * MIGRATION_SOL_UNITS
+        mc_migration = mc_bc_ref if mc_bc_ref else mc_observed
+        src = "bonding_curve" if mc_bc_ref else src_observed
 
         created_ts          = _int(token.get("created_timestamp"))
         token_created_at    = datetime.fromtimestamp(created_ts, tz=timezone.utc) if created_ts else None
@@ -643,7 +650,7 @@ class Scanner:
 
         if capture_delay_sec is not None and capture_delay_sec > 90:
             logger.warning(
-                "Migracao %s (%s): %ds apos migracao — MC via %s: $%.0f",
+                "Migracao %s (%s): %ds apos migracao — MC oficial(%s): $%.0f",
                 token.get("symbol"), mint[:8], capture_delay_sec, src, mc_migration,
             )
         quality = {
@@ -676,6 +683,9 @@ class Scanner:
             "bc_progress_at_detection": watchlist_entry.get("bc_progress_at_detection") if watchlist_entry else None,
             "ts_migration":             now,
             "mc_migration":             mc_migration,
+            "mc_migration_observed":    mc_observed,
+            "mc_migration_bc_ref":      mc_bc_ref,
+            "mc_migration_source":      src,
             "capture_delay_sec":        capture_delay_sec,
             "token_created_at":         token_created_at,
             "time_to_migrate_sec":      time_to_migrate_sec,
@@ -691,13 +701,13 @@ class Scanner:
 
         send_alert(
             f"\U0001f514 *Migracao: {symbol}*\n"
-            f"MC: ${mc_migration:,.0f} | Liq: ${liq:,.0f}\n"
+            f"MC oficial: ${mc_migration:,.0f} ({src}) | Liq: ${liq:,.0f}\n"
             f"Exchange: {exch}\n"
             f"Smart: {smart} | Rug: {rug:.0%}"
         )
         delay_str = f" delay={capture_delay_sec}s" if capture_delay_sec is not None else ""
-        logger.info("Migracao %s (%s) MC=$%.0f[%s] liq=$%.0f exch=%s smart=%d%s",
-                    symbol, mint[:8], mc_migration, src, liq, exch, smart, delay_str)
+        logger.info("Migracao %s (%s) MC_oficial=$%.0f[%s] MC_obs=$%.0f[%s] liq=$%.0f exch=%s smart=%d%s",
+                    symbol, mint[:8], mc_migration, src, mc_observed, src_observed, liq, exch, smart, delay_str)
 
         self.hot.add(mint, mc_migration, now, symbol, total_supply)
 
