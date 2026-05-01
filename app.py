@@ -7,9 +7,12 @@ import io
 from flask import Flask, render_template_string, redirect, Response
 
 import db
+from monitoring import init_sentry
 from gmgn_client import GmgnClient
 from scheduler import HeapScheduler
 from scanner import Scanner, HotMonitor
+
+init_sentry()
 
 logging.basicConfig(
     level=logging.INFO,
