@@ -140,3 +140,19 @@ class GmgnClient:
                     logger.warning("token info %s: %s", mint[:8], e)
                 return None
         return None
+
+    def get_solana_price_usd(self, chain: str = "sol") -> Optional[float]:
+        """Obtém preço spot de SOL em USD usando token info da própria GMGN."""
+        sol_mint = "So11111111111111111111111111111111111111112"
+        info = self.get_token_info(sol_mint, chain=chain)
+        if not info:
+            return None
+
+        for key in ("price", "price_usd", "usd_price", "last_price"):
+            v = info.get(key)
+            try:
+                if v is not None and float(v) > 0:
+                    return float(v)
+            except Exception:
+                continue
+        return None
