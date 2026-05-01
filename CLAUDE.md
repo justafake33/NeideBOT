@@ -258,7 +258,7 @@ Scanner (poll 5s)
 
 ### Fontes de dados por prioridade
 | Dado | 1ª fonte | 2ª fonte | 3ª fonte | 4ª fonte |
-|------|----------|----------|----------|-----------|
+|------|----------|----------|----------|----------|
 | mc_migration | kline (open no complete_ts) | trenches usd_market_cap | — | — |
 | mc_bottom / mc_peak | kline 1m (hot-precise) | push_mc (trenches 5s) | — | — |
 | mc_1h | kline (ts_mig a ts_mig+3660) | token/info | push_mc (mc_last) | — |
