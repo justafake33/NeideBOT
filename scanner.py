@@ -66,6 +66,7 @@ class HotMonitor:
         self.scheduler = scheduler
         self._tokens: dict = {}
         self._cancelled: set = set()
+        self._mc_live: dict = {}  # mint → último MC do trenches, atualizado a cada poll
         self._lock = threading.Lock()
 
     def add(self, mint: str, mc_migration: float, ts_migration: datetime,
@@ -93,6 +94,7 @@ class HotMonitor:
     def push_mc(self, mint: str, mc: float):
         """Chamado pelo Scanner a cada poll — detecção rápida de rug e bottom aproximado."""
         with self._lock:
+            self._mc_live[mint] = mc  # captura sempre, mesmo após graduação
             state = self._tokens.get(mint)
             if not state or mint in self._cancelled:
                 return
@@ -405,6 +407,14 @@ class HotMonitor:
                 except Exception:
                     pass
 
+        # Fallback: último MC do trenches (poll 5s — único dado confiável para Meteora DAMM v2)
+        if mc is None:
+            with self._lock:
+                mc_live = self._mc_live.get(mint)
+            if mc_live:
+                mc  = mc_live
+                src = "trenches_live"
+
         if mc is None:
             logger.warning("Checkpoint %s %s: todas as fontes falharam", symbol, label)
             return
@@ -469,7 +479,7 @@ class Scanner:
             with self._lock:
                 already_seen = bool(mint and mint in self._seen)
             if already_seen:
-                if mint and mc and F_MC_MIN <= mc <= F_MC_MAX:
+                if mint and mc:
                     self.hot.push_mc(mint, mc)
             else:
                 self._safe(self._handle_completed, token)
