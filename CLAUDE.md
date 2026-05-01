@@ -4,6 +4,8 @@
 Bot autônomo de trading em Solana.
 Estratégia central: detectar tokens recém-migrados (Pump.fun/Meteora DAMM v2), aguardar o dump pós-migração e comprar o fundo com filtros de qualidade.
 
+**Timeframe de trade: minutos.** Checkpoints de 4h e 24h foram descartados — a janela relevante é a hora seguinte à migração.
+
 Completamente independente do wallet-monitor/copy trade.
 
 ---
@@ -32,9 +34,10 @@ Swap/orders: adiciona header `X-Signature` (Ed25519 sobre subpath+params+body+ti
 | `/v1/token/security/{chain}/{mint}` | GET | Segurança: honeypot, rug_ratio, tax, holder concentration |
 | `/v1/market/rank` | GET | Trending tokens |
 | `/v1/market/token_kline` | GET | Candlestick OHLCV — **NÃO funciona historicamente para Meteora DAMM v2** |
-| `/v1/trade/swap` | POST | Execução de swap (Fase 2+) |
-| `/v1/trade/strategy/create` | POST | TP/SL automático (Fase 2+) |
-| `/v1/trade/query_order` | GET | Status de ordem (Fase 2+) |
+| `/v1/market/token_signal` | POST | Sinais em tempo real — type 12 = SmartDegenBuy (próximo passo: Fase 2) |
+| `/v1/trade/swap` | POST | Execução de swap (Fase 6) |
+| `/v1/trade/strategy/create` | POST | TP/SL automático (Fase 6) |
+| `/v1/trade/query_order` | GET | Status de ordem (Fase 6) |
 
 ### Rate limits (leaky bucket, capacity 10)
 | Endpoint | Peso | Taxa sustentada |
@@ -42,12 +45,13 @@ Swap/orders: adiciona header `X-Signature` (Ed25519 sobre subpath+params+body+ti
 | trenches | 3 | ~3.3 req/s |
 | token info/security | 1 | ~10 req/s |
 | kline | 2 | ~5 req/s |
+| token_signal | 3 | ~3.3 req/s |
 | swap/strategy | 1 | ~10 req/s |
 
 > ⚠️ IPv4 only — GMGN API não aceita IPv6. Verificar no Railway.
 > ⚠️ 429 → ler `reset_at` do body e aguardar. Retry imediato estende ban em 5s.
 
-### Mapeamento de campos confirmado
+### Mapeamento de campos — trenches
 
 ```python
 # POST /v1/trenches — body example
@@ -62,48 +66,51 @@ Swap/orders: adiciona header `X-Signature` (Ed25519 sobre subpath+params+body+ti
 # completed       → data["completed"]
 # new_creation    → data["new_creation"]
 
-# Campos por token no trenches:
-token["address"]                  # mint
-token["symbol"]                   # nome
-token["smart_degen_count"]        # smart wallets
-token["renowned_count"]           # KOLs
-token["sniper_count"]             # sniper wallets
-token["rug_ratio"]                # risco rug (0-1)
-token["bundler_trader_amount_rate"]  # % bundlers (usar para rug_ratio no DB)
-token["rat_trader_amount_rate"]   # % de rat traders (filtro)
-token["is_wash_trading"]          # bool — wash trading detectado pelo GMGN
-token["top_10_holder_rate"]       # concentração top 10
-token["bc_progress"]              # % da bonding curve (0-99)
-token["usd_market_cap"]           # MC em USD (preferir sobre market_cap)
-token["market_cap"]               # fallback de MC
-token["liquidity"]                # liquidez total (NÃO dividir por 2 no trenches)
-token["total_fee"]                # fee total em SOL (filtro de volume real)
-token["complete_timestamp"]       # unix timestamp da migração
-token["created_timestamp"]        # unix timestamp de criação do token
-token["complete_cost_time"]       # segundos do token criado até migrar
-token["total_supply"]             # supply total
-token["exchange"]                 # exchange de destino (Raydium, Meteora, etc.)
+# Campos base por token:
+token["address"]                     # mint
+token["symbol"]                      # nome
+token["smart_degen_count"]           # smart wallets (contagem bruta)
+token["renowned_count"]              # KOLs
+token["sniper_count"]                # sniper wallets
+token["rug_ratio"]                   # risco rug snapshot (0-1)
+token["bundler_trader_amount_rate"]  # % bundlers → usar como rug_ratio no DB
+token["rat_trader_amount_rate"]      # % de rat traders (filtro)
+token["is_wash_trading"]             # bool — wash trading detectado pelo GMGN
+token["top_10_holder_rate"]          # concentração top 10
+token["bc_progress"]                 # % da bonding curve (0-99)
+token["usd_market_cap"]              # MC em USD (preferir sobre market_cap)
+token["market_cap"]                  # fallback de MC
+token["liquidity"]                   # liquidez total (NÃO dividir por 2 no trenches)
+token["total_fee"]                   # fee total em SOL (filtro de volume real)
+token["complete_timestamp"]          # unix timestamp da migração
+token["created_timestamp"]           # unix timestamp de criação do token
+token["complete_cost_time"]          # segundos do token criado até migrar
+token["total_supply"]                # supply total
+token["exchange"]                    # exchange de destino (Raydium, Meteora, etc.)
+
+# Campos Fase 1 — qualidade (chegam no mesmo trenches, zero custo extra):
+token["creator_token_status"]        # "creator_hold" ou "creator_close" — dev ainda segura?
+token["creator_balance_rate"]        # % do supply que o dev ainda tem
+token["dev_team_hold_rate"]          # % do time total
+token["suspected_insider_hold_rate"] # % de insiders identificados pelo GMGN
+token["top70_sniper_hold_rate"]      # os 70 maiores snipers ainda estão dentro?
+token["bluechip_owner_percentage"]   # % dos holders que são wallets bluechip (qualidade real)
+token["bot_degen_rate"]              # ratio de bots
+token["entrapment_ratio"]            # manipulação de preço por armadilha
+token["lock_percent"]                # % da liquidez travada
+token["burn_status"]                 # status do burn de liquidez ("none", "burn")
+token["cto_flag"]                    # 1 = comunidade assumiu o projeto
+token["has_at_least_one_social"]     # tem pelo menos uma rede social
+token["x_user_follower"]             # seguidores no Twitter
 
 # GET /v1/token/info/sol/{mint} → body["data"]
 # ⚠️ Retorna 404 para tokens Meteora DAMM v2 nas primeiras horas após migração
 raw = body["data"]
 mc  = float(raw["price"]) * float(raw["circulating_supply"])
 liq = float(raw["liquidity"]) / 2   # double-sided → ÷2
-wts = raw.get("wallet_tags_stat") or {}
-smart_wallets    = wts.get("smart_wallets")
-renowned_wallets = wts.get("renowned_wallets")
-sniper_wallets   = wts.get("sniper_wallets")
-stat = raw.get("stat") or {}
-rug_ratio         = float(stat.get("top_bundler_trader_percentage") or 0)
-volume_5m         = float(stat.get("volume_5m") or 0)
-top10_holder_rate = float(stat.get("top_10_holder_rate") or 0)
-holders_count = int(raw.get("holder_count") or 0)
-is_honeypot   = raw.get("is_honeypot")
-bc_progress   = raw.get("bc_progress")
 
 # GET /v1/market/token_kline
 # ⚠️ Meteora DAMM v2: retorna dados APENAS para os primeiros ~60min após migração.
-# Não funciona para consultas históricas (4h, 24h atrás).
 # Resolução deve ser "1m" (string), NÃO o inteiro 1.
 params = {
   "chain": "sol",
@@ -113,23 +120,35 @@ params = {
   "to": to_ts,       # unix timestamp
 }
 # Response: lista de candles com campos: time (ms), open, high, low, close, volume
+
+# POST /v1/market/token_signal — Fase 2
+# signal_type=12 (SmartDegenBuy): smart money comprando em tempo real
+# Campos relevantes: trigger_at, trigger_mc, signal_times, market_cap
+# NÃO usar signal_type 14, 15 ou 16 — API retorna 400
 ```
 
 ---
 
 ## 🎯 ESTRATÉGIA CENTRAL — Post-Migration Dip
 
-### O Padrão
+### O Padrão Real (validado com 828 tokens)
 Quando um token completa a bonding curve no Pump.fun, ele migra para Raydium ou Meteora DAMM v2.
-Nesse momento os early buyers realizam lucro → dump imediato.
-Se o token tem fundamentos reais, esse dump é temporário e o preço recupera.
+Os early buyers realizam lucro → dump imediato.
 
-### Pipeline de execução (Fase 2+)
+**O que os dados confirmaram:**
+- Dump mediano: **72%** (muito mais severo que o roadmap original assumia)
+- **78% dos tokens não fazem bounce** — o pico vem antes do fundo
+- Fundo mediano: **13.6min** após migração
+- Os filtros atuais (smart count, rug, top10, wash) **não discriminam recovery**
+- O sinal que separa os 22% com bounce dos 78% sem bounce ainda não está capturado → é o foco da Fase 2 (Smart Flow Delta via signal type 12)
+
+### Pipeline de execução
 ```
 ESTÁGIO 1 — Watchlist (bc_progress ≥ 80%)
     │
     ├─ POST /v1/trenches type=near_completion → data["pump"]
     ├─ Filtros aplicados (rug, rat, top10, smart, wash)
+    ├─ Campos Fase 1 coletados (creator_status, bluechip_pct, etc.)
     └─ Token entra na watchlist com dados de qualidade
 
 ESTÁGIO 2 — Migração detectada
@@ -137,36 +156,29 @@ ESTÁGIO 2 — Migração detectada
     ├─ POST /v1/trenches type=completed → data["completed"]
     ├─ Filtros de MC ($5k-$200k), liquidez (≥$10k), fee (≥1 SOL)
     ├─ MC preciso via kline no complete_timestamp (fallback: trenches)
-    ├─ Token entra no HotMonitor por 60 minutos
-    │
-    ├─ HotMonitor rastreia fundo (mc_min) e pico (mc_max) a cada 5s
-    ├─ kline preciso a cada 60s (hot-precise thread)
-    │
-    └─ Checkpoints: 1h (graduação) → 4h → 24h
+    └─ Token entra no HotMonitor por 60 minutos
 
-FASE 2 — Execução (BOT_ATIVO=true)
-    ├─ Aguarda dump ≥ DUMP_THRESHOLD% do mc_migration
-    ├─ Aplica filtros de qualidade
-    ├─ POST /v1/trade/swap
-    └─ TP/SL via POST /v1/trade/strategy/create
+HotMonitor (janela 60min)
+    ├─ push_mc (5s): rastreia mc_min, mc_max, mc_last
+    ├─ hot-precise (60s): kline low/high para precisão
+    └─ _tick (30s): graduação após 60min → salva mc_bottom, mc_peak, mc_1h
+
+FASE 2 — próximo passo
+    ├─ Signal type 12 (SmartDegenBuy) durante o dump → Smart Flow Delta
+    ├─ Se smart money compra com trigger_mc < mc_migration → sinal de entrada
+    └─ Execução via POST /v1/trade/swap
 ```
 
 ---
 
-## 🔍 FASE 1 — Coleta de Dados (em andamento)
+## 🔍 ESTADO ATUAL — Coleta de Dados
 
-### Estado atual (2026-05-01)
-- **790 tokens** coletados no banco
-- **719** com `mc_bottom` (91%)
-- **341** com `mc_1h` (43%)
-- **0** com `mc_4h` / `mc_24h` — fix deployado em 2026-05-01
-- `recovery` calculado para 341 tokens
-
-### Por que mc_4h = 0?
-O kline do GMGN **não retorna dados históricos** para tokens Meteora DAMM v2 — funciona apenas para os primeiros ~60min após migração. Após isso, a única fonte confiável é o `trenches` poll (5s). A solução implementada:
-1. `_mc_live`: dict que captura o último MC do trenches para todos os tokens vistos
-2. Fallback em `_checkpoint`: kline (estreito) → kline (range completo) → token/info → `_mc_live`
-3. Para checkpoints futuros, `_mc_live` tem o último valor do trenches (atualizado a cada 5s)
+### Situação (2026-05-01)
+- **828 tokens** coletados no banco
+- **754** com `mc_bottom` (91%)
+- **361** com `mc_1h` (44%)
+- `mc_4h` e `mc_24h` **descartados** — trade é de minutos, não horas
+- Campos Fase 1 sendo coletados desde o último deploy
 
 ### Campos coletados por migração
 
@@ -184,13 +196,9 @@ O kline do GMGN **não retorna dados históricos** para tokens Meteora DAMM v2 �
 | mc_bottom | HotMonitor | MC mínimo na janela quente |
 | time_to_bottom | HotMonitor | Minutos até o fundo |
 | pct_drop | Calculado | (mc_migration - mc_bottom) / mc_migration |
-| mc_1h | Checkpoint | MC 1h após migração |
+| mc_1h | Checkpoint | MC 1h após migração (proxy de saída para trade de minutos) |
 | var_1h | Calculado | % vs mc_migration |
-| mc_4h | Checkpoint | MC 4h após migração |
-| var_4h | Calculado | % vs mc_migration |
-| mc_24h | Checkpoint | MC 24h após migração |
-| var_24h | Calculado | % vs mc_migration |
-| smart_wallets | trenches | Smart wallets (smart_degen_count) |
+| smart_wallets | trenches | smart_degen_count |
 | renowned_wallets | trenches | KOL wallets |
 | sniper_wallets | trenches | Sniper wallets |
 | rug_ratio | trenches | bundler_trader_amount_rate |
@@ -204,30 +212,48 @@ O kline do GMGN **não retorna dados históricos** para tokens Meteora DAMM v2 �
 | token_created_at | trenches | Timestamp de criação |
 | time_to_migrate_sec | trenches | Segundos criação → migração |
 | capture_delay_sec | Sistema | Segundos entre migração e captura |
+| **creator_token_status** | trenches | "creator_hold" / "creator_close" — dev ainda segura? |
+| **creator_balance_rate** | trenches | % do supply que o dev tem |
+| **dev_team_hold_rate** | trenches | % do time total |
+| **suspected_insider_rate** | trenches | % de insiders identificados |
+| **top70_sniper_hold_rate** | trenches | Snipers ainda dentro? |
+| **bluechip_owner_pct** | trenches | % dos holders que são bluechip (qualidade real) |
+| **bot_degen_rate** | trenches | Ratio de bots |
+| **entrapment_ratio** | trenches | Manipulação de preço |
+| **lock_percent** | trenches | % da liquidez travada |
+| **burn_status** | trenches | Status do burn |
+| **cto_flag** | trenches | Comunidade assumiu o projeto |
+| **has_social** | trenches | Tem rede social |
+| **x_follower_count** | trenches | Seguidores no Twitter |
 
 ---
 
 ## 📐 HIPÓTESES FORMAIS
 Registradas ANTES de ver os dados. Não alterar retroativamente.
 
-**H1** — ≥70% dos tokens caem ≥20% do ATH nos primeiros 60min.
-**H2** — Em tokens com recovery=TRUE, o fundo ocorre em ≤15min.
-**H3** — Tokens com smart_wallets ≥3 têm recovery rate ≥ 15pp maior que smart<3.
-**H4** — Tokens com sniper_wallets/holders ≥30% têm recovery rate < 30%.
-**H5** — Tokens com top10_holder_rate ≥0.80 têm var_24h < -80% em ≥60% dos casos.
-**H6** — Entradas entre -25% e -45% do mc_migration têm melhor risco/retorno em var_4h e var_24h.
-**H7** — Tokens com liq_migration < $5.000 geram slippage inaceitável para posições > $50.
-**H8** — Tokens com is_wash_trading=TRUE têm recovery rate ≥20pp menor que FALSE.
+| # | Hipótese | Resultado |
+|---|----------|-----------|
+| H1 | ≥70% dos tokens caem ≥20% do ATH nos primeiros 60min | ✅ **91.4%** |
+| H2 | Em tokens com recovery=TRUE, o fundo ocorre em ≤15min | ❌ **49.7%** (meta: ≥70%) |
+| H3 | smart_wallets ≥3 têm recovery rate ≥15pp maior que smart<3 | ❌ **+0.2pp** — sem discriminação |
+| H4 | sniper_wallets ≥30% têm recovery rate <30% | ❌ sniper alto levemente positivo (+0.7pp) |
+| H5 | top10_holder_rate ≥0.80 → var_24h <-80% em ≥60% | ⚠️ descartado — 24h fora do escopo |
+| H6 | Entradas entre -25% e -45% têm melhor R:R em var_4h/24h | ⚠️ descartado — 4h/24h fora do escopo |
+| H7 | liq_migration <$5k gera slippage inaceitável para >$50 | ⏳ pendente validação em execução |
+| H8 | is_wash_trading=TRUE tem recovery rate ≥20pp menor | ❌ **-0.1pp** — sem discriminação |
+
+**Conclusão dos dados:** os filtros atuais do trenches (contagens brutas, snapshots estáticos) não discriminam recovery. O sinal que importa é o **comportamento durante o dump** — smart money comprando em tempo real (Fase 2, signal type 12).
 
 ---
 
-## 🏗️ ARQUITETURA ATUAL (Fase 1)
+## 🏗️ ARQUITETURA ATUAL
 
 ```
 Scanner (poll 5s)
     │
     ├─ POST /v1/trenches near_completion → data["pump"]
     │       └─ bc ≥ 80% + filtros qualidade → Watchlist + DB
+    │       └─ Campos Fase 1 coletados (creator_status, bluechip_pct, etc.)
     │
     ├─ POST /v1/trenches completed → data["completed"]
     │       └─ Filtros MC/liq/fee → upsert_migration
@@ -238,17 +264,9 @@ Scanner (poll 5s)
     └─ HotMonitor (janela 60min)
             ├─ push_mc (5s): rastreia mc_min, mc_max, mc_last, _mc_live
             ├─ hot-precise (60s): kline low/high para precisão
-            ├─ _tick (30s): graduação após 60min
-            │       └─ kline scan 1h completo → mc_bottom, mc_peak, mc_1h
-            │       └─ Fallbacks 1h: token/info → push_mc (mc_last)
-            │       └─ Agenda checkpoints 4h e 24h no HeapScheduler
-            │
-            ├─ _checkpoint(4h/24h):
-            │       └─ kline estreito (±2min) → kline completo (desde mig) → token/info → _mc_live
-            │
-            └─ startup_backfill (ao reiniciar):
-                    └─ Tokens na janela: re-add ao _tokens
-                    └─ Tokens passados: agendamento/execução imediata de checkpoints ausentes
+            └─ _tick (30s): graduação após 60min
+                    └─ kline scan 1h completo → mc_bottom, mc_peak, mc_1h
+                    └─ Fallbacks 1h: token/info → push_mc (mc_last)
 ```
 
 ### HeapScheduler
@@ -257,12 +275,11 @@ Scanner (poll 5s)
 - `scheduler.schedule(delay_sec, fn, *args)`
 
 ### Fontes de dados por prioridade
-| Dado | 1ª fonte | 2ª fonte | 3ª fonte | 4ª fonte |
-|------|----------|----------|----------|----------|
-| mc_migration | kline (open no complete_ts) | trenches usd_market_cap | — | — |
-| mc_bottom / mc_peak | kline 1m (hot-precise) | push_mc (trenches 5s) | — | — |
-| mc_1h | kline (ts_mig a ts_mig+3660) | token/info | push_mc (mc_last) | — |
-| mc_4h / mc_24h | kline estreito | kline completo | token/info | **_mc_live** |
+| Dado | 1ª fonte | 2ª fonte | 3ª fonte |
+|------|----------|----------|----------|
+| mc_migration | kline (open no complete_ts) | trenches usd_market_cap | — |
+| mc_bottom / mc_peak | kline 1m (hot-precise) | push_mc (trenches 5s) | — |
+| mc_1h | kline (ts_mig a ts_mig+3660) | token/info | push_mc (mc_last) |
 
 ---
 
@@ -271,7 +288,7 @@ Scanner (poll 5s)
 ```
 DATABASE_URL=postgres://...
 GMGN_API_KEY=xxxx
-GMGN_PRIVATE_KEY=xxxx        # Ed25519 PEM — necessário na Fase 2
+GMGN_PRIVATE_KEY=xxxx        # Ed25519 PEM — necessário na Fase 6
 GMGN_HOST=https://openapi.gmgn.ai
 TELEGRAM_TOKEN=xxxx
 TELEGRAM_CHAT=xxxx
@@ -295,15 +312,14 @@ HOT_PRECISE_SEC=60           # intervalo kline hot-precise
 
 ---
 
-## 📊 Dashboard `/scanner`
+## 📊 Dashboards
 
-URL: `/scanner` (auto-refresh 15s)
-Export CSV: `/export/csv`
-Health: `/health`
-
-**Colunas:** Data BRT | Token | BC% | T/Migração | MC Mig | Pico | Ganho | T/Pico | Fundo | Queda | T/Fundo | 1h | 4h | 24h | Smart | Sniper | Rug% | Top10 | Wash | HP | Recovery
-
-Mostra até 2000 linhas. Horário BRT (UTC-3). MC em USD formatado.
+| URL | Descrição |
+|-----|-----------|
+| `/scanner` | Tabela de migrações em tempo real (auto-refresh 15s) |
+| `/analise` | Backtest exploratório — timing, dump depth, filtros, R:R, cobertura Fase 1 |
+| `/export/csv` | Export completo do banco |
+| `/health` | Health check |
 
 ---
 
@@ -311,18 +327,20 @@ Mostra até 2000 linhas. Horário BRT (UTC-3). MC em USD formatado.
 
 1. **Não executar capital antes do backtest** — mínimo 200 migrações com dados completos
 2. **Threading**: heap scheduler — nunca `threading.Timer` por evento
-3. **GMGN rate limit**: trenches peso 3, kline peso 2, token info peso 1. 429 → ler `reset_at` do body
+3. **GMGN rate limit**: trenches peso 3, kline peso 2, token info peso 1, signal peso 3. 429 → ler `reset_at` do body
 4. **data["pump"]**: near_completion retorna nessa chave, não "near_completion"
 5. **bc_progress ≥ 80**: entrada na watchlist | **complete_timestamp**: sentinel de migrado
 6. **Timestamps em UTC** no banco — converter para BRT apenas na exibição
-7. **Kline Meteora DAMM v2**: NÃO retorna dados históricos. Fallback obrigatório: `_mc_live`
+7. **Kline Meteora DAMM v2**: NÃO retorna dados históricos. Apenas primeiros ~60min após migração
 8. **token/info**: retorna 404 para Meteora DAMM v2 nas primeiras horas. Não confiar como fonte primária
 9. **Token morto**: mc cair ≥80% do mc_migration → `cancel()` no HotMonitor
 10. **IPv4 only**: GMGN API não aceita IPv6
 11. **is_wash_trading**: campo nativo do trenches, não calcular manualmente
 12. **logging.basicConfig** deve ser chamado ANTES de `init_sentry()` para logs aparecerem
-13. **_mc_live**: captura MC de TODOS os completed já vistos (sem filtro de range) — fonte para checkpoints
-14. **startup_backfill**: janela de 26h (24h + 2h buffer) para recuperar checkpoints após restart
+13. **_mc_live**: captura MC de TODOS os completed já vistos (sem filtro de range)
+14. **4h/24h descartados**: trade é de minutos. Checkpoints de 4h/24h removidos da arquitetura
+15. **signal type 12**: NÃO usar signal_type 14, 15 ou 16 — API retorna 400
+16. **Campos Fase 1**: chegam no poll do trenches sem custo adicional de API — nunca recalcular manualmente
 
 ---
 
@@ -330,13 +348,14 @@ Mostra até 2000 linhas. Horário BRT (UTC-3). MC em USD formatado.
 
 | Fase | Métrica | Meta |
 |------|---------|------|
-| Fase 1 | Migrações com dados completos | ≥200 |
-| Fase 1 | Campos completos | mc_migration, mc_bottom, mc_1h, mc_4h, mc_24h |
-| Fase 2 | Win rate out-of-sample | ≥50% |
-| Fase 2 | Payoff ratio | ≥2× |
-| Fase 2 | Max drawdown simulado | ≤40% |
-| Fase 4 | Latência detecção → ordem | <15s |
-| Fase 4 | Divergência real vs backtest | <30% após 50 trades |
+| Coleta | Migrações com bottom + mc_1h | ≥200 |
+| Coleta | Cobertura campos Fase 1 | ≥80% dos tokens novos |
+| Fase 2 | Identificar sinal dos 22% com bounce | signal type 12 correlacionado |
+| Execução | Win rate out-of-sample | ≥50% |
+| Execução | Payoff ratio | ≥2× |
+| Execução | Max drawdown simulado | ≤40% |
+| Live | Latência detecção → ordem | <15s |
+| Live | Divergência real vs backtest | <30% após 50 trades |
 
 ---
 
@@ -344,10 +363,12 @@ Mostra até 2000 linhas. Horário BRT (UTC-3). MC em USD formatado.
 
 1. Hipóteses documentadas ANTES de ver os dados
 2. Coleta de dados pura (sem viés de confirmação)
-3. Backtest walk-forward (in-sample / out-of-sample) — nunca validar no mesmo conjunto
+3. Análise exploratória antes de construir qualquer feature
 4. Filtros construídos sobre o backtest, não sobre intuição
-5. Deploy com capital mínimo como validação final
+5. Backtest walk-forward (in-sample / out-of-sample) — nunca validar no mesmo conjunto
+6. Deploy com capital mínimo como validação final
 
 > Sardinhas reagem após a migração. Big players já estão posicionados na Watchlist desde os 80%.
-> Sardinhas olham volume. Big players olham `is_wash_trading`.
+> Sardinhas olham volume. Big players olham `creator_token_status`.
 > Sardinhas seguem intuição. Big players seguem dados out-of-sample.
+> Sardinhas constroem features. Big players constroem datasets.
