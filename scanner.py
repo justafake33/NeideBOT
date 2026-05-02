@@ -310,6 +310,9 @@ class HotMonitor:
             to_ts=ts_mig_unix + 3660,
         )
 
+        mc_1h = None
+        src   = None
+
         if candles_1h:
             for c in candles_1h:
                 candle_ts   = int(c.get("time", 0)) / 1000
@@ -327,35 +330,34 @@ class HotMonitor:
             close_price = _float(last.get("close"))
             if close_price and close_price > 0:
                 mc_1h = close_price * total_supply
-                var   = (mc_1h - mc_migration) / mc_migration if mc_migration else None
-                db.update_checkpoint(mint, "1h", mc_1h, var)
-                logger.info("Checkpoint 1h %s: $%.0f (%s) [kline]", symbol, mc_1h,
-                            f"{var*100:+.1f}%" if var is not None else "N/A")
-        else:
-            mc_1h = None
-            src   = None
+                src   = "kline"
 
-            # Fallback 1: token/info (pode estar indexado após 1h)
-            info = self.gmgn.get_token_info(mint)
-            if info:
+        # Sempre tenta token/info: fallback para mc_1h E fonte de lock_percent (locked_ratio)
+        info = self.gmgn.get_token_info(mint)
+        if info:
+            if mc_1h is None:
                 try:
                     mc_1h = float(info["price"]) * float(info["circulating_supply"])
                     src   = "token/info"
                 except Exception:
                     pass
+            locked = _float(info.get("locked_ratio"))
+            if locked is not None:
+                db.update_lock_percent(mint, locked)
+                logger.debug("lock_percent %s: %.2f [token/info]", symbol, locked)
 
-            # Fallback 2: último MC do push_mc — máximo 5s de defasagem
-            if mc_1h is None and state.get("mc_last"):
-                mc_1h = state["mc_last"]
-                src   = "push_mc"
+        # Fallback final: último MC do push_mc — máximo 5s de defasagem
+        if mc_1h is None and state.get("mc_last"):
+            mc_1h = state["mc_last"]
+            src   = "push_mc"
 
-            if mc_1h:
-                var = (mc_1h - mc_migration) / mc_migration if mc_migration else None
-                db.update_checkpoint(mint, "1h", mc_1h, var)
-                logger.info("Checkpoint 1h %s: $%.0f (%s) [%s]", symbol, mc_1h,
-                            f"{var*100:+.1f}%" if var is not None else "N/A", src)
-            else:
-                logger.warning("Graduacao %s: todas as fontes falharam — 1h pulado", symbol)
+        if mc_1h:
+            var = (mc_1h - mc_migration) / mc_migration if mc_migration else None
+            db.update_checkpoint(mint, "1h", mc_1h, var)
+            logger.info("Checkpoint 1h %s: $%.0f (%s) [%s]", symbol, mc_1h,
+                        f"{var*100:+.1f}%" if var is not None else "N/A", src)
+        else:
+            logger.warning("Graduacao %s: todas as fontes falharam — 1h pulado", symbol)
 
         for delay_min, label in [(240, "4h"), (1440, "24h")]:
             remaining = delay_min * 60 - elapsed_sec
