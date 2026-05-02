@@ -458,6 +458,122 @@ def _run_analysis(rows):
     else:
         r["rr_n"] = 0
 
+    # ── TP/SL derivado dos dados reais ──────────────────────────────────────
+    # Tokens com bounce confirmado: pico veio DEPOIS do fundo
+    bounce_tokens = [
+        x for x in rows
+        if x.get("mc_bottom") and x.get("mc_peak")
+        and x.get("time_to_bottom") is not None
+        and x.get("time_to_peak")   is not None
+        and x["time_to_peak"] > x["time_to_bottom"]
+        and x["mc_bottom"] > 0
+    ]
+    no_bounce_tokens = [
+        x for x in rows
+        if x.get("mc_bottom") and x.get("mc_peak")
+        and x.get("time_to_bottom") is not None
+        and x.get("time_to_peak")   is not None
+        and x["time_to_peak"] <= x["time_to_bottom"]
+        and x["mc_bottom"] > 0
+    ]
+
+    r["bounce_n"]    = len(bounce_tokens)
+    r["no_bounce_n"] = len(no_bounce_tokens)
+    r["both_n"]      = len(bounce_tokens) + len(no_bounce_tokens)
+
+    if bounce_tokens:
+        # Magnitude do bounce: quanto subiu do fundo ao pico (%)
+        bounce_mags = [(x["mc_peak"] / x["mc_bottom"] - 1) for x in bounce_tokens]
+        bp = _percentiles(bounce_mags, (10, 25, 50, 75, 90))
+        r["bounce_mag_p10"] = f"{bp[10]*100:.0f}%"  if bp.get(10) else "—"
+        r["bounce_mag_p25"] = f"{bp[25]*100:.0f}%"  if bp.get(25) else "—"
+        r["bounce_mag_p50"] = f"{bp[50]*100:.0f}%"  if bp.get(50) else "—"
+        r["bounce_mag_p75"] = f"{bp[75]*100:.0f}%"  if bp.get(75) else "—"
+        r["bounce_mag_p90"] = f"{bp[90]*100:.0f}%"  if bp.get(90) else "—"
+
+        # Taxa de acerto por nível de TP — dados reais
+        tp_rows = []
+        for tp_pct, label in [
+            (0.10, "+10%"), (0.20, "+20%"), (0.30, "+30%"),
+            (0.50, "+50%"), (0.75, "+75%"), (1.00, "+100%"),
+            (1.50, "+150%"), (2.00, "+200%"),
+        ]:
+            # Quantos tokens com bounce teriam batido esse TP?
+            hit_bounce = sum(1 for m in bounce_mags if m >= tp_pct)
+            # EV aproximado: se bate TP ganha tp_pct, se não bate perde até o fundo
+            # Loss estimada: tokens sem bounce — perde a diferença para mc_1h ou trava no stop
+            hit_rate = hit_bounce / len(bounce_mags)
+            # EV simplificado: apenas sobre tokens com bounce (os sem bounce = perda separada)
+            ev_bounce_only = hit_rate * tp_pct - (1 - hit_rate) * _mean(
+                [max(0, tp_pct - m) for m in bounce_mags if m < tp_pct] or [0]
+            )
+            tp_rows.append({
+                "tp":        label,
+                "hit_n":     hit_bounce,
+                "hit_rate":  f"{hit_rate*100:.1f}%",
+                "hit_raw":   hit_rate,
+                "ev_approx": f"{ev_bounce_only*100:+.1f}%",
+                "ev_pos":    ev_bounce_only > 0,
+            })
+        r["tp_rows"] = tp_rows
+
+        # Janela de oportunidade: tempo entre fundo e pico
+        window_vals = [x["time_to_peak"] - x["time_to_bottom"] for x in bounce_tokens]
+        wp = _percentiles(window_vals, (25, 50, 75, 90))
+        r["window_p25"] = f"{wp[25]:.1f}min" if wp.get(25) else "—"
+        r["window_p50"] = f"{wp[50]:.1f}min" if wp.get(50) else "—"
+        r["window_p75"] = f"{wp[75]:.1f}min" if wp.get(75) else "—"
+        r["window_p90"] = f"{wp[90]:.1f}min" if wp.get(90) else "—"
+        r["window_u5"]  = _pct(sum(1 for v in window_vals if v <= 5),  len(window_vals))
+        r["window_u10"] = _pct(sum(1 for v in window_vals if v <= 10), len(window_vals))
+        r["window_u15"] = _pct(sum(1 for v in window_vals if v <= 15), len(window_vals))
+
+        # SL estimado via downside nos tokens SEM bounce
+        # Se você entra e o bounce não acontece, quanto perde relativo ao fundo?
+        # Proxy: (mc_1h / mc_bottom - 1) nos tokens sem bounce
+        no_bounce_with_1h = [
+            x for x in no_bounce_tokens
+            if x.get("mc_1h") and x["mc_bottom"] > 0
+        ]
+        if no_bounce_with_1h:
+            sl_vals = [(x["mc_1h"] / x["mc_bottom"] - 1) for x in no_bounce_with_1h]
+            sp = _percentiles(sl_vals, (10, 25, 50))
+            r["sl_p10"] = f"{sp[10]*100:+.1f}%" if sp.get(10) else "—"
+            r["sl_p25"] = f"{sp[25]*100:+.1f}%" if sp.get(25) else "—"
+            r["sl_p50"] = f"{sp[50]*100:+.1f}%" if sp.get(50) else "—"
+            r["sl_n"]   = len(no_bounce_with_1h)
+        else:
+            r["sl_n"] = 0
+
+        # R:R ótimo: cruza tp_hit_rate × magnitude_media / loss_media_sem_bounce
+        if no_bounce_with_1h:
+            avg_loss_no_bounce = abs(_mean([
+                (x["mc_1h"] / x["mc_bottom"] - 1) for x in no_bounce_with_1h
+            ]))
+            rr_optimal = []
+            total_tokens = len(bounce_tokens) + len(no_bounce_tokens)
+            bounce_rate  = len(bounce_tokens) / total_tokens if total_tokens else 0
+            for tp_pct, label in [(0.20,"+20%"),(0.30,"+30%"),(0.50,"+50%"),(1.00,"+100%")]:
+                tp_hit_given_bounce = sum(1 for m in bounce_mags if m >= tp_pct) / len(bounce_mags)
+                real_win_rate = bounce_rate * tp_hit_given_bounce
+                avg_win = tp_pct
+                avg_loss = avg_loss_no_bounce * (1 - bounce_rate) + tp_pct * bounce_rate * (1 - tp_hit_given_bounce)
+                ev = real_win_rate * avg_win - (1 - real_win_rate) * avg_loss_no_bounce
+                rr_optimal.append({
+                    "tp":      label,
+                    "win_rate": f"{real_win_rate*100:.1f}%",
+                    "ev":       f"{ev*100:+.1f}%",
+                    "ev_pos":   ev > 0,
+                    "payoff":   f"{avg_win/avg_loss_no_bounce:.2f}×" if avg_loss_no_bounce else "—",
+                })
+            r["rr_optimal"] = rr_optimal
+        else:
+            r["rr_optimal"] = []
+    else:
+        r["tp_rows"] = []
+        r["rr_optimal"] = []
+        r["sl_n"] = 0
+
     # ── H2 ───────────────────────────────────────────────────────────────────
     rec_ok = [x for x in rows if x["recovery"] is True  and x["time_to_bottom"] is not None]
     rec_no = [x for x in rows if x["recovery"] is False and x["time_to_bottom"] is not None]
@@ -863,8 +979,93 @@ tr:hover td { background: #161b22; }
 <p class="muted">Dados insuficientes — aguardar mais migrações completas (bottom + mc_1h).</p>
 {% endif %}
 
-<!-- Seção 5b: Win Rate com entrada realista -->
-<h2>5b — Win Rate com Entrada Realista (slippage + fees)</h2>
+<!-- Seção 5b: TP/SL derivado dos dados reais -->
+<h2>5b — TP e SL Ótimos: o que os dados revelam</h2>
+{% if d.bounce_n > 0 %}
+<p class="note" style="margin-bottom:12px">
+  Universo: <strong>{{ d.both_n }}</strong> tokens com bottom e peak.
+  <span class="green">{{ d.bounce_n }} com bounce</span> (pico após fundo) |
+  <span class="red">{{ d.no_bounce_n }} sem bounce</span> (pico veio antes do fundo).
+</p>
+
+<div class="row" style="margin-bottom:16px">
+  <div class="kv"><span>Magnitude bounce — p10</span><span>{{ d.bounce_mag_p10 }}</span></div>
+  <div class="kv"><span>p25</span><span>{{ d.bounce_mag_p25 }}</span></div>
+  <div class="kv"><span>p50 (mediana)</span><span class="yellow">{{ d.bounce_mag_p50 }}</span></div>
+  <div class="kv"><span>p75</span><span>{{ d.bounce_mag_p75 }}</span></div>
+  <div class="kv"><span>p90</span><span>{{ d.bounce_mag_p90 }}</span></div>
+</div>
+<p class="note" style="margin-bottom:10px">
+  Taxa de acerto por nível de TP — sobre tokens que fizeram bounce (base real, não hipotética).
+</p>
+<table>
+<thead><tr>
+  <th>TP</th><th>Tokens que teriam batido</th><th>Hit rate</th><th>EV aproximado</th>
+</tr></thead>
+<tbody>
+{% for t in d.tp_rows %}
+<tr>
+  <td><strong>{{ t.tp }}</strong></td>
+  <td>{{ t.hit_n }} / {{ d.bounce_n }}</td>
+  <td><span class="tag {{ 't-green' if t.hit_raw > 0.5 else 't-yellow' if t.hit_raw > 0.3 else 't-red' }}">{{ t.hit_rate }}</span></td>
+  <td class="{{ 'green' if t.ev_pos else 'red' }}">{{ t.ev_approx }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+
+<h2 style="margin-top:24px">5c — Janela de Oportunidade (tempo entre fundo e pico)</h2>
+<p class="note" style="margin-bottom:10px">Quanto tempo você tem para executar a saída após o fundo.</p>
+<div class="row" style="margin-bottom:12px">
+  <div class="kv"><span>p25</span><span>{{ d.window_p25 }}</span></div>
+  <div class="kv"><span>p50</span><span class="yellow">{{ d.window_p50 }}</span></div>
+  <div class="kv"><span>p75</span><span>{{ d.window_p75 }}</span></div>
+  <div class="kv"><span>p90</span><span>{{ d.window_p90 }}</span></div>
+  <div class="kv"><span>≤5min</span><span class="red">{{ d.window_u5 }}</span></div>
+  <div class="kv"><span>≤10min</span><span>{{ d.window_u10 }}</span></div>
+  <div class="kv"><span>≤15min</span><span>{{ d.window_u15 }}</span></div>
+</div>
+
+{% if d.sl_n > 0 %}
+<h2 style="margin-top:24px">5d — Stop Loss: o que acontece quando não há bounce (n={{ d.sl_n }})</h2>
+<p class="note" style="margin-bottom:10px">
+  Tokens onde o pico veio ANTES do fundo — se você comprou "o fundo" mas errou,
+  quanto perdeu até a marca de 1h?
+</p>
+<div class="row">
+  <div class="kv"><span>p10 (melhor caso)</span><span>{{ d.sl_p10 }}</span></div>
+  <div class="kv"><span>p25</span><span>{{ d.sl_p25 }}</span></div>
+  <div class="kv"><span>p50 (mediana)</span><span class="red">{{ d.sl_p50 }}</span></div>
+</div>
+{% endif %}
+
+{% if d.rr_optimal %}
+<h2 style="margin-top:24px">5e — R:R Real: combinando bounce rate × hit rate × loss média</h2>
+<p class="note" style="margin-bottom:10px">
+  Win rate real = P(bounce) × P(TP atingido | bounce). Loss = perda mediana nos sem-bounce.
+  Este é o número que importa para sizing de posição.
+</p>
+<table>
+<thead><tr><th>TP</th><th>Win Rate Real</th><th>Payoff</th><th>EV por trade</th></tr></thead>
+<tbody>
+{% for r in d.rr_optimal %}
+<tr>
+  <td><strong>{{ r.tp }}</strong></td>
+  <td>{{ r.win_rate }}</td>
+  <td>{{ r.payoff }}</td>
+  <td class="{{ 'green' if r.ev_pos else 'red' }}">{{ r.ev }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+
+{% else %}
+<p class="muted">Dados insuficientes — aguardar tokens com bottom e peak preenchidos.</p>
+{% endif %}
+
+<!-- Seção 5f: Win Rate com entrada realista (mc_1h como saída) -->
+<h2>5f — Win Rate com Saída em 1h (comparação — saída em tempo fixo)</h2>
 <p class="note" style="margin-bottom:10px">
   Entrada no fundo exato é fisicamente impossível. Cada linha mostra o impacto do premium de entrada no resultado.
   Saída = mc_1h em todos os cenários.
