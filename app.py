@@ -522,6 +522,117 @@ def _run_analysis(rows):
     r["cts_close_n"]  = len(close_grp)
     r["cts_hold_n"]   = len(hold_grp)
 
+    # ── Fase 1 — correlação com win rate ─────────────────────────────────────
+    # Base: tokens com campos Fase 1 + bottom + 1h preenchidos
+    f1_base = [x for x in rows
+               if x.get("mc_bottom") and x.get("mc_1h") and x["mc_bottom"] > 0
+               and x.get("creator_token_status") is not None]  # proxy: tem ao menos 1 campo novo
+
+    def _wr_delta(grp, base):
+        if not grp or not base: return None, None, 0
+        w = sum(1 for x in grp if x["mc_1h"] > x["mc_bottom"])
+        wr = w / len(grp)
+        bw = sum(1 for x in base if x["mc_1h"] > x["mc_bottom"])
+        base_wr = bw / len(base)
+        return wr, (wr - base_wr) * 100, len(grp)
+
+    f1_corr = []
+
+    # creator_token_status
+    for label, fn in [
+        ("creator_close (dev vendeu)", lambda x: x.get("creator_token_status") == "creator_close"),
+        ("creator_hold  (dev segura)", lambda x: x.get("creator_token_status") == "creator_hold"),
+    ]:
+        grp = [x for x in f1_base if fn(x)]
+        wr, delta, n = _wr_delta(grp, f1_base)
+        if wr is not None:
+            f1_corr.append({"label": label, "n": n,
+                            "wr": f"{wr*100:.1f}%",
+                            "delta": f"{delta:+.1f}pp",
+                            "pos": delta > 0})
+
+    # bluechip_owner_pct — buckets
+    for label, lo, hi in [("<5%", 0, .05), ("5–15%", .05, .15), (">15%", .15, 9)]:
+        grp = [x for x in f1_base
+               if x.get("bluechip_owner_pct") is not None
+               and lo <= x["bluechip_owner_pct"] < hi]
+        wr, delta, n = _wr_delta(grp, f1_base)
+        if wr is not None:
+            f1_corr.append({"label": f"bluechip_owner {label}", "n": n,
+                            "wr": f"{wr*100:.1f}%",
+                            "delta": f"{delta:+.1f}pp",
+                            "pos": delta > 0})
+
+    # suspected_insider_rate — baixo vs alto
+    for label, fn in [
+        ("insider_rate ≤10%", lambda x: x.get("suspected_insider_rate") is not None and x["suspected_insider_rate"] <= .10),
+        ("insider_rate >10%", lambda x: x.get("suspected_insider_rate") is not None and x["suspected_insider_rate"] >  .10),
+    ]:
+        grp = [x for x in f1_base if fn(x)]
+        wr, delta, n = _wr_delta(grp, f1_base)
+        if wr is not None:
+            f1_corr.append({"label": label, "n": n,
+                            "wr": f"{wr*100:.1f}%",
+                            "delta": f"{delta:+.1f}pp",
+                            "pos": delta > 0})
+
+    # dev_team_hold_rate
+    for label, fn in [
+        ("dev_hold ≤5%",  lambda x: x.get("dev_team_hold_rate") is not None and x["dev_team_hold_rate"] <= .05),
+        ("dev_hold >5%",  lambda x: x.get("dev_team_hold_rate") is not None and x["dev_team_hold_rate"] >  .05),
+    ]:
+        grp = [x for x in f1_base if fn(x)]
+        wr, delta, n = _wr_delta(grp, f1_base)
+        if wr is not None:
+            f1_corr.append({"label": label, "n": n,
+                            "wr": f"{wr*100:.1f}%",
+                            "delta": f"{delta:+.1f}pp",
+                            "pos": delta > 0})
+
+    # top70_sniper_hold_rate
+    for label, fn in [
+        ("top70_sniper ≤20%", lambda x: x.get("top70_sniper_hold_rate") is not None and x["top70_sniper_hold_rate"] <= .20),
+        ("top70_sniper >20%", lambda x: x.get("top70_sniper_hold_rate") is not None and x["top70_sniper_hold_rate"] >  .20),
+    ]:
+        grp = [x for x in f1_base if fn(x)]
+        wr, delta, n = _wr_delta(grp, f1_base)
+        if wr is not None:
+            f1_corr.append({"label": label, "n": n,
+                            "wr": f"{wr*100:.1f}%",
+                            "delta": f"{delta:+.1f}pp",
+                            "pos": delta > 0})
+
+    # bot_degen_rate
+    for label, fn in [
+        ("bot_degen ≤10%", lambda x: x.get("bot_degen_rate") is not None and x["bot_degen_rate"] <= .10),
+        ("bot_degen >10%", lambda x: x.get("bot_degen_rate") is not None and x["bot_degen_rate"] >  .10),
+    ]:
+        grp = [x for x in f1_base if fn(x)]
+        wr, delta, n = _wr_delta(grp, f1_base)
+        if wr is not None:
+            f1_corr.append({"label": label, "n": n,
+                            "wr": f"{wr*100:.1f}%",
+                            "delta": f"{delta:+.1f}pp",
+                            "pos": delta > 0})
+
+    # has_social / cto_flag
+    for label, fn in [
+        ("has_social = TRUE",  lambda x: x.get("has_social") is True),
+        ("has_social = FALSE", lambda x: x.get("has_social") is False),
+        ("cto_flag = TRUE",    lambda x: x.get("cto_flag") is True),
+    ]:
+        grp = [x for x in f1_base if fn(x)]
+        wr, delta, n = _wr_delta(grp, f1_base)
+        if wr is not None:
+            f1_corr.append({"label": label, "n": n,
+                            "wr": f"{wr*100:.1f}%",
+                            "delta": f"{delta:+.1f}pp",
+                            "pos": delta > 0})
+
+    r["f1_base_n"]  = len(f1_base)
+    r["f1_base_wr"] = f"{(sum(1 for x in f1_base if x['mc_1h'] > x['mc_bottom']) / len(f1_base) * 100):.1f}%" if f1_base else "—"
+    r["f1_corr"]    = f1_corr
+
     return r
 
 
@@ -728,6 +839,30 @@ tr:hover td { background: #161b22; }
   <div class="kv"><span>creator_hold (n={{ d.cts_hold_n }})</span><span class="red">{{ d.cts_hold_wr }}</span></div>
 </div>
 {% endif %}
+{% endif %}
+
+<!-- Seção 8: Fase 1 — correlação com win rate -->
+<h2>8 — Fase 1: Correlação dos Novos Campos com Win Rate</h2>
+{% if d.f1_base_n > 0 %}
+<p class="note" style="margin-bottom:10px">
+  Base: <strong>{{ d.f1_base_n }}</strong> tokens com campos Fase 1 + bottom + mc_1h preenchidos.
+  Baseline win rate: <strong>{{ d.f1_base_wr }}</strong>
+</p>
+<table>
+<thead><tr><th>Campo / Grupo</th><th>N</th><th>Win Rate</th><th>Delta vs Baseline</th></tr></thead>
+<tbody>
+{% for f in d.f1_corr %}
+<tr>
+  <td>{{ f.label }}</td>
+  <td>{{ f.n }}</td>
+  <td>{{ f.wr }}</td>
+  <td><span class="tag {{ 't-green' if f.pos else 't-red' }}">{{ f.delta }}</span></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% else %}
+<p class="muted">Dados insuficientes — aguardar tokens com campos Fase 1 preenchidos.</p>
 {% endif %}
 
 </body>
