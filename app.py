@@ -1247,9 +1247,15 @@ tr:hover td { background: #161b22; }
 
 @app.route("/analise")
 def analise():
-    rows = db.get_all_migrations(limit=10000)
-    d = _run_analysis(rows)
-    return render_template_string(ANALISE_HTML, d=d)
+    import traceback as _tb
+    try:
+        rows = db.get_all_migrations(limit=10000)
+        d = _run_analysis(rows)
+        return render_template_string(ANALISE_HTML, d=d)
+    except Exception:
+        err = _tb.format_exc()
+        logger.exception("ERRO em /analise")
+        return f"<pre style='color:red;background:#111;padding:20px'>{err}</pre>", 500
 
 
 # ==============================================================================
