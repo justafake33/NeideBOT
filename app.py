@@ -359,14 +359,17 @@ def _run_analysis(rows):
     # ── Filtros (H3/H4/H5/H8) ────────────────────────────────────────────────
     scored = [x for x in rows if x["recovery"] is not None and x["mc_bottom"] is not None and x["mc_1h"] is not None and x["mc_bottom"]>0]
 
-    def _wr(grp):
+    def _wr_threshold(grp, entry_pct=0.0):
+        """Win = mc_1h > mc_bottom * (1 + entry_pct). entry_pct simula slippage/fee de entrada."""
         if not grp: return None, 0
-        w = sum(1 for x in grp if x["mc_1h"] > x["mc_bottom"])
-        return w/len(grp), len(grp)
+        w = sum(1 for x in grp if x["mc_1h"] > x["mc_bottom"] * (1 + entry_pct))
+        return w / len(grp), len(grp)
 
-    base_wr, base_n = _wr(scored)
+    # Baseline com entrada realista de 5% acima do fundo (slippage + fee)
+    base_wr, base_n = _wr_threshold(scored, entry_pct=0.05)
     r["base_wr"] = f"{base_wr*100:.1f}%" if base_wr is not None else "—"
     r["base_n"]  = base_n
+    r["base_note"] = "entrada +5% do fundo (slippage + fee realista)"
 
     filter_rows = []
     combos = [
@@ -394,16 +397,19 @@ def _run_analysis(rows):
     ]
     for label, fn in combos:
         grp = [x for x in scored if fn(x)]
-        w, n = _wr(grp)
-        if w is None:
+        w0, n  = _wr_threshold(grp, entry_pct=0.00)
+        w5, _  = _wr_threshold(grp, entry_pct=0.05)
+        if w0 is None:
             continue
-        delta = (w - base_wr) * 100 if base_wr else 0
+        delta0 = (w0 - (base_wr or 0)) * 100
+        delta5 = (w5 - (base_wr or 0)) * 100 if w5 is not None else 0
         filter_rows.append({
-            "label": label,
-            "n":     n,
-            "wr":    f"{w*100:.1f}%",
-            "delta": f"{delta:+.1f}pp",
-            "pos":   delta > 0,
+            "label":  label,
+            "n":      n,
+            "wr0":    f"{w0*100:.1f}%",
+            "wr5":    f"{w5*100:.1f}%" if w5 is not None else "—",
+            "delta5": f"{delta5:+.1f}pp",
+            "pos":    delta5 > 0,
         })
     r["filter_rows"] = filter_rows
 
@@ -630,8 +636,78 @@ def _run_analysis(rows):
                             "pos": delta > 0})
 
     r["f1_base_n"]  = len(f1_base)
-    r["f1_base_wr"] = f"{(sum(1 for x in f1_base if x['mc_1h'] > x['mc_bottom']) / len(f1_base) * 100):.1f}%" if f1_base else "—"
+    r["f1_base_wr"] = f"{(sum(1 for x in f1_base if x['mc_1h'] > x['mc_bottom'] * 1.05) / len(f1_base) * 100):.1f}%" if f1_base else "—"
     r["f1_corr"]    = f1_corr
+
+    # ── Cenários de entrada realista ─────────────────────────────────────────
+    tradeable = [x for x in rows if x.get("mc_bottom") and x.get("mc_1h") and x["mc_bottom"] > 0]
+    realistic_scenarios = []
+    for label, entry_pct in [
+        ("Fundo exato (teórico — impossível na prática)", 0.00),
+        ("Fundo +2%  (slippage mínimo)",                 0.02),
+        ("Fundo +5%  (slippage + fee — realista)",       0.05),
+        ("Fundo +10% (entrada conservadora)",            0.10),
+        ("Fundo +15% (entrada tardia)",                  0.15),
+    ]:
+        if not tradeable:
+            continue
+        gains  = [(x["mc_1h"] / (x["mc_bottom"] * (1 + entry_pct)) - 1) for x in tradeable]
+        wins   = [g for g in gains if g > 0]
+        losses = [g for g in gains if g <= 0]
+        wr     = len(wins) / len(gains)
+        avg_w  = _mean(wins)
+        avg_l  = abs(_mean(losses)) if losses else None
+        payoff = avg_w / avg_l if avg_w and avg_l else None
+        ev     = wr * avg_w - (1 - wr) * avg_l if avg_w and avg_l else None
+        realistic_scenarios.append({
+            "label":    label,
+            "n":        len(tradeable),
+            "wr":       f"{wr*100:.1f}%",
+            "wr_float": wr,
+            "avg_w":    f"{avg_w*100:+.1f}%" if avg_w else "—",
+            "avg_l":    f"{_mean(losses)*100:+.1f}%" if losses else "—",
+            "payoff":   f"{payoff:.2f}×" if payoff else "—",
+            "ev":       f"{ev*100:+.1f}%" if ev is not None else "—",
+            "ev_pos":   ev is not None and ev > 0,
+        })
+    r["realistic_scenarios"] = realistic_scenarios
+
+    # ── Série temporal — análise dos primeiros 10min ──────────────────────────
+    try:
+        tick_agg = db.get_tick_aggregates(max_elapsed_sec=600)
+    except Exception:
+        tick_agg = []
+
+    r["ts_n_tokens"] = len(tick_agg)
+    if tick_agg:
+        with_rec    = [x for x in tick_agg if x.get("recovery") is True  and x.get("avg_smart") is not None]
+        without_rec = [x for x in tick_agg if x.get("recovery") is False and x.get("avg_smart") is not None]
+        r["ts_has_recovery_n"]        = len(with_rec)
+        r["ts_no_recovery_n"]         = len(without_rec)
+        r["ts_avg_smart_recovery"]    = f"{_mean([x['avg_smart']   for x in with_rec]):.2f}"    if with_rec    else "—"
+        r["ts_avg_smart_no"]          = f"{_mean([x['avg_smart']   for x in without_rec]):.2f}" if without_rec else "—"
+        r["ts_delta_smart_recovery"]  = f"{_mean([x['delta_smart'] for x in with_rec]):.1f}"    if with_rec    else "—"
+        r["ts_delta_smart_no"]        = f"{_mean([x['delta_smart'] for x in without_rec]):.1f}" if without_rec else "—"
+        r["ts_avg_vol_recovery"]      = f"${_mean([x['avg_vol_1m'] for x in with_rec]):,.0f}"   if with_rec    else "—"
+        r["ts_avg_vol_no"]            = f"${_mean([x['avg_vol_1m'] for x in without_rec]):,.0f}"if without_rec else "—"
+        r["ts_avg_holders_recovery"]  = f"{_mean([x['avg_holders'] for x in with_rec]):.0f}"   if with_rec    else "—"
+        r["ts_avg_holders_no"]        = f"{_mean([x['avg_holders'] for x in without_rec]):.0f}"if without_rec else "—"
+        # Exchange breakdown
+        exchanges = {}
+        for x in tick_agg:
+            exch = x.get("exchange") or "unknown"
+            if exch not in exchanges:
+                exchanges[exch] = {"n": 0, "rec": 0}
+            exchanges[exch]["n"] += 1
+            if x.get("recovery") is True:
+                exchanges[exch]["rec"] += 1
+        r["ts_exchanges"] = [
+            {"exch": k, "n": v["n"], "rec_pct": f"{v['rec']/v['n']*100:.0f}%" if v["n"] else "—"}
+            for k, v in sorted(exchanges.items(), key=lambda kv: -kv[1]["n"])
+        ]
+    else:
+        r["ts_has_recovery_n"] = r["ts_no_recovery_n"] = 0
+        r["ts_exchanges"] = []
 
     return r
 
@@ -737,23 +813,27 @@ tr:hover td { background: #161b22; }
 
 <!-- Seção 4: Filtros -->
 <h2>4 — Validação dos Filtros (H3, H4, H5, H8)</h2>
-<p class="note" style="margin-bottom:10px">Baseline win rate (mc_1h &gt; bottom): <strong>{{ d.base_wr }}</strong> (n={{ d.base_n }})</p>
+<p class="note" style="margin-bottom:10px">
+  Baseline win rate ({{ d.base_note }}): <strong>{{ d.base_wr }}</strong> (n={{ d.base_n }})<br>
+  WR+0% = entrada no fundo exato (teórico) | WR+5% = entrada realista com slippage+fee
+</p>
 <table>
-<thead><tr><th>Filtro</th><th>N</th><th>Win Rate</th><th>Delta vs Baseline</th></tr></thead>
+<thead><tr><th>Filtro</th><th>N</th><th>WR +0% (teórico)</th><th>WR +5% (realista)</th><th>Delta vs Baseline (+5%)</th></tr></thead>
 <tbody>
 {% for f in d.filter_rows %}
 <tr>
   <td>{{ f.label }}</td>
   <td>{{ f.n }}</td>
-  <td>{{ f.wr }}</td>
-  <td><span class="tag {{ 't-green' if f.pos else 't-red' }}">{{ f.delta }}</span></td>
+  <td class="muted">{{ f.wr0 }}</td>
+  <td>{{ f.wr5 }}</td>
+  <td><span class="tag {{ 't-green' if f.pos else 't-red' }}">{{ f.delta5 }}</span></td>
 </tr>
 {% endfor %}
 </tbody>
 </table>
 
 <!-- Seção 5: R:R -->
-<h2>5 — R:R Simulado (entrada no fundo, saída = mc_1h)</h2>
+<h2>5 — R:R Teórico (entrada EXATA no fundo mínimo — impossível na prática, ver Seção 5b)</h2>
 {% if d.rr_n > 0 %}
 <div class="grid">
   <div class="card"><div class="card-label">Universo</div><div class="card-value">{{ d.rr_n }}</div></div>
@@ -781,6 +861,38 @@ tr:hover td { background: #161b22; }
 {% endif %}
 {% else %}
 <p class="muted">Dados insuficientes — aguardar mais migrações completas (bottom + mc_1h).</p>
+{% endif %}
+
+<!-- Seção 5b: Win Rate com entrada realista -->
+<h2>5b — Win Rate com Entrada Realista (slippage + fees)</h2>
+<p class="note" style="margin-bottom:10px">
+  Entrada no fundo exato é fisicamente impossível. Cada linha mostra o impacto do premium de entrada no resultado.
+  Saída = mc_1h em todos os cenários.
+</p>
+{% if d.realistic_scenarios %}
+<table>
+<thead><tr>
+  <th>Cenário de entrada</th><th>N</th><th>Win Rate</th>
+  <th>Gain médio (winners)</th><th>Loss média (losers)</th>
+  <th>Payoff</th><th>EV por trade</th>
+</tr></thead>
+<tbody>
+{% for s in d.realistic_scenarios %}
+<tr>
+  <td>{{ s.label }}</td>
+  <td>{{ s.n }}</td>
+  <td><span class="tag {{ 't-green' if s.wr_float > 0.5 else 't-red' }}">{{ s.wr }}</span></td>
+  <td class="green">{{ s.avg_w }}</td>
+  <td class="red">{{ s.avg_l }}</td>
+  <td>{{ s.payoff }}</td>
+  <td class="{{ 'green' if s.ev_pos else 'red' }}">{{ s.ev }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+<p class="note" style="margin-top:8px">EV negativo com entrada +5% significa que a estratégia de saída em 1h não é lucrativa — precisa de saída mais rápida (target explícito) ou melhor timing de entrada.</p>
+{% else %}
+<p class="muted">Dados insuficientes.</p>
 {% endif %}
 
 <!-- Seção 6: H2 -->
@@ -863,6 +975,68 @@ tr:hover td { background: #161b22; }
 </table>
 {% else %}
 <p class="muted">Dados insuficientes — aguardar tokens com campos Fase 1 preenchidos.</p>
+{% endif %}
+
+<!-- Seção 9: Série Temporal -->
+<h2>9 — Série Temporal: Primeiros 10min (Smart Flow + Volume)</h2>
+{% if d.ts_n_tokens > 0 %}
+<p class="note" style="margin-bottom:10px">
+  {{ d.ts_n_tokens }} tokens com série temporal coletada.
+  Recovery={{ d.ts_has_recovery_n }} | Sem recovery={{ d.ts_no_recovery_n }}
+  — comparação de comportamento nos primeiros 10min pós-migração.
+</p>
+<table>
+<thead><tr>
+  <th>Métrica (primeiros 10min)</th>
+  <th>Recovery=TRUE</th>
+  <th>Recovery=FALSE</th>
+  <th>Interpretação</th>
+</tr></thead>
+<tbody>
+<tr>
+  <td>avg smart_count</td>
+  <td class="green">{{ d.ts_avg_smart_recovery }}</td>
+  <td class="red">{{ d.ts_avg_smart_no }}</td>
+  <td class="muted">Wallets inteligentes presentes</td>
+</tr>
+<tr>
+  <td>delta smart_count (max−min)</td>
+  <td class="green">{{ d.ts_delta_smart_recovery }}</td>
+  <td class="red">{{ d.ts_delta_smart_no }}</td>
+  <td class="muted">Acumulação durante o dump</td>
+</tr>
+<tr>
+  <td>avg volume_1m</td>
+  <td class="green">{{ d.ts_avg_vol_recovery }}</td>
+  <td class="red">{{ d.ts_avg_vol_no }}</td>
+  <td class="muted">Interesse comprador no período</td>
+</tr>
+<tr>
+  <td>avg holders_count</td>
+  <td class="green">{{ d.ts_avg_holders_recovery }}</td>
+  <td class="red">{{ d.ts_avg_holders_no }}</td>
+  <td class="muted">Base de holders durante janela</td>
+</tr>
+</tbody>
+</table>
+
+{% if d.ts_exchanges %}
+<p class="note" style="margin-top:16px;margin-bottom:6px">Recovery rate por exchange (tokens com série temporal):</p>
+<table style="width:auto">
+<thead><tr><th>Exchange</th><th>N tokens</th><th>Recovery%</th></tr></thead>
+<tbody>
+{% for e in d.ts_exchanges %}
+<tr>
+  <td>{{ e.exch }}</td>
+  <td>{{ e.n }}</td>
+  <td>{{ e.rec_pct }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+{% else %}
+<p class="muted">Série temporal ainda não coletada — dados disponíveis nas próximas migrações após este deploy.</p>
 {% endif %}
 
 </body>
