@@ -359,14 +359,17 @@ def _run_analysis(rows):
     # ── Filtros (H3/H4/H5/H8) ────────────────────────────────────────────────
     scored = [x for x in rows if x["recovery"] is not None and x["mc_bottom"] is not None and x["mc_1h"] is not None and x["mc_bottom"]>0]
 
-    def _wr(grp):
+    def _wr_threshold(grp, entry_pct=0.0):
+        """Win = mc_1h > mc_bottom * (1 + entry_pct). entry_pct simula slippage/fee de entrada."""
         if not grp: return None, 0
-        w = sum(1 for x in grp if x["mc_1h"] > x["mc_bottom"])
-        return w/len(grp), len(grp)
+        w = sum(1 for x in grp if x["mc_1h"] > x["mc_bottom"] * (1 + entry_pct))
+        return w / len(grp), len(grp)
 
-    base_wr, base_n = _wr(scored)
+    # Baseline com entrada realista de 5% acima do fundo (slippage + fee)
+    base_wr, base_n = _wr_threshold(scored, entry_pct=0.05)
     r["base_wr"] = f"{base_wr*100:.1f}%" if base_wr is not None else "—"
     r["base_n"]  = base_n
+    r["base_note"] = "entrada +5% do fundo (slippage + fee realista)"
 
     filter_rows = []
     combos = [
@@ -394,16 +397,19 @@ def _run_analysis(rows):
     ]
     for label, fn in combos:
         grp = [x for x in scored if fn(x)]
-        w, n = _wr(grp)
-        if w is None:
+        w0, n  = _wr_threshold(grp, entry_pct=0.00)
+        w5, _  = _wr_threshold(grp, entry_pct=0.05)
+        if w0 is None:
             continue
-        delta = (w - base_wr) * 100 if base_wr else 0
+        delta0 = (w0 - (base_wr or 0)) * 100
+        delta5 = (w5 - (base_wr or 0)) * 100 if w5 is not None else 0
         filter_rows.append({
-            "label": label,
-            "n":     n,
-            "wr":    f"{w*100:.1f}%",
-            "delta": f"{delta:+.1f}pp",
-            "pos":   delta > 0,
+            "label":  label,
+            "n":      n,
+            "wr0":    f"{w0*100:.1f}%",
+            "wr5":    f"{w5*100:.1f}%" if w5 is not None else "—",
+            "delta5": f"{delta5:+.1f}pp",
+            "pos":    delta5 > 0,
         })
     r["filter_rows"] = filter_rows
 
@@ -451,6 +457,122 @@ def _run_analysis(rows):
             r["rr_deep_n"] = 0
     else:
         r["rr_n"] = 0
+
+    # ── TP/SL derivado dos dados reais ──────────────────────────────────────
+    # Tokens com bounce confirmado: pico veio DEPOIS do fundo
+    bounce_tokens = [
+        x for x in rows
+        if x.get("mc_bottom") and x.get("mc_peak")
+        and x.get("time_to_bottom") is not None
+        and x.get("time_to_peak")   is not None
+        and x["time_to_peak"] > x["time_to_bottom"]
+        and x["mc_bottom"] > 0
+    ]
+    no_bounce_tokens = [
+        x for x in rows
+        if x.get("mc_bottom") and x.get("mc_peak")
+        and x.get("time_to_bottom") is not None
+        and x.get("time_to_peak")   is not None
+        and x["time_to_peak"] <= x["time_to_bottom"]
+        and x["mc_bottom"] > 0
+    ]
+
+    r["bounce_n"]    = len(bounce_tokens)
+    r["no_bounce_n"] = len(no_bounce_tokens)
+    r["both_n"]      = len(bounce_tokens) + len(no_bounce_tokens)
+
+    if bounce_tokens:
+        # Magnitude do bounce: quanto subiu do fundo ao pico (%)
+        bounce_mags = [(x["mc_peak"] / x["mc_bottom"] - 1) for x in bounce_tokens]
+        bp = _percentiles(bounce_mags, (10, 25, 50, 75, 90))
+        r["bounce_mag_p10"] = f"{bp[10]*100:.0f}%"  if bp.get(10) else "—"
+        r["bounce_mag_p25"] = f"{bp[25]*100:.0f}%"  if bp.get(25) else "—"
+        r["bounce_mag_p50"] = f"{bp[50]*100:.0f}%"  if bp.get(50) else "—"
+        r["bounce_mag_p75"] = f"{bp[75]*100:.0f}%"  if bp.get(75) else "—"
+        r["bounce_mag_p90"] = f"{bp[90]*100:.0f}%"  if bp.get(90) else "—"
+
+        # Taxa de acerto por nível de TP — dados reais
+        tp_rows = []
+        for tp_pct, label in [
+            (0.10, "+10%"), (0.20, "+20%"), (0.30, "+30%"),
+            (0.50, "+50%"), (0.75, "+75%"), (1.00, "+100%"),
+            (1.50, "+150%"), (2.00, "+200%"),
+        ]:
+            # Quantos tokens com bounce teriam batido esse TP?
+            hit_bounce = sum(1 for m in bounce_mags if m >= tp_pct)
+            # EV aproximado: se bate TP ganha tp_pct, se não bate perde até o fundo
+            # Loss estimada: tokens sem bounce — perde a diferença para mc_1h ou trava no stop
+            hit_rate = hit_bounce / len(bounce_mags)
+            # EV simplificado: apenas sobre tokens com bounce (os sem bounce = perda separada)
+            ev_bounce_only = hit_rate * tp_pct - (1 - hit_rate) * _mean(
+                [max(0, tp_pct - m) for m in bounce_mags if m < tp_pct] or [0]
+            )
+            tp_rows.append({
+                "tp":        label,
+                "hit_n":     hit_bounce,
+                "hit_rate":  f"{hit_rate*100:.1f}%",
+                "hit_raw":   hit_rate,
+                "ev_approx": f"{ev_bounce_only*100:+.1f}%",
+                "ev_pos":    ev_bounce_only > 0,
+            })
+        r["tp_rows"] = tp_rows
+
+        # Janela de oportunidade: tempo entre fundo e pico
+        window_vals = [x["time_to_peak"] - x["time_to_bottom"] for x in bounce_tokens]
+        wp = _percentiles(window_vals, (25, 50, 75, 90))
+        r["window_p25"] = f"{wp[25]:.1f}min" if wp.get(25) else "—"
+        r["window_p50"] = f"{wp[50]:.1f}min" if wp.get(50) else "—"
+        r["window_p75"] = f"{wp[75]:.1f}min" if wp.get(75) else "—"
+        r["window_p90"] = f"{wp[90]:.1f}min" if wp.get(90) else "—"
+        r["window_u5"]  = _pct(sum(1 for v in window_vals if v <= 5),  len(window_vals))
+        r["window_u10"] = _pct(sum(1 for v in window_vals if v <= 10), len(window_vals))
+        r["window_u15"] = _pct(sum(1 for v in window_vals if v <= 15), len(window_vals))
+
+        # SL estimado via downside nos tokens SEM bounce
+        # Se você entra e o bounce não acontece, quanto perde relativo ao fundo?
+        # Proxy: (mc_1h / mc_bottom - 1) nos tokens sem bounce
+        no_bounce_with_1h = [
+            x for x in no_bounce_tokens
+            if x.get("mc_1h") and x["mc_bottom"] > 0
+        ]
+        if no_bounce_with_1h:
+            sl_vals = [(x["mc_1h"] / x["mc_bottom"] - 1) for x in no_bounce_with_1h]
+            sp = _percentiles(sl_vals, (10, 25, 50))
+            r["sl_p10"] = f"{sp[10]*100:+.1f}%" if sp.get(10) else "—"
+            r["sl_p25"] = f"{sp[25]*100:+.1f}%" if sp.get(25) else "—"
+            r["sl_p50"] = f"{sp[50]*100:+.1f}%" if sp.get(50) else "—"
+            r["sl_n"]   = len(no_bounce_with_1h)
+        else:
+            r["sl_n"] = 0
+
+        # R:R ótimo: cruza tp_hit_rate × magnitude_media / loss_media_sem_bounce
+        if no_bounce_with_1h:
+            avg_loss_no_bounce = abs(_mean([
+                (x["mc_1h"] / x["mc_bottom"] - 1) for x in no_bounce_with_1h
+            ]))
+            rr_optimal = []
+            total_tokens = len(bounce_tokens) + len(no_bounce_tokens)
+            bounce_rate  = len(bounce_tokens) / total_tokens if total_tokens else 0
+            for tp_pct, label in [(0.20,"+20%"),(0.30,"+30%"),(0.50,"+50%"),(1.00,"+100%")]:
+                tp_hit_given_bounce = sum(1 for m in bounce_mags if m >= tp_pct) / len(bounce_mags)
+                real_win_rate = bounce_rate * tp_hit_given_bounce
+                avg_win = tp_pct
+                avg_loss = avg_loss_no_bounce * (1 - bounce_rate) + tp_pct * bounce_rate * (1 - tp_hit_given_bounce)
+                ev = real_win_rate * avg_win - (1 - real_win_rate) * avg_loss_no_bounce
+                rr_optimal.append({
+                    "tp":      label,
+                    "win_rate": f"{real_win_rate*100:.1f}%",
+                    "ev":       f"{ev*100:+.1f}%",
+                    "ev_pos":   ev > 0,
+                    "payoff":   f"{avg_win/avg_loss_no_bounce:.2f}×" if avg_loss_no_bounce else "—",
+                })
+            r["rr_optimal"] = rr_optimal
+        else:
+            r["rr_optimal"] = []
+    else:
+        r["tp_rows"] = []
+        r["rr_optimal"] = []
+        r["sl_n"] = 0
 
     # ── H2 ───────────────────────────────────────────────────────────────────
     rec_ok = [x for x in rows if x["recovery"] is True  and x["time_to_bottom"] is not None]
@@ -630,8 +752,78 @@ def _run_analysis(rows):
                             "pos": delta > 0})
 
     r["f1_base_n"]  = len(f1_base)
-    r["f1_base_wr"] = f"{(sum(1 for x in f1_base if x['mc_1h'] > x['mc_bottom']) / len(f1_base) * 100):.1f}%" if f1_base else "—"
+    r["f1_base_wr"] = f"{(sum(1 for x in f1_base if x['mc_1h'] > x['mc_bottom'] * 1.05) / len(f1_base) * 100):.1f}%" if f1_base else "—"
     r["f1_corr"]    = f1_corr
+
+    # ── Cenários de entrada realista ─────────────────────────────────────────
+    tradeable = [x for x in rows if x.get("mc_bottom") and x.get("mc_1h") and x["mc_bottom"] > 0]
+    realistic_scenarios = []
+    for label, entry_pct in [
+        ("Fundo exato (teórico — impossível na prática)", 0.00),
+        ("Fundo +2%  (slippage mínimo)",                 0.02),
+        ("Fundo +5%  (slippage + fee — realista)",       0.05),
+        ("Fundo +10% (entrada conservadora)",            0.10),
+        ("Fundo +15% (entrada tardia)",                  0.15),
+    ]:
+        if not tradeable:
+            continue
+        gains  = [(x["mc_1h"] / (x["mc_bottom"] * (1 + entry_pct)) - 1) for x in tradeable]
+        wins   = [g for g in gains if g > 0]
+        losses = [g for g in gains if g <= 0]
+        wr     = len(wins) / len(gains)
+        avg_w  = _mean(wins)
+        avg_l  = abs(_mean(losses)) if losses else None
+        payoff = avg_w / avg_l if avg_w and avg_l else None
+        ev     = wr * avg_w - (1 - wr) * avg_l if avg_w and avg_l else None
+        realistic_scenarios.append({
+            "label":    label,
+            "n":        len(tradeable),
+            "wr":       f"{wr*100:.1f}%",
+            "wr_float": wr,
+            "avg_w":    f"{avg_w*100:+.1f}%" if avg_w else "—",
+            "avg_l":    f"{_mean(losses)*100:+.1f}%" if losses else "—",
+            "payoff":   f"{payoff:.2f}×" if payoff else "—",
+            "ev":       f"{ev*100:+.1f}%" if ev is not None else "—",
+            "ev_pos":   ev is not None and ev > 0,
+        })
+    r["realistic_scenarios"] = realistic_scenarios
+
+    # ── Série temporal — análise dos primeiros 10min ──────────────────────────
+    try:
+        tick_agg = db.get_tick_aggregates(max_elapsed_sec=600)
+    except Exception:
+        tick_agg = []
+
+    r["ts_n_tokens"] = len(tick_agg)
+    if tick_agg:
+        with_rec    = [x for x in tick_agg if x.get("recovery") is True  and x.get("avg_smart") is not None]
+        without_rec = [x for x in tick_agg if x.get("recovery") is False and x.get("avg_smart") is not None]
+        r["ts_has_recovery_n"]        = len(with_rec)
+        r["ts_no_recovery_n"]         = len(without_rec)
+        r["ts_avg_smart_recovery"]    = f"{_mean([x['avg_smart']   for x in with_rec]):.2f}"    if with_rec    else "—"
+        r["ts_avg_smart_no"]          = f"{_mean([x['avg_smart']   for x in without_rec]):.2f}" if without_rec else "—"
+        r["ts_delta_smart_recovery"]  = f"{_mean([x['delta_smart'] for x in with_rec]):.1f}"    if with_rec    else "—"
+        r["ts_delta_smart_no"]        = f"{_mean([x['delta_smart'] for x in without_rec]):.1f}" if without_rec else "—"
+        r["ts_avg_vol_recovery"]      = f"${_mean([x['avg_vol_1m'] for x in with_rec]):,.0f}"   if with_rec    else "—"
+        r["ts_avg_vol_no"]            = f"${_mean([x['avg_vol_1m'] for x in without_rec]):,.0f}"if without_rec else "—"
+        r["ts_avg_holders_recovery"]  = f"{_mean([x['avg_holders'] for x in with_rec]):.0f}"   if with_rec    else "—"
+        r["ts_avg_holders_no"]        = f"{_mean([x['avg_holders'] for x in without_rec]):.0f}"if without_rec else "—"
+        # Exchange breakdown
+        exchanges = {}
+        for x in tick_agg:
+            exch = x.get("exchange") or "unknown"
+            if exch not in exchanges:
+                exchanges[exch] = {"n": 0, "rec": 0}
+            exchanges[exch]["n"] += 1
+            if x.get("recovery") is True:
+                exchanges[exch]["rec"] += 1
+        r["ts_exchanges"] = [
+            {"exch": k, "n": v["n"], "rec_pct": f"{v['rec']/v['n']*100:.0f}%" if v["n"] else "—"}
+            for k, v in sorted(exchanges.items(), key=lambda kv: -kv[1]["n"])
+        ]
+    else:
+        r["ts_has_recovery_n"] = r["ts_no_recovery_n"] = 0
+        r["ts_exchanges"] = []
 
     return r
 
@@ -737,23 +929,27 @@ tr:hover td { background: #161b22; }
 
 <!-- Seção 4: Filtros -->
 <h2>4 — Validação dos Filtros (H3, H4, H5, H8)</h2>
-<p class="note" style="margin-bottom:10px">Baseline win rate (mc_1h &gt; bottom): <strong>{{ d.base_wr }}</strong> (n={{ d.base_n }})</p>
+<p class="note" style="margin-bottom:10px">
+  Baseline win rate ({{ d.base_note }}): <strong>{{ d.base_wr }}</strong> (n={{ d.base_n }})<br>
+  WR+0% = entrada no fundo exato (teórico) | WR+5% = entrada realista com slippage+fee
+</p>
 <table>
-<thead><tr><th>Filtro</th><th>N</th><th>Win Rate</th><th>Delta vs Baseline</th></tr></thead>
+<thead><tr><th>Filtro</th><th>N</th><th>WR +0% (teórico)</th><th>WR +5% (realista)</th><th>Delta vs Baseline (+5%)</th></tr></thead>
 <tbody>
 {% for f in d.filter_rows %}
 <tr>
   <td>{{ f.label }}</td>
   <td>{{ f.n }}</td>
-  <td>{{ f.wr }}</td>
-  <td><span class="tag {{ 't-green' if f.pos else 't-red' }}">{{ f.delta }}</span></td>
+  <td class="muted">{{ f.wr0 }}</td>
+  <td>{{ f.wr5 }}</td>
+  <td><span class="tag {{ 't-green' if f.pos else 't-red' }}">{{ f.delta5 }}</span></td>
 </tr>
 {% endfor %}
 </tbody>
 </table>
 
 <!-- Seção 5: R:R -->
-<h2>5 — R:R Simulado (entrada no fundo, saída = mc_1h)</h2>
+<h2>5 — R:R Teórico (entrada EXATA no fundo mínimo — impossível na prática, ver Seção 5b)</h2>
 {% if d.rr_n > 0 %}
 <div class="grid">
   <div class="card"><div class="card-label">Universo</div><div class="card-value">{{ d.rr_n }}</div></div>
@@ -781,6 +977,123 @@ tr:hover td { background: #161b22; }
 {% endif %}
 {% else %}
 <p class="muted">Dados insuficientes — aguardar mais migrações completas (bottom + mc_1h).</p>
+{% endif %}
+
+<!-- Seção 5b: TP/SL derivado dos dados reais -->
+<h2>5b — TP e SL Ótimos: o que os dados revelam</h2>
+{% if d.bounce_n > 0 %}
+<p class="note" style="margin-bottom:12px">
+  Universo: <strong>{{ d.both_n }}</strong> tokens com bottom e peak.
+  <span class="green">{{ d.bounce_n }} com bounce</span> (pico após fundo) |
+  <span class="red">{{ d.no_bounce_n }} sem bounce</span> (pico veio antes do fundo).
+</p>
+
+<div class="row" style="margin-bottom:16px">
+  <div class="kv"><span>Magnitude bounce — p10</span><span>{{ d.bounce_mag_p10 }}</span></div>
+  <div class="kv"><span>p25</span><span>{{ d.bounce_mag_p25 }}</span></div>
+  <div class="kv"><span>p50 (mediana)</span><span class="yellow">{{ d.bounce_mag_p50 }}</span></div>
+  <div class="kv"><span>p75</span><span>{{ d.bounce_mag_p75 }}</span></div>
+  <div class="kv"><span>p90</span><span>{{ d.bounce_mag_p90 }}</span></div>
+</div>
+<p class="note" style="margin-bottom:10px">
+  Taxa de acerto por nível de TP — sobre tokens que fizeram bounce (base real, não hipotética).
+</p>
+<table>
+<thead><tr>
+  <th>TP</th><th>Tokens que teriam batido</th><th>Hit rate</th><th>EV aproximado</th>
+</tr></thead>
+<tbody>
+{% for t in d.tp_rows %}
+<tr>
+  <td><strong>{{ t.tp }}</strong></td>
+  <td>{{ t.hit_n }} / {{ d.bounce_n }}</td>
+  <td><span class="tag {{ 't-green' if t.hit_raw > 0.5 else 't-yellow' if t.hit_raw > 0.3 else 't-red' }}">{{ t.hit_rate }}</span></td>
+  <td class="{{ 'green' if t.ev_pos else 'red' }}">{{ t.ev_approx }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+
+<h2 style="margin-top:24px">5c — Janela de Oportunidade (tempo entre fundo e pico)</h2>
+<p class="note" style="margin-bottom:10px">Quanto tempo você tem para executar a saída após o fundo.</p>
+<div class="row" style="margin-bottom:12px">
+  <div class="kv"><span>p25</span><span>{{ d.window_p25 }}</span></div>
+  <div class="kv"><span>p50</span><span class="yellow">{{ d.window_p50 }}</span></div>
+  <div class="kv"><span>p75</span><span>{{ d.window_p75 }}</span></div>
+  <div class="kv"><span>p90</span><span>{{ d.window_p90 }}</span></div>
+  <div class="kv"><span>≤5min</span><span class="red">{{ d.window_u5 }}</span></div>
+  <div class="kv"><span>≤10min</span><span>{{ d.window_u10 }}</span></div>
+  <div class="kv"><span>≤15min</span><span>{{ d.window_u15 }}</span></div>
+</div>
+
+{% if d.sl_n > 0 %}
+<h2 style="margin-top:24px">5d — Stop Loss: o que acontece quando não há bounce (n={{ d.sl_n }})</h2>
+<p class="note" style="margin-bottom:10px">
+  Tokens onde o pico veio ANTES do fundo — se você comprou "o fundo" mas errou,
+  quanto perdeu até a marca de 1h?
+</p>
+<div class="row">
+  <div class="kv"><span>p10 (melhor caso)</span><span>{{ d.sl_p10 }}</span></div>
+  <div class="kv"><span>p25</span><span>{{ d.sl_p25 }}</span></div>
+  <div class="kv"><span>p50 (mediana)</span><span class="red">{{ d.sl_p50 }}</span></div>
+</div>
+{% endif %}
+
+{% if d.rr_optimal %}
+<h2 style="margin-top:24px">5e — R:R Real: combinando bounce rate × hit rate × loss média</h2>
+<p class="note" style="margin-bottom:10px">
+  Win rate real = P(bounce) × P(TP atingido | bounce). Loss = perda mediana nos sem-bounce.
+  Este é o número que importa para sizing de posição.
+</p>
+<table>
+<thead><tr><th>TP</th><th>Win Rate Real</th><th>Payoff</th><th>EV por trade</th></tr></thead>
+<tbody>
+{% for r in d.rr_optimal %}
+<tr>
+  <td><strong>{{ r.tp }}</strong></td>
+  <td>{{ r.win_rate }}</td>
+  <td>{{ r.payoff }}</td>
+  <td class="{{ 'green' if r.ev_pos else 'red' }}">{{ r.ev }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+
+{% else %}
+<p class="muted">Dados insuficientes — aguardar tokens com bottom e peak preenchidos.</p>
+{% endif %}
+
+<!-- Seção 5f: Win Rate com entrada realista (mc_1h como saída) -->
+<h2>5f — Win Rate com Saída em 1h (comparação — saída em tempo fixo)</h2>
+<p class="note" style="margin-bottom:10px">
+  Entrada no fundo exato é fisicamente impossível. Cada linha mostra o impacto do premium de entrada no resultado.
+  Saída = mc_1h em todos os cenários.
+</p>
+{% if d.realistic_scenarios %}
+<table>
+<thead><tr>
+  <th>Cenário de entrada</th><th>N</th><th>Win Rate</th>
+  <th>Gain médio (winners)</th><th>Loss média (losers)</th>
+  <th>Payoff</th><th>EV por trade</th>
+</tr></thead>
+<tbody>
+{% for s in d.realistic_scenarios %}
+<tr>
+  <td>{{ s.label }}</td>
+  <td>{{ s.n }}</td>
+  <td><span class="tag {{ 't-green' if s.wr_float > 0.5 else 't-red' }}">{{ s.wr }}</span></td>
+  <td class="green">{{ s.avg_w }}</td>
+  <td class="red">{{ s.avg_l }}</td>
+  <td>{{ s.payoff }}</td>
+  <td class="{{ 'green' if s.ev_pos else 'red' }}">{{ s.ev }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+<p class="note" style="margin-top:8px">EV negativo com entrada +5% significa que a estratégia de saída em 1h não é lucrativa — precisa de saída mais rápida (target explícito) ou melhor timing de entrada.</p>
+{% else %}
+<p class="muted">Dados insuficientes.</p>
 {% endif %}
 
 <!-- Seção 6: H2 -->
@@ -863,6 +1176,68 @@ tr:hover td { background: #161b22; }
 </table>
 {% else %}
 <p class="muted">Dados insuficientes — aguardar tokens com campos Fase 1 preenchidos.</p>
+{% endif %}
+
+<!-- Seção 9: Série Temporal -->
+<h2>9 — Série Temporal: Primeiros 10min (Smart Flow + Volume)</h2>
+{% if d.ts_n_tokens > 0 %}
+<p class="note" style="margin-bottom:10px">
+  {{ d.ts_n_tokens }} tokens com série temporal coletada.
+  Recovery={{ d.ts_has_recovery_n }} | Sem recovery={{ d.ts_no_recovery_n }}
+  — comparação de comportamento nos primeiros 10min pós-migração.
+</p>
+<table>
+<thead><tr>
+  <th>Métrica (primeiros 10min)</th>
+  <th>Recovery=TRUE</th>
+  <th>Recovery=FALSE</th>
+  <th>Interpretação</th>
+</tr></thead>
+<tbody>
+<tr>
+  <td>avg smart_count</td>
+  <td class="green">{{ d.ts_avg_smart_recovery }}</td>
+  <td class="red">{{ d.ts_avg_smart_no }}</td>
+  <td class="muted">Wallets inteligentes presentes</td>
+</tr>
+<tr>
+  <td>delta smart_count (max−min)</td>
+  <td class="green">{{ d.ts_delta_smart_recovery }}</td>
+  <td class="red">{{ d.ts_delta_smart_no }}</td>
+  <td class="muted">Acumulação durante o dump</td>
+</tr>
+<tr>
+  <td>avg volume_1m</td>
+  <td class="green">{{ d.ts_avg_vol_recovery }}</td>
+  <td class="red">{{ d.ts_avg_vol_no }}</td>
+  <td class="muted">Interesse comprador no período</td>
+</tr>
+<tr>
+  <td>avg holders_count</td>
+  <td class="green">{{ d.ts_avg_holders_recovery }}</td>
+  <td class="red">{{ d.ts_avg_holders_no }}</td>
+  <td class="muted">Base de holders durante janela</td>
+</tr>
+</tbody>
+</table>
+
+{% if d.ts_exchanges %}
+<p class="note" style="margin-top:16px;margin-bottom:6px">Recovery rate por exchange (tokens com série temporal):</p>
+<table style="width:auto">
+<thead><tr><th>Exchange</th><th>N tokens</th><th>Recovery%</th></tr></thead>
+<tbody>
+{% for e in d.ts_exchanges %}
+<tr>
+  <td>{{ e.exch }}</td>
+  <td>{{ e.n }}</td>
+  <td>{{ e.rec_pct }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+{% else %}
+<p class="muted">Série temporal ainda não coletada — dados disponíveis nas próximas migrações após este deploy.</p>
 {% endif %}
 
 </body>

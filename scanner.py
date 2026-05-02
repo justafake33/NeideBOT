@@ -69,6 +69,8 @@ class HotMonitor:
         self._cancelled: set = set()
         self._mc_live: dict = {}  # mint → último MC do trenches, atualizado a cada poll
         self._lock = threading.Lock()
+        self._tick_buffer: list = []
+        self._tick_lock = threading.Lock()
 
     def add(self, mint: str, mc_migration: float, ts_migration: datetime,
             symbol: str, total_supply: float = 1_000_000_000):
@@ -92,17 +94,35 @@ class HotMonitor:
             self._cancelled.add(mint)
             self._tokens.pop(mint, None)
 
-    def push_mc(self, mint: str, mc: float):
-        """Chamado pelo Scanner a cada poll — detecção rápida de rug e bottom aproximado."""
+    def push_mc(self, mint: str, mc: float, token_data: dict = None):
+        """Chamado pelo Scanner a cada poll — detecção rápida de rug, bottom e coleta de série temporal."""
         with self._lock:
             self._mc_live[mint] = mc  # captura sempre, mesmo após graduação
             state = self._tokens.get(mint)
             if not state or mint in self._cancelled:
                 return
 
-        elapsed_min = (datetime.now(timezone.utc) - state["ts_migration"]).total_seconds() / 60
+        elapsed_sec = int((datetime.now(timezone.utc) - state["ts_migration"]).total_seconds())
+        elapsed_min = elapsed_sec / 60
 
         state["mc_last"] = mc
+
+        # Acumula tick no buffer para batch insert (flush a cada HOT_INTERVAL)
+        if token_data and 0 <= elapsed_sec <= 3660:
+            tick = {
+                "mint":           mint,
+                "elapsed_sec":    elapsed_sec,
+                "mc":             mc,
+                "smart_count":    _int(token_data.get("smart_degen_count")),
+                "renowned_count": _int(token_data.get("renowned_count")),
+                "volume_1m":      _float(token_data.get("volume_1m")),
+                "volume_5m":      _float(token_data.get("volume_5m")),
+                "volume_15m":     _float(token_data.get("volume_15m")),
+                "holders_count":  _int(token_data.get("holder_count")),
+                "liquidity":      _float(token_data.get("liquidity")),
+            }
+            with self._tick_lock:
+                self._tick_buffer.append(tick)
 
         if mc < state["mc_migration"] * 0.20:
             logger.info("Rug %s: queda >=80%%", state["symbol"])
@@ -192,10 +212,24 @@ class HotMonitor:
                     logger.info("Backfill: agendado %s %s em %.0fmin",
                                 symbol, label, remaining / 60)
 
+    def _flush_tick_buffer(self):
+        """Drena o buffer de ticks para o banco em uma única transação."""
+        with self._tick_lock:
+            batch = self._tick_buffer[:]
+            self._tick_buffer.clear()
+        if not batch:
+            return
+        try:
+            db.insert_ticks_batch(batch)
+            logger.debug("tick_buffer: %d ticks inseridos", len(batch))
+        except Exception as e:
+            logger.warning("flush_tick_buffer: %s", e)
+
     def _loop(self):
         while True:
             try:
                 self._tick()
+                self._flush_tick_buffer()
             except Exception as e:
                 logger.exception("HotMonitor erro: %s", e)
             time.sleep(HOT_INTERVAL)
@@ -483,11 +517,11 @@ class Scanner:
                 already_seen = bool(mint and mint in self._seen)
             if already_seen:
                 if mint and mc:
-                    self.hot.push_mc(mint, mc)
+                    self.hot.push_mc(mint, mc, token)
             else:
                 self._safe(self._handle_completed, token)
                 if mint and mc and F_MC_MIN <= mc <= F_MC_MAX:
-                    self.hot.push_mc(mint, mc)
+                    self.hot.push_mc(mint, mc, token)
 
     def _safe(self, fn, token: dict):
         try:
@@ -696,6 +730,12 @@ class Scanner:
             "cto_flag":               bool(token.get("cto_flag")) if token.get("cto_flag") is not None else None,
             "has_social":             bool(token.get("has_at_least_one_social")) if token.get("has_at_least_one_social") is not None else None,
             "x_follower_count":       _int(token.get("x_user_follower")),
+            # Campos antes descartados — agora salvos
+            "exchange":               token.get("exchange"),
+            "rat_trader_rate":        _float(token.get("rat_trader_amount_rate")),
+            "total_fee_sol":          _float(token.get("total_fee")),
+            "bc_progress_migration":  _float(token.get("bc_progress")),
+            "complete_timestamp":     _int(token.get("complete_timestamp")),
         }
 
         if watchlist_entry:

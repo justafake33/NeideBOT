@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Optional
 
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_values
 
 logger = logging.getLogger(__name__)
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -83,6 +83,12 @@ def init_db():
                 cto_flag                  BOOL,
                 has_social                BOOL,
                 x_follower_count          INT,
+                -- Campos antes descartados do trenches
+                exchange                  TEXT,
+                rat_trader_rate           FLOAT,
+                total_fee_sol             FLOAT,
+                bc_progress_migration     FLOAT,
+                complete_timestamp        BIGINT,
                 created_at                TIMESTAMPTZ DEFAULT NOW()
             )
         """)
@@ -110,13 +116,41 @@ def init_db():
             "ADD COLUMN IF NOT EXISTS cto_flag               BOOL",
             "ADD COLUMN IF NOT EXISTS has_social              BOOL",
             "ADD COLUMN IF NOT EXISTS x_follower_count        INT",
+            # Campos antes descartados do trenches
+            "ADD COLUMN IF NOT EXISTS exchange                TEXT",
+            "ADD COLUMN IF NOT EXISTS rat_trader_rate         FLOAT",
+            "ADD COLUMN IF NOT EXISTS total_fee_sol           FLOAT",
+            "ADD COLUMN IF NOT EXISTS bc_progress_migration   FLOAT",
+            "ADD COLUMN IF NOT EXISTS complete_timestamp      BIGINT",
         ]:
             cur.execute(f"ALTER TABLE migrations {col}")
+
+        # Série temporal — ticks a cada 5s durante os 60min de monitoramento
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS token_ticks (
+                id             BIGSERIAL PRIMARY KEY,
+                mint           TEXT        NOT NULL,
+                tick_ts        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                elapsed_sec    INT         NOT NULL,
+                mc             FLOAT,
+                smart_count    INT,
+                renowned_count INT,
+                volume_1m      FLOAT,
+                volume_5m      FLOAT,
+                volume_15m     FLOAT,
+                holders_count  INT,
+                liquidity      FLOAT
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_token_ticks_mint    ON token_ticks (mint)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_token_ticks_mint_ts ON token_ticks (mint, tick_ts)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_token_ticks_elapsed ON token_ticks (mint, elapsed_sec)")
+
     logger.info("DB inicializado")
 
 
 def upsert_watchlist(data: dict):
-    """Registra token detectado na watchlist (bc >= 90%) antes da migração."""
+    """Registra token detectado na watchlist (bc >= 80%) antes da migração."""
     with _cursor() as cur:
         cur.execute("""
             INSERT INTO migrations (
@@ -179,7 +213,7 @@ def upsert_watchlist(data: dict):
 
 
 def upsert_migration(data: dict):
-    """Registra ou atualiza token que completou a migração para Raydium."""
+    """Registra ou atualiza token que completou a migração para Raydium/Meteora."""
     with _cursor() as cur:
         cur.execute("""
             INSERT INTO migrations (
@@ -194,7 +228,9 @@ def upsert_migration(data: dict):
                 creator_token_status, creator_balance_rate, dev_team_hold_rate,
                 suspected_insider_rate, top70_sniper_hold_rate, bluechip_owner_pct,
                 bot_degen_rate, entrapment_ratio, lock_percent, burn_status,
-                cto_flag, has_social, x_follower_count
+                cto_flag, has_social, x_follower_count,
+                exchange, rat_trader_rate, total_fee_sol,
+                bc_progress_migration, complete_timestamp
             ) VALUES (
                 %(mint)s, %(token_nome)s, %(ts_detected)s, %(bc_progress_at_detection)s,
                 %(ts_migration)s, %(mc_migration)s,
@@ -207,61 +243,68 @@ def upsert_migration(data: dict):
                 %(creator_token_status)s, %(creator_balance_rate)s, %(dev_team_hold_rate)s,
                 %(suspected_insider_rate)s, %(top70_sniper_hold_rate)s, %(bluechip_owner_pct)s,
                 %(bot_degen_rate)s, %(entrapment_ratio)s, %(lock_percent)s, %(burn_status)s,
-                %(cto_flag)s, %(has_social)s, %(x_follower_count)s
+                %(cto_flag)s, %(has_social)s, %(x_follower_count)s,
+                %(exchange)s, %(rat_trader_rate)s, %(total_fee_sol)s,
+                %(bc_progress_migration)s, %(complete_timestamp)s
             )
             ON CONFLICT (mint) DO UPDATE SET
-                ts_migration          = EXCLUDED.ts_migration,
-                mc_migration          = EXCLUDED.mc_migration,
-                mc_migration_observed = EXCLUDED.mc_migration_observed,
-                mc_migration_bc_ref   = EXCLUDED.mc_migration_bc_ref,
-                mc_migration_source   = EXCLUDED.mc_migration_source,
-                capture_delay_sec     = EXCLUDED.capture_delay_sec,
-                token_created_at      = COALESCE(migrations.token_created_at, EXCLUDED.token_created_at),
-                time_to_migrate_sec   = COALESCE(migrations.time_to_migrate_sec, EXCLUDED.time_to_migrate_sec),
-                smart_wallets         = COALESCE(migrations.smart_wallets, EXCLUDED.smart_wallets),
-                renowned_wallets      = COALESCE(migrations.renowned_wallets, EXCLUDED.renowned_wallets),
-                sniper_wallets        = COALESCE(migrations.sniper_wallets, EXCLUDED.sniper_wallets),
-                rug_ratio             = COALESCE(migrations.rug_ratio, EXCLUDED.rug_ratio),
-                top10_holder_rate     = COALESCE(migrations.top10_holder_rate, EXCLUDED.top10_holder_rate),
-                holders_count         = COALESCE(migrations.holders_count, EXCLUDED.holders_count),
-                volume_1m             = COALESCE(migrations.volume_1m, EXCLUDED.volume_1m),
-                volume_5m             = COALESCE(migrations.volume_5m, EXCLUDED.volume_5m),
-                volume_15m            = COALESCE(migrations.volume_15m, EXCLUDED.volume_15m),
-                is_wash_trading       = COALESCE(migrations.is_wash_trading, EXCLUDED.is_wash_trading),
-                liq_migration         = COALESCE(migrations.liq_migration, EXCLUDED.liq_migration),
-                is_honeypot           = COALESCE(migrations.is_honeypot, EXCLUDED.is_honeypot),
-                creator_token_status  = COALESCE(migrations.creator_token_status, EXCLUDED.creator_token_status),
-                creator_balance_rate  = COALESCE(migrations.creator_balance_rate, EXCLUDED.creator_balance_rate),
-                dev_team_hold_rate    = COALESCE(migrations.dev_team_hold_rate, EXCLUDED.dev_team_hold_rate),
-                suspected_insider_rate= COALESCE(migrations.suspected_insider_rate, EXCLUDED.suspected_insider_rate),
-                top70_sniper_hold_rate= COALESCE(migrations.top70_sniper_hold_rate, EXCLUDED.top70_sniper_hold_rate),
-                bluechip_owner_pct    = COALESCE(migrations.bluechip_owner_pct, EXCLUDED.bluechip_owner_pct),
-                bot_degen_rate        = COALESCE(migrations.bot_degen_rate, EXCLUDED.bot_degen_rate),
-                entrapment_ratio      = COALESCE(migrations.entrapment_ratio, EXCLUDED.entrapment_ratio),
-                lock_percent          = COALESCE(migrations.lock_percent, EXCLUDED.lock_percent),
-                burn_status           = COALESCE(migrations.burn_status, EXCLUDED.burn_status),
-                cto_flag              = COALESCE(migrations.cto_flag, EXCLUDED.cto_flag),
-                has_social            = COALESCE(migrations.has_social, EXCLUDED.has_social),
-                x_follower_count      = COALESCE(migrations.x_follower_count, EXCLUDED.x_follower_count)
+                ts_migration           = EXCLUDED.ts_migration,
+                mc_migration           = EXCLUDED.mc_migration,
+                mc_migration_observed  = EXCLUDED.mc_migration_observed,
+                mc_migration_bc_ref    = EXCLUDED.mc_migration_bc_ref,
+                mc_migration_source    = EXCLUDED.mc_migration_source,
+                capture_delay_sec      = EXCLUDED.capture_delay_sec,
+                exchange               = EXCLUDED.exchange,
+                rat_trader_rate        = COALESCE(migrations.rat_trader_rate, EXCLUDED.rat_trader_rate),
+                total_fee_sol          = EXCLUDED.total_fee_sol,
+                bc_progress_migration  = EXCLUDED.bc_progress_migration,
+                complete_timestamp     = COALESCE(migrations.complete_timestamp, EXCLUDED.complete_timestamp),
+                token_created_at       = COALESCE(migrations.token_created_at, EXCLUDED.token_created_at),
+                time_to_migrate_sec    = COALESCE(migrations.time_to_migrate_sec, EXCLUDED.time_to_migrate_sec),
+                smart_wallets          = COALESCE(migrations.smart_wallets, EXCLUDED.smart_wallets),
+                renowned_wallets       = COALESCE(migrations.renowned_wallets, EXCLUDED.renowned_wallets),
+                sniper_wallets         = COALESCE(migrations.sniper_wallets, EXCLUDED.sniper_wallets),
+                rug_ratio              = COALESCE(migrations.rug_ratio, EXCLUDED.rug_ratio),
+                top10_holder_rate      = COALESCE(migrations.top10_holder_rate, EXCLUDED.top10_holder_rate),
+                holders_count          = COALESCE(migrations.holders_count, EXCLUDED.holders_count),
+                volume_1m              = COALESCE(migrations.volume_1m, EXCLUDED.volume_1m),
+                volume_5m              = COALESCE(migrations.volume_5m, EXCLUDED.volume_5m),
+                volume_15m             = COALESCE(migrations.volume_15m, EXCLUDED.volume_15m),
+                is_wash_trading        = COALESCE(migrations.is_wash_trading, EXCLUDED.is_wash_trading),
+                liq_migration          = COALESCE(migrations.liq_migration, EXCLUDED.liq_migration),
+                is_honeypot            = COALESCE(migrations.is_honeypot, EXCLUDED.is_honeypot),
+                creator_token_status   = COALESCE(migrations.creator_token_status, EXCLUDED.creator_token_status),
+                creator_balance_rate   = COALESCE(migrations.creator_balance_rate, EXCLUDED.creator_balance_rate),
+                dev_team_hold_rate     = COALESCE(migrations.dev_team_hold_rate, EXCLUDED.dev_team_hold_rate),
+                suspected_insider_rate = COALESCE(migrations.suspected_insider_rate, EXCLUDED.suspected_insider_rate),
+                top70_sniper_hold_rate = COALESCE(migrations.top70_sniper_hold_rate, EXCLUDED.top70_sniper_hold_rate),
+                bluechip_owner_pct     = COALESCE(migrations.bluechip_owner_pct, EXCLUDED.bluechip_owner_pct),
+                bot_degen_rate         = COALESCE(migrations.bot_degen_rate, EXCLUDED.bot_degen_rate),
+                entrapment_ratio       = COALESCE(migrations.entrapment_ratio, EXCLUDED.entrapment_ratio),
+                lock_percent           = COALESCE(migrations.lock_percent, EXCLUDED.lock_percent),
+                burn_status            = COALESCE(migrations.burn_status, EXCLUDED.burn_status),
+                cto_flag               = COALESCE(migrations.cto_flag, EXCLUDED.cto_flag),
+                has_social             = COALESCE(migrations.has_social, EXCLUDED.has_social),
+                x_follower_count       = COALESCE(migrations.x_follower_count, EXCLUDED.x_follower_count)
         """, {
-            "mint": data.get("mint"),
-            "token_nome": data.get("token_nome"),
-            "ts_detected": data.get("ts_detected"),
-            "bc_progress_at_detection": data.get("bc_progress_at_detection"),
-            "ts_migration": data.get("ts_migration"),
-            "mc_migration": data.get("mc_migration"),
-            "mc_migration_observed": data.get("mc_migration_observed"),
-            "mc_migration_bc_ref": data.get("mc_migration_bc_ref"),
-            "mc_migration_source": data.get("mc_migration_source"),
-            "smart_wallets": data.get("smart_wallets"),
-            "renowned_wallets": data.get("renowned_wallets"),
-            "sniper_wallets": data.get("sniper_wallets"),
-            "rug_ratio": data.get("rug_ratio"),
-            "top10_holder_rate": data.get("top10_holder_rate"),
-            "holders_count": data.get("holders_count"),
-            "volume_1m": data.get("volume_1m"),
-            "volume_5m": data.get("volume_5m"),
-            "volume_15m": data.get("volume_15m"),
+            "mint":                   data.get("mint"),
+            "token_nome":             data.get("token_nome"),
+            "ts_detected":            data.get("ts_detected"),
+            "bc_progress_at_detection":data.get("bc_progress_at_detection"),
+            "ts_migration":           data.get("ts_migration"),
+            "mc_migration":           data.get("mc_migration"),
+            "mc_migration_observed":  data.get("mc_migration_observed"),
+            "mc_migration_bc_ref":    data.get("mc_migration_bc_ref"),
+            "mc_migration_source":    data.get("mc_migration_source"),
+            "smart_wallets":          data.get("smart_wallets"),
+            "renowned_wallets":       data.get("renowned_wallets"),
+            "sniper_wallets":         data.get("sniper_wallets"),
+            "rug_ratio":              data.get("rug_ratio"),
+            "top10_holder_rate":      data.get("top10_holder_rate"),
+            "holders_count":          data.get("holders_count"),
+            "volume_1m":              data.get("volume_1m"),
+            "volume_5m":              data.get("volume_5m"),
+            "volume_15m":             data.get("volume_15m"),
             "is_wash_trading":        data.get("is_wash_trading"),
             "liq_migration":          data.get("liq_migration"),
             "is_honeypot":            data.get("is_honeypot"),
@@ -281,6 +324,11 @@ def upsert_migration(data: dict):
             "cto_flag":               data.get("cto_flag"),
             "has_social":             data.get("has_social"),
             "x_follower_count":       data.get("x_follower_count"),
+            "exchange":               data.get("exchange"),
+            "rat_trader_rate":        data.get("rat_trader_rate"),
+            "total_fee_sol":          data.get("total_fee_sol"),
+            "bc_progress_migration":  data.get("bc_progress_migration"),
+            "complete_timestamp":     data.get("complete_timestamp"),
         })
 
 
@@ -352,6 +400,66 @@ def update_checkpoint(mint: str, label: str, mc: float, var: Optional[float]):
                 )
                 WHERE mint = %(mint)s
             """, {"mint": mint})
+
+
+def insert_ticks_batch(ticks: list):
+    """Insere múltiplos ticks em uma única transação (batch do buffer de 30s)."""
+    if not ticks:
+        return
+    with _cursor() as cur:
+        cur.executemany("""
+            INSERT INTO token_ticks
+                (mint, elapsed_sec, mc, smart_count, renowned_count,
+                 volume_1m, volume_5m, volume_15m, holders_count, liquidity)
+            VALUES
+                (%(mint)s, %(elapsed_sec)s, %(mc)s, %(smart_count)s, %(renowned_count)s,
+                 %(volume_1m)s, %(volume_5m)s, %(volume_15m)s, %(holders_count)s, %(liquidity)s)
+        """, ticks)
+
+
+def get_tick_aggregates(max_elapsed_sec: int = 600) -> list:
+    """
+    Retorna métricas agregadas da série temporal dos primeiros N segundos por token.
+    JOIN com migrations para ter recovery, mc_bottom, mc_1h.
+    Usado na Seção 9 do /analise.
+    """
+    with _cursor() as cur:
+        cur.execute("""
+            SELECT
+                t.mint,
+                COUNT(*)                                          AS tick_count,
+                AVG(t.smart_count)                                AS avg_smart,
+                MAX(t.smart_count) - MIN(t.smart_count)          AS delta_smart,
+                AVG(t.renowned_count)                             AS avg_renowned,
+                AVG(t.volume_1m)                                  AS avg_vol_1m,
+                MAX(t.volume_1m)                                  AS max_vol_1m,
+                AVG(t.volume_5m)                                  AS avg_vol_5m,
+                AVG(t.holders_count)                              AS avg_holders,
+                MAX(t.holders_count) - MIN(t.holders_count)      AS delta_holders,
+                AVG(t.liquidity)                                  AS avg_liquidity,
+                m.mc_bottom,
+                m.mc_1h,
+                m.recovery,
+                m.mc_migration,
+                m.exchange
+            FROM token_ticks t
+            JOIN migrations m ON m.mint = t.mint
+            WHERE t.elapsed_sec <= %(max_sec)s
+            GROUP BY t.mint, m.mc_bottom, m.mc_1h, m.recovery, m.mc_migration, m.exchange
+            HAVING COUNT(*) >= 5
+        """, {"max_sec": max_elapsed_sec})
+        return [dict(row) for row in cur.fetchall()]
+
+
+def cleanup_old_ticks(days: int = 30):
+    """Remove ticks mais antigos que N dias. Chamar uma vez por dia."""
+    with _cursor() as cur:
+        cur.execute("""
+            DELETE FROM token_ticks
+            WHERE tick_ts < NOW() - INTERVAL '%(days)s days'
+        """, {"days": days})
+        deleted = cur.rowcount
+    logger.info("cleanup_old_ticks: %d ticks removidos (>%dd)", deleted, days)
 
 
 def get_tokens_for_backfill() -> list:
