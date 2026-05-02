@@ -796,18 +796,28 @@ def _run_analysis(rows):
 
     r["ts_n_tokens"] = len(tick_agg)
     if tick_agg:
-        with_rec    = [x for x in tick_agg if x.get("recovery") is True  and x.get("avg_smart") is not None]
-        without_rec = [x for x in tick_agg if x.get("recovery") is False and x.get("avg_smart") is not None]
+        with_rec    = [x for x in tick_agg if x.get("recovery") is True]
+        without_rec = [x for x in tick_agg if x.get("recovery") is False]
         r["ts_has_recovery_n"]        = len(with_rec)
         r["ts_no_recovery_n"]         = len(without_rec)
-        r["ts_avg_smart_recovery"]    = f"{_mean([x['avg_smart']   for x in with_rec]):.2f}"    if with_rec    else "—"
-        r["ts_avg_smart_no"]          = f"{_mean([x['avg_smart']   for x in without_rec]):.2f}" if without_rec else "—"
-        r["ts_delta_smart_recovery"]  = f"{_mean([x['delta_smart'] for x in with_rec]):.1f}"    if with_rec    else "—"
-        r["ts_delta_smart_no"]        = f"{_mean([x['delta_smart'] for x in without_rec]):.1f}" if without_rec else "—"
-        r["ts_avg_vol_recovery"]      = f"${_mean([x['avg_vol_1m'] for x in with_rec]):,.0f}"   if with_rec    else "—"
-        r["ts_avg_vol_no"]            = f"${_mean([x['avg_vol_1m'] for x in without_rec]):,.0f}"if without_rec else "—"
-        r["ts_avg_holders_recovery"]  = f"{_mean([x['avg_holders'] for x in with_rec]):.0f}"   if with_rec    else "—"
-        r["ts_avg_holders_no"]        = f"{_mean([x['avg_holders'] for x in without_rec]):.0f}"if without_rec else "—"
+
+        def _mn(lst, key):
+            vals = [x[key] for x in lst if x.get(key) is not None]
+            return _mean(vals)
+
+        def _fmtv(v, fmt):
+            return (fmt % v) if v is not None else "—"
+
+        r["ts_avg_smart_recovery"]    = _fmtv(_mn(with_rec,    'avg_smart'),    "%.2f")
+        r["ts_avg_smart_no"]          = _fmtv(_mn(without_rec, 'avg_smart'),    "%.2f")
+        r["ts_delta_smart_recovery"]  = _fmtv(_mn(with_rec,    'delta_smart'),  "%.1f")
+        r["ts_delta_smart_no"]        = _fmtv(_mn(without_rec, 'delta_smart'),  "%.1f")
+        _vol_rec = _mn(with_rec,    'avg_vol_1m')
+        _vol_no  = _mn(without_rec, 'avg_vol_1m')
+        r["ts_avg_vol_recovery"]      = ("$%,.0f" % _vol_rec) if _vol_rec is not None else "—"
+        r["ts_avg_vol_no"]            = ("$%,.0f" % _vol_no)  if _vol_no  is not None else "—"
+        r["ts_avg_holders_recovery"]  = _fmtv(_mn(with_rec,    'avg_holders'),  "%.0f")
+        r["ts_avg_holders_no"]        = _fmtv(_mn(without_rec, 'avg_holders'),  "%.0f")
         # Exchange breakdown
         exchanges = {}
         for x in tick_agg:
@@ -1247,15 +1257,9 @@ tr:hover td { background: #161b22; }
 
 @app.route("/analise")
 def analise():
-    import traceback as _tb
-    try:
-        rows = db.get_all_migrations(limit=10000)
-        d = _run_analysis(rows)
-        return render_template_string(ANALISE_HTML, d=d)
-    except Exception:
-        err = _tb.format_exc()
-        logger.exception("ERRO em /analise")
-        return f"<pre style='color:red;background:#111;padding:20px'>{err}</pre>", 500
+    rows = db.get_all_migrations(limit=10000)
+    d = _run_analysis(rows)
+    return render_template_string(ANALISE_HTML, d=d)
 
 
 # ==============================================================================
