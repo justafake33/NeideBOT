@@ -94,10 +94,10 @@ token["creator_balance_rate"]        # % do supply que o dev ainda tem
 token["dev_team_hold_rate"]          # % do time total
 token["suspected_insider_hold_rate"] # % de insiders identificados pelo GMGN
 token["top70_sniper_hold_rate"]      # os 70 maiores snipers ainda estão dentro?
-token["bluechip_owner_percentage"]   # % dos holders que são wallets bluechip (qualidade real)
+token["bluechip_owner_percentage"]   # ⚠️ NÃO está no trenches — apenas em /v1/market/rank (trending). Não coletar por token.
 token["bot_degen_rate"]              # ratio de bots
 token["entrapment_ratio"]            # manipulação de preço por armadilha
-token["lock_percent"]                # % da liquidez travada
+# lock_percent: NÃO está no trenches. Fonte: token/info["locked_ratio"] na graduação (60min).
 token["burn_status"]                 # status do burn de liquidez ("none", "burn")
 token["cto_flag"]                    # 1 = comunidade assumiu o projeto
 token["has_at_least_one_social"]     # tem pelo menos uma rede social
@@ -148,7 +148,7 @@ ESTÁGIO 1 — Watchlist (bc_progress ≥ 80%)
     │
     ├─ POST /v1/trenches type=near_completion → data["pump"]
     ├─ Filtros aplicados (rug, rat, top10, smart, wash)
-    ├─ Campos Fase 1 coletados (creator_status, bluechip_pct, etc.)
+    ├─ Campos Fase 1 coletados do trenches (creator_status, cto_flag, etc.)
     └─ Token entra na watchlist com dados de qualidade
 
 ESTÁGIO 2 — Migração detectada
@@ -217,10 +217,10 @@ FASE 2 — próximo passo
 | **dev_team_hold_rate** | trenches | % do time total |
 | **suspected_insider_rate** | trenches | % de insiders identificados |
 | **top70_sniper_hold_rate** | trenches | Snipers ainda dentro? |
-| **bluechip_owner_pct** | trenches | % dos holders que são bluechip (qualidade real) |
+| **bluechip_owner_pct** | ~~trenches~~ N/A | ⚠️ Apenas em /v1/market/rank (trending). Não coletável por token. Coluna fica NULL. |
 | **bot_degen_rate** | trenches | Ratio de bots |
 | **entrapment_ratio** | trenches | Manipulação de preço |
-| **lock_percent** | trenches | % da liquidez travada |
+| **lock_percent** | token/info (graduação 1h) | locked_ratio do /v1/token/info — coletado na graduação após 60min |
 | **burn_status** | trenches | Status do burn |
 | **cto_flag** | trenches | Comunidade assumiu o projeto |
 | **has_social** | trenches | Tem rede social |
@@ -253,7 +253,7 @@ Scanner (poll 5s)
     │
     ├─ POST /v1/trenches near_completion → data["pump"]
     │       └─ bc ≥ 80% + filtros qualidade → Watchlist + DB
-    │       └─ Campos Fase 1 coletados (creator_status, bluechip_pct, etc.)
+    │       └─ Campos Fase 1 coletados do trenches (creator_status, cto_flag, etc.)
     │
     ├─ POST /v1/trenches completed → data["completed"]
     │       └─ Filtros MC/liq/fee → upsert_migration
@@ -266,7 +266,8 @@ Scanner (poll 5s)
             ├─ hot-precise (60s): kline low/high para precisão
             └─ _tick (30s): graduação após 60min
                     └─ kline scan 1h completo → mc_bottom, mc_peak, mc_1h
-                    └─ Fallbacks 1h: token/info → push_mc (mc_last)
+                    └─ token/info sempre chamado: fallback mc_1h + lock_percent (locked_ratio)
+                    └─ Fallback final mc_1h: push_mc (mc_last)
 ```
 
 ### HeapScheduler
@@ -280,6 +281,8 @@ Scanner (poll 5s)
 | mc_migration | kline (open no complete_ts) | trenches usd_market_cap | — |
 | mc_bottom / mc_peak | kline 1m (hot-precise) | push_mc (trenches 5s) | — |
 | mc_1h | kline (ts_mig a ts_mig+3660) | token/info | push_mc (mc_last) |
+| lock_percent | token/info locked_ratio (graduação 1h) | — | — |
+| bluechip_owner_pct | ⚠️ N/A — apenas em /v1/market/rank | — | — |
 
 ---
 
@@ -341,6 +344,8 @@ HOT_PRECISE_SEC=60           # intervalo kline hot-precise
 14. **4h/24h descartados**: trade é de minutos. Checkpoints de 4h/24h removidos da arquitetura
 15. **signal type 12**: NÃO usar signal_type 14, 15 ou 16 — API retorna 400
 16. **Campos Fase 1**: chegam no poll do trenches sem custo adicional de API — nunca recalcular manualmente
+17. **bluechip_owner_pct**: NÃO está no trenches — apenas em `/v1/market/rank` (trending). Coluna fica NULL, não remover do schema.
+18. **lock_percent**: NÃO está no trenches — coletado como `locked_ratio` do token/info na graduação (60min após migração)
 
 ---
 

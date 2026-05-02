@@ -316,6 +316,15 @@ def update_bottom(mint: str, mc: float, time_to_bottom: float):
         """, {"mint": mint, "mc": mc, "ttb": time_to_bottom})
 
 
+def update_lock_percent(mint: str, lock_percent: float):
+    """Atualiza lock_percent (locked_ratio do token/info) se ainda não preenchido."""
+    with _cursor() as cur:
+        cur.execute("""
+            UPDATE migrations SET lock_percent = %(lp)s
+            WHERE mint = %(mint)s AND lock_percent IS NULL
+        """, {"mint": mint, "lp": lock_percent})
+
+
 def update_checkpoint(mint: str, label: str, mc: float, var: Optional[float]):
     """Atualiza MC e variação % para checkpoints de 1h, 4h ou 24h."""
     cols = {
