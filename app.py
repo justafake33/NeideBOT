@@ -616,6 +616,210 @@ def analise_bottom_score():
         "por_token":         results_by_token,
     }, 200
 
+# ==============================================================================
+# /analise/smart-flow — Smart count delta durante o dump vs recovery
+# ==============================================================================
+
+@app.route("/analise/smart-flow")
+def analise_smart_flow():
+    """
+    Analisa se smart_count (e renowned_count) sobem durante o dump — o sinal
+    de que smart money está acumulando enquanto o preço cai.
+
+    Para cada token com ticks + recovery, calcula:
+    - delta_smart: variação de smart_count desde o início até o fundo
+    - smart_entering: flag se smart_count subiu em ≥2 janelas de 4 ticks (20s)
+    - dump_velocity: queda % de MC nos primeiros 2 minutos (preditor de tipo de dump)
+    - Correlação de cada feature com recovery=TRUE
+
+    Também retorna sweep de thresholds para delta_smart como sinal isolado.
+    """
+    WINDOW_SHORT = 4   # 4 ticks = 20s (janela curta)
+    MIN_TICKS    = 8
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT m.mint, m.token_nome, m.mc_migration, m.mc_bottom,
+                   m.time_to_bottom, m.recovery, m.smart_wallets,
+                   m.renowned_wallets, m.liq_migration,
+                   COUNT(t.id) AS tick_count
+            FROM migrations m
+            JOIN token_ticks t ON t.mint = m.mint
+            WHERE m.recovery IS NOT NULL
+              AND m.mc_migration IS NOT NULL
+              AND m.mc_bottom IS NOT NULL
+              AND m.mc_migration > 0
+            GROUP BY m.mint, m.token_nome, m.mc_migration, m.mc_bottom,
+                     m.time_to_bottom, m.recovery, m.smart_wallets,
+                     m.renowned_wallets, m.liq_migration
+            HAVING COUNT(t.id) >= %(min_ticks)s
+            ORDER BY m.mint
+        """, {"min_ticks": MIN_TICKS})
+        tokens = [dict(r) for r in cur.fetchall()]
+
+    if not tokens:
+        return {"erro": "Nenhum token com ticks + recovery"}, 200
+
+    results = []
+
+    for tok in tokens:
+        mint        = tok["mint"]
+        mc_mig      = float(tok["mc_migration"])
+        mc_bot      = float(tok["mc_bottom"])
+        recovery    = bool(tok["recovery"])
+        time_to_bot = float(tok["time_to_bottom"] or 0)
+
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT elapsed_sec, mc, smart_count, renowned_count,
+                       volume_1m, holders_count
+                FROM token_ticks
+                WHERE mint = %(mint)s
+                ORDER BY elapsed_sec ASC
+            """, {"mint": mint})
+            ticks = [dict(r) for r in cur.fetchall()]
+
+        if len(ticks) < MIN_TICKS:
+            continue
+
+        # ── Dump velocity: queda % nos primeiros 2 minutos ──
+        ticks_2min = [t for t in ticks if (t.get("elapsed_sec") or 0) <= 120]
+        if len(ticks_2min) >= 2:
+            mc_start = ticks_2min[0].get("mc") or mc_mig
+            mc_2min  = ticks_2min[-1].get("mc") or mc_start
+            dump_velocity_2min = (mc_start - mc_2min) / mc_start if mc_start > 0 else None
+        else:
+            dump_velocity_2min = None
+
+        # ── Smart count: baseline (primeiro tick) e fundo ──
+        smart_start    = ticks[0].get("smart_count") or 0
+        renowned_start = ticks[0].get("renowned_count") or 0
+
+        # Ticks ao redor do fundo real (±90s do time_to_bottom)
+        bot_elapsed = time_to_bot * 60
+        ticks_near_bot = [t for t in ticks
+                          if abs((t.get("elapsed_sec") or 0) - bot_elapsed) <= 90]
+
+        smart_at_bot    = ticks_near_bot[-1].get("smart_count") or 0    if ticks_near_bot else smart_start
+        renowned_at_bot = ticks_near_bot[-1].get("renowned_count") or 0 if ticks_near_bot else renowned_start
+
+        delta_smart    = smart_at_bot    - smart_start
+        delta_renowned = renowned_at_bot - renowned_start
+
+        # ── Smart entering: contagem de janelas de 4 ticks onde smart_count subiu ──
+        smart_windows_up = 0
+        for i in range(WINDOW_SHORT, len(ticks)):
+            window = ticks[i - WINDOW_SHORT: i]
+            sc = [t.get("smart_count") or 0 for t in window]
+            if sc[-1] > sc[0]:
+                smart_windows_up += 1
+
+        total_windows   = max(len(ticks) - WINDOW_SHORT, 1)
+        smart_entry_rate = smart_windows_up / total_windows  # fração de janelas com smart subindo
+
+        # ── Pct dump total ──
+        pct_dump = (mc_mig - mc_bot) / mc_mig if mc_mig > 0 else None
+
+        results.append({
+            "mint":               mint,
+            "symbol":             tok["token_nome"],
+            "recovery":           recovery,
+            "time_to_bottom_min": time_to_bot,
+            "pct_dump":           round(pct_dump, 3) if pct_dump else None,
+            "dump_velocity_2min": round(dump_velocity_2min, 3) if dump_velocity_2min is not None else None,
+            "smart_start":        smart_start,
+            "smart_at_bottom":    smart_at_bot,
+            "delta_smart":        delta_smart,
+            "renowned_start":     renowned_start,
+            "renowned_at_bot":    renowned_at_bot,
+            "delta_renowned":     delta_renowned,
+            "smart_entry_rate":   round(smart_entry_rate, 3),
+            "smart_windows_up":   smart_windows_up,
+            "total_windows":      total_windows,
+            "tick_count":         tok["tick_count"],
+        })
+
+    if not results:
+        return {"erro": "Nenhum resultado calculado"}, 200
+
+    rec_true  = [r for r in results if r["recovery"]]
+    rec_false = [r for r in results if not r["recovery"]]
+
+    def _avg(lst, key):
+        vals = [r[key] for r in lst if r.get(key) is not None]
+        return round(sum(vals) / len(vals), 3) if vals else None
+
+    def _med(lst, key):
+        vals = sorted([r[key] for r in lst if r.get(key) is not None])
+        return vals[len(vals)//2] if vals else None
+
+    # ── Sweep delta_smart como sinal ──
+    delta_sweep = []
+    for thr in [-2, -1, 0, 1, 2, 3, 5]:
+        tp = sum(1 for r in rec_true  if r["delta_smart"] >= thr)
+        fp = sum(1 for r in rec_false if r["delta_smart"] >= thr)
+        fn = len(rec_true)  - tp
+        tn = len(rec_false) - fp
+        prec = tp / (tp + fp) if (tp + fp) > 0 else None
+        rec  = tp / (tp + fn) if (tp + fn) > 0 else None
+        f1   = (2*prec*rec/(prec+rec)) if prec and rec and (prec+rec) > 0 else None
+        delta_sweep.append({
+            "delta_smart_min": thr,
+            "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+            "precision": round(prec, 3) if prec else None,
+            "recall":    round(rec,  3) if rec  else None,
+            "f1":        round(f1,   3) if f1   else None,
+        })
+
+    # ── Sweep smart_entry_rate como sinal ──
+    rate_sweep = []
+    for thr in [0.05, 0.10, 0.15, 0.20, 0.30, 0.40]:
+        tp = sum(1 for r in rec_true  if r["smart_entry_rate"] >= thr)
+        fp = sum(1 for r in rec_false if r["smart_entry_rate"] >= thr)
+        fn = len(rec_true)  - tp
+        tn = len(rec_false) - fp
+        prec = tp / (tp + fp) if (tp + fp) > 0 else None
+        rec  = tp / (tp + fn) if (tp + fn) > 0 else None
+        f1   = (2*prec*rec/(prec+rec)) if prec and rec and (prec+rec) > 0 else None
+        rate_sweep.append({
+            "entry_rate_min": thr,
+            "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+            "precision": round(prec, 3) if prec else None,
+            "recall":    round(rec,  3) if rec  else None,
+            "f1":        round(f1,   3) if f1   else None,
+        })
+
+    return {
+        "resumo": {
+            "tokens_analisados": len(results),
+            "recovery_true":     len(rec_true),
+            "recovery_false":    len(rec_false),
+        },
+        "discriminacao": {
+            # delta_smart: variação de smart_count entre início e fundo
+            "avg_delta_smart_recovery":    _avg(rec_true,  "delta_smart"),
+            "avg_delta_smart_no_rec":      _avg(rec_false, "delta_smart"),
+            "med_delta_smart_recovery":    _med(rec_true,  "delta_smart"),
+            "med_delta_smart_no_rec":      _med(rec_false, "delta_smart"),
+            # smart_entry_rate: fração de janelas 20s com smart subindo
+            "avg_entry_rate_recovery":     _avg(rec_true,  "smart_entry_rate"),
+            "avg_entry_rate_no_rec":       _avg(rec_false, "smart_entry_rate"),
+            # dump_velocity: queda nos primeiros 2 minutos
+            "avg_dump_vel_2min_recovery":  _avg(rec_true,  "dump_velocity_2min"),
+            "avg_dump_vel_2min_no_rec":    _avg(rec_false, "dump_velocity_2min"),
+            # time to bottom
+            "avg_time_to_bot_recovery":    _avg(rec_true,  "time_to_bottom_min"),
+            "avg_time_to_bot_no_rec":      _avg(rec_false, "time_to_bottom_min"),
+            # pct_dump total
+            "avg_pct_dump_recovery":       _avg(rec_true,  "pct_dump"),
+            "avg_pct_dump_no_rec":         _avg(rec_false, "pct_dump"),
+        },
+        "delta_smart_sweep":   delta_sweep,
+        "smart_entry_rate_sweep": rate_sweep,
+        "por_token":           results,
+    }, 200
+
+
 def _pct(n, total):
     return f"{n/total*100:.1f}%" if total else "—"
 
