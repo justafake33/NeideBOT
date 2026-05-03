@@ -2113,6 +2113,179 @@ tr:hover td { background: #161b22; }
 """
 
 
+@app.route("/analise/price-decel")
+def analise_price_decel():
+    """
+    Análise de deceleração de preço como sinal de fundo.
+
+    Para cada token com recovery definido, pega os ticks ao redor do mc_bottom
+    confirmado e calcula a taxa de variação de preço em 3 janelas:
+      A: [bottom - 120s, bottom - 60s)  — 2 a 1 min antes do fundo
+      B: [bottom - 60s,  bottom - 30s)  — 1 min a 30s antes do fundo
+      C: [bottom - 30s,  bottom + 5s]   — últimos 30s até o fundo
+
+    Se slope_A < slope_B < slope_C (todos negativos, ficando menos negativos),
+    o preço está desacelerando na queda — sinal observável em tempo real.
+    """
+    from collections import defaultdict
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT mint, recovery,
+                   ROUND(time_to_bottom * 60)::int AS bottom_elapsed,
+                   mc_bottom, mc_migration
+            FROM migrations
+            WHERE recovery IS NOT NULL
+              AND time_to_bottom IS NOT NULL
+              AND mc_bottom IS NOT NULL
+              AND mc_migration IS NOT NULL
+              AND mc_migration > 0
+        """)
+        mig_rows = cur.fetchall()
+
+    if not mig_rows:
+        return {"erro": "Nenhum dado"}, 200
+
+    mig_by_mint = {
+        r[0]: {"recovery": r[1], "bottom_elapsed": int(r[2]),
+               "mc_bottom": float(r[3]), "mc_migration": float(r[4])}
+        for r in mig_rows
+    }
+    mints = list(mig_by_mint.keys())
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT t.mint, t.elapsed_sec, t.mc_last
+            FROM token_ticks t
+            JOIN (
+                SELECT mint, ROUND(time_to_bottom * 60)::int AS bottom_elapsed
+                FROM migrations
+                WHERE mint = ANY(%s) AND time_to_bottom IS NOT NULL
+            ) m ON t.mint = m.mint
+            WHERE t.mc_last IS NOT NULL
+              AND t.elapsed_sec >= m.bottom_elapsed - 180
+              AND t.elapsed_sec <= m.bottom_elapsed + 60
+            ORDER BY t.mint, t.elapsed_sec
+        """, (mints,))
+        tick_rows = cur.fetchall()
+
+    ticks_by_mint = defaultdict(list)
+    for mint, elapsed, mc in tick_rows:
+        ticks_by_mint[mint].append((int(elapsed), float(mc)))
+
+    def slope_in_window(ticks, bottom_e, lo, hi):
+        pts = sorted([(e, mc) for e, mc in ticks if lo <= (e - bottom_e) < hi])
+        if len(pts) < 2:
+            return None
+        dt = pts[-1][0] - pts[0][0]
+        if dt == 0:
+            return None
+        return (pts[-1][1] - pts[0][1]) / dt  # MC/s
+
+    results = {"recovery": [], "no_recovery": []}
+
+    for mint, meta in mig_by_mint.items():
+        ticks = ticks_by_mint.get(mint, [])
+        if len(ticks) < 4:
+            continue
+
+        be  = meta["bottom_elapsed"]
+        mc0 = meta["mc_migration"]
+
+        s_a = slope_in_window(ticks, be, -120, -60)
+        s_b = slope_in_window(ticks, be, -60,  -30)
+        s_c = slope_in_window(ticks, be, -30,    5)
+
+        if s_a is None or s_b is None or s_c is None:
+            continue
+
+        # normaliza por mc_migration → % do MC por segundo
+        norm = lambda s: round(s / mc0 * 100, 5)
+        na, nb, nc = norm(s_a), norm(s_b), norm(s_c)
+
+        entry = {
+            "mint":            mint,
+            "slope_a":         na,
+            "slope_b":         nb,
+            "slope_c":         nc,
+            "decel_ab":        round(nb - na, 5),  # positivo = desacelerando
+            "decel_bc":        round(nc - nb, 5),  # positivo = desacelerando mais
+            "full_decel":      (nb > na) and (nc > nb),  # A < B < C
+        }
+        key = "recovery" if meta["recovery"] else "no_recovery"
+        results[key].append(entry)
+
+    def _avg(entries, key):
+        vals = [e[key] for e in entries]
+        return round(sum(vals) / len(vals), 5) if vals else None
+
+    def _pct_full_decel(entries):
+        if not entries:
+            return None
+        return round(sum(1 for e in entries if e["full_decel"]) / len(entries) * 100, 1)
+
+    rec   = results["recovery"]
+    norec = results["no_recovery"]
+
+    avg_rec_a   = _avg(rec,   "slope_a")
+    avg_rec_b   = _avg(rec,   "slope_b")
+    avg_rec_c   = _avg(rec,   "slope_c")
+    avg_norec_a = _avg(norec, "slope_a")
+    avg_norec_b = _avg(norec, "slope_b")
+    avg_norec_c = _avg(norec, "slope_c")
+
+    pct_decel_rec   = _pct_full_decel(rec)
+    pct_decel_norec = _pct_full_decel(norec)
+
+    delta_pct = round((pct_decel_rec or 0) - (pct_decel_norec or 0), 1)
+
+    discrimina = delta_pct >= 10
+
+    return {
+        "hipotese": "Deceleração de preço (d²p/dt² → 0) precede o fundo em recovery tokens",
+        "dataset": {
+            "total_migrations_com_recovery":   len(mig_by_mint),
+            "tokens_com_ticks_suficientes":    len(rec) + len(norec),
+            "recovery":                        len(rec),
+            "no_recovery":                     len(norec),
+        },
+        "slopes_normalizados_pct_mc_por_s": {
+            "janela_a_120s_60s_antes_fundo": {
+                "recovery":    avg_rec_a,
+                "no_recovery": avg_norec_a,
+            },
+            "janela_b_60s_30s_antes_fundo": {
+                "recovery":    avg_rec_b,
+                "no_recovery": avg_norec_b,
+            },
+            "janela_c_30s_0s_antes_fundo": {
+                "recovery":    avg_rec_c,
+                "no_recovery": avg_norec_c,
+            },
+        },
+        "deceleration_full_A_menor_B_menor_C": {
+            "pct_recovery_tokens":    pct_decel_rec,
+            "pct_no_recovery_tokens": pct_decel_norec,
+            "delta_pp":               delta_pct,
+        },
+        "veredicto": {
+            "discrimina":     discrimina,
+            "delta_pp":       delta_pct,
+            "interpretacao": (
+                "recovery tokens desaceleram mais antes do fundo — sinal promissor"
+                if discrimina else
+                "sem discriminação clara de deceleração entre recovery e no_recovery"
+            ),
+        },
+        "amostra_top10_recovery": sorted(
+            rec, key=lambda e: e["decel_bc"], reverse=True
+        )[:10],
+        "amostra_top10_no_recovery": sorted(
+            norec, key=lambda e: e["decel_bc"], reverse=True
+        )[:10],
+    }, 200
+
+
 @app.route("/analise")
 def analise():
     rows = db.get_all_migrations(limit=10000)

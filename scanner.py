@@ -325,6 +325,9 @@ class HotMonitor:
                                         state["symbol"], mc_high, elapsed_min,
                                         (mc_high / state["mc_migration"] - 1) * 100)
                             state["mc_max"] = mc_high
+
+                # Back-filla volume_1m nos ticks existentes via candles kline
+                db.backfill_tick_volumes(mint, candles, state["ts_mig_unix"])
             except Exception as e:
                 logger.debug("precise bottom %s: %s", mint[:8], e)
             time.sleep(0.5)
