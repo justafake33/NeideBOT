@@ -284,22 +284,18 @@ def debug_signal():
 
     mint = tok["mint"]
 
-    # Cada candidato: (body, extra_query_params)
-    # chain deve ir no body; groups é obrigatório mas valor desconhecido
+    # groups é array de OBJETOS (TokenSignalGroup), não de strings
+    # Fonte: github.com/GMGNAI/gmgn-skills src/client/OpenApiClient.ts
+    # O endpoint é global (sem token_address) — retorna feed de sinais
     candidates = [
-        # valores alternativos de groups
-        ({"chain": "sol", "token_address": mint, "signal_type": 12, "groups": ["whale"]},         {}),
-        ({"chain": "sol", "token_address": mint, "signal_type": 12, "groups": ["sniper"]},        {}),
-        ({"chain": "sol", "token_address": mint, "signal_type": 12, "groups": ["insider"]},       {}),
-        ({"chain": "sol", "token_address": mint, "signal_type": 12, "groups": ["fresh_wallet"]},  {}),
-        ({"chain": "sol", "token_address": mint, "signal_type": 12, "groups": ["rat_trader"]},    {}),
-        # groups como inteiros
-        ({"chain": "sol", "token_address": mint, "signal_type": 12, "groups": [1]},               {}),
-        ({"chain": "sol", "token_address": mint, "signal_type": 12, "groups": [12]},              {}),
-        # signal_types como array em vez de signal_type inteiro
-        ({"chain": "sol", "token_address": mint, "signal_types": [12], "groups": ["smart_degen"]}, {}),
-        # mint como nome do campo
-        ({"chain": "sol", "mint": mint, "signal_type": 12, "groups": ["smart_degen"]},            {}),
+        # formato correto descoberto no código-fonte
+        ({"chain": "sol", "groups": [{"signal_type": [12]}]},                                                {}),
+        # com filtros de MC compatíveis com nossos tokens
+        ({"chain": "sol", "groups": [{"signal_type": [12], "mc_min": 5000, "mc_max": 200000}]},              {}),
+        # múltiplos signal_types
+        ({"chain": "sol", "groups": [{"signal_type": [12, 13]}]},                                            {}),
+        # sem signal_type (todos os tipos)
+        ({"chain": "sol", "groups": [{}]},                                                                    {}),
     ]
 
     results = []
