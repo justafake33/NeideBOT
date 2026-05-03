@@ -330,6 +330,57 @@ def debug_signal():
     return {"mint": mint, "token": tok["token_nome"], "testes": results}, 200
 
 
+@app.route("/debug/signal-live")
+def debug_signal_live():
+    """
+    Testa get_token_signal() diretamente e mostra:
+    - quantos entries retornaram no feed global
+    - quais fazem match com tokens no HotMonitor
+    - últimos 5 sinais salvos no banco
+    """
+    import time as _time
+    if not gmgn:
+        return {"error": "GmgnClient não inicializado"}, 503
+
+    # Chama o método novo
+    try:
+        entries = gmgn.get_token_signal()
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+    # Tokens ativos no HotMonitor
+    with scanner.hot._lock if scanner else _DummyCtx():
+        active_mints = set(scanner.hot._tokens.keys()) if scanner else set()
+
+    matches = [e for e in entries if e.get("token_address") in active_mints]
+
+    # Últimos 5 sinais no banco
+    try:
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT mint, trigger_at, trigger_mc, signal_times, ts_recorded
+                FROM token_signals
+                ORDER BY ts_recorded DESC LIMIT 5
+            """)
+            saved = [dict(r) for r in cur.fetchall()]
+    except Exception:
+        saved = []
+
+    return {
+        "feed_total":    len(entries),
+        "hot_tokens":    len(active_mints),
+        "matches":       len(matches),
+        "match_list":    [{"mint": e.get("token_address"), "trigger_mc": e.get("trigger_mc"),
+                           "signal_times": e.get("signal_times")} for e in matches],
+        "saved_recent":  saved,
+    }, 200
+
+
+class _DummyCtx:
+    def __enter__(self): return self
+    def __exit__(self, *_): pass
+
+
 # ==============================================================================
 # /analise — Backtest exploratório (trade de minutos)
 # ==============================================================================
@@ -1350,10 +1401,11 @@ def analise():
 # Startup — funciona com Gunicorn e execução direta
 # ==============================================================================
 
-gmgn = None  # exposto globalmente para rotas de debug
+gmgn    = None  # exposto globalmente para rotas de debug
+scanner = None  # exposto globalmente para rotas de debug
 
 def _start_services():
-    global gmgn
+    global gmgn, scanner
     if not os.getenv("DATABASE_URL"):
         logger.warning("DATABASE_URL não configurado — serviços não iniciados")
         return

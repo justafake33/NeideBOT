@@ -121,10 +121,27 @@ params = {
 }
 # Response: lista de candles com campos: time (ms), open, high, low, close, volume
 
-# POST /v1/market/token_signal — Fase 2
+# POST /v1/market/token_signal — **IMPLEMENTADO** (Fase 2)
+# Feed GLOBAL — retorna todos os tokens com smart buys nas últimas ~8.3h (window: 30000s)
+# NÃO é por token — filtramos no lado do bot por tokens ativos no HotMonitor
 # signal_type=12 (SmartDegenBuy): smart money comprando em tempo real
-# Campos relevantes: trigger_at, trigger_mc, signal_times, market_cap
 # NÃO usar signal_type 14, 15 ou 16 — API retorna 400
+#
+# Body correto (groups é array de OBJETOS, não strings):
+body = {"chain": "sol", "groups": [{"signal_type": [12]}]}
+#
+# Campos por entry na resposta:
+entry["token_address"]      # mint
+entry["trigger_at"]         # unix timestamp do sinal
+entry["trigger_mc"]         # MC quando o smart buy foi detectado
+entry["first_trigger_mc"]   # MC do primeiro sinal histórico do token
+entry["signal_times"]       # contagem total de sinais acumulados
+entry["smart_degen_wallets"] # lista de wallets: [{address, buy_amount, buy_timestamp}]
+entry["market_cap"]         # MC atual
+entry["window"]             # 30000 (segundos de lookback)
+#
+# Fonte: github.com/GMGNAI/gmgn-skills — src/client/OpenApiClient.ts
+# Interface TokenSignalGroup: {signal_type?, mc_min?, mc_max?, trigger_mc_min?, trigger_mc_max?, ...}
 ```
 
 ---
@@ -163,22 +180,24 @@ HotMonitor (janela 60min)
     ├─ hot-precise (60s): kline low/high para precisão
     └─ _tick (30s): graduação após 60min → salva mc_bottom, mc_peak, mc_1h
 
-FASE 2 — próximo passo
-    ├─ Signal type 12 (SmartDegenBuy) durante o dump → Smart Flow Delta
-    ├─ Se smart money compra com trigger_mc < mc_migration → sinal de entrada
-    └─ Execução via POST /v1/trade/swap
+FASE 2 — coleta ativa (IMPLEMENTADO 2026-05-03)
+    ├─ _poll_signals() a cada 5s: GET /v1/market/token_signal type 12
+    ├─ Feed global → filtra por mints ativos no HotMonitor
+    ├─ Persiste em token_signals (mint, trigger_at UNIQUE, trigger_mc, wallets_json)
+    ├─ Objetivo: correlacionar trigger_mc < mc_migration com recovery=TRUE
+    └─ Próximo: analisar Smart Flow Delta → sinal de entrada → Fase 6 (swap)
 ```
 
 ---
 
 ## 🔍 ESTADO ATUAL — Coleta de Dados
 
-### Situação (2026-05-01)
-- **828 tokens** coletados no banco
-- **754** com `mc_bottom` (91%)
-- **361** com `mc_1h` (44%)
+### Situação (2026-05-03)
+- **1015+ tokens** coletados no banco
+- **~91%** com `mc_bottom`
+- Campos Fase 1 coletados desde deploy anterior
 - `mc_4h` e `mc_24h` **descartados** — trade é de minutos, não horas
-- Campos Fase 1 sendo coletados desde o último deploy
+- **Fase 2 ativa**: sinais type 12 coletados em `token_signals` a cada 5s durante janela quente
 
 ### Campos coletados por migração
 
@@ -261,6 +280,12 @@ Scanner (poll 5s)
     │       └─ HotMonitor.add()
     │       └─ push_mc para TODOS os completed já vistos (atualiza _mc_live)
     │
+    ├─ _poll_signals() — Fase 2 (a cada 5s, apenas se HotMonitor tem tokens ativos)
+    │       └─ POST /v1/market/token_signal → feed global type 12 (SmartDegenBuy)
+    │       └─ Filtra por tokens ativos no HotMonitor._tokens
+    │       └─ Persiste matches em token_signals (ON CONFLICT DO NOTHING)
+    │       └─ Ban guard: _signal_ban_until — não chama enquanto banido
+    │
     └─ HotMonitor (janela 60min)
             ├─ push_mc (5s): rastreia mc_min, mc_max, mc_last, _mc_live
             ├─ hot-precise (60s): kline low/high para precisão
@@ -269,6 +294,13 @@ Scanner (poll 5s)
                     └─ token/info sempre chamado: fallback mc_1h + lock_percent (locked_ratio)
                     └─ Fallback final mc_1h: push_mc (mc_last)
 ```
+
+### Tabelas do banco
+| Tabela | Conteúdo |
+|--------|----------|
+| `migrations` | Uma linha por token migrado — todos os campos de qualidade + checkpoints |
+| `token_ticks` | Série temporal 5s por token durante janela quente (60min) |
+| `token_signals` | **Fase 2** — sinais type 12 por token durante janela quente |
 
 ### HeapScheduler
 - Thread única com heap de eventos futuros
@@ -323,6 +355,8 @@ HOT_PRECISE_SEC=60           # intervalo kline hot-precise
 | `/analise` | Backtest exploratório — timing, dump depth, filtros, R:R, cobertura Fase 1 |
 | `/export/csv` | Export completo do banco |
 | `/health` | Health check |
+| `/debug/signal` | Diagnóstico histórico — testa formatos do token_signal (legacy) |
+| `/debug/signal-live` | **Fase 2** — chama get_token_signal(), mostra matches com HotMonitor e últimos sinais salvos |
 
 ---
 
@@ -346,6 +380,12 @@ HOT_PRECISE_SEC=60           # intervalo kline hot-precise
 16. **Campos Fase 1**: chegam no poll do trenches sem custo adicional de API — nunca recalcular manualmente
 17. **bluechip_owner_pct**: NÃO está no trenches — apenas em `/v1/market/rank` (trending). Coluna fica NULL, não remover do schema.
 18. **lock_percent**: NÃO está no trenches — coletado como `locked_ratio` do token/info na graduação (60min após migração)
+19. **token_signal é feed global**: NÃO é por token — retorna TODOS com smart buys no lookback de 30000s. Filtrar por HotMonitor._tokens no lado do bot.
+20. **groups é array de objetos**: body correto = `{"chain":"sol","groups":[{"signal_type":[12]}]}`. Array de strings causa erro "invalid json body".
+21. **_signal_ban_until**: ban guard no Scanner — cada chamada enquanto banido estende o ban. Checar `time.time() < _signal_ban_until` ANTES de chamar.
+22. **_poll_signals skip se vazio**: não chama API se `HotMonitor._tokens` estiver vazio — economiza rate limit.
+23. **token_signals tabela**: `UNIQUE (mint, trigger_at)` — `ON CONFLICT DO NOTHING` evita duplicatas no poll a cada 5s.
+24. **scanner global em app.py**: `scanner` e `gmgn` são globals em app.py para acesso nas rotas de debug.
 
 ---
 
