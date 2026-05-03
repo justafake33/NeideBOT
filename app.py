@@ -277,7 +277,7 @@ def debug_signal():
         try:
             resp = gmgn.session.post(
                 f"{gmgn.host}/v1/market/token_signal",
-                json={"token": mint, "signal_type": 12},
+                json={"token": mint, "signal_type": 12, "chain": "sol"},
                 params={
                     "timestamp": str(int(_time.time())),
                     "client_id":  str(_uuid4()),
