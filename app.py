@@ -2147,12 +2147,17 @@ def analise_price_decel():
         return {"erro": "Nenhum dado"}, 200
 
     mig_by_mint = {}
+    skipped_early_bottom = 0
     for r in mig_rows:
         r = dict(r)
         try:
+            be = int(r["bottom_elapsed"])
+            if be < 180:  # fundo em < 3min — janela A não tem dados suficientes
+                skipped_early_bottom += 1
+                continue
             mig_by_mint[r["mint"]] = {
                 "recovery":       r["recovery"],
-                "bottom_elapsed": int(r["bottom_elapsed"]),
+                "bottom_elapsed": be,
                 "mc_bottom":      float(r["mc_bottom"]),
                 "mc_migration":   float(r["mc_migration"]),
             }
@@ -2185,9 +2190,10 @@ def analise_price_decel():
     _debug = {
         "mints_em_mig_by_mint":    len(mints),
         "tick_rows_retornados":    len(tick_rows),
-        "mints_em_ticks_by_mint":  len(ticks_by_mint),
-        "sample_mint":             _sample_mint,
-        "sample_ticks_count":      len(ticks_by_mint[_sample_mint]) if _sample_mint else 0,
+        "mints_em_ticks_by_mint":    len(ticks_by_mint),
+        "skipped_early_bottom_lt3m": skipped_early_bottom,
+        "sample_mint":               _sample_mint,
+        "sample_ticks_count":        len(ticks_by_mint[_sample_mint]) if _sample_mint else 0,
         "sample_mig_bottom_elapsed": mig_by_mint.get(_sample_mint, {}).get("bottom_elapsed"),
     }
 
@@ -2263,7 +2269,9 @@ def analise_price_decel():
         "hipotese": "Deceleração de preço (d²p/dt² → 0) precede o fundo em recovery tokens",
         "_debug": _debug,
         "dataset": {
-            "total_migrations_com_recovery":   len(mig_by_mint),
+            "total_migrations_com_recovery":   len(mig_by_mint) + skipped_early_bottom,
+            "filtrados_fundo_lt_3min":         skipped_early_bottom,
+            "tokens_analisaveis":              len(mig_by_mint),
             "tokens_com_ticks_suficientes":    len(rec) + len(norec),
             "recovery":                        len(rec),
             "no_recovery":                     len(norec),
