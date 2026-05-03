@@ -382,8 +382,239 @@ class _DummyCtx:
 
 
 # ==============================================================================
-# /analise — Backtest exploratório (trade de minutos)
+# /analise/bottom-score — Backtest retroativo do Bottom Score
 # ==============================================================================
+
+@app.route("/analise/bottom-score")
+def analise_bottom_score():
+    """
+    Backtest retroativo do Bottom Score composto (5 métricas derivadas de token_ticks).
+
+    Para cada token com ticks + recovery definido, calcula o score a cada janela
+    de 12 ticks (60s) e mede:
+    - Se Score >= threshold antecipou o fundo real
+    - Discriminação recovery=TRUE vs FALSE
+    - Lead time médio antes do fundo
+    - Taxa de falso positivo por threshold
+
+    Retorna JSON com resultados completos.
+    """
+    import math
+
+    THRESHOLD   = 0.55   # threshold principal do score composto
+    MIN_TICKS   = 8      # mínimo de ticks para o token ser incluído
+    WINDOW      = 12     # janela de ticks para calcular o score (60s)
+    MIN_DUMP    = 0.30   # só avalia depois que já caiu >=30% do mc_migration
+
+    # Busca tokens com ticks + recovery + mc_migration + mc_bottom
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT m.mint, m.token_nome, m.mc_migration, m.mc_bottom,
+                   m.time_to_bottom, m.recovery, m.liq_migration,
+                   COUNT(t.id) AS tick_count
+            FROM migrations m
+            JOIN token_ticks t ON t.mint = m.mint
+            WHERE m.recovery IS NOT NULL
+              AND m.mc_migration IS NOT NULL
+              AND m.mc_bottom    IS NOT NULL
+              AND m.mc_migration > 0
+            GROUP BY m.mint, m.token_nome, m.mc_migration, m.mc_bottom,
+                     m.time_to_bottom, m.recovery, m.liq_migration
+            HAVING COUNT(t.id) >= %(min_ticks)s
+            ORDER BY m.mint
+        """, {"min_ticks": MIN_TICKS})
+        tokens = [dict(r) for r in cur.fetchall()]
+
+    if not tokens:
+        return {"erro": "Nenhum token com ticks + recovery encontrado", "tokens_com_ticks": 0}, 200
+
+    results_by_token = []
+
+    for tok in tokens:
+        mint         = tok["mint"]
+        mc_mig       = float(tok["mc_migration"])
+        mc_bot       = float(tok["mc_bottom"])
+        liq_mig      = float(tok["liq_migration"] or 0)
+        recovery     = bool(tok["recovery"])
+        time_to_bot  = float(tok["time_to_bottom"] or 0)
+
+        # Busca ticks ordenados por elapsed
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT elapsed_sec, mc, volume_1m, volume_5m, volume_15m,
+                       holders_count, liquidity
+                FROM token_ticks
+                WHERE mint = %(mint)s
+                ORDER BY elapsed_sec ASC
+            """, {"mint": mint})
+            ticks = [dict(r) for r in cur.fetchall()]
+
+        if len(ticks) < MIN_TICKS:
+            continue
+
+        # Calcula k (constante AMM) — aproximada via liq_migration e mc_migration
+        k_amm = (liq_mig * mc_mig) if liq_mig > 0 and mc_mig > 0 else None
+
+        first_signal_elapsed = None   # primeiro elapsed onde Score >= threshold
+        scores_at_bottom     = []     # scores nos ticks ao redor do fundo real
+        max_score_before_bot = 0.0
+
+        for i in range(WINDOW, len(ticks)):
+            window = ticks[i - WINDOW: i]
+            cur_tick = ticks[i]
+            mc_cur   = cur_tick.get("mc") or 0
+
+            if mc_cur <= 0 or mc_mig <= 0:
+                continue
+
+            # Só avalia após dump mínimo
+            if mc_cur > mc_mig * (1 - MIN_DUMP):
+                continue
+
+            mc_series   = [t.get("mc") or 0     for t in window]
+            vol_1m      = [t.get("volume_1m") or 0 for t in window]
+            vol_15m_raw = [t.get("volume_15m") or 0 for t in window]
+            holders     = [t.get("holders_count") or 0 for t in window]
+
+            # ── Componente 1: Price Acceleration (desaceleração do dump) ──
+            # Compara velocidade dos últimos 4 ticks vs 4 anteriores
+            pv_recent = (mc_series[-1] - mc_series[-4]) if len(mc_series) >= 4 else 0
+            pv_prior  = (mc_series[-5] - mc_series[-8]) if len(mc_series) >= 8 else 0
+            c1 = 1.0 if (pv_recent > pv_prior and pv_prior < 0) else 0.0
+
+            # ── Componente 2: Volume secando (vol_1m atual < 60% da média) ──
+            vol_avg = (sum(vol_1m[:-1]) / max(len(vol_1m) - 1, 1))
+            c2 = 1.0 if (vol_avg > 0 and vol_1m[-1] < vol_avg * 0.60) else 0.0
+
+            # ── Componente 3: Holders pararam de sair ──
+            hold_delta = holders[-1] - holders[-3] if len(holders) >= 3 else 0
+            c3 = 1.0 if hold_delta >= 0 else 0.0
+
+            # ── Componente 4: VWAP desvio (preço em extremo oversold) ──
+            # Aproximado: mc_cur está abaixo de qual percentil do mc histórico dos ticks
+            mc_hist = [t.get("mc") or 0 for t in ticks[:i] if (t.get("mc") or 0) > 0]
+            if len(mc_hist) >= 5:
+                mc_mean = sum(mc_hist) / len(mc_hist)
+                mc_std  = (sum((x - mc_mean)**2 for x in mc_hist) / len(mc_hist)) ** 0.5
+                desvio  = (mc_cur - mc_mean) / mc_std if mc_std > 0 else 0
+                c4 = 1.0 if desvio < -1.5 else 0.0
+            else:
+                c4 = 0.0
+
+            # ── Componente 5: Price Impact AMM (pool extremamente rasa) ──
+            liq_cur = cur_tick.get("liquidity") or liq_mig
+            if k_amm and liq_cur > 0 and mc_cur > 0:
+                try:
+                    sol_reserve   = math.sqrt(k_amm * mc_cur)
+                    new_sol       = sol_reserve + 100
+                    new_mc        = (new_sol ** 2) / k_amm
+                    price_impact  = (new_mc - mc_cur) / mc_cur
+                    c5 = 1.0 if price_impact > 0.05 else 0.0
+                except Exception:
+                    c5 = 0.0
+            else:
+                c5 = 0.0
+
+            score = 0.30*c1 + 0.25*c2 + 0.20*c3 + 0.15*c4 + 0.10*c5
+            elapsed_cur = cur_tick.get("elapsed_sec") or 0
+
+            # Registra primeiro sinal acima do threshold
+            if score >= THRESHOLD and first_signal_elapsed is None:
+                first_signal_elapsed = elapsed_cur
+
+            # Score ao redor do fundo real (±60s do time_to_bottom)
+            if abs(elapsed_cur / 60 - time_to_bot) <= 1.0:
+                scores_at_bottom.append(score)
+
+            if elapsed_cur / 60 <= time_to_bot:
+                max_score_before_bot = max(max_score_before_bot, score)
+
+        # Lead time: quanto antes do fundo o score dispara
+        lead_sec = None
+        if first_signal_elapsed is not None:
+            lead_sec = time_to_bot * 60 - first_signal_elapsed
+
+        results_by_token.append({
+            "mint":                   mint,
+            "symbol":                 tok["token_nome"],
+            "recovery":               recovery,
+            "mc_migration":           mc_mig,
+            "mc_bottom":              mc_bot,
+            "time_to_bottom_min":     time_to_bot,
+            "tick_count":             tok["tick_count"],
+            "first_signal_elapsed_s": first_signal_elapsed,
+            "lead_time_sec":          lead_sec,
+            "max_score_before_bot":   round(max_score_before_bot, 3),
+            "score_at_bottom":        round(sum(scores_at_bottom)/len(scores_at_bottom), 3) if scores_at_bottom else None,
+            "signal_fired":           first_signal_elapsed is not None,
+        })
+
+    if not results_by_token:
+        return {"erro": "Nenhum token com ticks suficientes para análise"}, 200
+
+    # ── Métricas de discriminação ──
+    rec_true  = [r for r in results_by_token if r["recovery"]]
+    rec_false = [r for r in results_by_token if not r["recovery"]]
+
+    def _rate(lst, key, val):
+        if not lst: return None
+        return sum(1 for r in lst if r[key] == val) / len(lst)
+
+    def _avg(lst, key):
+        vals = [r[key] for r in lst if r[key] is not None]
+        return round(sum(vals)/len(vals), 3) if vals else None
+
+    # Taxa de disparo por grupo
+    signal_rate_recovery = _rate(rec_true,  "signal_fired", True)
+    signal_rate_no_rec   = _rate(rec_false, "signal_fired", True)
+
+    # Score médio antes do fundo por grupo
+    avg_score_recovery = _avg(rec_true,  "max_score_before_bot")
+    avg_score_no_rec   = _avg(rec_false, "max_score_before_bot")
+
+    # Lead time médio (apenas quando sinal disparou antes do fundo)
+    lead_rec  = [r["lead_time_sec"] for r in rec_true  if (r["lead_time_sec"] or 0) > 0]
+    lead_norec= [r["lead_time_sec"] for r in rec_false if (r["lead_time_sec"] or 0) > 0]
+
+    # Sweep de thresholds
+    threshold_sweep = []
+    for thr in [0.30, 0.40, 0.50, 0.55, 0.60, 0.70, 0.80]:
+        tp = sum(1 for r in rec_true  if r["max_score_before_bot"] >= thr)
+        fp = sum(1 for r in rec_false if r["max_score_before_bot"] >= thr)
+        fn = len(rec_true)  - tp
+        tn = len(rec_false) - fp
+        precision = tp / (tp + fp) if (tp + fp) > 0 else None
+        recall    = tp / (tp + fn) if (tp + fn) > 0 else None
+        f1        = (2 * precision * recall / (precision + recall)
+                     if precision and recall and (precision + recall) > 0 else None)
+        threshold_sweep.append({
+            "threshold": thr,
+            "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+            "precision": round(precision, 3) if precision else None,
+            "recall":    round(recall,    3) if recall    else None,
+            "f1":        round(f1,        3) if f1        else None,
+        })
+
+    return {
+        "resumo": {
+            "tokens_analisados":        len(results_by_token),
+            "recovery_true":            len(rec_true),
+            "recovery_false":           len(rec_false),
+            "threshold_principal":      THRESHOLD,
+        },
+        "discriminacao": {
+            "signal_rate_recovery":     round(signal_rate_recovery, 3) if signal_rate_recovery else None,
+            "signal_rate_no_recovery":  round(signal_rate_no_rec,   3) if signal_rate_no_rec   else None,
+            "delta_pp":                 round((signal_rate_recovery or 0) - (signal_rate_no_rec or 0), 3),
+            "avg_max_score_recovery":   avg_score_recovery,
+            "avg_max_score_no_rec":     avg_score_no_rec,
+            "lead_time_recovery_p50_s": sorted(lead_rec)[len(lead_rec)//2]  if lead_rec  else None,
+            "lead_time_recovery_avg_s": round(sum(lead_rec)/len(lead_rec))   if lead_rec  else None,
+            "lead_time_norec_p50_s":    sorted(lead_norec)[len(lead_norec)//2] if lead_norec else None,
+        },
+        "threshold_sweep":   threshold_sweep,
+        "por_token":         results_by_token,
+    }, 200
 
 def _pct(n, total):
     return f"{n/total*100:.1f}%" if total else "—"
