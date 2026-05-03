@@ -146,6 +146,23 @@ def init_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_token_ticks_mint_ts ON token_ticks (mint, tick_ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_token_ticks_elapsed ON token_ticks (mint, elapsed_sec)")
 
+        # Sinais type 12 (SmartDegenBuy) — Fase 2
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS token_signals (
+                id               BIGSERIAL PRIMARY KEY,
+                mint             TEXT      NOT NULL,
+                trigger_at       BIGINT    NOT NULL,
+                trigger_mc       FLOAT,
+                first_trigger_mc FLOAT,
+                signal_times     INT,
+                wallets_json     TEXT,
+                ts_recorded      TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE (mint, trigger_at)
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_token_signals_mint ON token_signals (mint)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_token_signals_trigger ON token_signals (mint, trigger_at)")
+
     logger.info("DB inicializado")
 
 
@@ -475,6 +492,25 @@ def get_tokens_for_backfill() -> list:
             ORDER BY ts_migration ASC
         """)
         return [dict(row) for row in cur.fetchall()]
+
+
+def insert_signal_batch(signals: list):
+    """
+    Insere sinais type 12 (SmartDegenBuy) em batch. Ignora duplicatas (UNIQUE mint+trigger_at).
+    signals: lista de dicts com chaves mint, trigger_at, trigger_mc, first_trigger_mc,
+             signal_times, wallets_json.
+    """
+    if not signals:
+        return
+    with _cursor() as cur:
+        cur.executemany("""
+            INSERT INTO token_signals
+                (mint, trigger_at, trigger_mc, first_trigger_mc, signal_times, wallets_json)
+            VALUES
+                (%(mint)s, %(trigger_at)s, %(trigger_mc)s, %(first_trigger_mc)s,
+                 %(signal_times)s, %(wallets_json)s)
+            ON CONFLICT (mint, trigger_at) DO NOTHING
+        """, signals)
 
 
 def get_all_migrations(limit: int = 2000) -> list:

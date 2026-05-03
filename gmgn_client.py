@@ -142,6 +142,22 @@ class GmgnClient:
                 return None
         return None
 
+    def get_token_signal(self, chain: str = "sol") -> list:
+        """
+        POST /v1/market/token_signal — feed global de sinais type 12 (SmartDegenBuy).
+        Retorna todos os tokens com smart wallets comprando nas últimas ~8.3h.
+        Filtragem pelo caller (cross-reference com HotMonitor._tokens).
+        """
+        body = {"chain": chain, "groups": [{"signal_type": [12]}]}
+        try:
+            result = self._post("/v1/market/token_signal", body)
+            return result.get("data", []) or []
+        except RateLimitError:
+            raise
+        except Exception as e:
+            logger.warning("token_signal erro: %s", e)
+            return []
+
     def get_solana_price_usd(self, chain: str = "sol") -> Optional[float]:
         """Obtém preço spot de SOL em USD usando token info da própria GMGN."""
         sol_mint = "So11111111111111111111111111111111111111112"
