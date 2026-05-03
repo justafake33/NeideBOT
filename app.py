@@ -2146,11 +2146,18 @@ def analise_price_decel():
     if not mig_rows:
         return {"erro": "Nenhum dado"}, 200
 
-    mig_by_mint = {
-        r[0]: {"recovery": r[1], "bottom_elapsed": int(r[2]),
-               "mc_bottom": float(r[3]), "mc_migration": float(r[4])}
-        for r in mig_rows
-    }
+    mig_by_mint = {}
+    for r in mig_rows:
+        r = dict(r)
+        try:
+            mig_by_mint[r["mint"]] = {
+                "recovery":       r["recovery"],
+                "bottom_elapsed": int(r["bottom_elapsed"]),
+                "mc_bottom":      float(r["mc_bottom"]),
+                "mc_migration":   float(r["mc_migration"]),
+            }
+        except (TypeError, ValueError):
+            continue
     mints = list(mig_by_mint.keys())
 
     with db._cursor() as cur:
@@ -2170,8 +2177,14 @@ def analise_price_decel():
         tick_rows = cur.fetchall()
 
     ticks_by_mint = defaultdict(list)
-    for mint, elapsed, mc in tick_rows:
-        ticks_by_mint[mint].append((int(elapsed), float(mc)))
+    for row in tick_rows:
+        row = dict(row)
+        try:
+            ticks_by_mint[row["mint"]].append(
+                (int(row["elapsed_sec"]), float(row["mc_last"]))
+            )
+        except (TypeError, ValueError):
+            continue
 
     def slope_in_window(ticks, bottom_e, lo, hi):
         pts = sorted([(e, mc) for e, mc in ticks if lo <= (e - bottom_e) < hi])
