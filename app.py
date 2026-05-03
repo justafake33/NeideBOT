@@ -246,6 +246,8 @@ def health():
     return {"status": "ok"}, 200
 
 
+_signal_ban_until: float = 0.0  # timestamp UTC até quando a conta está banida
+
 @app.route("/debug/signal")
 def debug_signal():
     """
@@ -255,7 +257,22 @@ def debug_signal():
     import time as _time
     from uuid import uuid4 as _uuid4
 
-    # Apenas 1 token para minimizar chamadas
+    global _signal_ban_until
+
+    # Não chama a API enquanto o ban não expirou
+    now = _time.time()
+    if now < _signal_ban_until:
+        wait = int(_signal_ban_until - now)
+        return {
+            "error": "conta banida",
+            "reset_at": int(_signal_ban_until),
+            "aguarde_segundos": wait,
+            "mensagem": f"Aguarde {wait}s antes de chamar novamente",
+        }, 429
+
+    if not gmgn:
+        return {"error": "GmgnClient não inicializado"}, 503
+
     with db._cursor() as cur:
         cur.execute("""
             SELECT mint, token_nome, mc_migration, mc_bottom, mc_1h, recovery
@@ -265,12 +282,8 @@ def debug_signal():
         """)
         tok = dict(cur.fetchone())
 
-    if not gmgn:
-        return {"error": "GmgnClient não inicializado"}, 503
-
     mint = tok["mint"]
 
-    # Testa variações de body para descobrir o formato correto
     candidates = [
         {"chain": "sol", "token_address": mint, "signal_type": 12, "groups": ["smart_degen"]},
         {"chain": "sol", "address":       mint, "signal_type": 12, "groups": ["smart_degen"]},
@@ -281,8 +294,9 @@ def debug_signal():
     ]
 
     results = []
+    resp = None
     for body in candidates:
-        _time.sleep(2)  # respeita rate limit (peso 3)
+        _time.sleep(3)
         try:
             resp = gmgn.session.post(
                 f"{gmgn.host}/v1/market/token_signal",
@@ -293,9 +307,20 @@ def debug_signal():
             raw = resp.json()
         except Exception as e:
             raw = {"error": str(e)}
+            results.append({"body_enviado": body, "resposta": raw})
+            break
+
+        # Registra ban para evitar chamadas futuras que estendem o ban
+        if resp.status_code == 429:
+            try:
+                reset_at = float(raw.get("reset_at", _time.time() + 300))
+            except Exception:
+                reset_at = _time.time() + 300
+            _signal_ban_until = reset_at
+            results.append({"body_enviado": body, "resposta": raw})
+            break
 
         results.append({"body_enviado": body, "resposta": raw})
-        # Para na primeira resposta que não seja 400
         if resp.status_code != 400:
             break
 
