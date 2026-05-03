@@ -34,7 +34,7 @@ Swap/orders: adiciona header `X-Signature` (Ed25519 sobre subpath+params+body+ti
 | `/v1/token/security/{chain}/{mint}` | GET | Segurança: honeypot, rug_ratio, tax, holder concentration |
 | `/v1/market/rank` | GET | Trending tokens |
 | `/v1/market/token_kline` | GET | Candlestick OHLCV — **NÃO funciona historicamente para Meteora DAMM v2** |
-| `/v1/market/token_signal` | POST | Sinais em tempo real — type 12 = SmartDegenBuy (próximo passo: Fase 2) |
+| `/v1/market/token_signal` | POST | Sinais em tempo real — type 12 = SmartDegenBuy (**IMPLEMENTADO Fase 2**) |
 | `/v1/trade/swap` | POST | Execução de swap (Fase 6) |
 | `/v1/trade/strategy/create` | POST | TP/SL automático (Fase 6) |
 | `/v1/trade/query_order` | GET | Status de ordem (Fase 6) |
@@ -103,6 +103,9 @@ token["cto_flag"]                    # 1 = comunidade assumiu o projeto
 token["has_at_least_one_social"]     # tem pelo menos uma rede social
 token["x_user_follower"]             # seguidores no Twitter
 
+# ⚠️ volume_1m/5m/15m NÃO chegam via trenches completed — apenas em near_completion.
+# Fonte para token_ticks: kline 1m (campo "volume" por candle), back-fillado no hot-precise.
+
 # GET /v1/token/info/sol/{mint} → body["data"]
 # ⚠️ Retorna 404 para tokens Meteora DAMM v2 nas primeiras horas após migração
 raw = body["data"]
@@ -120,6 +123,7 @@ params = {
   "to": to_ts,       # unix timestamp
 }
 # Response: lista de candles com campos: time (ms), open, high, low, close, volume
+# volume = volume negociado naquele minuto → usado como volume_1m no token_ticks
 
 # POST /v1/market/token_signal — **IMPLEMENTADO** (Fase 2)
 # Feed GLOBAL — retorna todos os tokens com smart buys nas últimas ~8.3h (window: 30000s)
@@ -148,7 +152,7 @@ entry["window"]             # 30000 (segundos de lookback)
 
 ## 🎯 ESTRATÉGIA CENTRAL — Post-Migration Dip
 
-### O Padrão Real (validado com 828 tokens)
+### O Padrão Real (validado com 1015+ tokens)
 Quando um token completa a bonding curve no Pump.fun, ele migra para Raydium ou Meteora DAMM v2.
 Os early buyers realizam lucro → dump imediato.
 
@@ -156,8 +160,13 @@ Os early buyers realizam lucro → dump imediato.
 - Dump mediano: **72%** (muito mais severo que o roadmap original assumia)
 - **78% dos tokens não fazem bounce** — o pico vem antes do fundo
 - Fundo mediano: **13.6min** após migração
-- Os filtros atuais (smart count, rug, top10, wash) **não discriminam recovery**
-- O sinal que separa os 22% com bounce dos 78% sem bounce ainda não está capturado → é o foco da Fase 2 (Smart Flow Delta via signal type 12)
+- Snapshots estáticos (smart count, rug, top10, wash, holders) **não discriminam recovery**
+- **H10 CONFIRMADA**: tokens com fundo em < 25min têm 61% recovery vs 39% para > 25min (+22pp)
+- O sinal de compra ativa em tempo real (signal type 12) é a hipótese central ainda pendente (H9)
+
+### Regra de time-stop (H10 validada)
+> Se um token ainda estiver caindo após **30 minutos** da migração sem sinal de fundo → descartar.
+> Probabilidade de recovery cai para 37% após 30min. Dumps lentos = distribuição, não capitulação.
 
 ### Pipeline de execução
 ```
@@ -177,15 +186,15 @@ ESTÁGIO 2 — Migração detectada
 
 HotMonitor (janela 60min)
     ├─ push_mc (5s): rastreia mc_min, mc_max, mc_last
-    ├─ hot-precise (60s): kline low/high para precisão
+    ├─ hot-precise (60s): kline low/high + back-fill volume_1m nos ticks
     └─ _tick (30s): graduação após 60min → salva mc_bottom, mc_peak, mc_1h
 
 FASE 2 — coleta ativa (IMPLEMENTADO 2026-05-03)
-    ├─ _poll_signals() a cada 5s: GET /v1/market/token_signal type 12
+    ├─ _poll_signals() a cada 5s: POST /v1/market/token_signal type 12
     ├─ Feed global → filtra por mints ativos no HotMonitor
     ├─ Persiste em token_signals (mint, trigger_at UNIQUE, trigger_mc, wallets_json)
-    ├─ Objetivo: correlacionar trigger_mc < mc_migration com recovery=TRUE
-    └─ Próximo: analisar Smart Flow Delta → sinal de entrada → Fase 6 (swap)
+    ├─ Objetivo: H9 — correlacionar trigger_mc < mc_migration com recovery=TRUE
+    └─ Próximo: validar H9 com ≥100 tokens com sinais → Fase 6 (swap)
 ```
 
 ---
@@ -193,11 +202,12 @@ FASE 2 — coleta ativa (IMPLEMENTADO 2026-05-03)
 ## 🔍 ESTADO ATUAL — Coleta de Dados
 
 ### Situação (2026-05-03)
-- **1015+ tokens** coletados no banco
-- **~91%** com `mc_bottom`
+- **1015+ tokens** coletados no banco, **425** com `recovery` definido
+- **~91%** com `mc_bottom`, **~52%** com `recovery=TRUE` (baseline)
 - Campos Fase 1 coletados desde deploy anterior
 - `mc_4h` e `mc_24h` **descartados** — trade é de minutos, não horas
 - **Fase 2 ativa**: sinais type 12 coletados em `token_signals` a cada 5s durante janela quente
+- **Volume fix aplicado**: `volume_1m` back-fillado via kline no hot-precise (a partir deste deploy)
 
 ### Campos coletados por migração
 
@@ -213,9 +223,9 @@ FASE 2 — coleta ativa (IMPLEMENTADO 2026-05-03)
 | time_to_peak | HotMonitor | Minutos até o pico |
 | pct_gain | Calculado | (mc_peak - mc_migration) / mc_migration |
 | mc_bottom | HotMonitor | MC mínimo na janela quente |
-| time_to_bottom | HotMonitor | Minutos até o fundo |
+| time_to_bottom | HotMonitor | Minutos até o fundo ← **discrimina recovery (H10)** |
 | pct_drop | Calculado | (mc_migration - mc_bottom) / mc_migration |
-| mc_1h | Checkpoint | MC 1h após migração (proxy de saída para trade de minutos) |
+| mc_1h | Checkpoint | MC 1h após migração |
 | var_1h | Calculado | % vs mc_migration |
 | smart_wallets | trenches | smart_degen_count |
 | renowned_wallets | trenches | KOL wallets |
@@ -223,7 +233,7 @@ FASE 2 — coleta ativa (IMPLEMENTADO 2026-05-03)
 | rug_ratio | trenches | bundler_trader_amount_rate |
 | top10_holder_rate | trenches | Concentração top 10 holders |
 | holders_count | trenches | Total de holders |
-| volume_1m/5m/15m | trenches | Volume por janela |
+| volume_1m/5m/15m | trenches (near_completion) / kline (completed) | Volume por janela |
 | is_wash_trading | trenches | Campo nativo GMGN |
 | liq_migration | trenches | Liquidez no momento da migração |
 | is_honeypot | trenches | Flag de segurança |
@@ -236,10 +246,10 @@ FASE 2 — coleta ativa (IMPLEMENTADO 2026-05-03)
 | **dev_team_hold_rate** | trenches | % do time total |
 | **suspected_insider_rate** | trenches | % de insiders identificados |
 | **top70_sniper_hold_rate** | trenches | Snipers ainda dentro? |
-| **bluechip_owner_pct** | ~~trenches~~ N/A | ⚠️ Apenas em /v1/market/rank (trending). Não coletável por token. Coluna fica NULL. |
+| **bluechip_owner_pct** | ~~trenches~~ N/A | ⚠️ Apenas em /v1/market/rank. Coluna fica NULL. |
 | **bot_degen_rate** | trenches | Ratio de bots |
 | **entrapment_ratio** | trenches | Manipulação de preço |
-| **lock_percent** | token/info (graduação 1h) | locked_ratio do /v1/token/info — coletado na graduação após 60min |
+| **lock_percent** | token/info (graduação 1h) | locked_ratio do /v1/token/info |
 | **burn_status** | trenches | Status do burn |
 | **cto_flag** | trenches | Comunidade assumiu o projeto |
 | **has_social** | trenches | Tem rede social |
@@ -260,8 +270,22 @@ Registradas ANTES de ver os dados. Não alterar retroativamente.
 | H6 | Entradas entre -25% e -45% têm melhor R:R em var_4h/24h | ⚠️ descartado — 4h/24h fora do escopo |
 | H7 | liq_migration <$5k gera slippage inaceitável para >$50 | ⏳ pendente validação em execução |
 | H8 | is_wash_trading=TRUE tem recovery rate ≥20pp menor | ❌ **-0.1pp** — sem discriminação |
+| H9 | Tokens com ≥1 signal type 12 com trigger_mc < mc_migration têm recovery rate ≥20pp maior | ⏳ **pendente** — aguardando acumulação de token_signals (~100 tokens) |
+| H10 | time_to_bottom < 25min → recovery rate ≥20pp maior que time_to_bottom ≥ 25min | ✅ **+21.8pp** confirmado (61.2% vs 39.3%, n=425) |
 
-**Conclusão dos dados:** os filtros atuais do trenches (contagens brutas, snapshots estáticos) não discriminam recovery. O sinal que importa é o **comportamento durante o dump** — smart money comprando em tempo real (Fase 2, signal type 12).
+### Análises de tick-features (2026-05-03) — resultados negativos documentados
+
+| Feature | avg recovery | avg no_rec | Conclusão |
+|---------|-------------|-----------|-----------|
+| delta_smart (smart_count início→fundo) | 1.07 | 2.27 | ❌ invertido — não discrimina |
+| delta_renowned (KOLs início→fundo) | 0.44 | 0.65 | ❌ invertido — não discrimina |
+| delta_combined (smart+KOL) | 1.51 | 2.92 | ❌ invertido — não discrimina |
+| delta_holders | 15.46 | 15.31 | ❌ flat — não discrimina |
+| vol_spike (volume no fundo) | null | null | ⏳ dados indisponíveis — fix aplicado |
+| vol5m_slope | null | null | ⏳ dados indisponíveis — fix aplicado |
+| time_to_bottom | 19.5 min | 40.2 min | ✅ **maior discriminador encontrado** |
+
+> **Por que delta_smart é invertido:** `smart_count` do trenches/ticks = snapshot de posições acumuladas (inclui quem comprou há dias e segura). NÃO é compra ativa. Tokens com dump longo (que não bounceam) acumulam mais smart wallets simplesmente porque o dump dura mais. O sinal correto de compra ativa é o signal type 12.
 
 ---
 
@@ -288,7 +312,7 @@ Scanner (poll 5s)
     │
     └─ HotMonitor (janela 60min)
             ├─ push_mc (5s): rastreia mc_min, mc_max, mc_last, _mc_live
-            ├─ hot-precise (60s): kline low/high para precisão
+            ├─ hot-precise (60s): kline low/high + backfill_tick_volumes()
             └─ _tick (30s): graduação após 60min
                     └─ kline scan 1h completo → mc_bottom, mc_peak, mc_1h
                     └─ token/info sempre chamado: fallback mc_1h + lock_percent (locked_ratio)
@@ -299,7 +323,7 @@ Scanner (poll 5s)
 | Tabela | Conteúdo |
 |--------|----------|
 | `migrations` | Uma linha por token migrado — todos os campos de qualidade + checkpoints |
-| `token_ticks` | Série temporal 5s por token durante janela quente (60min) |
+| `token_ticks` | Série temporal 5s por token durante janela quente (60min). volume_1m back-fillado via kline. |
 | `token_signals` | **Fase 2** — sinais type 12 por token durante janela quente |
 
 ### HeapScheduler
@@ -313,6 +337,7 @@ Scanner (poll 5s)
 | mc_migration | kline (open no complete_ts) | trenches usd_market_cap | — |
 | mc_bottom / mc_peak | kline 1m (hot-precise) | push_mc (trenches 5s) | — |
 | mc_1h | kline (ts_mig a ts_mig+3660) | token/info | push_mc (mc_last) |
+| volume_1m (token_ticks) | kline candle volume (hot-precise back-fill) | — | — |
 | lock_percent | token/info locked_ratio (graduação 1h) | — | — |
 | bluechip_owner_pct | ⚠️ N/A — apenas em /v1/market/rank | — | — |
 
@@ -353,6 +378,10 @@ HOT_PRECISE_SEC=60           # intervalo kline hot-precise
 |-----|-----------|
 | `/scanner` | Tabela de migrações em tempo real (auto-refresh 15s) |
 | `/analise` | Backtest exploratório — timing, dump depth, filtros, R:R, cobertura Fase 1 |
+| `/analise/h10` | **Teste formal H10** — time_to_bottom vs recovery rate (n=425) |
+| `/analise/bottom-score` | Backtest retroativo Bottom Score (5 métricas preço/volume) — resultado negativo |
+| `/analise/smart-flow` | delta_smart / delta_renowned vs recovery — resultado negativo |
+| `/analise/tick-features` | Análise completa de todas as colunas token_ticks vs recovery |
 | `/export/csv` | Export completo do banco |
 | `/health` | Health check |
 | `/debug/signal` | Diagnóstico histórico — testa formatos do token_signal (legacy) |
@@ -386,21 +415,26 @@ HOT_PRECISE_SEC=60           # intervalo kline hot-precise
 22. **_poll_signals skip se vazio**: não chama API se `HotMonitor._tokens` estiver vazio — economiza rate limit.
 23. **token_signals tabela**: `UNIQUE (mint, trigger_at)` — `ON CONFLICT DO NOTHING` evita duplicatas no poll a cada 5s.
 24. **scanner global em app.py**: `scanner` e `gmgn` são globals em app.py para acesso nas rotas de debug.
+25. **volume_1m NÃO vem do trenches completed**: trenches retorna volume apenas para near_completion (bonding curve ativa). Para tokens migrados, `volume_1m` em token_ticks é back-fillado via kline 1m no `_precise_bottom_tick()` (a cada 60s). Dados históricos anteriores ao fix ficam NULL.
+26. **delta_smart é snapshot, não compra ativa**: smart_count no trenches/ticks acumula wallets com qualquer posição. NÃO detecta compras novas. Sinal de compra ativa = signal type 12 (token_signals).
+27. **time_to_bottom é o único preditor validado até agora**: tokens com fundo < 25-30min têm 61% recovery rate vs 39% para fundo > 25-30min (H10 confirmada, n=425, +22pp).
 
 ---
 
 ## 🎯 KPIs de Sucesso
 
-| Fase | Métrica | Meta |
-|------|---------|------|
-| Coleta | Migrações com bottom + mc_1h | ≥200 |
-| Coleta | Cobertura campos Fase 1 | ≥80% dos tokens novos |
-| Fase 2 | Identificar sinal dos 22% com bounce | signal type 12 correlacionado |
-| Execução | Win rate out-of-sample | ≥50% |
-| Execução | Payoff ratio | ≥2× |
-| Execução | Max drawdown simulado | ≤40% |
-| Live | Latência detecção → ordem | <15s |
-| Live | Divergência real vs backtest | <30% após 50 trades |
+| Fase | Métrica | Meta | Status |
+|------|---------|------|--------|
+| Coleta | Migrações com bottom + mc_1h | ≥200 | ✅ 425 |
+| Coleta | Cobertura campos Fase 1 | ≥80% dos tokens novos | ✅ |
+| Fase 2 | token_signals acumulados para testar H9 | ≥100 tokens com sinais | ⏳ em coleta |
+| Análise | H10 validada | delta_pp ≥ 20pp | ✅ +21.8pp |
+| Análise | H9 validada | delta_pp ≥ 20pp | ⏳ aguardando dados |
+| Execução | Win rate out-of-sample | ≥50% | ⏳ Fase 6 |
+| Execução | Payoff ratio | ≥2× | ⏳ Fase 6 |
+| Execução | Max drawdown simulado | ≤40% | ⏳ Fase 6 |
+| Live | Latência detecção → ordem | <15s | ⏳ Fase 6 |
+| Live | Divergência real vs backtest | <30% após 50 trades | ⏳ Fase 6 |
 
 ---
 
@@ -417,3 +451,4 @@ HOT_PRECISE_SEC=60           # intervalo kline hot-precise
 > Sardinhas olham volume. Big players olham `creator_token_status`.
 > Sardinhas seguem intuição. Big players seguem dados out-of-sample.
 > Sardinhas constroem features. Big players constroem datasets.
+> Sardinhas medem delta_smart. Big players esperam H9 com dados reais de compra ativa.
