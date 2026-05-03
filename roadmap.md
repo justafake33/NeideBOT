@@ -1,6 +1,6 @@
 # NeideBOT — Roadmap
 
-> Última atualização: 2026-05-03
+> Última atualização: 2026-05-03 (sessão 2)
 
 ---
 
@@ -27,8 +27,10 @@
 | H8 | is_wash_trading=TRUE → recovery ≥20pp menor | ❌ REFUTADA | -0.1pp |
 | H9 | ≥1 signal type 12 com trigger_mc < mc_migration → recovery ≥20pp maior | ⏳ PENDENTE | aguardando ~100 tokens |
 | H10 | time_to_bottom < 25min → recovery ≥20pp maior | ✅ CONFIRMADA | **+21.8pp** (61.2% vs 39.3%, n=425) |
+| H11 | Deceleração de preço antes do fundo discrimina recovery | ❌ REFUTADA | direção invertida — recovery tokens ACELERAM |
+| H12 | dump_depth + time_elapsed → P(recovery) > 50% (zona de entrada probabilística) | ⏳ PENDENTE | próxima análise |
 
-### Análises de tick-features — resultados negativos (2026-05-03)
+### Análises de features — resultados documentados
 
 | Feature | avg recovery | avg no_rec | Conclusão |
 |---------|-------------|-----------|-----------|
@@ -36,11 +38,11 @@
 | delta_renowned (KOLs) | 0.44 | 0.65 | ❌ invertido |
 | delta_combined (smart+KOL) | 1.51 | 2.92 | ❌ invertido |
 | delta_holders | 15.46 | 15.31 | ❌ flat |
-| vol_spike (volume no fundo) | null | null | ⏳ fix aplicado, dados futuros |
-| vol5m_slope | null | null | ⏳ fix aplicado, dados futuros |
+| vol_spike / vol5m_slope | null | null | ⏳ fix aplicado, dados futuros |
 | **time_to_bottom** | **19.5 min** | **40.2 min** | ✅ **maior discriminador** |
+| **slope_c** (2min antes fundo) | **-0.171** %MC/s | -0.107 %MC/s | ⚡ invertido útil — capitulação brusca |
 
-> **Por que delta_smart é invertido:** `smart_count` é snapshot cumulativo de posições — não detecta compras ativas. Tokens com dump longo acumulam mais smart wallets simplesmente porque o dump dura mais. Sinal de compra ativa = signal type 12 (token_signals).
+> **Capitulação brusca ≠ deceleração:** recovery tokens têm spike de queda 60% mais intenso nos 2 min antes do fundo. Não é sinal de compra — é confirmação de capitulação. Observável em tempo real via push_mc. Bias: análise apenas sobre tokens com fundo ≥10min (n=49); tokens de fundo rápido (maior recovery, H10) excluídos por densidade de ticks.
 
 ---
 
@@ -77,24 +79,44 @@
 - H10 validada formalmente: time_to_bottom < 25min = único preditor confirmado
 - Dashboards: `/analise/bottom-score`, `/analise/smart-flow`, `/analise/tick-features`, `/analise/h10`
 
+### Fase 2.6 — Price Deceleration Analysis (2026-05-03)
+- H11 (deceleração) testada com 49 tokens (fundo ≥10min) — **REFUTADA**
+- Padrão real: recovery tokens têm **capitulação brusca** no fundo (slope_c −0.171 vs −0.107)
+- Novo sinal candidato: magnitude do spike de queda nos 2min antes do fundo
+- Dashboard: `/analise/price-decel`
+- **Próximo:** H12 — modelo probabilístico por dump_depth + time_elapsed
+
 ---
 
 ## Próximas Fases
 
-### Fase 3 — Validação H9 ⏳ (próxima)
+### Fase 3 — Modelo Probabilístico de Entrada ⏳ (AGORA — H12)
+
+**Big player move:** não esperar H9 passivamente. Extrair o máximo do dataset existente (445 tokens) construindo um modelo de entrada baseado no que já está confirmado.
+
+**H12 — Análise de Dump Depth + Time Elapsed:**
+- Grid 2D: `pct_drop` (bins de 10%) × `time_elapsed` (bins de 5min)
+- Para cada célula: `P(recovery | drop_depth, time_elapsed)`
+- Zona de entrada ótima: célula com P(recovery) máximo E N suficiente
+- Combina naturalmente com H10 (time-stop 30min = descartar coluna >30min)
+- Dashboard: `/analise/dump-depth`
+
+**Por que fazer isso AGORA:**
+- Dados já existem (445 tokens com recovery, pct_drop, time_to_bottom)
+- Não depende de acumulação adicional (diferente de H9)
+- Resultado define a zona de entrada do sistema de execução
+- Se P(recovery | drop=60-70%, time=10-20min) > 65% → temos um edge acionável
+
+### Fase 3b — Validação H9 ⏳ (paralelo, passivo)
 **Gate:** acumular ~100 tokens com pelo menos 1 sinal em `token_signals`
 
 **O que validar:**
 - Correlação: `trigger_mc < mc_migration` → `recovery = TRUE`
 - Delta esperado: ≥20pp (H9)
-- Análise: timing do sinal vs time_to_bottom
 
 **Decisão após H9:**
-- H9 CONFIRMADA → avançar para Fase 6 (execução)
-- H9 REFUTADA → revisar estratégia de entrada; candidatos alternativos:
-  - Volume spike pós-fundo (dados disponíveis após volume fix)
-  - AMM price impact como proxy de liquidez absortiva
-  - Combinação time_to_bottom < 30min como time-stop suficiente
+- H9 CONFIRMADA → usar como confirmador de entrada sobre o modelo H12
+- H9 REFUTADA → modelo H12 sozinho como sistema de entrada
 
 ### Fase 4 — Regras de Entrada ⏳ (após H9)
 **Condições candidatas (a validar):**
@@ -133,22 +155,28 @@
 ## Decision Gates
 
 ```
-[AGORA]  Acumulação de token_signals
-    │    Meta: ~100 tokens com sinais
+[AGORA]  H12 — Modelo probabilístico dump_depth × time_elapsed
+    │    Dados: 445 tokens já no banco, zero espera
+    │    /analise/dump-depth
     │
     ▼
-[H9]     Validar: trigger_mc < mc_migration → recovery ≥20pp?
+[H12]    P(recovery | drop%, time) > 65% em alguma zona?
     │
-    ├── SIM (+20pp) ──→ [Fase 4] Regras de entrada + sizing
-    │                        │
-    │                        ▼
-    │                   [Fase 5] Backtest walk-forward
-    │                        │
-    │                        ▼
-    │                   [Fase 6] Execução com capital mínimo
+    ├── SIM ──→ [Fase 4] Zona de entrada definida
+    │               │
+    │               │    (paralelo) H9 acumulando token_signals
+    │               ▼
+    │           H9 CONFIRMADA → signal type 12 como confirmador
+    │           H9 REFUTADA   → H12 sozinho como entrada
+    │               │
+    │               ▼
+    │           [Fase 5] Backtest walk-forward (in/out-of-sample)
+    │               │
+    │               ▼
+    │           [Fase 6] Execução live com capital mínimo
     │
-    └── NÃO ──────→ [Análise] Volume spike pós-fundo (dados disponíveis pós volume-fix)
-                         └──→ [Revisão] time_to_bottom sozinho como gate suficiente?
+    └── NÃO ──→ [Análise] Volume spike (dados acumulando com fix)
+                    └──→ time_to_bottom < 30min como gate único?
 ```
 
 ---
@@ -182,3 +210,7 @@
 4. **Compra ativa ≠ posição acumulada**: delta_smart é invertido porque smart_count conta posições antigas. A hipótese central (H9) usa signal type 12 que detecta COMPRAS novas em tempo real.
 
 5. **Metodologia > Features**: construir dataset limpo e validar hipóteses formalmente antes de implementar qualquer lógica de execução. Nenhum trade foi feito com capital antes da validação.
+
+6. **Invertido ≠ inútil**: H11 refutou deceleração, mas revelou que recovery tokens têm capitulação mais brusca. Resultados negativos sempre ensinam algo — documentar o padrão real, não só o resultado.
+
+7. **Não esperar passivamente**: com H10 confirmada e 445 tokens no banco, o próximo passo não é esperar H9 (semanas). É extrair máximo valor dos dados existentes agora — modelo probabilístico H12.

@@ -2113,6 +2113,140 @@ tr:hover td { background: #161b22; }
 """
 
 
+@app.route("/analise/dump-depth")
+def analise_dump_depth():
+    """
+    H12: dump_depth × time_elapsed → P(recovery)
+
+    Grid 2D: pct_drop (profundidade do dump) × time_to_bottom (minutos).
+    Para cada célula: recovery rate, N e flag de zona acionável (N≥15, rate≥60%).
+
+    Também calcula distribuições marginais e a zona ótima de entrada.
+    Em tempo real: entrar quando (current_drop%, time_elapsed) cair numa zona ≥60%.
+    """
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT pct_drop, time_to_bottom, recovery
+            FROM migrations
+            WHERE recovery     IS NOT NULL
+              AND pct_drop     IS NOT NULL
+              AND time_to_bottom IS NOT NULL
+              AND mc_migration > 0
+              AND pct_drop BETWEEN 0 AND 1
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
+
+    if not rows:
+        return {"erro": "Nenhum dado"}, 200
+
+    total      = len(rows)
+    total_rec  = sum(1 for r in rows if r["recovery"])
+    baseline   = round(total_rec / total, 3)
+
+    # Bins de dump depth (pct_drop é 0-1 no banco → multiplicar por 100)
+    drop_bins = [
+        (0,  30,  "0-30%"),
+        (30, 50,  "30-50%"),
+        (50, 65,  "50-65%"),
+        (65, 80,  "65-80%"),
+        (80, 101, "80%+"),
+    ]
+    # Bins de tempo até o fundo (minutos)
+    time_bins = [
+        (0,  5,  "0-5min"),
+        (5,  10, "5-10min"),
+        (10, 20, "10-20min"),
+        (20, 30, "20-30min"),
+        (30, 999,"30min+"),
+    ]
+
+    def cell(subset):
+        n   = len(subset)
+        rec = sum(1 for r in subset if r["recovery"])
+        rate = round(rec / n, 3) if n else None
+        return {
+            "n":             n,
+            "recovery":      rec,
+            "recovery_rate": rate,
+            "actionable":    n >= 15 and rate is not None and rate >= 0.60,
+            "vs_baseline":   round(rate - baseline, 3) if rate is not None else None,
+        }
+
+    # Grid 2D
+    grid = []
+    for dlo, dhi, dlabel in drop_bins:
+        row_data = {"drop_range": dlabel, "cells": []}
+        for tlo, thi, tlabel in time_bins:
+            subset = [
+                r for r in rows
+                if dlo <= float(r["pct_drop"]) * 100 < dhi
+                and tlo <= float(r["time_to_bottom"]) < thi
+            ]
+            c = cell(subset)
+            c["time_range"] = tlabel
+            row_data["cells"].append(c)
+        grid.append(row_data)
+
+    # Marginais 1D
+    drop_marginal = []
+    for dlo, dhi, dlabel in drop_bins:
+        subset = [r for r in rows if dlo <= float(r["pct_drop"]) * 100 < dhi]
+        c = cell(subset)
+        c["drop_range"] = dlabel
+        drop_marginal.append(c)
+
+    time_marginal = []
+    for tlo, thi, tlabel in time_bins:
+        subset = [r for r in rows if tlo <= float(r["time_to_bottom"]) < thi]
+        c = cell(subset)
+        c["time_range"] = tlabel
+        time_marginal.append(c)
+
+    # Zonas acionáveis (N≥15, rate≥60%) ordenadas por recovery_rate
+    actionable = sorted(
+        [
+            {
+                "drop_range":    dlabel,
+                "time_range":    tlabel,
+                "n":             c["n"],
+                "recovery_rate": c["recovery_rate"],
+                "vs_baseline_pp": round((c["recovery_rate"] - baseline) * 100, 1)
+                                  if c["recovery_rate"] else None,
+            }
+            for (dlo, dhi, dlabel), (tlo, thi, tlabel), c in [
+                (db_, tb_, cell([
+                    r for r in rows
+                    if db_[0] <= float(r["pct_drop"]) * 100 < db_[1]
+                    and tb_[0] <= float(r["time_to_bottom"]) < tb_[1]
+                ]))
+                for db_ in drop_bins for tb_ in time_bins
+            ]
+            if c["actionable"]
+        ],
+        key=lambda x: x["recovery_rate"] or 0,
+        reverse=True,
+    )
+
+    return {
+        "hipotese":      "H12: dump_depth + time_elapsed → zona probabilística de entrada",
+        "dataset":       {"total": total, "recovery": total_rec,
+                          "baseline_rate": baseline},
+        "grid_2d":       grid,
+        "drop_marginal": drop_marginal,
+        "time_marginal": time_marginal,
+        "zonas_acionaveis": actionable,
+        "veredicto": {
+            "zonas_encontradas": len(actionable),
+            "melhor_zona": actionable[0] if actionable else None,
+            "interpretacao": (
+                f"{len(actionable)} zona(s) com N≥15 e recovery≥60% — edge identificado"
+                if actionable else
+                "nenhuma zona acionável com N≥15 e rate≥60% — aumentar dataset"
+            ),
+        },
+    }, 200
+
+
 @app.route("/analise/price-decel")
 def analise_price_decel():
     """

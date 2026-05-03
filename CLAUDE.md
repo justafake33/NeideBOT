@@ -272,8 +272,10 @@ Registradas ANTES de ver os dados. Não alterar retroativamente.
 | H8 | is_wash_trading=TRUE tem recovery rate ≥20pp menor | ❌ **-0.1pp** — sem discriminação |
 | H9 | Tokens com ≥1 signal type 12 com trigger_mc < mc_migration têm recovery rate ≥20pp maior | ⏳ **pendente** — aguardando acumulação de token_signals (~100 tokens) |
 | H10 | time_to_bottom < 25min → recovery rate ≥20pp maior que time_to_bottom ≥ 25min | ✅ **+21.8pp** confirmado (61.2% vs 39.3%, n=425) |
+| H11 | Deceleração de preço (d²p/dt²→0) precede o fundo em recovery tokens | ❌ **REFUTADA** — direção invertida. Recovery tokens ACELERAM no fundo (capitulação brusca), não desaceleram |
+| H12 | dump_depth + time_elapsed definem zona probabilística de entrada (P(recovery) > 50%) | ⏳ **pendente** — Option 2, próxima análise |
 
-### Análises de tick-features (2026-05-03) — resultados negativos documentados
+### Análises de tick-features — resultados documentados
 
 | Feature | avg recovery | avg no_rec | Conclusão |
 |---------|-------------|-----------|-----------|
@@ -284,8 +286,11 @@ Registradas ANTES de ver os dados. Não alterar retroativamente.
 | vol_spike (volume no fundo) | null | null | ⏳ dados indisponíveis — fix aplicado |
 | vol5m_slope | null | null | ⏳ dados indisponíveis — fix aplicado |
 | time_to_bottom | 19.5 min | 40.2 min | ✅ **maior discriminador encontrado** |
+| slope_c (2min antes do fundo) | **-0.171** %MC/s | -0.107 %MC/s | ⚡ **invertido útil** — recovery = capitulação mais brusca |
 
 > **Por que delta_smart é invertido:** `smart_count` do trenches/ticks = snapshot de posições acumuladas (inclui quem comprou há dias e segura). NÃO é compra ativa. Tokens com dump longo (que não bounceam) acumulam mais smart wallets simplesmente porque o dump dura mais. O sinal correto de compra ativa é o signal type 12.
+
+> **slope_c invertido mas útil:** recovery tokens têm dump 60% mais rápido nos 2 minutos antes do fundo (−0.171 vs −0.107). Não é deceleração — é capitulação brusca. Padrão: queda moderada → leve pausa → spike de capitulação → fundo. No-recovery: queda lenta e gradual sem spike. Caveat: análise sobre tokens com fundo ≥10min (n=49) — os de fundo rápido (H10, maior recovery) foram excluídos por densidade de ticks insuficiente.
 
 ---
 
@@ -382,6 +387,7 @@ HOT_PRECISE_SEC=60           # intervalo kline hot-precise
 | `/analise/bottom-score` | Backtest retroativo Bottom Score (5 métricas preço/volume) — resultado negativo |
 | `/analise/smart-flow` | delta_smart / delta_renowned vs recovery — resultado negativo |
 | `/analise/tick-features` | Análise completa de todas as colunas token_ticks vs recovery |
+| `/analise/price-decel` | Slope de preço em 3 janelas antes do fundo — H11 REFUTADA, capitulação brusca emerge |
 | `/export/csv` | Export completo do banco |
 | `/health` | Health check |
 | `/debug/signal` | Diagnóstico histórico — testa formatos do token_signal (legacy) |
@@ -418,6 +424,8 @@ HOT_PRECISE_SEC=60           # intervalo kline hot-precise
 25. **volume_1m NÃO vem do trenches completed**: trenches retorna volume apenas para near_completion (bonding curve ativa). Para tokens migrados, `volume_1m` em token_ticks é back-fillado via kline 1m no `_precise_bottom_tick()` (a cada 60s). Dados históricos anteriores ao fix ficam NULL.
 26. **delta_smart é snapshot, não compra ativa**: smart_count no trenches/ticks acumula wallets com qualquer posição. NÃO detecta compras novas. Sinal de compra ativa = signal type 12 (token_signals).
 27. **time_to_bottom é o único preditor validado até agora**: tokens com fundo < 25-30min têm 61% recovery rate vs 39% para fundo > 25-30min (H10 confirmada, n=425, +22pp).
+28. **token_ticks têm intervalo médio ~30s, não 5s**: ticks só são inseridos quando o token aparece no trenches poll com token_data. Se o token sair do feed antes do poll, o tick não é criado. Janelas de análise devem ter ≥150s de largura para capturar ≥5 pontos.
+29. **Capitulação brusca ≠ deceleração**: recovery tokens têm slope_c = −0.171 %MC/s vs −0.107 em no-recovery. O padrão é queda moderada → leve pausa → spike de capitulação → fundo. Análise sobre subconjunto com fundo ≥10min (n=49) — bias de seleção contra os tokens de fundo rápido (maior recovery).
 
 ---
 
