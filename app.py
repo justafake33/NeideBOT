@@ -2162,14 +2162,14 @@ def analise_price_decel():
 
     with db._cursor() as cur:
         cur.execute("""
-            SELECT t.mint, t.elapsed_sec, t.mc_last
+            SELECT t.mint, t.elapsed_sec, t.mc
             FROM token_ticks t
             JOIN (
                 SELECT mint, ROUND(time_to_bottom * 60)::int AS bottom_elapsed
                 FROM migrations
                 WHERE mint = ANY(%s) AND time_to_bottom IS NOT NULL
             ) m ON t.mint = m.mint
-            WHERE t.mc_last IS NOT NULL
+            WHERE t.mc IS NOT NULL
               AND t.elapsed_sec >= m.bottom_elapsed - 180
               AND t.elapsed_sec <= m.bottom_elapsed + 60
             ORDER BY t.mint, t.elapsed_sec
@@ -2181,7 +2181,7 @@ def analise_price_decel():
         row = dict(row)
         try:
             ticks_by_mint[row["mint"]].append(
-                (int(row["elapsed_sec"]), float(row["mc_last"]))
+                (int(row["elapsed_sec"]), float(row["mc"]))
             )
         except (TypeError, ValueError):
             continue
