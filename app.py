@@ -2187,14 +2187,23 @@ def analise_price_decel():
 
     # debug temporário — remover após confirmar dados
     _sample_mint = next(iter(ticks_by_mint), None)
+    # Quantos mints têm pelo menos 1 tick dentro de 60s do bottom
+    _covering = sum(
+        1 for mint, meta in mig_by_mint.items()
+        if any(abs(e - meta["bottom_elapsed"]) <= 60
+               for e, _ in ticks_by_mint.get(mint, []))
+    )
+    _sample_ticks = ticks_by_mint.get(_sample_mint, [])
     _debug = {
-        "mints_em_mig_by_mint":    len(mints),
-        "tick_rows_retornados":    len(tick_rows),
-        "mints_em_ticks_by_mint":    len(ticks_by_mint),
-        "skipped_early_bottom_lt3m": skipped_early_bottom,
-        "sample_mint":               _sample_mint,
-        "sample_ticks_count":        len(ticks_by_mint[_sample_mint]) if _sample_mint else 0,
-        "sample_mig_bottom_elapsed": mig_by_mint.get(_sample_mint, {}).get("bottom_elapsed"),
+        "mints_em_mig_by_mint":        len(mints),
+        "tick_rows_retornados":         len(tick_rows),
+        "mints_em_ticks_by_mint":       len(ticks_by_mint),
+        "mints_ticks_cobrem_fundo":     _covering,
+        "skipped_early_bottom_lt3m":    skipped_early_bottom,
+        "sample_mint":                  _sample_mint,
+        "sample_ticks_count":           len(_sample_ticks),
+        "sample_ticks_max_elapsed":     max((e for e, _ in _sample_ticks), default=None),
+        "sample_mig_bottom_elapsed":    mig_by_mint.get(_sample_mint, {}).get("bottom_elapsed"),
     }
 
     def slope_in_window(ticks, bottom_e, lo, hi):
