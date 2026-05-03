@@ -163,6 +163,24 @@ def init_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_token_signals_mint ON token_signals (mint)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_token_signals_trigger ON token_signals (mint, trigger_at)")
 
+        # Bounce signals — detector de bounce em tempo real
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bounce_signals (
+                id              BIGSERIAL PRIMARY KEY,
+                mint            TEXT      NOT NULL,
+                symbol          TEXT,
+                ts_signal       TIMESTAMPTZ DEFAULT NOW(),
+                elapsed_sec     INT,
+                mc_migration    FLOAT,
+                mc_min          FLOAT,
+                mc_at_signal    FLOAT,
+                drop_from_mig   FLOAT,
+                bounce_pct      FLOAT,
+                UNIQUE (mint)
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_bounce_signals_ts ON bounce_signals (ts_signal)")
+
     logger.info("DB inicializado")
 
 
@@ -417,6 +435,20 @@ def update_checkpoint(mint: str, label: str, mc: float, var: Optional[float]):
                 )
                 WHERE mint = %(mint)s
             """, {"mint": mint})
+
+
+def insert_bounce_signal(data: dict):
+    """Registra um sinal de bounce. UNIQUE(mint) — um sinal por token."""
+    with _cursor() as cur:
+        cur.execute("""
+            INSERT INTO bounce_signals
+                (mint, symbol, elapsed_sec, mc_migration, mc_min,
+                 mc_at_signal, drop_from_mig, bounce_pct)
+            VALUES
+                (%(mint)s, %(symbol)s, %(elapsed_sec)s, %(mc_migration)s, %(mc_min)s,
+                 %(mc_at_signal)s, %(drop_from_mig)s, %(bounce_pct)s)
+            ON CONFLICT (mint) DO NOTHING
+        """, data)
 
 
 def insert_ticks_batch(ticks: list):

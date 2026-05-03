@@ -146,6 +146,71 @@ class HotMonitor:
                         state["symbol"], mc, elapsed_min,
                         (mc / state["mc_migration"] - 1) * 100)
 
+        self._check_bounce(mint, state, mc, elapsed_sec)
+
+    # ------------------------------------------------------------------
+    # Bounce detector
+    # ------------------------------------------------------------------
+
+    BOUNCE_MIN_PCT   = float(os.getenv("BOUNCE_MIN_PCT",   "0.15"))  # bounce mínimo do mc_min
+    BOUNCE_DROP_MIN  = float(os.getenv("BOUNCE_DROP_MIN",  "0.30"))  # queda mínima da migração
+    BOUNCE_TIME_MAX  = float(os.getenv("BOUNCE_TIME_MAX",  "30.0"))  # janela máxima em minutos
+
+    def _check_bounce(self, mint: str, state: dict, mc: float, elapsed_sec: int):
+        """Detecta bounce em tempo real e dispara alerta no Telegram."""
+        if state.get("bounce_fired"):
+            return
+
+        elapsed_min  = elapsed_sec / 60
+        mc_min       = state["mc_min"]
+        mc_migration = state["mc_migration"]
+
+        if elapsed_min > self.BOUNCE_TIME_MAX:
+            return
+        if mc_min <= 0 or mc_migration <= 0:
+            return
+
+        drop_from_mig = (mc_migration - mc_min) / mc_migration
+        if drop_from_mig < self.BOUNCE_DROP_MIN:
+            return
+
+        bounce_pct = (mc - mc_min) / mc_min
+        if bounce_pct < self.BOUNCE_MIN_PCT:
+            return
+
+        state["bounce_fired"] = True
+        symbol = state.get("symbol", mint[:8])
+
+        try:
+            db.insert_bounce_signal({
+                "mint":         mint,
+                "symbol":       symbol,
+                "elapsed_sec":  elapsed_sec,
+                "mc_migration": mc_migration,
+                "mc_min":       mc_min,
+                "mc_at_signal": mc,
+                "drop_from_mig": round(drop_from_mig, 4),
+                "bounce_pct":   round(bounce_pct, 4),
+            })
+        except Exception as e:
+            logger.warning("insert_bounce_signal %s: %s", mint[:8], e)
+
+        msg = (
+            f"🔔 BOUNCE {symbol}\n"
+            f"  Migração: ${mc_migration:,.0f}\n"
+            f"  Fundo:    ${mc_min:,.0f} (-{drop_from_mig:.0%})\n"
+            f"  Agora:    ${mc:,.0f} (+{bounce_pct:.0%} do fundo)\n"
+            f"  Tempo:    {elapsed_min:.1f}min\n"
+            f"  Mint: {mint}"
+        )
+        try:
+            send_alert(msg)
+        except Exception as e:
+            logger.warning("send_alert bounce %s: %s", mint[:8], e)
+
+        logger.info("BOUNCE %s: fundo=$%.0f drop=%.0f%% bounce=%.0f%% em %.1fmin",
+                    symbol, mc_min, drop_from_mig * 100, bounce_pct * 100, elapsed_min)
+
     # ------------------------------------------------------------------
     # Threads
     # ------------------------------------------------------------------
