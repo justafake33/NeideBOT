@@ -2250,49 +2250,34 @@ def analise_dump_depth():
 @app.route("/analise/backtest")
 def analise_backtest():
     """
-    Backtester de TP/SL sobre os tokens históricos.
+    Backtester tick-level: usa token_ticks reais (~30s) para simular TP/SL.
 
-    Simula entrada no bounce (mc_min * 1.15) para tokens que passam nos filtros:
-      - drop_from_migration >= 30%
-      - time_to_bottom < 30min
-
-    Para cada combinação TP × SL calcula:
-      - win_rate: % de trades que atingiram o TP antes do SL
-      - avg_gain: ganho médio nos wins (%)
-      - avg_loss: perda média nos losses (%)
-      - payoff_ratio: avg_gain / avg_loss
-      - expected_value: win_rate * avg_gain + (1-win_rate) * avg_loss
-      - n_trades: número de trades simulados
-
-    Fonte de dados:
-      - mc_bottom (entry = mc_bottom * 1.15)
-      - mc_peak (TP hit se mc_peak >= entry * (1+tp) E time_to_peak >= time_to_bottom)
-      - mc_1h (exit price se TP não atingido)
+    Lógica por trade:
+      - entry_price  = mc_bottom * (1 + bounce_pct)
+      - Caminha pelos ticks APOS o fundo em ordem cronologica
+      - Primeiro tick com mc <= entry*(1-sl)  -> SL acionado -> loss = -sl
+      - Primeiro tick com mc >= entry*(1+tp)  -> TP acionado -> gain = +tp
+      - Nenhum hit ate fim da janela           -> saida no ultimo tick (P&L real)
     """
+    import collections
     from flask import request
 
-    # Parâmetros opcionais via query string
     bounce_pct = float(request.args.get("bounce", "0.15"))
     min_drop   = float(request.args.get("min_drop", "0.30"))
     max_time   = float(request.args.get("max_time", "30"))
 
     with db._cursor() as cur:
         cur.execute("""
-            SELECT pct_drop, time_to_bottom, time_to_peak,
-                   mc_bottom, mc_peak, mc_1h, mc_migration, recovery
+            SELECT mint, pct_drop, time_to_bottom, mc_bottom, mc_migration
             FROM migrations
-            WHERE recovery       IS NOT NULL
-              AND pct_drop       IS NOT NULL
+            WHERE pct_drop       IS NOT NULL
               AND time_to_bottom IS NOT NULL
               AND mc_bottom      IS NOT NULL
-              AND mc_peak        IS NOT NULL
-              AND mc_1h          IS NOT NULL
               AND mc_migration    > 0
               AND mc_bottom       > 0
         """)
         rows = [dict(r) for r in cur.fetchall()]
 
-    # Filtra tokens que teriam gerado sinal de bounce
     eligible = [
         r for r in rows
         if float(r["pct_drop"]) >= min_drop
@@ -2300,73 +2285,105 @@ def analise_backtest():
     ]
 
     if not eligible:
-        return {"erro": "Nenhum token elegível com os filtros informados"}, 200
+        return {"erro": "Nenhum token elegivel com os filtros informados"}, 200
 
-    # Grid de TP × SL
+    mints = [r["mint"] for r in eligible]
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT mint, elapsed_sec, mc
+            FROM token_ticks
+            WHERE mint = ANY(%s)
+              AND mc IS NOT NULL AND mc > 0
+            ORDER BY mint, elapsed_sec
+        """, (mints,))
+        tick_rows = cur.fetchall()
+
+    ticks_by_mint: dict = collections.defaultdict(list)
+    for row in tick_rows:
+        rd = dict(row)
+        ticks_by_mint[rd["mint"]].append((rd["elapsed_sec"], float(rd["mc"])))
+
     tp_values = [0.15, 0.20, 0.30, 0.40, 0.50, 0.75, 1.00]
     sl_values = [0.10, 0.15, 0.20, 0.25, 0.30]
 
     def simulate(tp: float, sl: float):
         wins, losses = [], []
-        for r in eligible:
-            entry     = float(r["mc_bottom"]) * (1 + bounce_pct)
-            tp_target = entry * (1 + tp)
-            sl_target = entry * (1 - sl)
+        n_sl_hit, n_tp_hit, n_time_exit, n_no_ticks = 0, 0, 0, 0
 
-            # TP hit: peak atingiu o alvo E peak veio depois do fundo
-            peak_after = (
-                r["time_to_peak"] is not None and
-                float(r["time_to_peak"]) >= float(r["time_to_bottom"])
-            )
-            tp_hit = peak_after and float(r["mc_peak"]) >= tp_target
+        for r in eligible:
+            mint       = r["mint"]
+            mc_bottom  = float(r["mc_bottom"])
+            bottom_sec = float(r["time_to_bottom"]) * 60
+            entry      = mc_bottom * (1 + bounce_pct)
+            tp_target  = entry * (1 + tp)
+            sl_floor   = entry * (1 - sl)
+
+            ticks       = ticks_by_mint.get(mint, [])
+            post_bottom = [(es, mc) for es, mc in ticks if es > bottom_sec]
+
+            if not post_bottom:
+                n_no_ticks += 1
+                continue
+
+            sl_hit = False
+            tp_hit = False
+            for _es, mc in post_bottom:
+                if mc <= sl_floor:
+                    sl_hit = True
+                    break
+                if mc >= tp_target:
+                    tp_hit = True
+                    break
 
             if tp_hit:
                 wins.append(tp)
+                n_tp_hit += 1
+            elif sl_hit:
+                losses.append(-sl)
+                n_sl_hit += 1
             else:
-                # Exit em mc_1h
-                exit_price = float(r["mc_1h"])
-                pnl = (exit_price - entry) / entry
-                if pnl <= -sl:
-                    losses.append(-sl)
-                else:
-                    # Saiu sem TP nem SL — ganho/perda parcial
-                    if pnl >= 0:
-                        wins.append(pnl)
-                    else:
-                        losses.append(pnl)
+                last_mc = post_bottom[-1][1]
+                pnl     = (last_mc - entry) / entry
+                losses.append(pnl)
+                n_time_exit += 1
 
-        n       = len(wins) + len(losses)
-        wr      = len(wins) / n if n else 0
-        ag      = sum(wins)  / len(wins)  if wins   else 0
-        al      = sum(losses)/ len(losses) if losses else 0
-        ev      = wr * ag + (1 - wr) * al
-        payoff  = abs(ag / al) if al != 0 else None
+        n      = len(wins) + len(losses)
+        wr     = len(wins) / n if n else 0
+        ag     = sum(wins)    / len(wins)   if wins   else 0
+        al     = sum(losses)  / len(losses) if losses else 0
+        ev     = wr * ag + (1 - wr) * al
+        payoff = abs(ag / al)               if al != 0 else None
 
         return {
-            "tp":            f"{tp:.0%}",
-            "sl":            f"{sl:.0%}",
-            "n_trades":      n,
-            "win_rate":      round(wr,     3),
-            "avg_gain":      round(ag,     3),
-            "avg_loss":      round(al,     3),
-            "payoff_ratio":  round(payoff, 2) if payoff else None,
-            "expected_value": round(ev,    4),
+            "tp":             f"{tp:.0%}",
+            "sl":             f"{sl:.0%}",
+            "n_trades":       n,
+            "n_tp_hit":       n_tp_hit,
+            "n_sl_hit":       n_sl_hit,
+            "n_time_exit":    n_time_exit,
+            "n_no_ticks":     n_no_ticks,
+            "win_rate":       round(wr,     3),
+            "avg_gain":       round(ag,     3),
+            "avg_loss":       round(al,     3),
+            "payoff_ratio":   round(payoff, 2) if payoff else None,
+            "expected_value": round(ev,     4),
         }
 
     grid = [simulate(tp, sl) for tp in tp_values for sl in sl_values]
 
-    # Melhor EV com N >= 20
     best_ev = max(
         (r for r in grid if r["n_trades"] >= 20),
         key=lambda x: x["expected_value"],
         default=None,
     )
-    # Melhor win rate com N >= 20
     best_wr = max(
         (r for r in grid if r["n_trades"] >= 20),
         key=lambda x: x["win_rate"],
         default=None,
     )
+
+    eligible_with_ticks = sum(1 for r in eligible if ticks_by_mint.get(r["mint"]))
 
     return {
         "parametros": {
@@ -2375,8 +2392,9 @@ def analise_backtest():
             "max_time_filter":  f"{max_time:.0f}min",
         },
         "dataset": {
-            "total_com_dados":  len(rows),
-            "tokens_elegiveis": len(eligible),
+            "tokens_elegiveis":  len(eligible),
+            "tokens_com_ticks":  eligible_with_ticks,
+            "tokens_sem_ticks":  len(eligible) - eligible_with_ticks,
         },
         "melhor_ev":       best_ev,
         "melhor_win_rate": best_wr,
