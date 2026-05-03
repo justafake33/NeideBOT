@@ -820,6 +820,223 @@ def analise_smart_flow():
     }, 200
 
 
+# ==============================================================================
+# /analise/tick-features — Análise completa de todas as colunas do token_ticks
+# ==============================================================================
+
+@app.route("/analise/tick-features")
+def analise_tick_features():
+    """
+    Analisa TODAS as colunas do token_ticks como preditores de recovery:
+    - delta_smart:    variação de smart_count (início → fundo)
+    - delta_renowned: variação de renowned_count (KOLs)
+    - combined_delta: smart + renowned juntos
+    - delta_holders:  variação de holders_count (novos entrando = acumulação)
+    - vol_spike:      volume_1m no fundo / baseline (capitulação de volume)
+    - vol_5m_slope:   inclinação de volume_5m (secando = exaustão vendedora)
+    - dump_pct:       queda % total até o fundo
+
+    Retorna sweep de threshold para cada variável + discriminação comparativa.
+    """
+    MIN_TICKS = 8
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT m.mint, m.token_nome, m.mc_migration, m.mc_bottom,
+                   m.time_to_bottom, m.recovery, m.liq_migration,
+                   COUNT(t.id) AS tick_count
+            FROM migrations m
+            JOIN token_ticks t ON t.mint = m.mint
+            WHERE m.recovery IS NOT NULL
+              AND m.mc_migration IS NOT NULL
+              AND m.mc_bottom    IS NOT NULL
+              AND m.mc_migration > 0
+            GROUP BY m.mint, m.token_nome, m.mc_migration, m.mc_bottom,
+                     m.time_to_bottom, m.recovery, m.liq_migration
+            HAVING COUNT(t.id) >= %(min_ticks)s
+            ORDER BY m.mint
+        """, {"min_ticks": MIN_TICKS})
+        tokens = [dict(r) for r in cur.fetchall()]
+
+    if not tokens:
+        return {"erro": "Nenhum token com ticks + recovery"}, 200
+
+    results = []
+
+    for tok in tokens:
+        mint        = tok["mint"]
+        mc_mig      = float(tok["mc_migration"])
+        mc_bot      = float(tok["mc_bottom"])
+        recovery    = bool(tok["recovery"])
+        time_to_bot = float(tok["time_to_bottom"] or 0)
+
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT elapsed_sec, mc, smart_count, renowned_count,
+                       holders_count, volume_1m, volume_5m
+                FROM token_ticks
+                WHERE mint = %(mint)s
+                ORDER BY elapsed_sec ASC
+            """, {"mint": mint})
+            ticks = [dict(r) for r in cur.fetchall()]
+
+        if len(ticks) < MIN_TICKS:
+            continue
+
+        def _v(t, k): return float(t.get(k) or 0)
+
+        # ── Baseline: primeiros 4 ticks (20s iniciais) ──
+        baseline = ticks[:4]
+        smart_base    = sum(_v(t, "smart_count")    for t in baseline) / len(baseline)
+        renowned_base = sum(_v(t, "renowned_count") for t in baseline) / len(baseline)
+        holders_base  = sum(_v(t, "holders_count")  for t in baseline) / len(baseline)
+        vol1m_base    = sum(_v(t, "volume_1m")       for t in baseline) / len(baseline)
+        vol5m_base    = sum(_v(t, "volume_5m")       for t in baseline) / len(baseline)
+
+        # ── Ticks ao redor do fundo (±90s) ──
+        bot_elapsed   = time_to_bot * 60
+        near_bot      = [t for t in ticks if abs(_v(t, "elapsed_sec") - bot_elapsed) <= 90]
+        if not near_bot:
+            near_bot = [ticks[-1]]
+        last_near_bot = near_bot[-1]
+
+        smart_bot    = _v(last_near_bot, "smart_count")
+        renowned_bot = _v(last_near_bot, "renowned_count")
+        holders_bot  = _v(last_near_bot, "holders_count")
+        vol1m_bot    = _v(last_near_bot, "volume_1m")
+
+        # ── Deltas absolutos ──
+        delta_smart    = smart_bot    - smart_base
+        delta_renowned = renowned_bot - renowned_base
+        delta_combined = delta_smart  + delta_renowned       # smart + KOL juntos
+        delta_holders  = holders_bot  - holders_base
+
+        # ── Vol spike: volume no fundo vs baseline ──
+        vol_spike = (vol1m_bot / vol1m_base) if vol1m_base > 1 else None
+
+        # ── Vol 5m slope: inclinação da última metade dos ticks ──
+        mid = len(ticks) // 2
+        vol5m_first_half = [_v(t, "volume_5m") for t in ticks[:mid] if _v(t, "volume_5m") > 0]
+        vol5m_last_half  = [_v(t, "volume_5m") for t in ticks[mid:] if _v(t, "volume_5m") > 0]
+        avg_vol5m_first  = sum(vol5m_first_half) / len(vol5m_first_half) if vol5m_first_half else None
+        avg_vol5m_last   = sum(vol5m_last_half)  / len(vol5m_last_half)  if vol5m_last_half  else None
+        vol5m_slope = None
+        if avg_vol5m_first and avg_vol5m_last and avg_vol5m_first > 0:
+            vol5m_slope = (avg_vol5m_last - avg_vol5m_first) / avg_vol5m_first  # negativo = secando
+
+        # ── Pct dump ──
+        pct_dump = (mc_mig - mc_bot) / mc_mig if mc_mig > 0 else None
+
+        # ── Holders velocity: novos holders por minuto na janela ao redor do fundo ──
+        first_20_ticks = ticks[:20]
+        hold_start = _v(first_20_ticks[0],  "holders_count")
+        hold_end   = _v(first_20_ticks[-1], "holders_count")
+        elapsed_span = _v(first_20_ticks[-1], "elapsed_sec") - _v(first_20_ticks[0], "elapsed_sec")
+        holders_vel_per_min = ((hold_end - hold_start) / (elapsed_span / 60)
+                               if elapsed_span > 0 else None)
+
+        results.append({
+            "mint":              mint,
+            "symbol":            tok["token_nome"],
+            "recovery":          recovery,
+            "time_to_bottom_min":time_to_bot,
+            "pct_dump":          round(pct_dump,       3) if pct_dump is not None else None,
+            "delta_smart":       round(delta_smart,    2),
+            "delta_renowned":    round(delta_renowned, 2),
+            "delta_combined":    round(delta_combined, 2),
+            "delta_holders":     round(delta_holders,  2),
+            "vol_spike":         round(vol_spike,      3) if vol_spike is not None else None,
+            "vol5m_slope":       round(vol5m_slope,    3) if vol5m_slope is not None else None,
+            "holders_vel_per_min": round(holders_vel_per_min, 2) if holders_vel_per_min is not None else None,
+            "tick_count":        tok["tick_count"],
+        })
+
+    if not results:
+        return {"erro": "Nenhum resultado"}, 200
+
+    rec_true  = [r for r in results if r["recovery"]]
+    rec_false = [r for r in results if not r["recovery"]]
+
+    def _avg(lst, key):
+        vals = [r[key] for r in lst if r.get(key) is not None]
+        return round(sum(vals) / len(vals), 3) if vals else None
+
+    def _med(lst, key):
+        vals = sorted([r[key] for r in lst if r.get(key) is not None])
+        return round(vals[len(vals)//2], 3) if vals else None
+
+    def _sweep(feature, thresholds, direction="above"):
+        """Calcula precision/recall/F1 para cada threshold de uma feature."""
+        rows = []
+        for thr in thresholds:
+            if direction == "above":
+                tp = sum(1 for r in rec_true  if (r.get(feature) or 0) >= thr)
+                fp = sum(1 for r in rec_false if (r.get(feature) or 0) >= thr)
+            else:  # below (para vol5m_slope negativo = secando)
+                tp = sum(1 for r in rec_true  if (r.get(feature) or 0) <= thr)
+                fp = sum(1 for r in rec_false if (r.get(feature) or 0) <= thr)
+            fn = len(rec_true)  - tp
+            tn = len(rec_false) - fp
+            prec = tp / (tp + fp) if (tp + fp) > 0 else None
+            rec  = tp / (tp + fn) if (tp + fn) > 0 else None
+            f1   = (2*prec*rec/(prec+rec)) if prec and rec and (prec+rec) > 0 else None
+            rows.append({
+                "threshold": thr, "direction": direction,
+                "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+                "precision": round(prec, 3) if prec else None,
+                "recall":    round(rec,  3) if rec  else None,
+                "f1":        round(f1,   3) if f1   else None,
+            })
+        return rows
+
+    return {
+        "resumo": {
+            "tokens_analisados": len(results),
+            "recovery_true":     len(rec_true),
+            "recovery_false":    len(rec_false),
+        },
+        "discriminacao": {
+            # smart money (wallets verificadas)
+            "avg_delta_smart_recovery":       _avg(rec_true,  "delta_smart"),
+            "avg_delta_smart_no_rec":         _avg(rec_false, "delta_smart"),
+            "med_delta_smart_recovery":       _med(rec_true,  "delta_smart"),
+            "med_delta_smart_no_rec":         _med(rec_false, "delta_smart"),
+            # KOLs (renowned)
+            "avg_delta_renowned_recovery":    _avg(rec_true,  "delta_renowned"),
+            "avg_delta_renowned_no_rec":      _avg(rec_false, "delta_renowned"),
+            "med_delta_renowned_recovery":    _med(rec_true,  "delta_renowned"),
+            "med_delta_renowned_no_rec":      _med(rec_false, "delta_renowned"),
+            # smart + KOL combinados
+            "avg_delta_combined_recovery":    _avg(rec_true,  "delta_combined"),
+            "avg_delta_combined_no_rec":      _avg(rec_false, "delta_combined"),
+            # holders novos entrando durante dump
+            "avg_delta_holders_recovery":     _avg(rec_true,  "delta_holders"),
+            "avg_delta_holders_no_rec":       _avg(rec_false, "delta_holders"),
+            "avg_holders_vel_recovery":       _avg(rec_true,  "holders_vel_per_min"),
+            "avg_holders_vel_no_rec":         _avg(rec_false, "holders_vel_per_min"),
+            # volume
+            "avg_vol_spike_recovery":         _avg(rec_true,  "vol_spike"),
+            "avg_vol_spike_no_rec":           _avg(rec_false, "vol_spike"),
+            "avg_vol5m_slope_recovery":       _avg(rec_true,  "vol5m_slope"),
+            "avg_vol5m_slope_no_rec":         _avg(rec_false, "vol5m_slope"),
+            # timing (já sabemos que discrimina)
+            "avg_time_to_bot_recovery":       _avg(rec_true,  "time_to_bottom_min"),
+            "avg_time_to_bot_no_rec":         _avg(rec_false, "time_to_bottom_min"),
+            "avg_pct_dump_recovery":          _avg(rec_true,  "pct_dump"),
+            "avg_pct_dump_no_rec":            _avg(rec_false, "pct_dump"),
+        },
+        "sweeps": {
+            "delta_smart":    _sweep("delta_smart",    [-1, 0, 1, 2, 3, 5]),
+            "delta_renowned": _sweep("delta_renowned", [-1, 0, 1, 2, 3]),
+            "delta_combined": _sweep("delta_combined", [0, 1, 2, 3, 5, 7]),
+            "delta_holders":  _sweep("delta_holders",  [-50, 0, 50, 100, 200]),
+            "vol_spike":      _sweep("vol_spike",      [0.5, 1.0, 1.5, 2.0, 3.0]),
+            "vol5m_slope":    _sweep("vol5m_slope",    [0, -0.1, -0.2, -0.3, -0.5], direction="below"),
+        },
+        "por_token": results,
+    }, 200
+
+
 def _pct(n, total):
     return f"{n/total*100:.1f}%" if total else "—"
 
