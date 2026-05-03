@@ -1037,6 +1037,77 @@ def analise_tick_features():
     }, 200
 
 
+# ==============================================================================
+# /analise/h10 — Teste formal de H10: time_to_bottom < 25min prediz recovery?
+# ==============================================================================
+
+@app.route("/analise/h10")
+def analise_h10():
+    """
+    H10: tokens com time_to_bottom < 25min têm recovery rate ≥20pp maior
+    que tokens com time_to_bottom ≥ 25min.
+
+    Usa o banco completo (1015+ tokens) — não requer token_ticks.
+    Também faz sweep de thresholds (10, 15, 20, 25, 30min) para encontrar
+    o corte com maior discriminação.
+    """
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT time_to_bottom, recovery, mc_migration, mc_bottom,
+                   pct_drop, smart_wallets, liq_migration
+            FROM migrations
+            WHERE recovery IS NOT NULL
+              AND time_to_bottom IS NOT NULL
+              AND mc_migration IS NOT NULL
+              AND mc_migration > 0
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
+
+    if not rows:
+        return {"erro": "Nenhum dado"}, 200
+
+    total       = len(rows)
+    total_rec   = sum(1 for r in rows if r["recovery"])
+    baseline_rate = total_rec / total  # recovery rate geral
+
+    sweep = []
+    for thr in [5, 10, 15, 20, 25, 30, 40]:
+        fast = [r for r in rows if float(r["time_to_bottom"] or 0) <  thr]
+        slow = [r for r in rows if float(r["time_to_bottom"] or 0) >= thr]
+        if not fast or not slow:
+            continue
+
+        rec_fast = sum(1 for r in fast if r["recovery"])
+        rec_slow = sum(1 for r in slow if r["recovery"])
+        rate_fast = rec_fast / len(fast)
+        rate_slow = rec_slow / len(slow)
+
+        sweep.append({
+            "threshold_min":    thr,
+            "n_fast":           len(fast),
+            "n_slow":           len(slow),
+            "recovery_rate_fast": round(rate_fast, 3),
+            "recovery_rate_slow": round(rate_slow, 3),
+            "delta_pp":         round(rate_fast - rate_slow, 3),
+            "h10_confirmed":    (rate_fast - rate_slow) >= 0.20,
+        })
+
+    # Resultado principal no threshold de 25min
+    main = next((s for s in sweep if s["threshold_min"] == 25), None)
+
+    return {
+        "hipotese":         "H10: time_to_bottom < 25min → recovery rate ≥20pp maior",
+        "dataset":          {"total": total, "recovery_true": total_rec,
+                             "baseline_recovery_rate": round(baseline_rate, 3)},
+        "resultado_25min":  main,
+        "sweep_thresholds": sweep,
+        "veredicto": (
+            "CONFIRMADA" if main and main["h10_confirmed"] else
+            "NEGADA"     if main else "SEM DADOS"
+        ),
+    }, 200
+
+
 def _pct(n, total):
     return f"{n/total*100:.1f}%" if total else "—"
 
