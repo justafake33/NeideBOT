@@ -249,57 +249,57 @@ def health():
 @app.route("/debug/signal")
 def debug_signal():
     """
-    Rota temporária: chama signal type 12 em 10 tokens graduados reais
-    para entender o que o GMGN retorna antes de integrar no scanner.
+    Rota de diagnóstico: testa formatos diferentes do signal type 12
+    num único token para descobrir o body correto sem estourar rate limit.
     """
     import time as _time
     from uuid import uuid4 as _uuid4
 
-    # Pega 10 tokens variados: alguns com recovery, alguns sem, alguns recentes
+    # Apenas 1 token para minimizar chamadas
     with db._cursor() as cur:
         cur.execute("""
-            SELECT mint, token_nome, mc_migration, mc_bottom, mc_1h,
-                   recovery, ts_migration
+            SELECT mint, token_nome, mc_migration, mc_bottom, mc_1h, recovery
             FROM migrations
-            WHERE mc_bottom IS NOT NULL
-              AND ts_migration IS NOT NULL
-            ORDER BY ts_migration DESC
-            LIMIT 10
+            WHERE mc_bottom IS NOT NULL AND ts_migration IS NOT NULL
+            ORDER BY ts_migration DESC LIMIT 1
         """)
-        tokens = [dict(r) for r in cur.fetchall()]
+        tok = dict(cur.fetchone())
 
     if not gmgn:
         return {"error": "GmgnClient não inicializado"}, 503
 
+    mint = tok["mint"]
+
+    # Testa variações de body para descobrir o formato correto
+    candidates = [
+        {"chain": "sol", "token_address": mint, "signal_type": 12, "groups": ["smart_degen"]},
+        {"chain": "sol", "address":       mint, "signal_type": 12, "groups": ["smart_degen"]},
+        {"chain": "sol", "token":         mint, "signal_type": 12, "groups": ["smart_money"]},
+        {"chain": "sol", "token":         mint, "signal_type": 12, "groups": ["kol"]},
+        {"chain": "sol", "token":         mint, "signal_type": 12, "groups": ["renowned"]},
+        {"chain": "sol", "token":         mint, "signal_type": 12, "groups": ["all"]},
+    ]
+
     results = []
-    for tok in tokens:
-        mint = tok["mint"]
+    for body in candidates:
+        _time.sleep(2)  # respeita rate limit (peso 3)
         try:
             resp = gmgn.session.post(
                 f"{gmgn.host}/v1/market/token_signal",
-                json={"token": mint, "signal_type": 12, "chain": "sol", "groups": ["smart_degen"]},
-                params={
-                    "timestamp": str(int(_time.time())),
-                    "client_id":  str(_uuid4()),
-                },
+                json=body,
+                params={"timestamp": str(int(_time.time())), "client_id": str(_uuid4())},
                 timeout=10,
             )
             raw = resp.json()
         except Exception as e:
             raw = {"error": str(e)}
 
-        results.append({
-            "mint":         mint,
-            "token_nome":   tok["token_nome"],
-            "recovery":     tok["recovery"],
-            "mc_migration": tok["mc_migration"],
-            "mc_bottom":    tok["mc_bottom"],
-            "mc_1h":        tok["mc_1h"],
-            "ts_migration": str(tok["ts_migration"]),
-            "signal_raw":   raw,
-        })
+        results.append({"body_enviado": body, "resposta": raw})
+        # Para na primeira resposta que não seja 400
+        if resp.status_code != 400:
+            break
 
-    return {"tokens_testados": len(results), "resultados": results}, 200
+    return {"mint": mint, "token": tok["token_nome"], "testes": results}, 200
 
 
 # ==============================================================================
