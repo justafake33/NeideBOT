@@ -246,6 +246,62 @@ def health():
     return {"status": "ok"}, 200
 
 
+@app.route("/debug/signal")
+def debug_signal():
+    """
+    Rota temporária: chama signal type 12 em 10 tokens graduados reais
+    para entender o que o GMGN retorna antes de integrar no scanner.
+    """
+    import time as _time
+    from uuid import uuid4 as _uuid4
+
+    # Pega 10 tokens variados: alguns com recovery, alguns sem, alguns recentes
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT mint, token_nome, mc_migration, mc_bottom, mc_1h,
+                   recovery, ts_migration
+            FROM migrations
+            WHERE mc_bottom IS NOT NULL
+              AND ts_migration IS NOT NULL
+            ORDER BY ts_migration DESC
+            LIMIT 10
+        """)
+        tokens = [dict(r) for r in cur.fetchall()]
+
+    if not gmgn:
+        return {"error": "GmgnClient não inicializado"}, 503
+
+    results = []
+    for tok in tokens:
+        mint = tok["mint"]
+        try:
+            resp = gmgn.session.post(
+                f"{gmgn.host}/v1/market/token_signal",
+                json={"token": mint, "signal_type": 12},
+                params={
+                    "timestamp": str(int(_time.time())),
+                    "client_id":  str(_uuid4()),
+                },
+                timeout=10,
+            )
+            raw = resp.json()
+        except Exception as e:
+            raw = {"error": str(e)}
+
+        results.append({
+            "mint":         mint,
+            "token_nome":   tok["token_nome"],
+            "recovery":     tok["recovery"],
+            "mc_migration": tok["mc_migration"],
+            "mc_bottom":    tok["mc_bottom"],
+            "mc_1h":        tok["mc_1h"],
+            "ts_migration": str(tok["ts_migration"]),
+            "signal_raw":   raw,
+        })
+
+    return {"tokens_testados": len(results), "resultados": results}, 200
+
+
 # ==============================================================================
 # /analise — Backtest exploratório (trade de minutos)
 # ==============================================================================
@@ -1266,7 +1322,10 @@ def analise():
 # Startup — funciona com Gunicorn e execução direta
 # ==============================================================================
 
+gmgn = None  # exposto globalmente para rotas de debug
+
 def _start_services():
+    global gmgn
     if not os.getenv("DATABASE_URL"):
         logger.warning("DATABASE_URL não configurado — serviços não iniciados")
         return
