@@ -285,20 +285,21 @@ def debug_signal():
     mint = tok["mint"]
 
     # Cada candidato: (body, extra_query_params)
-    # Testamos chain/signal_type como query param e corpo mínimo sem groups
+    # chain deve ir no body; groups é obrigatório mas valor desconhecido
     candidates = [
-        # chain + signal_type como query param, body só com token
-        ({"token_address": mint},                          {"chain": "sol", "signal_type": 12}),
-        ({"address": mint},                                {"chain": "sol", "signal_type": 12}),
-        ({"token": mint},                                  {"chain": "sol", "signal_type": 12}),
-        # signal_type como string
-        ({"token_address": mint},                          {"chain": "sol", "signal_type": "12"}),
-        # type em vez de signal_type
-        ({"token_address": mint, "type": 12},              {"chain": "sol"}),
-        # tudo no body, sem groups
-        ({"chain": "sol", "token_address": mint, "signal_type": 12}, {}),
-        # tokens como array
-        ({"chain": "sol", "tokens": [mint], "signal_type": 12},      {}),
+        # valores alternativos de groups
+        ({"chain": "sol", "token_address": mint, "signal_type": 12, "groups": ["whale"]},         {}),
+        ({"chain": "sol", "token_address": mint, "signal_type": 12, "groups": ["sniper"]},        {}),
+        ({"chain": "sol", "token_address": mint, "signal_type": 12, "groups": ["insider"]},       {}),
+        ({"chain": "sol", "token_address": mint, "signal_type": 12, "groups": ["fresh_wallet"]},  {}),
+        ({"chain": "sol", "token_address": mint, "signal_type": 12, "groups": ["rat_trader"]},    {}),
+        # groups como inteiros
+        ({"chain": "sol", "token_address": mint, "signal_type": 12, "groups": [1]},               {}),
+        ({"chain": "sol", "token_address": mint, "signal_type": 12, "groups": [12]},              {}),
+        # signal_types como array em vez de signal_type inteiro
+        ({"chain": "sol", "token_address": mint, "signal_types": [12], "groups": ["smart_degen"]}, {}),
+        # mint como nome do campo
+        ({"chain": "sol", "mint": mint, "signal_type": 12, "groups": ["smart_degen"]},            {}),
     ]
 
     results = []
