@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import threading
@@ -473,6 +474,7 @@ class Scanner:
         self._watchlist: dict = {}
         self._seen: set = set()
         self._lock = threading.Lock()
+        self._signal_ban_until: float = 0.0  # unix ts — aguarda antes de chamar token_signal
 
     def start(self):
         thread = threading.Thread(target=self._loop, daemon=True, name="scanner")
@@ -522,6 +524,58 @@ class Scanner:
                 self._safe(self._handle_completed, token)
                 if mint and mc and F_MC_MIN <= mc <= F_MC_MAX:
                     self.hot.push_mc(mint, mc, token)
+
+        self._poll_signals()
+
+    def _poll_signals(self):
+        """
+        Faz poll do feed global de sinais type 12 (SmartDegenBuy) e persiste
+        apenas os sinais de tokens que estão ativos no HotMonitor.
+        Rate limit: peso 3; chamado a cada 5s (mesma janela do trenches).
+        """
+        now = time.time()
+        if now < self._signal_ban_until:
+            return
+
+        with self.hot._lock:
+            active_mints = set(self.hot._tokens.keys())
+
+        if not active_mints:
+            return
+
+        try:
+            entries = self.gmgn.get_token_signal()
+        except RateLimitError as e:
+            self._signal_ban_until = e.reset_at + 1
+            logger.warning("token_signal rate limit — ban até %.0f (%.0fs)",
+                           e.reset_at, e.reset_at - now)
+            return
+
+        matches = []
+        for entry in entries:
+            mint = entry.get("token_address")
+            if mint not in active_mints:
+                continue
+            trigger_at = entry.get("trigger_at")
+            if not trigger_at:
+                continue
+            wallets = entry.get("smart_degen_wallets") or []
+            matches.append({
+                "mint":             mint,
+                "trigger_at":       int(trigger_at),
+                "trigger_mc":       _float(entry.get("trigger_mc")),
+                "first_trigger_mc": _float(entry.get("first_trigger_mc")),
+                "signal_times":     entry.get("signal_times"),
+                "wallets_json":     json.dumps(wallets) if wallets else None,
+            })
+
+        if matches:
+            try:
+                db.insert_signal_batch(matches)
+                logger.info("Sinais type12: %d novos (de %d entries, %d tokens hot)",
+                            len(matches), len(entries), len(active_mints))
+            except Exception as e:
+                logger.warning("insert_signal_batch: %s", e)
 
     def _safe(self, fn, token: dict):
         try:
