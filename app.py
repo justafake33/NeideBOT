@@ -284,30 +284,40 @@ def debug_signal():
 
     mint = tok["mint"]
 
+    # Cada candidato: (body, extra_query_params)
+    # Testamos chain/signal_type como query param e corpo mínimo sem groups
     candidates = [
-        {"chain": "sol", "token_address": mint, "signal_type": 12, "groups": ["smart_degen"]},
-        {"chain": "sol", "address":       mint, "signal_type": 12, "groups": ["smart_degen"]},
-        {"chain": "sol", "token":         mint, "signal_type": 12, "groups": ["smart_money"]},
-        {"chain": "sol", "token":         mint, "signal_type": 12, "groups": ["kol"]},
-        {"chain": "sol", "token":         mint, "signal_type": 12, "groups": ["renowned"]},
-        {"chain": "sol", "token":         mint, "signal_type": 12, "groups": ["all"]},
+        # chain + signal_type como query param, body só com token
+        ({"token_address": mint},                          {"chain": "sol", "signal_type": 12}),
+        ({"address": mint},                                {"chain": "sol", "signal_type": 12}),
+        ({"token": mint},                                  {"chain": "sol", "signal_type": 12}),
+        # signal_type como string
+        ({"token_address": mint},                          {"chain": "sol", "signal_type": "12"}),
+        # type em vez de signal_type
+        ({"token_address": mint, "type": 12},              {"chain": "sol"}),
+        # tudo no body, sem groups
+        ({"chain": "sol", "token_address": mint, "signal_type": 12}, {}),
+        # tokens como array
+        ({"chain": "sol", "tokens": [mint], "signal_type": 12},      {}),
     ]
 
     results = []
     resp = None
-    for body in candidates:
+    for body, extra_params in candidates:
         _time.sleep(3)
+        base_params = {"timestamp": str(int(_time.time())), "client_id": str(_uuid4())}
+        base_params.update(extra_params)
         try:
             resp = gmgn.session.post(
                 f"{gmgn.host}/v1/market/token_signal",
                 json=body,
-                params={"timestamp": str(int(_time.time())), "client_id": str(_uuid4())},
+                params=base_params,
                 timeout=10,
             )
             raw = resp.json()
         except Exception as e:
             raw = {"error": str(e)}
-            results.append({"body_enviado": body, "resposta": raw})
+            results.append({"body_enviado": body, "params_extras": extra_params, "resposta": raw})
             break
 
         # Registra ban para evitar chamadas futuras que estendem o ban
@@ -317,10 +327,10 @@ def debug_signal():
             except Exception:
                 reset_at = _time.time() + 300
             _signal_ban_until = reset_at
-            results.append({"body_enviado": body, "resposta": raw})
+            results.append({"body_enviado": body, "params_extras": extra_params, "resposta": raw})
             break
 
-        results.append({"body_enviado": body, "resposta": raw})
+        results.append({"body_enviado": body, "params_extras": extra_params, "resposta": raw})
         if resp.status_code != 400:
             break
 
