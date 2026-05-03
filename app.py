@@ -2152,7 +2152,7 @@ def analise_price_decel():
         r = dict(r)
         try:
             be = int(r["bottom_elapsed"])
-            if be < 180:  # fundo em < 3min — janela A não tem dados suficientes
+            if be < 600:  # fundo em < 10min — janela A (5-10min antes) sem dados
                 skipped_early_bottom += 1
                 continue
             mig_by_mint[r["mint"]] = {
@@ -2225,9 +2225,10 @@ def analise_price_decel():
         be  = meta["bottom_elapsed"]
         mc0 = meta["mc_migration"]
 
-        s_a = slope_in_window(ticks, be, -120, -60)
-        s_b = slope_in_window(ticks, be, -60,  -30)
-        s_c = slope_in_window(ticks, be, -30,    5)
+        # Janelas alargadas — ticks têm intervalo médio ~30s, não 5s
+        s_a = slope_in_window(ticks, be, -600, -300)  # 5-10min antes do fundo
+        s_b = slope_in_window(ticks, be, -300, -120)  # 2-5min antes do fundo
+        s_c = slope_in_window(ticks, be, -120,   30)  # 2min antes até 30s depois
 
         if s_a is None or s_b is None or s_c is None:
             continue
@@ -2286,15 +2287,15 @@ def analise_price_decel():
             "no_recovery":                     len(norec),
         },
         "slopes_normalizados_pct_mc_por_s": {
-            "janela_a_120s_60s_antes_fundo": {
+            "janela_a_10min_5min_antes_fundo": {
                 "recovery":    avg_rec_a,
                 "no_recovery": avg_norec_a,
             },
-            "janela_b_60s_30s_antes_fundo": {
+            "janela_b_5min_2min_antes_fundo": {
                 "recovery":    avg_rec_b,
                 "no_recovery": avg_norec_b,
             },
-            "janela_c_30s_0s_antes_fundo": {
+            "janela_c_2min_antes_ate_fundo": {
                 "recovery":    avg_rec_c,
                 "no_recovery": avg_norec_c,
             },
