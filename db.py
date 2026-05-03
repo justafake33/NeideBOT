@@ -434,6 +434,41 @@ def insert_ticks_batch(ticks: list):
         """, ticks)
 
 
+def backfill_tick_volumes(mint: str, candles: list, ts_mig_unix: int):
+    """
+    Back-filla volume_1m nos ticks existentes usando candles do kline 1m.
+    Cada candle cobre 60s; atualiza ticks no intervalo elapsed ±30s do candle.
+    Só sobrescreve se volume_1m ainda for NULL (não destrói dados existentes).
+    """
+    if not candles:
+        return
+    rows = []
+    for c in candles:
+        candle_ts   = int(c.get("time", 0)) / 1000
+        elapsed_sec = int(candle_ts - ts_mig_unix)
+        if elapsed_sec < 0:
+            continue
+        try:
+            vol = float(c.get("volume") or 0)
+        except Exception:
+            continue
+        if vol > 0:
+            rows.append({"mint": mint, "elapsed": elapsed_sec, "vol": vol})
+
+    if not rows:
+        return
+    with _cursor() as cur:
+        for r in rows:
+            cur.execute("""
+                UPDATE token_ticks
+                SET volume_1m = %(vol)s
+                WHERE mint    = %(mint)s
+                  AND elapsed_sec BETWEEN %(lo)s AND %(hi)s
+                  AND volume_1m IS NULL
+            """, {"mint": r["mint"], "vol": r["vol"],
+                  "lo": r["elapsed"] - 30, "hi": r["elapsed"] + 30})
+
+
 def get_tick_aggregates(max_elapsed_sec: int = 600) -> list:
     """
     Retorna métricas agregadas da série temporal dos primeiros N segundos por token.
