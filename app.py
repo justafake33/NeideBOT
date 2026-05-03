@@ -2385,6 +2385,33 @@ def analise_backtest():
 
     eligible_with_ticks = sum(1 for r in eligible if ticks_by_mint.get(r["mint"]))
 
+    # Diagnostico: tokens sem ticks — antigos ou morreram rapido?
+    no_tick_tokens = [r for r in eligible if not ticks_by_mint.get(r["mint"])]
+    no_tick_recovery_dist = {}
+    if no_tick_tokens:
+        with db._cursor() as cur:
+            nt_mints = [r["mint"] for r in no_tick_tokens]
+            cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE recovery IS TRUE)  AS rec_true,
+                    COUNT(*) FILTER (WHERE recovery IS FALSE) AS rec_false,
+                    COUNT(*) FILTER (WHERE recovery IS NULL)  AS rec_null,
+                    COUNT(*) FILTER (WHERE ts_migration < NOW() - INTERVAL '7 days') AS old_tokens,
+                    AVG(pct_drop) AS avg_drop,
+                    AVG(time_to_bottom) AS avg_ttb
+                FROM migrations
+                WHERE mint = ANY(%s)
+            """, (nt_mints,))
+            nd = dict(cur.fetchone())
+            no_tick_recovery_dist = {
+                "recovery_true":  nd["rec_true"],
+                "recovery_false": nd["rec_false"],
+                "recovery_null":  nd["rec_null"],
+                "older_than_7d":  nd["old_tokens"],
+                "avg_drop":       round(float(nd["avg_drop"] or 0), 3),
+                "avg_time_to_bottom": round(float(nd["avg_ttb"] or 0), 1),
+            }
+
     return {
         "parametros": {
             "bounce_entry_pct": f"{bounce_pct:.0%}",
@@ -2395,6 +2422,7 @@ def analise_backtest():
             "tokens_elegiveis":  len(eligible),
             "tokens_com_ticks":  eligible_with_ticks,
             "tokens_sem_ticks":  len(eligible) - eligible_with_ticks,
+            "sem_ticks_diagnostico": no_tick_recovery_dist,
         },
         "melhor_ev":       best_ev,
         "melhor_win_rate": best_wr,
