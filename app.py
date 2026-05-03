@@ -2180,6 +2180,17 @@ def analise_price_decel():
         except (TypeError, ValueError):
             continue
 
+    # debug temporário — remover após confirmar dados
+    _sample_mint = next(iter(ticks_by_mint), None)
+    _debug = {
+        "mints_em_mig_by_mint":    len(mints),
+        "tick_rows_retornados":    len(tick_rows),
+        "mints_em_ticks_by_mint":  len(ticks_by_mint),
+        "sample_mint":             _sample_mint,
+        "sample_ticks_count":      len(ticks_by_mint[_sample_mint]) if _sample_mint else 0,
+        "sample_mig_bottom_elapsed": mig_by_mint.get(_sample_mint, {}).get("bottom_elapsed"),
+    }
+
     def slope_in_window(ticks, bottom_e, lo, hi):
         pts = sorted([(e, mc) for e, mc in ticks if lo <= (e - bottom_e) < hi])
         if len(pts) < 2:
@@ -2250,6 +2261,7 @@ def analise_price_decel():
 
     return {
         "hipotese": "Deceleração de preço (d²p/dt² → 0) precede o fundo em recovery tokens",
+        "_debug": _debug,
         "dataset": {
             "total_migrations_com_recovery":   len(mig_by_mint),
             "tokens_com_ticks_suficientes":    len(rec) + len(norec),
