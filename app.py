@@ -286,16 +286,12 @@ def debug_signal():
 
     # groups é array de OBJETOS (TokenSignalGroup), não de strings
     # Fonte: github.com/GMGNAI/gmgn-skills src/client/OpenApiClient.ts
-    # O endpoint é global (sem token_address) — retorna feed de sinais
+    # O endpoint é feed global, sem token_address
     candidates = [
-        # formato correto descoberto no código-fonte
-        ({"chain": "sol", "groups": [{"signal_type": [12]}]},                                                {}),
-        # com filtros de MC compatíveis com nossos tokens
-        ({"chain": "sol", "groups": [{"signal_type": [12], "mc_min": 5000, "mc_max": 200000}]},              {}),
-        # múltiplos signal_types
-        ({"chain": "sol", "groups": [{"signal_type": [12, 13]}]},                                            {}),
-        # sem signal_type (todos os tipos)
-        ({"chain": "sol", "groups": [{}]},                                                                    {}),
+        ({"chain": "sol", "groups": [{"signal_type": [12]}]},                                    {}),
+        ({"chain": "sol", "groups": [{"signal_type": [12], "mc_min": 5000, "mc_max": 200000}]},  {}),
+        ({"chain": "sol", "groups": [{"signal_type": [12, 13]}]},                                {}),
+        ({"chain": "sol", "groups": [{}]},                                                        {}),
     ]
 
     results = []
