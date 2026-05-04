@@ -1,6 +1,6 @@
 # NeideBOT — ROADMAP
 
-> **Regra:** Não avance para o próximo passo sem validar o anterior com dados reais.
+> **Regra:** Não avance para o próximo passo sem validar o anterior com dados reais!
 
 ---
 
