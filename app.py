@@ -501,6 +501,218 @@ tr:hover td { background: #161b22; }
 
 
 # ==============================================================================
+# /debug/strategy-sim — Simulação de threshold de bounce e status type 12
+# ==============================================================================
+
+@app.route("/debug/strategy-sim")
+def debug_strategy_sim():
+    THRESHOLDS = [0.05, 0.08, 0.10, 0.15]
+    TP = 0.75
+    SL = 0.15
+
+    with db._cursor() as cur:
+        # --- type 12 signals ---
+        cur.execute("""
+            SELECT
+                COUNT(*)                              AS total_signals,
+                COUNT(DISTINCT mint)                  AS tokens_com_sinal,
+                MIN(ts_recorded)                      AS primeiro,
+                MAX(ts_recorded)                      AS ultimo,
+                AVG(trigger_mc)                       AS avg_trigger_mc
+            FROM token_signals
+        """)
+        sig_summary = dict(cur.fetchone())
+
+        cur.execute("""
+            SELECT ts.mint, m.token_nome, m.recovery, m.mc_migration,
+                   ts.trigger_mc, m.mc_bottom, m.mc_1h,
+                   m.time_to_bottom,
+                   (ts.trigger_mc < m.mc_migration) AS signal_below_mig
+            FROM token_signals ts
+            JOIN migrations m ON m.mint = ts.mint
+            WHERE m.recovery IS NOT NULL
+            ORDER BY ts.ts_recorded DESC
+            LIMIT 200
+        """)
+        sig_rows = [dict(r) for r in cur.fetchall()]
+
+        # --- bounce simulation ---
+        cur.execute("""
+            SELECT
+                m.token_nome, m.mint,
+                m.mc_migration, m.mc_bottom, m.time_to_bottom,
+                m.pct_drop, m.mc_peak, m.mc_1h, m.recovery,
+                b.bounce_pct   AS detected_bounce,
+                b.elapsed_sec  AS bounce_elapsed,
+                b.mc_at_signal
+            FROM migrations m
+            JOIN bounce_signals b ON b.mint = m.mint
+            WHERE m.mc_bottom IS NOT NULL
+              AND m.mc_bottom > 0
+            ORDER BY m.ts_migration DESC
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
+
+    # ---- agrega sinais type12 por token para análise H9 ----
+    sig_by_mint = {}
+    for r in sig_rows:
+        sig_by_mint.setdefault(r["mint"], []).append(r)
+
+    tokens_signal_below = sum(
+        1 for mint, sigs in sig_by_mint.items()
+        if any(s["signal_below_mig"] for s in sigs)
+    )
+    rec_with_signal    = [r for r in sig_rows if r["recovery"] is True]
+    norec_with_signal  = [r for r in sig_rows if r["recovery"] is False]
+    rec_rate_signal    = len(rec_with_signal) / len(sig_rows) * 100 if sig_rows else 0
+
+    # ---- simulação por threshold ----
+    def simulate(rows, threshold):
+        results = []
+        for r in rows:
+            bottom = r["mc_bottom"]
+            entry  = bottom * (1 + threshold)
+            tp_tgt = entry * (1 + TP)
+            sl_flr = entry * (1 - SL)
+            peak   = r["mc_peak"]
+            mc_1h  = r["mc_1h"]
+
+            # TP hit se peak atingiu o alvo
+            tp_hit = peak is not None and peak >= tp_tgt
+            # SL hit só é possível se sl_flr > mc_bottom (entry muito alta)
+            # e mc_1h ficou abaixo (não temos ticks, usamos mc_1h como proxy)
+            sl_hit = (not tp_hit) and mc_1h is not None and mc_1h < sl_flr
+
+            if tp_hit:
+                pnl = TP
+                outcome = "TP"
+            elif sl_hit:
+                pnl = -SL
+                outcome = "SL"
+            elif mc_1h is not None:
+                pnl = mc_1h / entry - 1
+                outcome = "1h_exit"
+            else:
+                pnl = None
+                outcome = "sem_dados"
+
+            results.append({**r, "entry": entry, "tp_tgt": tp_tgt, "sl_flr": sl_flr,
+                             "tp_hit": tp_hit, "sl_hit": sl_hit, "pnl": pnl, "outcome": outcome})
+        return results
+
+    sim_stats = {}
+    for thr in THRESHOLDS:
+        res = simulate(rows, thr)
+        with_data = [r for r in res if r["pnl"] is not None]
+        tp_n  = sum(1 for r in with_data if r["outcome"] == "TP")
+        sl_n  = sum(1 for r in with_data if r["outcome"] == "SL")
+        ex_n  = sum(1 for r in with_data if r["outcome"] == "1h_exit")
+        ev    = sum(r["pnl"] for r in with_data) / len(with_data) if with_data else None
+        wr    = tp_n / len(with_data) * 100 if with_data else None
+        sim_stats[thr] = {
+            "n": len(with_data), "tp": tp_n, "sl": sl_n, "exit": ex_n,
+            "wr": wr, "ev": ev, "rows": res
+        }
+
+    # ---- HTML ----
+    CSS = """
+    <style>
+    * { box-sizing:border-box; margin:0; padding:0; }
+    body { font-family:'Courier New',monospace; background:#0d1117; color:#c9d1d9; font-size:12px; }
+    h1,h2 { padding:14px 16px; color:#58a6ff; }
+    h2 { font-size:13px; color:#8b949e; padding:8px 16px; }
+    .grid { display:flex; gap:14px; padding:0 16px 16px; flex-wrap:wrap; }
+    .card { background:#161b22; border:1px solid #30363d; border-radius:6px; padding:10px 16px; min-width:130px; }
+    .card .lbl { color:#8b949e; font-size:10px; margin-bottom:3px; }
+    .card .val { font-size:16px; font-weight:bold; }
+    .green{color:#3fb950} .red{color:#f85149} .yellow{color:#d29922}
+    table { width:100%; border-collapse:collapse; }
+    th { background:#161b22; color:#8b949e; padding:5px 8px; text-align:left;
+         border-bottom:1px solid #30363d; font-size:11px; }
+    td { padding:4px 8px; border-bottom:1px solid #21262d; }
+    tr:hover td { background:#161b22; }
+    .section { padding:16px; }
+    .thr-tbl { width:auto; margin:0 16px 16px; }
+    .thr-tbl td,.thr-tbl th { padding:6px 14px; }
+    </style>"""
+
+    def _mc(v):   return f"${v:,.0f}" if v else "—"
+    def _pct(v):  return f"{v:.0%}" if v is not None else "—"
+    def _f1(v):   return f"{v:.1f}" if v is not None else "—"
+
+    h = f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Strategy Sim</title>{CSS}</head><body>"
+    h += "<h1>Strategy Sim — threshold de bounce e status type 12</h1>"
+
+    # --- type 12 summary ---
+    h += "<h2>▸ Coleta type 12 (SmartDegenBuy)</h2><div class='grid'>"
+    h += f"<div class='card'><div class='lbl'>Total sinais</div><div class='val'>{sig_summary['total_signals']}</div></div>"
+    h += f"<div class='card'><div class='lbl'>Tokens únicos</div><div class='val'>{sig_summary['tokens_com_sinal']}</div></div>"
+    h += f"<div class='card'><div class='lbl'>Sinal abaixo da mig</div><div class='val yellow'>{tokens_signal_below}</div></div>"
+    h += f"<div class='card'><div class='lbl'>Recovery rate (com sinal)</div><div class='val {'green' if rec_rate_signal>=52 else 'red'}'>{rec_rate_signal:.1f}%</div></div>"
+    h += f"<div class='card'><div class='lbl'>Baseline recovery</div><div class='val'>52%</div></div>"
+    primeiro = sig_summary['primeiro']
+    ultimo   = sig_summary['ultimo']
+    if primeiro:
+        primeiro_brt = (primeiro + BRT).strftime("%m/%d %H:%M")
+        ultimo_brt   = (ultimo   + BRT).strftime("%m/%d %H:%M")
+        h += f"<div class='card'><div class='lbl'>Período coleta</div><div class='val' style='font-size:11px'>{primeiro_brt}<br>→ {ultimo_brt}</div></div>"
+    h += "</div>"
+
+    # --- threshold comparison table ---
+    h += "<h2>▸ Simulação de threshold de entrada (TP=75% SL=15%, proxy via mc_peak e mc_1h)</h2>"
+    h += "<table class='thr-tbl'><thead><tr>"
+    h += "<th>Threshold</th><th>n trades</th><th>TP</th><th>SL</th><th>1h exit</th><th>Win rate</th><th>EV médio</th></tr></thead><tbody>"
+    for thr, s in sim_stats.items():
+        wr_cls = "green" if (s["wr"] or 0) >= 20 else "yellow"
+        ev_cls = "green" if (s["ev"] or 0) > 0 else "red"
+        h += f"<tr>"
+        h += f"<td><b>+{thr:.0%}</b></td>"
+        h += f"<td>{s['n']}</td>"
+        h += f"<td class='green'>{s['tp']}</td>"
+        h += f"<td class='red'>{s['sl']}</td>"
+        h += f"<td class='yellow'>{s['exit']}</td>"
+        h += f"<td class='{wr_cls}'>{_f1(s['wr'])}%</td>"
+        h += f"<td class='{ev_cls}'>{_pct(s['ev'])}</td>"
+        h += "</tr>"
+    h += "</tbody></table>"
+
+    # --- detail table for each threshold ---
+    for thr in THRESHOLDS:
+        s = sim_stats[thr]
+        h += f"<h2>▸ Detalhes threshold +{thr:.0%} (mostra apenas tokens com dados)</h2>"
+        h += "<div class='section'><table><thead><tr>"
+        h += "<th>Token</th><th>MC mig</th><th>MC bottom</th><th>Drop</th><th>T bottom</th>"
+        h += "<th>Entry</th><th>TP target</th><th>MC peak</th><th>MC 1h</th>"
+        h += "<th>Outcome</th><th>P&L</th><th>Recovery DB</th></tr></thead><tbody>"
+        for r in s["rows"]:
+            if r["pnl"] is None:
+                continue
+            oc = r["outcome"]
+            oc_cls = "green" if oc == "TP" else ("red" if oc == "SL" else "yellow")
+            pnl_cls = "green" if (r["pnl"] or 0) > 0 else "red"
+            rec = r["recovery"]
+            rec_str = '<span class="green">✓</span>' if rec else ('<span class="red">✗</span>' if rec is not None else "—")
+            h += f"<tr>"
+            h += f"<td><b>{r['token_nome']}</b></td>"
+            h += f"<td>{_mc(r['mc_migration'])}</td>"
+            h += f"<td>{_mc(r['mc_bottom'])}</td>"
+            h += f"<td>{_pct(r['pct_drop'])}</td>"
+            h += f"<td>{_f1(r['time_to_bottom'])}min</td>"
+            h += f"<td>{_mc(r['entry'])}</td>"
+            h += f"<td>{_mc(r['tp_tgt'])}</td>"
+            h += f"<td>{_mc(r['mc_peak'])}</td>"
+            h += f"<td>{_mc(r['mc_1h'])}</td>"
+            h += f"<td class='{oc_cls}'>{oc}</td>"
+            h += f"<td class='{pnl_cls}'>{_pct(r['pnl'])}</td>"
+            h += f"<td>{rec_str}</td>"
+            h += "</tr>"
+        h += "</tbody></table></div>"
+
+    h += "</body></html>"
+    return h
+
+
+# ==============================================================================
 # /analise/bottom-score — Backtest retroativo do Bottom Score
 # ==============================================================================
 
