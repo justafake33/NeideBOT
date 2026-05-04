@@ -135,6 +135,12 @@ class GmgnClient:
             except Exception:
                 reset_at = time.time() + 10
             raise RateLimitError(reset_at)
+        if not resp.ok:
+            try:
+                err_body = resp.json()
+            except Exception:
+                err_body = resp.text
+            logger.error("GMGN HTTP %d %s — body: %s", resp.status_code, resp.url, err_body)
         resp.raise_for_status()
         body = resp.json()
         if body.get("code", 0) != 0:
