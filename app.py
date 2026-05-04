@@ -984,6 +984,174 @@ def analise_bounce_quality():
 
 
 # ==============================================================================
+# /analise/filter-thresholds — Onde cortar cada filtro com base nos dados
+# ==============================================================================
+
+@app.route("/analise/filter-thresholds")
+def analise_filter_thresholds():
+    """
+    Para cada campo de filtro, divide os tokens em faixas e mostra
+    recovery rate por faixa. Deixa os dados determinarem os thresholds.
+    """
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                rug_ratio,
+                bot_degen_rate,
+                rat_trader_rate,
+                top10_holder_rate,
+                suspected_insider_rate,
+                top70_sniper_hold_rate,
+                entrapment_ratio,
+                smart_wallets,
+                liq_migration,
+                volume_1m,
+                recovery,
+                bundler_trader_amount_rate
+            FROM migrations
+            WHERE recovery IS NOT NULL
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
+
+    # Campos a analisar: (coluna_db, label, faixas, maior_é_pior)
+    FIELDS = [
+        ("rug_ratio",               "Rug ratio (GMGN score)",     [0,.05,.10,.15,.20,.30,.50,1], True),
+        ("bot_degen_rate",          "Bot degen rate",              [0,.10,.20,.30,.40,.50,.60,.70,.80,1], True),
+        ("rat_trader_rate",         "Rat trader rate",             [0,.05,.10,.15,.20,.30,.40,.50,1], True),
+        ("top10_holder_rate",       "Top 10 holders",              [0,.40,.50,.60,.70,.75,.80,.85,.90,1], True),
+        ("suspected_insider_rate",  "Suspected insiders",          [0,.02,.05,.10,.15,.20,.30,1], True),
+        ("top70_sniper_hold_rate",  "Top 70 snipers hold",         [0,.02,.05,.10,.15,.20,.30,1], True),
+        ("entrapment_ratio",        "Entrapment ratio",            [0,.01,.05,.10,.20,.30,1], True),
+        ("smart_wallets",           "Smart wallets",               [-1,0,1,2,3,5,10,999], False),
+        ("bundler_trader_amount_rate","Bundler trader rate",         [0,.10,.15,.20,.25,.30,.40,.50,.60,1], True),
+        ("liq_migration",           "Liquidez migração ($)",       [0,5000,10000,15000,25000,50000,999999], False),
+    ]
+
+    def bucket_label(lo, hi, is_int=False):
+        if is_int:
+            return f"{int(lo)+1}–{int(hi)}" if hi < 999 else f">{int(lo)}"
+        if hi >= 1:
+            return f">{lo:.0%}"
+        return f"{lo:.0%}–{hi:.0%}"
+
+    CSS = """<style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;font-size:12px}
+    h1{padding:14px 16px;color:#58a6ff}
+    h2{font-size:12px;color:#8b949e;padding:6px 16px 4px;
+       border-top:1px solid #21262d;margin-top:10px}
+    .wrap{padding:0 16px 16px;display:flex;flex-wrap:wrap;gap:20px}
+    .block{min-width:340px;max-width:480px}
+    .block h3{color:#c9d1d9;font-size:12px;margin-bottom:6px;padding:4px 0;
+              border-bottom:1px solid #30363d}
+    table{width:100%;border-collapse:collapse}
+    th{background:#161b22;color:#8b949e;padding:4px 8px;text-align:right;
+       border-bottom:1px solid #30363d;font-size:10px}
+    th:first-child{text-align:left}
+    td{padding:3px 8px;border-bottom:1px solid #21262d;text-align:right}
+    td:first-child{text-align:left;color:#8b949e}
+    .bar-cell{width:80px}
+    .bar{height:10px;border-radius:2px;display:inline-block}
+    .green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}
+    .note{background:#161b22;border:1px solid #30363d;border-radius:4px;
+          padding:10px 14px;margin:8px 16px 0;font-size:11px;color:#8b949e;line-height:1.7}
+    .best{background:#0d2818}
+    </style>"""
+
+    n_total = len(rows)
+    baseline = sum(1 for r in rows if r["recovery"]) / n_total if n_total else 0
+
+    h = f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Filter Thresholds</title>{CSS}</head><body>"
+    h += "<h1>Filter Thresholds — onde os dados mandam cortar</h1>"
+    h += f"<div class='note'>"
+    h += f"<b>Universo:</b> {n_total} tokens com recovery definido &nbsp;|&nbsp; "
+    h += f"<b>Baseline recovery rate:</b> <span class='yellow'>{baseline:.1%}</span><br>"
+    h += "Cada bloco mostra recovery rate por faixa de valor. "
+    h += "O corte ideal está onde a recovery rate cai abaixo do baseline de forma consistente."
+    h += "</div>"
+
+    h += "<div class='wrap'>"
+
+    for col, label, edges, higher_is_worse in FIELDS:
+        vals = [(r[col], r["recovery"]) for r in rows if r[col] is not None]
+        if not vals:
+            continue
+
+        is_int = col == "smart_wallets"
+
+        buckets = []
+        for i in range(len(edges) - 1):
+            lo, hi = edges[i], edges[i + 1]
+            if is_int:
+                bucket = [(v, rec) for v, rec in vals if lo < v <= hi]
+            else:
+                bucket = [(v, rec) for v, rec in vals if lo <= v < hi]
+            n = len(bucket)
+            if n == 0:
+                continue
+            rr = sum(1 for _, rec in bucket if rec) / n
+            lbl = bucket_label(lo, hi, is_int)
+            buckets.append((lbl, n, rr, lo, hi))
+
+        if not buckets:
+            continue
+
+        # Marca a faixa com maior diferença de recovery vs baseline
+        best_cut = None
+        if higher_is_worse:
+            # Procura primeira faixa onde rr < baseline - 5pp
+            for i, (lbl, n, rr, lo, hi) in enumerate(buckets):
+                if rr < baseline - 0.05 and n >= 10:
+                    best_cut = lo
+                    break
+        else:
+            # Procura faixa onde rr > baseline + 5pp
+            for i, (lbl, n, rr, lo, hi) in enumerate(buckets):
+                if rr > baseline + 0.05 and n >= 10:
+                    best_cut = hi
+                    break
+
+        h += "<div class='block'>"
+        h += f"<h3>{label}</h3>"
+        h += "<table><thead><tr><th>Faixa</th><th>N</th><th>Recovery%</th>"
+        h += "<th class='bar-cell'>vs baseline</th></tr></thead><tbody>"
+
+        for lbl, n, rr, lo, hi in buckets:
+            delta = rr - baseline
+            rr_cls = "green" if delta > 0.05 else ("red" if delta < -0.05 else "yellow")
+            delta_str = f"{delta:+.1%}"
+
+            # barra visual
+            bar_w = max(2, int(abs(delta) * 200))
+            bar_clr = "#3fb950" if delta > 0 else "#f85149"
+
+            is_best_row = (best_cut is not None and
+                           ((higher_is_worse and lo >= best_cut) or
+                            (not higher_is_worse and hi <= best_cut)))
+            row_cls = "best" if is_best_row else ""
+
+            h += f"<tr class='{row_cls}'>"
+            h += f"<td>{lbl}</td>"
+            h += f"<td>{n}</td>"
+            h += f"<td class='{rr_cls}'>{rr:.1%}</td>"
+            h += f"<td><span class='bar' style='width:{bar_w}px;background:{bar_clr}'></span> {delta_str}</td>"
+            h += "</tr>"
+
+        h += "</tbody></table>"
+
+        if best_cut is not None:
+            if higher_is_worse:
+                h += f"<div style='font-size:10px;color:#58a6ff;padding:4px 0'>▸ Corte sugerido pelos dados: &lt; {best_cut:.0%}</div>"
+            else:
+                h += f"<div style='font-size:10px;color:#58a6ff;padding:4px 0'>▸ Corte sugerido pelos dados: &gt; {best_cut}</div>"
+
+        h += "</div>"
+
+    h += "</div></body></html>"
+    return h
+
+
+# ==============================================================================
 # /analise/sniper-entry — Simula entrada na primeira queda pós-migração
 # ==============================================================================
 
