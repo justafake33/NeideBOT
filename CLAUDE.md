@@ -425,7 +425,9 @@ TELEGRAM_CHAT=xxxx
 SENTRY_DSN=xxxx              # DSN padrão (não o obsoleto)
 
 # Filtros do Scanner (configuráveis sem redeploy)
-FILTER_RUG_MAX=0.15          # máx bundler_trader_amount_rate
+FILTER_RUG_MAX=0.15          # máx token["rug_ratio"] (score interno GMGN, 0-1)
+FILTER_BUNDLER_MAX=0.20      # máx bundler_trader_amount_rate (% bundlers real)
+FILTER_BOT_MAX=0.50          # máx bot_degen_rate
 FILTER_RAT_MAX=0.20          # máx rat_trader_amount_rate
 FILTER_TOP10_MAX=0.80        # máx top_10_holder_rate
 FILTER_SMART_MIN=1           # mín smart_degen_count
@@ -524,6 +526,8 @@ ORDER_TIMEOUT_SEC=30         # timeout do fill (segundos)
 42. **TradeExecutor é thread-safe**: `on_bounce()` usa `_lock` para checar limite antes de despachar. Cada trade roda em thread própria (`trade-{id}`). Falha no fill não impede o próximo bounce.
 43. **Priority fee NÃO é enviado no swap**: GMGN gerencia internamente. Enviar com unidade errada pode causar fees absurdos (ex: 100000 microlamports/CU × 300k CU = $6+ por trade).
 44. **_checkpoint só aceita label="1h"**: após remoção dos checkpoints 4h/24h, o dict de labels foi simplificado. Chamar com outro label retorna sem fazer nada.
+45. **rug_ratio vs bundler_trader_amount_rate são campos diferentes**: `token["rug_ratio"]` é o score de risco interno da GMGN (escala 0-1, tende a ser baixo). `token["bundler_trader_amount_rate"]` é a % real de bundlers (o campo relevante para filtrar). O filtro `FILTER_BUNDLER_MAX` checa `bundler_trader_amount_rate`; `FILTER_RUG_MAX` checa `rug_ratio`. Ambos devem estar no filtro.
+46. **bot_degen_rate é um forte sinal de lixo**: tokens com >50% de bot_degen_rate tendem a ser rugs ou distribuição pura. Filtrado por `FILTER_BOT_MAX` (padrão 50%).
 
 ---
 

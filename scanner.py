@@ -22,6 +22,8 @@ HOT_WINDOW_MIN     = 60
 # Filtros (configuráveis via env vars no Railway sem redeploy)
 # ------------------------------------------------------------------
 F_RUG_MAX        = float(os.getenv("FILTER_RUG_MAX",        "0.15"))
+F_BUNDLER_MAX    = float(os.getenv("FILTER_BUNDLER_MAX",    "0.20"))  # bundler_trader_amount_rate
+F_BOT_MAX        = float(os.getenv("FILTER_BOT_MAX",        "0.50"))  # bot_degen_rate
 F_RAT_MAX        = float(os.getenv("FILTER_RAT_MAX",        "0.20"))
 F_TOP10_MAX      = float(os.getenv("FILTER_TOP10_MAX",      "0.80"))
 F_SMART_MIN      = int(os.getenv(  "FILTER_SMART_MIN",      "1"))
@@ -39,9 +41,18 @@ def _passes_filter(token: dict) -> tuple[bool, str]:
     if F_WASH_BLOCK and token.get("is_wash_trading"):
         return False, "wash_trading"
 
+    # rug_ratio = score interno GMGN (0-1); bundler_trader_amount_rate = % bundlers real
     rug = _float(token.get("rug_ratio"))
     if rug is not None and rug > F_RUG_MAX:
         return False, f"rug_ratio={rug:.0%}>{F_RUG_MAX:.0%}"
+
+    bundler = _float(token.get("bundler_trader_amount_rate"))
+    if bundler is not None and bundler > F_BUNDLER_MAX:
+        return False, f"bundler={bundler:.0%}>{F_BUNDLER_MAX:.0%}"
+
+    bot = _float(token.get("bot_degen_rate"))
+    if bot is not None and bot > F_BOT_MAX:
+        return False, f"bot_degen={bot:.0%}>{F_BOT_MAX:.0%}"
 
     rat = _float(token.get("rat_trader_amount_rate"))
     if rat is not None and rat > F_RAT_MAX:
