@@ -341,10 +341,21 @@ def export_bounces():
 
 
 @app.route("/export/bounce-ticks")
+@app.route("/export/bounce_ticks")
 def export_bounce_ticks():
     """Exporta ticks dos tokens que tiveram bounce_signal — ideal para estudar padrão pós-bounce."""
     with db._cursor() as cur:
         cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'token_ticks'
+        """)
+        tick_cols = {r["column_name"] for r in cur.fetchall()}
+
+        def col(name: str) -> str:
+            return f"t.{name}" if name in tick_cols else f"NULL AS {name}"
+
+        cur.execute(f"""
             SELECT
                 t.mint,
                 m.token_nome                    AS symbol,
@@ -358,28 +369,29 @@ def export_bounce_ticks():
                 t.ts,
                 EXTRACT(EPOCH FROM (t.ts - b.ts_signal)) AS sec_after_bounce,
                 t.mc,
-                t.mc_open,
-                t.mc_high,
-                t.mc_low,
-                t.volume_1m,
-                t.source,
-                -- preço relativo ao fundo
+                {col('mc_open')},
+                {col('mc_high')},
+                {col('mc_low')},
+                {col('volume_1m')},
+                {col('source')},
                 (t.mc - b.mc_bottom) / NULLIF(b.mc_bottom,0) AS gain_vs_bottom,
-                -- preço relativo à entrada alvo (mc_bottom × 1.15)
                 (t.mc - b.mc_bottom * 1.15) / NULLIF(b.mc_bottom * 1.15,0) AS gain_vs_entry
             FROM token_ticks t
             JOIN bounce_signals b ON b.mint = t.mint
             JOIN migrations m ON m.mint = t.mint
-            WHERE t.ts >= b.ts_signal - INTERVAL '2 minutes'  -- 2min antes do bounce p/ contexto
+            WHERE t.ts >= b.ts_signal - INTERVAL '2 minutes'
             ORDER BY t.mint, t.ts
         """)
         rows = [dict(r) for r in cur.fetchall()]
-    if not rows:
-        return "Sem ticks de bounces", 404
     output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=rows[0].keys())
-    writer.writeheader()
-    writer.writerows(rows)
+    if not rows:
+        writer = csv.writer(output)
+        writer.writerow(["message"])
+        writer.writerow(["Sem ticks de bounces"])
+    else:
+        writer = csv.DictWriter(output, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
     return Response(
         output.getvalue(),
         mimetype="text/csv",
