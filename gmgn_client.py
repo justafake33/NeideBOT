@@ -158,15 +158,15 @@ class GmgnClient:
 
     def swap(self, token_mint: str, amount_sol: float,
              slippage_bps: int = 500,
-             priority_fee: str = "auto",
-             tip_lamports: int = 1_000_000,
              chain: str = "sol") -> dict:
         """
         POST /v1/trade/swap — executa compra do token com SOL.
         amount_sol:   quantidade em SOL (ex: 0.005 ≈ $1 a $200/SOL).
         slippage_bps: slippage máximo em basis points (500 = 5%).
-        priority_fee: "auto" ou valor em microlamports (ex: "100000").
-        tip_lamports: Jito tip em lamports (1_000_000 = 0.001 SOL ≈ $0.20).
+
+        Priority fee e tip NÃO são enviados — GMGN gerencia internamente.
+        Enviar esses campos com unidade errada pode causar fees absurdos
+        (ex: 100000 microlamports/CU × 300k CU = $6+ por trade).
         """
         lamports = int(round(amount_sol * 1_000_000_000))
         body = {
@@ -175,8 +175,6 @@ class GmgnClient:
             "side":          "buy",
             "amount":        str(lamports),
             "slippage":      slippage_bps,
-            "priority_fee":  priority_fee,
-            "tip":           tip_lamports,
         }
         return self._post_trade("/v1/trade/swap", body, extra_params={"chain": chain})
 
