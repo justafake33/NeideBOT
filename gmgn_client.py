@@ -17,26 +17,64 @@ GMGN_PRIVATE_KEY = os.getenv("GMGN_PRIVATE_KEY", "")
 
 
 def _load_ed25519_key(pem: str):
-    """Carrega chave Ed25519 PEM. Retorna None se pem vazio ou inválido."""
+    """
+    Carrega chave Ed25519. Suporta múltiplos formatos:
+      1. PKCS8 PEM (-----BEGIN PRIVATE KEY-----)
+      2. Base64 raw (32 bytes seed ou 64 bytes seed+pub)
+      3. JSON array de bytes ([1,2,3,...])
+      4. Base58 (formato Solana keypair, 64 bytes)
+    Railway substitui newlines reais por \\n literais — normalizado aqui.
+    """
     if not pem:
         return None
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
+    raw = pem.strip().replace("\\n", "\n") if isinstance(pem, str) else pem.decode()
+
+    # 1. Tenta PEM padrão (PKCS8)
+    if "-----" in raw:
+        try:
+            return load_pem_private_key(raw.encode(), password=None)
+        except Exception as e:
+            logger.debug("PEM PKCS8 falhou: %s", e)
+
+    # 2. Tenta JSON array de bytes [1,2,3,...] (formato Solana CLI keypair)
+    if raw.startswith("["):
+        try:
+            import json as _j
+            arr   = _j.loads(raw)
+            seed  = bytes(arr[:32])
+            return Ed25519PrivateKey.from_private_bytes(seed)
+        except Exception as e:
+            logger.debug("JSON array falhou: %s", e)
+
+    # 3. Tenta base64 puro
     try:
-        from cryptography.hazmat.primitives.serialization import load_pem_private_key
-        # Railway/env vars costumam substituir newlines reais por \n literais
-        if isinstance(pem, str):
-            pem = pem.replace("\\n", "\n")
-        pem_bytes = pem.encode() if isinstance(pem, str) else pem
-        if not pem_bytes.strip().startswith(b"-----"):
-            # Trata raw base64 — envolve em cabeçalho PEM PKCS8
-            pem_bytes = (
-                b"-----BEGIN PRIVATE KEY-----\n"
-                + base64.b64encode(pem_bytes) + b"\n"
-                + b"-----END PRIVATE KEY-----\n"
-            )
-        return load_pem_private_key(pem_bytes, password=None)
+        raw_b64 = raw.replace(" ", "").replace("\n", "")
+        # Corrige padding faltante
+        raw_b64 += "=" * (-len(raw_b64) % 4)
+        decoded = base64.b64decode(raw_b64)
+        seed = decoded[:32]
+        return Ed25519PrivateKey.from_private_bytes(seed)
     except Exception as e:
-        logger.error("GMGN_PRIVATE_KEY inválida: %s", e)
-        return None
+        logger.debug("Base64 raw falhou: %s", e)
+
+    # 4. Tenta base58 (Solana keypair exportado)
+    try:
+        import base58 as _b58
+        decoded = _b58.b58decode(raw)
+        seed = decoded[:32]
+        return Ed25519PrivateKey.from_private_bytes(seed)
+    except Exception as e:
+        logger.debug("Base58 falhou: %s", e)
+
+    logger.error(
+        "GMGN_PRIVATE_KEY inválida — nenhum formato reconhecido. "
+        "Formatos aceitos: PKCS8 PEM, base64 (32/64 bytes), JSON array, base58."
+    )
+    return None
 
 # Plataformas e quote address types por chain (fonte: GMGN OpenApiClient.ts)
 _PLATFORMS = {
