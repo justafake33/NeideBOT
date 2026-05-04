@@ -984,6 +984,160 @@ def analise_bounce_quality():
 
 
 # ==============================================================================
+# /debug/recovery-gap — Por que tokens não têm recovery definido
+# ==============================================================================
+
+@app.route("/debug/recovery-gap")
+def debug_recovery_gap():
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                COUNT(*)                                                         AS total,
+                COUNT(recovery)                                                  AS com_recovery,
+                COUNT(*) FILTER (WHERE recovery IS NULL)                         AS sem_recovery,
+                COUNT(*) FILTER (WHERE recovery IS NULL
+                    AND mc_1h IS NULL AND mc_bottom IS NULL)                     AS sem_ambos,
+                COUNT(*) FILTER (WHERE recovery IS NULL
+                    AND mc_1h IS NULL AND mc_bottom IS NOT NULL)                 AS tem_bottom_falta_1h,
+                COUNT(*) FILTER (WHERE recovery IS NULL
+                    AND mc_1h IS NOT NULL AND mc_bottom IS NULL)                 AS tem_1h_falta_bottom,
+                COUNT(*) FILTER (WHERE recovery IS NULL
+                    AND mc_1h IS NOT NULL AND mc_bottom IS NOT NULL)             AS tem_ambos_sem_recovery,
+                COUNT(*) FILTER (WHERE recovery IS TRUE)                         AS rec_true,
+                COUNT(*) FILTER (WHERE recovery IS FALSE)                        AS rec_false,
+                COUNT(*) FILTER (WHERE ts_migration IS NULL)                     AS sem_ts_migration
+            FROM migrations
+        """)
+        totals = dict(cur.fetchone())
+
+        # Distribuição temporal — últimas 2 semanas
+        cur.execute("""
+            SELECT
+                DATE_TRUNC('day', ts_migration AT TIME ZONE 'America/Sao_Paulo') AS dia,
+                COUNT(*)                                           AS total,
+                COUNT(recovery)                                    AS com_recovery,
+                COUNT(*) FILTER (WHERE recovery IS NULL)           AS sem_recovery,
+                COUNT(*) FILTER (WHERE recovery IS TRUE)           AS rec_true,
+                COUNT(*) FILTER (WHERE recovery IS FALSE)          AS rec_false
+            FROM migrations
+            WHERE ts_migration IS NOT NULL
+              AND ts_migration > NOW() - INTERVAL '14 days'
+            GROUP BY 1 ORDER BY 1 DESC
+        """)
+        daily = [dict(r) for r in cur.fetchall()]
+
+        # Tokens com ambos os campos mas sem recovery — suspeito de bug
+        cur.execute("""
+            SELECT mint, token_nome, mc_1h, mc_bottom, ts_migration,
+                   EXTRACT(EPOCH FROM (NOW() - ts_migration))/3600 AS horas_desde_mig
+            FROM migrations
+            WHERE recovery IS NULL
+              AND mc_1h IS NOT NULL
+              AND mc_bottom IS NOT NULL
+            ORDER BY ts_migration DESC
+            LIMIT 20
+        """)
+        bug_candidates = [dict(r) for r in cur.fetchall()]
+
+        # Tokens sem mc_1h: quando migraram?
+        cur.execute("""
+            SELECT
+                CASE
+                    WHEN ts_migration > NOW() - INTERVAL '2 hours' THEN 'recente (<2h)'
+                    WHEN ts_migration > NOW() - INTERVAL '24 hours' THEN 'hoje (2-24h)'
+                    WHEN ts_migration > NOW() - INTERVAL '7 days'  THEN 'semana passada'
+                    ELSE 'antigo (>7d)'
+                END AS janela,
+                COUNT(*) AS n
+            FROM migrations
+            WHERE recovery IS NULL AND mc_1h IS NULL
+            GROUP BY 1 ORDER BY MIN(ts_migration) DESC
+        """)
+        sem_1h_por_janela = [dict(r) for r in cur.fetchall()]
+
+    CSS = """<style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;font-size:12px}
+    h1{padding:14px 16px;color:#58a6ff}
+    h2{font-size:12px;color:#8b949e;padding:8px 16px 4px;border-top:1px solid #21262d;margin-top:10px}
+    .grid{display:flex;gap:10px;padding:0 16px 12px;flex-wrap:wrap}
+    .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px 14px;min-width:130px}
+    .card .lbl{color:#8b949e;font-size:10px;margin-bottom:3px}
+    .card .val{font-size:15px;font-weight:bold}
+    .green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}.blue{color:#58a6ff}
+    table{width:100%;border-collapse:collapse}
+    th{background:#161b22;color:#8b949e;padding:4px 8px;text-align:right;
+       border-bottom:1px solid #30363d;font-size:10px}
+    th:first-child{text-align:left}
+    td{padding:3px 8px;border-bottom:1px solid #21262d;text-align:right}
+    td:first-child{text-align:left}
+    .sec{padding:0 16px 12px}
+    .warn{background:#2a1a00;border:1px solid #d29922;border-radius:4px;
+          padding:8px 14px;margin:8px 16px;font-size:11px;color:#d29922}
+    </style>"""
+
+    h = f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Recovery Gap</title>{CSS}</head><body>"
+    h += "<h1>Recovery Gap — por que 619 tokens não têm recovery</h1>"
+
+    t = totals
+    gap_pct = t['sem_recovery'] / t['total'] * 100 if t['total'] else 0
+
+    h += "<div class='grid'>"
+    h += f"<div class='card'><div class='lbl'>Total migrations</div><div class='val'>{t['total']}</div></div>"
+    h += f"<div class='card'><div class='lbl'>Com recovery</div><div class='val green'>{t['com_recovery']}</div></div>"
+    h += f"<div class='card'><div class='lbl'>Sem recovery</div><div class='val red'>{t['sem_recovery']} ({gap_pct:.0f}%)</div></div>"
+    h += f"<div class='card'><div class='lbl'>recovery=TRUE</div><div class='val green'>{t['rec_true']}</div></div>"
+    h += f"<div class='card'><div class='lbl'>recovery=FALSE</div><div class='val red'>{t['rec_false']}</div></div>"
+    h += "</div>"
+
+    h += "<h2>▸ Por que estão sem recovery?</h2>"
+    h += "<div class='grid'>"
+    h += f"<div class='card'><div class='lbl'>Sem mc_1h E sem mc_bottom</div><div class='val yellow'>{t['sem_ambos']}</div></div>"
+    h += f"<div class='card'><div class='lbl'>Tem bottom, falta mc_1h</div><div class='val yellow'>{t['tem_bottom_falta_1h']}</div></div>"
+    h += f"<div class='card'><div class='lbl'>Tem mc_1h, falta bottom</div><div class='val yellow'>{t['tem_1h_falta_bottom']}</div></div>"
+    h += f"<div class='card'><div class='lbl'>Tem ambos, sem recovery ⚠️</div><div class='val red'>{t['tem_ambos_sem_recovery']}</div></div>"
+    h += f"<div class='card'><div class='lbl'>Sem ts_migration</div><div class='val'>{t['sem_ts_migration']}</div></div>"
+    h += "</div>"
+
+    if t['tem_ambos_sem_recovery'] > 0:
+        h += f"<div class='warn'>⚠️ {t['tem_ambos_sem_recovery']} tokens têm mc_1h E mc_bottom mas recovery=NULL — possível bug no update_checkpoint()</div>"
+
+    h += "<h2>▸ Tokens sem mc_1h por janela temporal</h2>"
+    h += "<div class='sec'><table><thead><tr><th>Janela</th><th>N sem recovery</th></tr></thead><tbody>"
+    for r in sem_1h_por_janela:
+        h += f"<tr><td>{r['janela']}</td><td>{r['n']}</td></tr>"
+    h += "</tbody></table></div>"
+
+    h += "<h2>▸ Distribuição diária — últimas 2 semanas (BRT)</h2>"
+    h += "<div class='sec'><table><thead><tr>"
+    h += "<th>Dia</th><th>Total</th><th>c/Recovery</th><th>s/Recovery</th><th>TRUE</th><th>FALSE</th><th>Coverage%</th></tr></thead><tbody>"
+    for r in daily:
+        cov = r['com_recovery'] / r['total'] * 100 if r['total'] else 0
+        cov_cls = "green" if cov >= 70 else ("yellow" if cov >= 40 else "red")
+        h += f"<tr><td>{str(r['dia'])[:10]}</td><td>{r['total']}</td>"
+        h += f"<td class='green'>{r['com_recovery']}</td>"
+        h += f"<td class='red'>{r['sem_recovery']}</td>"
+        h += f"<td class='green'>{r['rec_true']}</td>"
+        h += f"<td class='red'>{r['rec_false']}</td>"
+        h += f"<td class='{cov_cls}'>{cov:.0f}%</td></tr>"
+    h += "</tbody></table></div>"
+
+    if bug_candidates:
+        h += "<h2>▸ Candidatos a bug — têm mc_1h + mc_bottom mas recovery=NULL</h2>"
+        h += "<div class='sec'><table><thead><tr>"
+        h += "<th>Token</th><th>mc_1h</th><th>mc_bottom</th><th>Ratio</th><th>Horas desde mig</th></tr></thead><tbody>"
+        for r in bug_candidates:
+            ratio = r['mc_1h'] / r['mc_bottom'] if r['mc_bottom'] else 0
+            h += f"<tr><td>{r['token_nome']}</td>"
+            h += f"<td>${r['mc_1h']:,.0f}</td><td>${r['mc_bottom']:,.0f}</td>"
+            h += f"<td>{ratio:.2f}x</td><td>{r['horas_desde_mig']:.1f}h</td></tr>"
+        h += "</tbody></table></div>"
+
+    h += "</body></html>"
+    return h
+
+
+# ==============================================================================
 # /analise/filter-thresholds — Onde cortar cada filtro com base nos dados
 # ==============================================================================
 
