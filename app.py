@@ -713,6 +713,278 @@ def debug_strategy_sim():
 
 
 # ==============================================================================
+# /analise/bounce-quality — O que realmente discrimina bounces bons de ruins
+# ==============================================================================
+
+@app.route("/analise/bounce-quality")
+def analise_bounce_quality():
+    """
+    Para cada bounce_signal, caminha os ticks APÓS o sinal e determina
+    o outcome real (TP/SL/exit) usando mc_high/mc_low dos kline ticks.
+    Depois mostra correlação de cada campo de qualidade com win/loss.
+    """
+    TP_PCT = 0.75
+    SL_PCT = 0.15
+
+    with db._cursor() as cur:
+        # Bounce signals com todos os campos de qualidade da migration
+        cur.execute("""
+            SELECT
+                b.mint, b.symbol,
+                b.elapsed_sec   AS bounce_elapsed,
+                b.mc_min        AS bottom,
+                b.mc_at_signal  AS entry,
+                b.bounce_pct,
+                b.drop_from_mig,
+                m.mc_migration,
+                m.time_to_bottom,
+                m.pct_drop,
+                m.mc_1h,
+                m.recovery,
+                m.rug_ratio,
+                m.rat_trader_rate,
+                m.top10_holder_rate,
+                m.smart_wallets,
+                m.renowned_wallets,
+                m.is_wash_trading,
+                m.bot_degen_rate,
+                m.bundler_trader_amount_rate   AS bundler,
+                m.suspected_insider_rate,
+                m.top70_sniper_hold_rate,
+                m.entrapment_ratio,
+                m.creator_token_status,
+                m.liq_migration,
+                m.exchange,
+                m.ts_migration
+            FROM bounce_signals b
+            JOIN migrations m ON m.mint = b.mint
+            WHERE b.mc_at_signal IS NOT NULL AND b.mc_at_signal > 0
+            ORDER BY m.ts_migration DESC
+        """)
+        bounces = [dict(r) for r in cur.fetchall()]
+
+        # Ticks de cada bounce (APENAS após o elapsed_sec do sinal)
+        cur.execute("""
+            SELECT mint, elapsed_sec, mc, mc_high, mc_low, source
+            FROM token_ticks
+            WHERE mint = ANY(%s)
+            ORDER BY mint, elapsed_sec
+        """, ([b["mint"] for b in bounces],))
+        all_ticks = cur.fetchall()
+
+    # Agrupa ticks por mint
+    ticks_by_mint = {}
+    for t in all_ticks:
+        ticks_by_mint.setdefault(t["mint"], []).append(t)
+
+    # Calcula outcome real por bounce
+    results = []
+    for b in bounces:
+        entry  = b["entry"]
+        tp_tgt = entry * (1 + TP_PCT)
+        sl_flr = entry * (1 - SL_PCT)
+        ticks  = [t for t in ticks_by_mint.get(b["mint"], [])
+                  if t["elapsed_sec"] > b["bounce_elapsed"]]
+
+        outcome = "sem_ticks"
+        pnl     = None
+        exit_mc = None
+        exit_at = None
+
+        for t in ticks:
+            # kline ticks têm OHLC — usa high p/ TP e low p/ SL
+            high = t["mc_high"] if t["mc_high"] else t["mc"]
+            low  = t["mc_low"]  if t["mc_low"]  else t["mc"]
+
+            # SL primeiro (conservador: se mesma vela, assume SL)
+            if low is not None and low <= sl_flr:
+                outcome = "SL"
+                pnl     = -SL_PCT
+                exit_mc = sl_flr
+                exit_at = t["elapsed_sec"]
+                break
+            if high is not None and high >= tp_tgt:
+                outcome = "TP"
+                pnl     = TP_PCT
+                exit_mc = tp_tgt
+                exit_at = t["elapsed_sec"]
+                break
+        else:
+            # Sem hit — saída no último tick disponível
+            if ticks:
+                last_mc = ticks[-1]["mc"]
+                if last_mc and entry:
+                    pnl     = last_mc / entry - 1
+                    exit_mc = last_mc
+                    exit_at = ticks[-1]["elapsed_sec"]
+                    outcome = "exit"
+            elif b.get("mc_1h"):
+                pnl     = b["mc_1h"] / entry - 1
+                exit_mc = b["mc_1h"]
+                outcome = "exit_1h"
+
+        results.append({**b, "tp_tgt": tp_tgt, "sl_flr": sl_flr,
+                        "outcome": outcome, "pnl": pnl,
+                        "exit_mc": exit_mc, "exit_at": exit_at,
+                        "n_ticks": len(ticks)})
+
+    # ---- Agregações ----
+    with_data  = [r for r in results if r["pnl"] is not None]
+    wins       = [r for r in with_data if r["outcome"] == "TP"]
+    losses     = [r for r in with_data if r["outcome"] == "SL"]
+    exits      = [r for r in with_data if r["outcome"] in ("exit", "exit_1h")]
+    no_ticks   = [r for r in results   if r["outcome"] == "sem_ticks"]
+
+    n_total  = len(results)
+    n_data   = len(with_data)
+    win_rate = len(wins) / n_data * 100 if n_data else 0
+    ev       = sum(r["pnl"] for r in with_data) / n_data if n_data else 0
+
+    def avg(lst, key):
+        vals = [r[key] for r in lst if r.get(key) is not None]
+        return sum(vals) / len(vals) if vals else None
+
+    def _f(v, pct=False):
+        if v is None: return "—"
+        return f"{v:.0%}" if pct else f"{v:.1f}"
+
+    # Campos numéricos para correlação win vs loss
+    FIELDS = [
+        ("time_to_bottom",       "T bottom (min)",      False),
+        ("pct_drop",             "Drop (%)",            True),
+        ("bounce_pct",           "Bounce%",             True),
+        ("bot_degen_rate",       "Bot degen",           True),
+        ("bundler",              "Bundler rate",        True),
+        ("rug_ratio",            "Rug ratio (GMGN)",    True),
+        ("rat_trader_rate",      "Rat trader",          True),
+        ("top10_holder_rate",    "Top10 holders",       True),
+        ("smart_wallets",        "Smart wallets",       False),
+        ("renowned_wallets",     "Renowned wallets",    False),
+        ("suspected_insider_rate","Insiders",           True),
+        ("top70_sniper_hold_rate","Top70 snipers",      True),
+        ("entrapment_ratio",     "Entrapment",          False),
+        ("liq_migration",        "Liq migração ($)",    False),
+        ("n_ticks",              "Ticks pós-sinal",     False),
+    ]
+
+    CSS = """<style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;font-size:12px}
+    h1,h2{padding:12px 16px;color:#58a6ff}
+    h2{font-size:13px;color:#8b949e;padding:6px 16px;border-top:1px solid #21262d;margin-top:8px}
+    .grid{display:flex;gap:12px;padding:0 16px 12px;flex-wrap:wrap}
+    .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px 16px;min-width:120px}
+    .card .lbl{color:#8b949e;font-size:10px;margin-bottom:3px}
+    .card .val{font-size:16px;font-weight:bold}
+    .green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}
+    table{width:100%;border-collapse:collapse}
+    th{background:#161b22;color:#8b949e;padding:5px 8px;text-align:left;
+       border-bottom:1px solid #30363d;font-size:11px;white-space:nowrap}
+    td{padding:4px 8px;border-bottom:1px solid #21262d}
+    tr:hover td{background:#161b22}
+    .sec{padding:16px}
+    .warn{background:#3d3b00;color:#d29922;padding:8px 16px;margin:8px 16px;border-radius:4px;font-size:11px}
+    </style>"""
+
+    h = f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Bounce Quality</title>{CSS}</head><body>"
+    h += "<h1>Bounce Quality — o que discrimina bounces bons de ruins</h1>"
+
+    # --- summary cards ---
+    h += "<div class='grid'>"
+    h += f"<div class='card'><div class='lbl'>Total bounces</div><div class='val'>{n_total}</div></div>"
+    h += f"<div class='card'><div class='lbl'>Com tick data</div><div class='val'>{n_data}</div></div>"
+    h += f"<div class='card'><div class='lbl'>Sem ticks</div><div class='val yellow'>{len(no_ticks)}</div></div>"
+    h += f"<div class='card'><div class='lbl'>TP hits</div><div class='val green'>{len(wins)}</div></div>"
+    h += f"<div class='card'><div class='lbl'>SL hits</div><div class='val red'>{len(losses)}</div></div>"
+    h += f"<div class='card'><div class='lbl'>Win rate</div><div class='val {'green' if win_rate>=50 else 'red'}'>{win_rate:.1f}%</div></div>"
+    h += f"<div class='card'><div class='lbl'>EV médio</div><div class='val {'green' if ev>0 else 'red'}'>{ev:+.0%}</div></div>"
+    h += "</div>"
+
+    if len(no_ticks) > n_data:
+        h += f"<div class='warn'>⚠️ {len(no_ticks)}/{n_total} bounces sem ticks — cobertura insuficiente para conclusões sólidas. Acumulando via kline.</div>"
+
+    # --- correlação win vs loss ---
+    h += "<h2>▸ Médias por campo: TP hits vs SL hits (quanto maior a diferença, mais discrimina)</h2>"
+    h += "<div class='sec'><table><thead><tr>"
+    h += "<th>Campo</th><th>TP avg</th><th>SL avg</th><th>Exits avg</th><th>Diferença TP-SL</th><th>Sinal</th></tr></thead><tbody>"
+
+    field_diffs = []
+    for key, label, is_pct in FIELDS:
+        a_win  = avg(wins,   key)
+        a_loss = avg(losses, key)
+        a_exit = avg(exits,  key)
+        if a_win is None and a_loss is None:
+            continue
+        diff = (a_win - a_loss) if (a_win is not None and a_loss is not None) else None
+        field_diffs.append((key, label, is_pct, a_win, a_loss, a_exit, diff))
+
+    field_diffs.sort(key=lambda x: abs(x[6] or 0), reverse=True)
+
+    for key, label, is_pct, a_win, a_loss, a_exit, diff in field_diffs:
+        if diff is None:
+            diff_str = "—"
+            diff_cls = ""
+        else:
+            if is_pct:
+                diff_str = f"{diff:+.1%}"
+            else:
+                diff_str = f"{diff:+.1f}"
+            diff_cls = "green" if diff > 0 else "red"
+
+        # Interpretação: campo alto = bom para TP? ou ruim?
+        if diff is not None:
+            if key in ("bot_degen_rate", "bundler", "rug_ratio", "rat_trader_rate",
+                       "top10_holder_rate", "suspected_insider_rate", "top70_sniper_hold_rate",
+                       "entrapment_ratio", "pct_drop"):
+                sinal = "⬇ alto = pior" if diff < 0 else "⬆ alto = melhor (inesperado)"
+            else:
+                sinal = "⬆ alto = melhor" if diff > 0 else "⬇ alto = pior (inesperado)"
+        else:
+            sinal = "—"
+
+        fmt = "{:.0%}" if is_pct else "{:.1f}"
+        h += f"<tr><td><b>{label}</b></td>"
+        h += f"<td class='green'>{fmt.format(a_win) if a_win is not None else '—'}</td>"
+        h += f"<td class='red'>{fmt.format(a_loss) if a_loss is not None else '—'}</td>"
+        h += f"<td class='yellow'>{fmt.format(a_exit) if a_exit is not None else '—'}</td>"
+        h += f"<td class='{diff_cls}'><b>{diff_str}</b></td>"
+        h += f"<td style='color:#8b949e;font-size:10px'>{sinal}</td></tr>"
+
+    h += "</tbody></table></div>"
+
+    # --- tabela detalhada ---
+    h += "<h2>▸ Resultados individuais (ordenados por tempo de migração)</h2>"
+    h += "<div class='sec'><table><thead><tr>"
+    h += "<th>Token</th><th>Outcome</th><th>P&L</th><th>Entry</th><th>Exit MC</th>"
+    h += "<th>T bottom</th><th>Ticks</th><th>Bot</th><th>Bundler</th>"
+    h += "<th>Drop</th><th>Bounce</th><th>Smart</th><th>Creator</th></tr></thead><tbody>"
+
+    for r in sorted(results, key=lambda x: x.get("ts_migration") or 0, reverse=True):
+        oc  = r["outcome"]
+        oc_cls = "green" if oc == "TP" else ("red" if oc == "SL" else "yellow")
+        pnl = r["pnl"]
+        pnl_cls = "green" if (pnl or 0) > 0 else "red"
+        h += f"<tr>"
+        h += f"<td><b>{r['symbol']}</b></td>"
+        h += f"<td class='{oc_cls}'>{oc}</td>"
+        h += f"<td class='{pnl_cls}'>{pnl:+.0%}</td>" if pnl is not None else "<td>—</td>"
+        h += f"<td>${r['entry']:,.0f}</td>"
+        h += f"<td>${r['exit_mc']:,.0f}</td>" if r.get("exit_mc") else "<td>—</td>"
+        h += f"<td>{r['time_to_bottom']:.1f}min</td>" if r.get("time_to_bottom") else "<td>—</td>"
+        h += f"<td>{r['n_ticks']}</td>"
+        h += f"<td>{r['bot_degen_rate']:.0%}</td>" if r.get("bot_degen_rate") is not None else "<td>—</td>"
+        h += f"<td>{r['bundler']:.0%}</td>" if r.get("bundler") is not None else "<td>—</td>"
+        h += f"<td>{r['pct_drop']:.0%}</td>" if r.get("pct_drop") is not None else "<td>—</td>"
+        h += f"<td>{r['bounce_pct']:.0%}</td>" if r.get("bounce_pct") is not None else "<td>—</td>"
+        h += f"<td>{r['smart_wallets']}</td>" if r.get("smart_wallets") is not None else "<td>—</td>"
+        h += f"<td>{r['creator_token_status'] or '—'}</td>"
+        h += "</tr>"
+
+    h += "</tbody></table></div></body></html>"
+    return h
+
+
+# ==============================================================================
 # /analise/bottom-score — Backtest retroativo do Bottom Score
 # ==============================================================================
 
