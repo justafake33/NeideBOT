@@ -4161,5 +4161,16 @@ def _start_services():
 _start_services()
 
 
+@app.route("/debug/my-ip")
+def debug_my_ip():
+    """Retorna o IP de saída do Railway — necessário para whitelist GMGN."""
+    import requests as _req
+    try:
+        ip = _req.get("https://ifconfig.me/ip", timeout=5).text.strip()
+    except Exception as e:
+        ip = f"erro: {e}"
+    return f"<pre>Railway outbound IP: {ip}\n\nAdicione este IP na whitelist do GMGN OpenAPI.</pre>"
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
