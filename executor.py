@@ -1,0 +1,250 @@
+"""
+executor.py — Fase 6-lite: execução de trades $1 para calibração de friction.
+
+Fluxo:
+  bounce_signal dispara → on_bounce() → thread _execute() →
+  swap() → wait_fill() → create_strategy() → log em trades table
+
+Ativado apenas com TRADING_ENABLED=true no Railway.
+Limite: CALIBRATION_MAX_TRADES trades (padrão 50).
+"""
+import logging
+import os
+import threading
+import time
+from datetime import datetime, timezone
+
+import db
+from gmgn_client import GmgnClient, get_sol_usd
+
+logger = logging.getLogger(__name__)
+
+TRADING_ENABLED    = os.getenv("TRADING_ENABLED",         "false").lower() == "true"
+CALIBRATION_AMOUNT = float(os.getenv("CALIBRATION_AMOUNT_USD",  "1.0"))
+CALIBRATION_MAX    = int(os.getenv(  "CALIBRATION_MAX_TRADES",  "50"))
+TRADE_TP_PCT       = float(os.getenv("TRADE_TP_PCT",            "0.75"))
+TRADE_SL_PCT       = float(os.getenv("TRADE_SL_PCT",            "0.15"))
+SLIPPAGE_BPS       = int(os.getenv(  "TRADE_SLIPPAGE_BPS",      "500"))   # 5% max
+ORDER_POLL_SEC     = int(os.getenv(  "ORDER_POLL_SEC",           "2"))
+ORDER_TIMEOUT_SEC  = int(os.getenv(  "ORDER_TIMEOUT_SEC",        "30"))
+
+
+class TradeExecutor:
+    """
+    Executor conectado ao bounce_signal detector.
+    Thread-safe — on_bounce() pode ser chamado de qualquer thread do scanner.
+    """
+
+    def __init__(self, gmgn: GmgnClient):
+        self.gmgn  = gmgn
+        self._lock = threading.Lock()
+        if TRADING_ENABLED:
+            logger.info(
+                "TradeExecutor ativo — TP=%.0f%% SL=%.0f%% amount=$%.2f max=%d trades",
+                TRADE_TP_PCT * 100, TRADE_SL_PCT * 100, CALIBRATION_AMOUNT, CALIBRATION_MAX,
+            )
+        else:
+            logger.info("TradeExecutor em modo DRY-RUN (TRADING_ENABLED=false)")
+
+    # ------------------------------------------------------------------
+    # Entry point — chamado pelo HotMonitor._check_bounce()
+    # ------------------------------------------------------------------
+
+    def on_bounce(self, mint: str, symbol: str, mc_bottom: float,
+                  mc_migration: float, elapsed_sec: int):
+        """
+        Chamado quando bounce_signal dispara.
+        Verifica limites, cria registro e despacha thread de execução.
+        """
+        if not TRADING_ENABLED:
+            logger.debug("DRY-RUN bounce %s mc_bottom=$%.0f", symbol, mc_bottom)
+            return
+
+        with self._lock:
+            try:
+                n = db.count_trades()
+            except Exception as e:
+                logger.error("count_trades: %s", e)
+                return
+            if n >= CALIBRATION_MAX:
+                logger.info(
+                    "Calibração concluída (%d/%d) — executor pausado", n, CALIBRATION_MAX
+                )
+                return
+
+        sol_usd = get_sol_usd()
+        if not sol_usd or sol_usd <= 0:
+            logger.warning("Sem preço SOL/USD — skip trade %s", symbol)
+            return
+
+        amount_sol     = CALIBRATION_AMOUNT / sol_usd
+        entry_expected = mc_bottom * 1.15   # entry target = 15% acima do fundo
+
+        try:
+            trade_id = db.insert_trade({
+                "mint":           mint,
+                "symbol":         symbol,
+                "ts_signal":      datetime.now(timezone.utc),
+                "mc_bottom":      mc_bottom,
+                "mc_migration":   mc_migration,
+                "entry_expected": entry_expected,
+                "amount_sol":     amount_sol,
+                "amount_usd":     CALIBRATION_AMOUNT,
+                "tp_pct":         TRADE_TP_PCT,
+                "sl_pct":         TRADE_SL_PCT,
+                "status":         "pending",
+            })
+        except Exception as e:
+            logger.error("insert_trade %s: %s", symbol, e)
+            return
+
+        logger.info(
+            "TRADE #%d %s — $%.2f (%.5f SOL @ $%.0f/SOL) entry=$%.0f",
+            trade_id, symbol, CALIBRATION_AMOUNT, amount_sol, sol_usd, entry_expected,
+        )
+
+        threading.Thread(
+            target=self._execute,
+            args=(trade_id, mint, symbol, amount_sol, sol_usd),
+            daemon=True,
+            name=f"trade-{trade_id}",
+        ).start()
+
+    # ------------------------------------------------------------------
+    # Execução — roda em thread própria
+    # ------------------------------------------------------------------
+
+    def _execute(self, trade_id: int, mint: str, symbol: str,
+                 amount_sol: float, sol_usd: float):
+        ts_signal = datetime.now(timezone.utc)
+
+        # 1. Swap
+        try:
+            ts_sent  = datetime.now(timezone.utc)
+            swap_res = self.gmgn.swap(
+                token_mint=mint,
+                amount_sol=amount_sol,
+                slippage_bps=SLIPPAGE_BPS,
+            )
+            data     = swap_res.get("data") or swap_res
+            order_id = data.get("order_id") or data.get("id")
+
+            db.update_trade(trade_id, {
+                "ts_order_sent": ts_sent,
+                "order_id":      order_id,
+                "status":        "open",
+            })
+            logger.info("Swap #%d %s — order_id=%s", trade_id, symbol, order_id)
+        except Exception as e:
+            logger.error("Swap #%d %s falhou: %s", trade_id, symbol, e)
+            _fail(trade_id, str(e))
+            return
+
+        # 2. Aguarda fill
+        try:
+            fill_res  = self._wait_fill(order_id)
+            fill_data = fill_res.get("data") or fill_res
+        except Exception as e:
+            logger.error("Fill #%d %s timeout: %s", trade_id, symbol, e)
+            _fail(trade_id, str(e))
+            return
+
+        ts_confirmed    = datetime.now(timezone.utc)
+        latency_sec     = (ts_confirmed - ts_signal).total_seconds()
+        tokens_received = _safe_float(fill_data.get("out_amount"))
+        fee_sol_raw     = _safe_float(fill_data.get("fee"))
+        fee_sol         = fee_sol_raw / 1e9 if fee_sol_raw and fee_sol_raw > 1000 else fee_sol_raw
+        in_lamports     = _safe_float(fill_data.get("in_amount"))
+        fill_sol        = in_lamports / 1e9 if in_lamports and in_lamports > 1000 else (in_lamports or amount_sol)
+
+        slippage_pct = None
+        if fill_sol and amount_sol:
+            slippage_pct = (fill_sol - amount_sol) / amount_sol
+
+        entry_price_sol = fill_sol / tokens_received if tokens_received else None
+
+        db.update_trade(trade_id, {
+            "ts_order_confirmed": ts_confirmed,
+            "tokens_received":    tokens_received,
+            "entry_price_sol":    entry_price_sol,
+            "entry_price_usd":    fill_sol * sol_usd if fill_sol else None,
+            "fee_sol":            fee_sol,
+            "latency_sec":        latency_sec,
+            "slippage_pct":       slippage_pct,
+            "status":             "strategy_pending",
+        })
+        logger.info(
+            "Fill #%d %s — tokens=%.0f latência=%.1fs slippage=%.2f%%",
+            trade_id, symbol, tokens_received or 0, latency_sec,
+            (slippage_pct or 0) * 100,
+        )
+
+        # 3. Cria estratégia TP/SL
+        if not tokens_received or tokens_received <= 0:
+            logger.warning("Trade #%d tokens_received=0 — skip create_strategy", trade_id)
+            db.update_trade(trade_id, {"status": "open", "strategy_id": None})
+            return
+
+        try:
+            strat_res   = self.gmgn.create_strategy(
+                token_mint=mint,
+                tokens_amount=tokens_received,
+                tp_pct=TRADE_TP_PCT,
+                sl_pct=TRADE_SL_PCT,
+            )
+            strat_data  = strat_res.get("data") or strat_res
+            strategy_id = strat_data.get("strategy_id") or strat_data.get("id")
+            db.update_trade(trade_id, {
+                "strategy_id": strategy_id,
+                "status":      "open",
+            })
+            logger.info(
+                "Estratégia #%d %s — strategy_id=%s TP=+%.0f%% SL=-%.0f%%",
+                trade_id, symbol, strategy_id, TRADE_TP_PCT * 100, TRADE_SL_PCT * 100,
+            )
+        except Exception as e:
+            logger.error("create_strategy #%d %s: %s", trade_id, symbol, e)
+            # Trade está aberto, estratégia falhou — salva erro mas não marca como error total
+            db.update_trade(trade_id, {
+                "status":    "open",
+                "error_msg": f"create_strategy: {e}",
+            })
+
+    def _wait_fill(self, order_id: str) -> dict:
+        """Poll query_order até status filled/completed ou timeout."""
+        if not order_id:
+            raise ValueError("order_id vazio — não é possível monitorar fill")
+        deadline = time.time() + ORDER_TIMEOUT_SEC
+        while time.time() < deadline:
+            try:
+                result = self.gmgn.query_order(order_id)
+                data   = result.get("data") or result
+                status = str(data.get("status") or "").lower()
+                if status in ("filled", "completed", "success", "done"):
+                    return result
+                if status in ("failed", "cancelled", "rejected", "expired"):
+                    raise RuntimeError(f"Ordem {order_id} status={status}")
+            except RuntimeError:
+                raise
+            except Exception as e:
+                logger.debug("query_order %s: %s", order_id, e)
+            time.sleep(ORDER_POLL_SEC)
+        raise TimeoutError(f"Ordem {order_id} não confirmada em {ORDER_TIMEOUT_SEC}s")
+
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+
+def _fail(trade_id: int, msg: str):
+    try:
+        db.update_trade(trade_id, {"status": "error", "error_msg": msg[:500]})
+    except Exception as e:
+        logger.error("update_trade fail #%d: %s", trade_id, e)
+
+
+def _safe_float(v) -> float | None:
+    try:
+        return float(v) if v is not None else None
+    except Exception:
+        return None

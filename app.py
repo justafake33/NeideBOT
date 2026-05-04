@@ -12,6 +12,7 @@ from monitoring import init_sentry
 from gmgn_client import GmgnClient
 from scheduler import HeapScheduler
 from scanner import Scanner, HotMonitor
+from executor import TradeExecutor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -2759,21 +2760,176 @@ def analise():
 
 
 # ==============================================================================
+# /trades — Dashboard Fase 6-lite
+# ==============================================================================
+
+_TRADES_HTML = """
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="15">
+<title>NeideBOT — Trades</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Courier New', monospace; background: #0d1117; color: #c9d1d9; font-size: 13px; }
+  h1 { padding: 16px; color: #58a6ff; }
+  .summary { display: flex; gap: 16px; padding: 0 16px 16px; flex-wrap: wrap; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px 18px; min-width: 140px; }
+  .card .label { color: #8b949e; font-size: 11px; margin-bottom: 4px; }
+  .card .val { font-size: 18px; font-weight: bold; }
+  .green { color: #3fb950; }
+  .red   { color: #f85149; }
+  .yellow{ color: #d29922; }
+  table  { width: 100%; border-collapse: collapse; }
+  th     { background: #161b22; color: #8b949e; padding: 6px 8px; text-align: left; border-bottom: 1px solid #30363d; font-size: 11px; }
+  td     { padding: 5px 8px; border-bottom: 1px solid #21262d; }
+  tr:hover td { background: #161b22; }
+  .badge { border-radius: 4px; padding: 2px 6px; font-size: 11px; }
+  .b-pending  { background: #3d3b00; color: #d29922; }
+  .b-open     { background: #003d00; color: #3fb950; }
+  .b-strategy_pending { background: #003d3d; color: #39d0d0; }
+  .b-tp_hit   { background: #003d00; color: #3fb950; }
+  .b-sl_hit   { background: #3d0000; color: #f85149; }
+  .b-error    { background: #3d0000; color: #f85149; }
+  .b-timeout  { background: #3d3b00; color: #d29922; }
+  .section    { padding: 16px; }
+</style>
+</head>
+<body>
+<h1>Trades — Fase 6-lite (calibração ${{ amount_usd }}/trade)</h1>
+<div class="summary">
+  <div class="card"><div class="label">Total trades</div><div class="val">{{ total }}</div></div>
+  <div class="card"><div class="label">Abertos</div><div class="val yellow">{{ open_count }}</div></div>
+  <div class="card"><div class="label">TP hit</div><div class="val green">{{ tp_count }}</div></div>
+  <div class="card"><div class="label">SL hit</div><div class="val red">{{ sl_count }}</div></div>
+  <div class="card"><div class="label">Erros</div><div class="val red">{{ err_count }}</div></div>
+  {% if win_rate is not none %}
+  <div class="card"><div class="label">Win rate</div><div class="val {% if win_rate >= 0.20 %}green{% else %}yellow{% endif %}">{{ "%.1f%%"|format(win_rate*100) }}</div></div>
+  {% endif %}
+  {% if avg_latency is not none %}
+  <div class="card"><div class="label">Latência média</div><div class="val">{{ "%.1fs"|format(avg_latency) }}</div></div>
+  {% endif %}
+  {% if avg_slippage is not none %}
+  <div class="card"><div class="label">Slippage médio</div><div class="val">{{ "%.2f%%"|format(avg_slippage*100) }}</div></div>
+  {% endif %}
+  {% if ev_real is not none %}
+  <div class="card"><div class="label">EV real</div><div class="val {% if ev_real > 0 %}green{% else %}red{% endif %}">{{ "%+.1f%%"|format(ev_real*100) }}</div></div>
+  {% endif %}
+  <div class="card"><div class="label">Meta calibração</div><div class="val">{{ calibration_max }} trades</div></div>
+</div>
+<div class="section">
+<table>
+<thead><tr>
+  <th>#</th><th>Symbol</th><th>Status</th><th>Sinal</th>
+  <th>MC bottom</th><th>Entry esperado</th><th>Fill USD</th>
+  <th>Slippage</th><th>Fee SOL</th><th>Latência</th>
+  <th>Tokens</th><th>P&L real</th><th>Strategy</th>
+</tr></thead>
+<tbody>
+{% for t in trades %}
+<tr>
+  <td>{{ t.id }}</td>
+  <td><b>{{ t.symbol or t.mint[:8] }}</b></td>
+  <td><span class="badge b-{{ t.status }}">{{ t.status }}</span></td>
+  <td>{{ t.ts_signal_brt or '—' }}</td>
+  <td>{{ fmt_mc(t.mc_bottom) }}</td>
+  <td>{{ fmt_mc(t.entry_expected) }}</td>
+  <td>{{ ("$%.4f"|format(t.entry_price_usd)) if t.entry_price_usd else '—' }}</td>
+  <td>{{ ("%+.2f%%"|format(t.slippage_pct*100)) if t.slippage_pct is not none else '—' }}</td>
+  <td>{{ ("%.5f"|format(t.fee_sol)) if t.fee_sol else '—' }}</td>
+  <td>{{ ("%.1fs"|format(t.latency_sec)) if t.latency_sec else '—' }}</td>
+  <td>{{ ("%.0f"|format(t.tokens_received)) if t.tokens_received else '—' }}</td>
+  <td>
+    {% if t.pnl_pct_real is not none %}
+      <span class="{% if t.pnl_pct_real > 0 %}green{% else %}red{% endif %}">
+        {{ "%+.1f%%"|format(t.pnl_pct_real*100) }}
+      </span>
+    {% else %}—{% endif %}
+  </td>
+  <td>{{ t.strategy_id[:12] if t.strategy_id else '—' }}</td>
+</tr>
+{% else %}
+<tr><td colspan="13" style="text-align:center;color:#8b949e;padding:20px">
+  Nenhum trade ainda. Ative TRADING_ENABLED=true no Railway.
+</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+</body></html>
+"""
+
+
+@app.route("/trades")
+def trades_dashboard():
+    import os as _os
+    trades_raw = db.get_trades(limit=200)
+
+    # Formata timestamps em BRT
+    for t in trades_raw:
+        ts = t.get("ts_signal")
+        t["ts_signal_brt"] = (ts + BRT).strftime("%m/%d %H:%M:%S") if ts else None
+
+    # Métricas
+    closed   = [t for t in trades_raw if t["status"] in ("tp_hit", "sl_hit")]
+    tp_count = sum(1 for t in trades_raw if t["status"] == "tp_hit")
+    sl_count = sum(1 for t in trades_raw if t["status"] == "sl_hit")
+    err_count= sum(1 for t in trades_raw if t["status"] == "error")
+    open_cnt = sum(1 for t in trades_raw if t["status"] in ("open", "pending", "strategy_pending"))
+
+    win_rate     = tp_count / len(closed) if closed else None
+    latencies    = [t["latency_sec"] for t in trades_raw if t.get("latency_sec")]
+    slippages    = [t["slippage_pct"] for t in trades_raw if t.get("slippage_pct") is not None]
+    avg_latency  = sum(latencies) / len(latencies) if latencies else None
+    avg_slippage = sum(slippages) / len(slippages) if slippages else None
+
+    # EV real sobre trades fechados
+    ev_real = None
+    if closed:
+        pnls = [t["pnl_pct_real"] for t in closed if t.get("pnl_pct_real") is not None]
+        if pnls:
+            ev_real = sum(pnls) / len(pnls)
+
+    trading_enabled = _os.getenv("TRADING_ENABLED", "false").lower() == "true"
+    from executor import CALIBRATION_AMOUNT, CALIBRATION_MAX
+
+    return render_template_string(
+        _TRADES_HTML,
+        trades=trades_raw,
+        total=len(trades_raw),
+        open_count=open_cnt,
+        tp_count=tp_count,
+        sl_count=sl_count,
+        err_count=err_count,
+        win_rate=win_rate,
+        avg_latency=avg_latency,
+        avg_slippage=avg_slippage,
+        ev_real=ev_real,
+        amount_usd=CALIBRATION_AMOUNT,
+        calibration_max=CALIBRATION_MAX,
+        fmt_mc=fmt_mc,
+    )
+
+
+# ==============================================================================
 # Startup — funciona com Gunicorn e execução direta
 # ==============================================================================
 
-gmgn    = None  # exposto globalmente para rotas de debug
-scanner = None  # exposto globalmente para rotas de debug
+gmgn     = None  # exposto globalmente para rotas de debug
+scanner  = None  # exposto globalmente para rotas de debug
+executor = None  # exposto globalmente para rotas de debug
 
 def _start_services():
-    global gmgn, scanner
+    global gmgn, scanner, executor
     if not os.getenv("DATABASE_URL"):
         logger.warning("DATABASE_URL não configurado — serviços não iniciados")
         return
     db.init_db()
     gmgn      = GmgnClient()
+    executor  = TradeExecutor(gmgn)
     scheduler = HeapScheduler()
-    hot       = HotMonitor(gmgn, scheduler)
+    hot       = HotMonitor(gmgn, scheduler, executor=executor)
     scanner   = Scanner(gmgn, hot)
     scheduler.start()
     hot.start()

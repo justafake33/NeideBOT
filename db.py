@@ -194,6 +194,49 @@ def init_db():
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_bounce_signals_ts ON bounce_signals (ts_signal)")
 
+        # Tabela de trades — Fase 6-lite (calibração $1/trade)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id                  BIGSERIAL    PRIMARY KEY,
+                mint                TEXT         NOT NULL,
+                symbol              TEXT,
+                ts_signal           TIMESTAMPTZ,
+                ts_order_sent       TIMESTAMPTZ,
+                ts_order_confirmed  TIMESTAMPTZ,
+                order_id            TEXT,
+                strategy_id         TEXT,
+                -- Entry
+                mc_bottom           FLOAT,
+                mc_migration        FLOAT,
+                entry_expected      FLOAT,
+                entry_price_sol     FLOAT,
+                entry_price_usd     FLOAT,
+                amount_sol          FLOAT,
+                amount_usd          FLOAT,
+                tokens_received     FLOAT,
+                -- Friction
+                slippage_pct        FLOAT,
+                fee_sol             FLOAT,
+                latency_sec         FLOAT,
+                -- Exit (preenchido pelo monitor de estratégia)
+                exit_type           TEXT,
+                exit_price_usd      FLOAT,
+                exit_ts             TIMESTAMPTZ,
+                pnl_pct_real        FLOAT,
+                pnl_pct_expected    FLOAT,
+                -- Config
+                tp_pct              FLOAT        DEFAULT 0.75,
+                sl_pct              FLOAT        DEFAULT 0.15,
+                -- Estado
+                status              TEXT         DEFAULT 'pending',
+                error_msg           TEXT,
+                created_at          TIMESTAMPTZ  DEFAULT NOW()
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_mint   ON trades (mint)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades (status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts     ON trades (created_at DESC)")
+
     logger.info("DB inicializado")
 
 
@@ -623,5 +666,61 @@ def get_all_migrations(limit: int = 2000) -> list:
             SELECT * FROM migrations
             ORDER BY COALESCE(ts_migration, ts_detected) DESC NULLS LAST
             LIMIT %(limit)s
+        """, {"limit": limit})
+        return [dict(row) for row in cur.fetchall()]
+
+
+# ==============================================================================
+# Trades — Fase 6-lite
+# ==============================================================================
+
+def insert_trade(data: dict) -> int:
+    """Cria registro de trade. Retorna o id gerado."""
+    with _cursor() as cur:
+        cur.execute("""
+            INSERT INTO trades
+                (mint, symbol, ts_signal, mc_bottom, mc_migration, entry_expected,
+                 amount_sol, amount_usd, tp_pct, sl_pct, status)
+            VALUES
+                (%(mint)s, %(symbol)s, %(ts_signal)s, %(mc_bottom)s, %(mc_migration)s,
+                 %(entry_expected)s, %(amount_sol)s, %(amount_usd)s,
+                 %(tp_pct)s, %(sl_pct)s, %(status)s)
+            RETURNING id
+        """, data)
+        return cur.fetchone()["id"]
+
+
+def update_trade(trade_id: int, data: dict):
+    """Atualiza campos do trade por id."""
+    if not data:
+        return
+    sets     = ", ".join(f"{k} = %({k})s" for k in data)
+    payload  = dict(data)
+    payload["_id"] = trade_id
+    with _cursor() as cur:
+        cur.execute(f"UPDATE trades SET {sets} WHERE id = %(_id)s", payload)
+
+
+def get_trade_by_id(trade_id: int) -> Optional[dict]:
+    with _cursor() as cur:
+        cur.execute("SELECT * FROM trades WHERE id = %(id)s", {"id": trade_id})
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def count_trades(exclude_errors: bool = True) -> int:
+    """Conta trades (exclui erros por padrão para o limite de calibração)."""
+    with _cursor() as cur:
+        if exclude_errors:
+            cur.execute("SELECT COUNT(*) AS n FROM trades WHERE status != 'error'")
+        else:
+            cur.execute("SELECT COUNT(*) AS n FROM trades")
+        return cur.fetchone()["n"]
+
+
+def get_trades(limit: int = 200) -> list:
+    with _cursor() as cur:
+        cur.execute("""
+            SELECT * FROM trades ORDER BY created_at DESC LIMIT %(limit)s
         """, {"limit": limit})
         return [dict(row) for row in cur.fetchall()]

@@ -63,9 +63,10 @@ def _passes_filter(token: dict) -> tuple[bool, str]:
 # ==============================================================================
 
 class HotMonitor:
-    def __init__(self, gmgn: GmgnClient, scheduler: HeapScheduler):
+    def __init__(self, gmgn: GmgnClient, scheduler: HeapScheduler, executor=None):
         self.gmgn = gmgn
         self.scheduler = scheduler
+        self._executor = executor
         self._tokens: dict = {}
         self._cancelled: set = set()
         self._mc_live: dict = {}  # mint → último MC do trenches, atualizado a cada poll
@@ -210,6 +211,18 @@ class HotMonitor:
 
         logger.info("BOUNCE %s: fundo=$%.0f drop=%.0f%% bounce=%.0f%% em %.1fmin",
                     symbol, mc_min, drop_from_mig * 100, bounce_pct * 100, elapsed_min)
+
+        if self._executor:
+            try:
+                self._executor.on_bounce(
+                    mint=mint,
+                    symbol=symbol,
+                    mc_bottom=mc_min,
+                    mc_migration=mc_migration,
+                    elapsed_sec=elapsed_sec,
+                )
+            except Exception as e:
+                logger.error("executor.on_bounce %s: %s", symbol, e)
 
     # ------------------------------------------------------------------
     # Threads
