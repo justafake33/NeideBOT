@@ -174,22 +174,23 @@ class GmgnClient:
     # Assinatura Ed25519 para endpoints de trade
     # ------------------------------------------------------------------
 
-    def _sign(self, subpath: str, params: dict, body) -> str:
+    def _sign(self, subpath: str, params: dict, body_str: str) -> str:
         """
-        Ed25519 sobre: "{subpath}:{sorted_qs}:{body}:{timestamp}"
+        Ed25519 sobre: "{subpath}:{sorted_qs}:{body_str}:{timestamp}"
         Formato oficial GMGN OpenApiClient (signer.ts buildMessage).
-        body=None → "" (GET requests); body=dict → compact JSON sorted.
+        body_str: JSON já serializado (mesmo string enviado no HTTP body).
+        GET requests: body_str="".
         """
-        ts       = params.get("timestamp", str(int(time.time())))
-        qs       = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-        body_str = _json.dumps(body, separators=(",", ":"), sort_keys=True) if body is not None else ""
-        message  = f"{subpath}:{qs}:{body_str}:{ts}".encode("utf-8")
-        sig      = self._private_key.sign(message)
+        ts      = params.get("timestamp", str(int(time.time())))
+        qs      = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        message = f"{subpath}:{qs}:{body_str}:{ts}".encode("utf-8")
+        sig     = self._private_key.sign(message)
         return base64.b64encode(sig).decode("ascii")
 
     def _post_trade(self, path: str, body: dict = None) -> dict:
         """POST com X-Signature (Ed25519) para endpoints de trade.
-        Query params: apenas timestamp + client_id (chain vai no body, não na query).
+        O body é serializado UMA vez e o mesmo string é usado na assinatura e no HTTP body.
+        (se usássemos json=body no requests, a serialização interna poderia diferir da assinada)
         """
         if not self._private_key:
             raise RuntimeError(
@@ -199,14 +200,14 @@ class GmgnClient:
             raise RuntimeError(
                 "GMGN_WALLET_ADDRESS não configurada — endpoints de trade desabilitados"
             )
-        body   = body or {}
-        params = self._params()  # só timestamp + client_id
-        sig    = self._sign(path, params, body)
-        resp   = self.session.post(
+        body_str = _json.dumps(body or {}, separators=(",", ":"))
+        params   = self._params()  # só timestamp + client_id
+        sig      = self._sign(path, params, body_str)
+        resp     = self.session.post(
             f"{self.host}{path}",
-            json=body,
+            data=body_str,                               # raw string — mesmo bytes assinados
             params=params,
-            headers={"X-Signature": sig},
+            headers={"X-Signature": sig, "Content-Type": "application/json"},
             timeout=15,
         )
         return self._handle_response(resp)
