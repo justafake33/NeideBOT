@@ -185,7 +185,7 @@ ESTÁGIO 2 — Migração detectada
     └─ Token entra no HotMonitor por 60 minutos
 
 HotMonitor (janela 60min)
-    ├─ push_mc (5s): rastreia mc_min, mc_max, mc_last
+    ├─ push_mc (5s): rastreia mc_min, mc_max, mc_last + _check_bounce()
     ├─ hot-precise (60s): kline low/high + back-fill volume_1m nos ticks
     └─ _tick (30s): graduação após 60min → salva mc_bottom, mc_peak, mc_1h
 
@@ -195,6 +195,13 @@ FASE 2 — coleta ativa (IMPLEMENTADO 2026-05-03)
     ├─ Persiste em token_signals (mint, trigger_at UNIQUE, trigger_mc, wallets_json)
     ├─ Objetivo: H9 — correlacionar trigger_mc < mc_migration com recovery=TRUE
     └─ Próximo: validar H9 com ≥100 tokens com sinais → Fase 6 (swap)
+
+BOUNCE DETECTOR — tempo real, sem capital (IMPLEMENTADO 2026-05-03)
+    ├─ _check_bounce() chamado em cada push_mc
+    ├─ Condições: drop ≥ 30% + bounce ≥ 15% do fundo + elapsed ≤ 30min
+    ├─ One-shot por token (bounce_fired = True após primeiro disparo)
+    ├─ Persiste em bounce_signals (UNIQUE mint) + alerta Telegram
+    └─ Usado pelo backtester tick-level para definir entry = mc_bottom * 1.15
 ```
 
 ---
@@ -208,6 +215,7 @@ FASE 2 — coleta ativa (IMPLEMENTADO 2026-05-03)
 - `mc_4h` e `mc_24h` **descartados** — trade é de minutos, não horas
 - **Fase 2 ativa**: sinais type 12 coletados em `token_signals` a cada 5s durante janela quente
 - **Volume fix aplicado**: `volume_1m` back-fillado via kline no hot-precise (a partir deste deploy)
+- **Bounce detector ativo**: `bounce_signals` populando em produção, alertas Telegram ao vivo
 
 ### Campos coletados por migração
 
@@ -273,7 +281,7 @@ Registradas ANTES de ver os dados. Não alterar retroativamente.
 | H9 | Tokens com ≥1 signal type 12 com trigger_mc < mc_migration têm recovery rate ≥20pp maior | ⏳ **pendente** — aguardando acumulação de token_signals (~100 tokens) |
 | H10 | time_to_bottom < 25min → recovery rate ≥20pp maior que time_to_bottom ≥ 25min | ✅ **+21.8pp** confirmado (61.2% vs 39.3%, n=425) |
 | H11 | Deceleração de preço (d²p/dt²→0) precede o fundo em recovery tokens | ❌ **REFUTADA** — direção invertida. Recovery tokens ACELERAM no fundo (capitulação brusca), não desaceleram |
-| H12 | dump_depth + time_elapsed definem zona probabilística de entrada (P(recovery) > 50%) | ⏳ **pendente** — Option 2, próxima análise |
+| H12 | dump_depth + time_elapsed definem zona probabilística de entrada (P(recovery) > 50%) | ⚠️ **PARCIAL** — time domina sobre depth. 3 zonas acionáveis (N≥15, rate≥60%) mas todas já cobertas por H10. Insight novo: zona 5-10min tem recovery 51% (dead zone). |
 
 ### Análises de tick-features — resultados documentados
 
@@ -291,6 +299,27 @@ Registradas ANTES de ver os dados. Não alterar retroativamente.
 > **Por que delta_smart é invertido:** `smart_count` do trenches/ticks = snapshot de posições acumuladas (inclui quem comprou há dias e segura). NÃO é compra ativa. Tokens com dump longo (que não bounceam) acumulam mais smart wallets simplesmente porque o dump dura mais. O sinal correto de compra ativa é o signal type 12.
 
 > **slope_c invertido mas útil:** recovery tokens têm dump 60% mais rápido nos 2 minutos antes do fundo (−0.171 vs −0.107). Não é deceleração — é capitulação brusca. Padrão: queda moderada → leve pausa → spike de capitulação → fundo. No-recovery: queda lenta e gradual sem spike. Caveat: análise sobre tokens com fundo ≥10min (n=49) — os de fundo rápido (H10, maior recovery) foram excluídos por densidade de ticks insuficiente.
+
+### Backtester tick-level — resultados (2026-05-03)
+
+**Metodologia:** entry = mc_bottom × 1.15. Caminha token_ticks cronologicamente após o fundo. Primeiro tick abaixo SL floor → loss. Primeiro tick acima TP target → gain. Fim da janela → saída no último tick.
+
+**Filtros aplicados:** drop ≥ 30%, time_to_bottom < 30min → 555 tokens elegíveis, **63 com ticks** (11.3%).
+
+| TP | SL | Win Rate | EV | n_tp | n_sl | n_time |
+|----|-----|----------|----|------|------|--------|
+| 15% | 15% | 36.5% | -3.4% | 23 | 37 | 3 |
+| 30% | 15% | 31.7% | +0.2% | 20 | 39 | 4 |
+| 40% | 15% | 30.2% | +2.5% | 19 | 40 | 4 |
+| 50% | 15% | 25.4% | +3.0% | 16 | 42 | 5 |
+| 75% | 15% | 25.4% | **+9.3%** | 16 | 42 | 5 |
+| 100% | 15% | 20.6% | **+11.6%** | 13 | 43 | 7 |
+
+**SL=15% domina todos os níveis de TP.** SL=10% dispara com ruído (apenas 3.5% acima do fundo). SL=15% exige retorno abaixo do fundo para acionar.
+
+**⚠️ BIAS CRÍTICO:** 492 de 555 tokens (88.7%) não têm ticks → bias de seleção severo. Os 63 com ticks podem ser os "melhores" tokens (que ficaram vivos o suficiente para gerar ticks). O EV real pode ser significativamente pior. Diagnóstico adicionado ao `/analise/backtest` (`sem_ticks_diagnostico`).
+
+**Próximo passo obrigatório:** verificar `recovery_true/false` dos 492 sem ticks. Se maioria for `recovery_false`, o EV +9.3% é inflado e não é acionável.
 
 ---
 
@@ -317,6 +346,7 @@ Scanner (poll 5s)
     │
     └─ HotMonitor (janela 60min)
             ├─ push_mc (5s): rastreia mc_min, mc_max, mc_last, _mc_live
+            │       └─ _check_bounce(): dispara bounce_signal se drop≥30% e bounce≥15%
             ├─ hot-precise (60s): kline low/high + backfill_tick_volumes()
             └─ _tick (30s): graduação após 60min
                     └─ kline scan 1h completo → mc_bottom, mc_peak, mc_1h
@@ -328,8 +358,9 @@ Scanner (poll 5s)
 | Tabela | Conteúdo |
 |--------|----------|
 | `migrations` | Uma linha por token migrado — todos os campos de qualidade + checkpoints |
-| `token_ticks` | Série temporal 5s por token durante janela quente (60min). volume_1m back-fillado via kline. |
+| `token_ticks` | Série temporal ~30s por token durante janela quente (60min). volume_1m back-fillado via kline. |
 | `token_signals` | **Fase 2** — sinais type 12 por token durante janela quente |
+| `bounce_signals` | **Fase 2** — um registro por token quando bounce detector dispara (UNIQUE mint) |
 
 ### HeapScheduler
 - Thread única com heap de eventos futuros
@@ -373,6 +404,11 @@ BC_MIN_WATCHLIST=80          # % BC mínimo para watchlist
 MAX_MIG_AGE_SEC=600          # ignorar migrações > 10min no restart
 POLL_INTERVAL_SEC=5          # intervalo do scanner
 HOT_PRECISE_SEC=60           # intervalo kline hot-precise
+
+# Bounce detector (configuráveis sem redeploy)
+BOUNCE_MIN_PCT=0.15          # bounce mínimo do fundo para disparar sinal (15%)
+BOUNCE_DROP_MIN=0.30         # drop mínimo da migração para considerar (30%)
+BOUNCE_TIME_MAX=30.0         # janela máxima em minutos (30min = H10 time-stop)
 ```
 
 ---
@@ -388,6 +424,8 @@ HOT_PRECISE_SEC=60           # intervalo kline hot-precise
 | `/analise/smart-flow` | delta_smart / delta_renowned vs recovery — resultado negativo |
 | `/analise/tick-features` | Análise completa de todas as colunas token_ticks vs recovery |
 | `/analise/price-decel` | Slope de preço em 3 janelas antes do fundo — H11 REFUTADA, capitulação brusca emerge |
+| `/analise/dump-depth` | H12 — grid 2D pct_drop × time_to_bottom → P(recovery). 3 zonas acionáveis mas time domina. |
+| `/analise/backtest` | **Backtester tick-level** — grid TP×SL usando token_ticks reais. Inclui sem_ticks_diagnostico. |
 | `/export/csv` | Export completo do banco |
 | `/health` | Health check |
 | `/debug/signal` | Diagnóstico histórico — testa formatos do token_signal (legacy) |
@@ -426,6 +464,10 @@ HOT_PRECISE_SEC=60           # intervalo kline hot-precise
 27. **time_to_bottom é o único preditor validado até agora**: tokens com fundo < 25-30min têm 61% recovery rate vs 39% para fundo > 25-30min (H10 confirmada, n=425, +22pp).
 28. **token_ticks têm intervalo médio ~30s, não 5s**: ticks só são inseridos quando o token aparece no trenches poll com token_data. Se o token sair do feed antes do poll, o tick não é criado. Janelas de análise devem ter ≥150s de largura para capturar ≥5 pontos.
 29. **Capitulação brusca ≠ deceleração**: recovery tokens têm slope_c = −0.171 %MC/s vs −0.107 em no-recovery. O padrão é queda moderada → leve pausa → spike de capitulação → fundo. Análise sobre subconjunto com fundo ≥10min (n=49) — bias de seleção contra os tokens de fundo rápido (maior recovery).
+30. **Backtester usa token_ticks, NÃO mc_1h**: mc_1h é checkpoint arbitrário. O backtester correto caminha os ticks reais após o fundo e detecta qual bate primeiro — SL ou TP. `n_sl_hit` + `n_time_exit` + `n_tp_hit` somam `n_trades`. Tokens sem ticks são excluídos (`n_no_ticks`).
+31. **Bias de cobertura nos ticks**: apenas ~11% dos tokens elegíveis têm ticks suficientes para o backtester. Os 89% restantes podem ter morrido antes de gerar ticks (pior caso) ou são tokens antigos sem cobertura (neutro). Verificar `sem_ticks_diagnostico.recovery_false` antes de confiar no EV calculado.
+32. **bounce_signals tabela**: `UNIQUE (mint)` — só registra o primeiro bounce detectado por token. `ON CONFLICT DO NOTHING` em `insert_bounce_signal()`.
+33. **SL=10% muito apertado**: entry = mc_bottom × 1.15, SL=10% → aciona em mc_bottom × 1.035 (3.5% acima do fundo). Qualquer ruído de mercado dispara o SL. SL=15% é o mínimo prático — exige retorno abaixo do fundo para acionar.
 
 ---
 
@@ -438,6 +480,7 @@ HOT_PRECISE_SEC=60           # intervalo kline hot-precise
 | Fase 2 | token_signals acumulados para testar H9 | ≥100 tokens com sinais | ⏳ em coleta |
 | Análise | H10 validada | delta_pp ≥ 20pp | ✅ +21.8pp |
 | Análise | H9 validada | delta_pp ≥ 20pp | ⏳ aguardando dados |
+| Backtester | EV positivo confirmado sem bias | EV > 0 com N≥100 com ticks | ⏳ aguardando cobertura de ticks |
 | Execução | Win rate out-of-sample | ≥50% | ⏳ Fase 6 |
 | Execução | Payoff ratio | ≥2× | ⏳ Fase 6 |
 | Execução | Max drawdown simulado | ≤40% | ⏳ Fase 6 |
@@ -460,3 +503,4 @@ HOT_PRECISE_SEC=60           # intervalo kline hot-precise
 > Sardinhas seguem intuição. Big players seguem dados out-of-sample.
 > Sardinhas constroem features. Big players constroem datasets.
 > Sardinhas medem delta_smart. Big players esperam H9 com dados reais de compra ativa.
+> Sardinhas confiam no EV de 63 tokens. Big players verificam os 492 que estão faltando.
