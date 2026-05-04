@@ -1156,7 +1156,10 @@ def analise_sniper_entry():
     h += "<div class='note'>"
     h += "<b>Hipótese:</b> token migra → early buyers vendem → dump em segundos → entrar durante a queda.<br>"
     h += f"<b>Universo:</b> {len(tokens)} tokens com ticks &nbsp;|&nbsp; TP={TP_PCT:.0%} &nbsp;|&nbsp; SL={SL_PCT:.0%}<br>"
-    h += "<b>SL_imediato:</b> candle de entrada já perfurou o SL — dump continuou sem pausa."
+    h += "<b>SL_imediato:</b> candle de entrada já perfurou o SL — dump continuou sem pausa.<br>"
+    h += "<b>⚠️ Resolução real dos ticks:</b> trenches poll a cada ~30s, kline a cada ~60s. "
+    h += "O dump dos primeiros 0-10s de migração é <b>invisível</b> nos nossos dados. "
+    h += "Entradas marcadas como '0s' são na verdade o primeiro tick capturado (~30-60s após migrar)."
     h += "</div>"
 
     # --- Grid de thresholds ---
@@ -1198,6 +1201,48 @@ def analise_sniper_entry():
     h += f"<td class='green'>{bounce_filt['ev']:+.1%}</td>"
     h += f"<td>~{15*60:.0f}s (~15min)</td></tr>"
     h += "</tbody></table></div>"
+
+    # --- Filtro: entradas no primeiro minuto (≤60s) ---
+    h += "<h2>▸ Isolando entradas ≤ 60s após migração — o 'primeiro minuto'</h2>"
+    early_rows = []
+    for thr in THRESHOLDS:
+        early = [r for r in detail_by_threshold[thr] if (r["entry_time"] or 0) <= 60]
+        if not early:
+            continue
+        e_wins = [r for r in early if r["outcome"] == "TP"]
+        e_sl_i = [r for r in early if r["outcome"] == "SL_imediato"]
+        e_sls  = [r for r in early if r["outcome"] in ("SL", "SL_imediato")]
+        n_e    = len(early)
+        ev_e   = sum(r["pnl"] for r in early if r["pnl"] is not None) / n_e if n_e else 0
+        wr_e   = len(e_wins) / n_e if n_e else 0
+        early_rows.append((thr, n_e, len(e_wins), len(e_sls), len(e_sl_i), wr_e, ev_e))
+
+    h += "<div class='sec'><table><thead><tr>"
+    h += "<th>Threshold</th><th>Trades ≤60s</th><th>TPs</th><th>SLs</th>"
+    h += "<th>SL imediato</th><th>% imediato</th><th>Win rate</th><th>EV</th></tr></thead><tbody>"
+    for thr, n_e, wins_e, sls_e, sl_i_e, wr_e, ev_e in early_rows:
+        ev_cls = "green" if ev_e > 0 else "red"
+        wr_cls = "green" if wr_e >= 0.25 else "red"
+        pct_imm = sl_i_e / n_e if n_e else 0
+        h += f"<tr><td><b>-{thr:.0%}</b></td><td>{n_e}</td>"
+        h += f"<td class='green'>{wins_e}</td><td class='red'>{sls_e}</td>"
+        h += f"<td class='yellow'>{sl_i_e}</td>"
+        h += f"<td class='{'red' if pct_imm > 0.4 else 'yellow'}'>{pct_imm:.0%}</td>"
+        h += f"<td class='{wr_cls}'>{wr_e:.1%}</td>"
+        h += f"<td class='{ev_cls}'>{ev_e:+.1%}</td></tr>"
+    h += "</tbody></table></div>"
+
+    h += "<div class='note'>"
+    h += "<b>Conclusão do primeiro minuto:</b><br>"
+    h += "O % de SL_imediato nas entradas ≤60s é a métrica chave. "
+    h += "Se >40% das entradas perfuram diretamente o SL sem pausa, significa que "
+    h += "o dump <b>não formou fundo ainda</b> — o preço continuou caindo. "
+    h += "Um sniper real nesse contexto precisaria de dados sub-segundo (on-chain via WebSocket: "
+    h += "Jito bundles, Helius webhooks) para detectar o momento exato de capitulação.<br><br>"
+    h += "<b>O que nossos ticks capturam de fato:</b> o estado do token ~30-60s após migrar. "
+    h += "Nesse ponto, tokens com fundo rápido (H10 &lt;25min) frequentemente já formaram o fundo "
+    h += "e estão em bounce — o que explica por que a estratégia de bounce com drop≤65% é a única com EV positivo."
+    h += "</div>"
 
     # --- Detalhe do melhor threshold ---
     if best_thr is not None:
