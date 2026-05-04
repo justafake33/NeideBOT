@@ -587,9 +587,10 @@ class Scanner:
         thread.start()
         logger.info(
             "Scanner iniciado (poll=%ds) | bc_min=%.0f%% | mc=$%.0f-$%.0f | liq>=$%.0f | fee>=%.1fSOL | "
-            "filtros: rug<%.0f%% rat<%.0f%% top10<%.0f%% smart>=%d wash=%s",
+            "filtros: rug<%.0f%% bundler<%.0f%% bot<%.0f%% rat<%.0f%% top10<%.0f%% smart>=%d wash=%s",
             POLL_INTERVAL, BC_MIN_WATCHLIST, F_MC_MIN, F_MC_MAX, F_LIQ_MIN, F_FEE_MIN,
-            F_RUG_MAX*100, F_RAT_MAX*100, F_TOP10_MAX*100,
+            F_RUG_MAX*100, F_BUNDLER_MAX*100, F_BOT_MAX*100,
+            F_RAT_MAX*100, F_TOP10_MAX*100,
             F_SMART_MIN, F_WASH_BLOCK,
         )
 
