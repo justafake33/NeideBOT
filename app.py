@@ -383,6 +383,124 @@ class _DummyCtx:
 
 
 # ==============================================================================
+# /debug/trades-review — Análise dos tokens que dispararam bounce signals
+# ==============================================================================
+
+@app.route("/debug/trades-review")
+def debug_trades_review():
+    """
+    Cruza a tabela trades com migrations e bounce_signals para analisar
+    a qualidade dos sinais que dispararam ordens.
+    Retorna HTML com todos os campos relevantes de qualidade + resultado.
+    """
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                t.id, t.symbol, t.status, t.ts_signal,
+                t.mc_bottom, t.entry_expected, t.error_msg,
+                m.mint,
+                m.ts_migration,
+                m.mc_migration, m.mc_migration_source,
+                m.mc_peak,  m.time_to_peak,
+                m.mc_bottom  AS m_bottom, m.time_to_bottom, m.pct_drop,
+                m.mc_1h,    m.var_1h,
+                m.recovery,
+                m.rug_ratio, m.rat_trader_rate, m.top10_holder_rate,
+                m.smart_wallets, m.renowned_wallets, m.is_wash_trading,
+                m.creator_token_status, m.creator_balance_rate,
+                m.suspected_insider_rate, m.top70_sniper_hold_rate,
+                m.entrapment_ratio, m.bot_degen_rate,
+                m.liq_migration, m.exchange,
+                b.elapsed_sec   AS bounce_elapsed,
+                b.drop_from_mig AS bounce_drop,
+                b.bounce_pct    AS bounce_pct,
+                b.mc_at_signal  AS bounce_mc
+            FROM trades t
+            LEFT JOIN migrations m ON m.token_nome = t.symbol
+            LEFT JOIN bounce_signals b ON b.mint = m.mint
+            ORDER BY t.id DESC
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
+
+    def _pct(v):
+        return f"{v:.0%}" if v is not None else "—"
+    def _mc(v):
+        return f"${v:,.0f}" if v is not None else "—"
+    def _f1(v):
+        return f"{v:.1f}" if v is not None else "—"
+
+    html = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Trades Review</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Courier New', monospace; background: #0d1117; color: #c9d1d9; font-size: 12px; }
+h1 { padding: 16px; color: #58a6ff; }
+table { width: 100%; border-collapse: collapse; }
+th { background: #161b22; color: #8b949e; padding: 5px 7px; text-align: left;
+     border-bottom: 1px solid #30363d; font-size: 11px; white-space: nowrap; }
+td { padding: 4px 7px; border-bottom: 1px solid #21262d; white-space: nowrap; }
+tr:hover td { background: #161b22; }
+.green { color: #3fb950; } .red { color: #f85149; } .yellow { color: #d29922; }
+.sep { background: #21262d; color: #8b949e; font-size: 10px; padding: 2px 7px; }
+</style></head><body>
+<h1>Trades Review — qualidade dos sinais</h1>
+<table><thead><tr>
+<th>#</th><th>Symbol</th><th>Status</th><th>Sinal (BRT)</th>
+<th>MC mig</th><th>MC bottom</th><th>Drop</th><th>T bottom</th>
+<th>MC 1h</th><th>var 1h</th><th>Recovery</th>
+<th class="sep">Bounce MC</th><th>Bounce%</th><th>T bounce</th>
+<th class="sep">Rug</th><th>Rat</th><th>Top10</th><th>Smart</th><th>Wash</th>
+<th class="sep">Creator</th><th>Cr bal</th><th>Insider</th><th>Sniper70</th>
+<th>Entrap</th><th>Bot</th>
+<th class="sep">Liq mig</th><th>Exchange</th><th>Error</th>
+</tr></thead><tbody>"""
+
+    for r in rows:
+        rec = r.get("recovery")
+        rec_str = '<span class="green">TRUE</span>' if rec else ('<span class="red">FALSE</span>' if rec is not None else "—")
+        status = r.get("status","")
+        sc = "green" if status=="tp_hit" else ("red" if status in ("sl_hit","error") else "yellow")
+        ts = r.get("ts_signal")
+        ts_brt = (ts + BRT).strftime("%m/%d %H:%M:%S") if ts else "—"
+        var1 = r.get("var_1h")
+        var_str = f'<span class="{"green" if var1 and var1>0 else "red"}">{_pct(var1)}</span>' if var1 is not None else "—"
+        err = (r.get("error_msg") or "")[:40]
+        html += f"""<tr>
+<td>{r['id']}</td>
+<td><b>{r['symbol']}</b></td>
+<td class="{sc}">{status}</td>
+<td>{ts_brt}</td>
+<td>{_mc(r.get('mc_migration'))}</td>
+<td>{_mc(r.get('m_bottom'))}</td>
+<td>{_pct(r.get('pct_drop'))}</td>
+<td>{_f1(r.get('time_to_bottom'))}min</td>
+<td>{_mc(r.get('mc_1h'))}</td>
+<td>{var_str}</td>
+<td>{rec_str}</td>
+<td>{_mc(r.get('bounce_mc'))}</td>
+<td>{_pct(r.get('bounce_pct'))}</td>
+<td>{_f1(r.get('bounce_elapsed') and r['bounce_elapsed']/60)}min</td>
+<td>{_pct(r.get('rug_ratio'))}</td>
+<td>{_pct(r.get('rat_trader_rate'))}</td>
+<td>{_pct(r.get('top10_holder_rate'))}</td>
+<td>{r.get('smart_wallets') or '—'}</td>
+<td>{'sim' if r.get('is_wash_trading') else 'não'}</td>
+<td>{r.get('creator_token_status') or '—'}</td>
+<td>{_pct(r.get('creator_balance_rate'))}</td>
+<td>{_pct(r.get('suspected_insider_rate'))}</td>
+<td>{_pct(r.get('top70_sniper_hold_rate'))}</td>
+<td>{_f1(r.get('entrapment_ratio'))}</td>
+<td>{_pct(r.get('bot_degen_rate'))}</td>
+<td>{_mc(r.get('liq_migration'))}</td>
+<td>{r.get('exchange') or '—'}</td>
+<td style="color:#8b949e;font-size:10px">{err}</td>
+</tr>"""
+
+    html += "</tbody></table></body></html>"
+    return html
+
+
+# ==============================================================================
 # /analise/bottom-score — Backtest retroativo do Bottom Score
 # ==============================================================================
 
