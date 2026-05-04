@@ -419,6 +419,7 @@ get_sol_usd() [gmgn_client.py]
 DATABASE_URL=postgres://...
 GMGN_API_KEY=xxxx
 GMGN_PRIVATE_KEY=xxxx        # Ed25519 PEM — necessário para Fase 6
+GMGN_WALLET_ADDRESS=xxxx     # endereço Solana da carteira — necessário para Fase 6
 GMGN_HOST=https://openapi.gmgn.ai
 TELEGRAM_TOKEN=xxxx
 TELEGRAM_CHAT=xxxx

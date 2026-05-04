@@ -189,6 +189,7 @@ class TradeExecutor:
             strat_res   = self.gmgn.create_strategy(
                 token_mint=mint,
                 tokens_amount=tokens_received,
+                entry_price_sol=entry_price_sol or 0,
                 tp_pct=TRADE_TP_PCT,
                 sl_pct=TRADE_SL_PCT,
             )
