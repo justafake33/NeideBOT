@@ -233,8 +233,6 @@ def export_csv():
         return "Sem dados", 404
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=rows[0].keys())
-    writer.writeheader()
-    writer.writerows(rows)
     return Response(
         output.getvalue(),
         mimetype="text/csv",
@@ -275,8 +273,6 @@ def export_ticks():
         return "Sem ticks", 404
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=rows[0].keys())
-    writer.writeheader()
-    writer.writerows(rows)
     return Response(
         output.getvalue(),
         mimetype="text/csv",
@@ -331,8 +327,6 @@ def export_bounces():
         return "Sem bounces", 404
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=rows[0].keys())
-    writer.writeheader()
-    writer.writerows(rows)
     return Response(
         output.getvalue(),
         mimetype="text/csv",
@@ -341,6 +335,7 @@ def export_bounces():
 
 
 @app.route("/export/bounce-ticks")
+@app.route("/export/bounce_ticks")
 def export_bounce_ticks():
     """Exporta ticks dos tokens que tiveram bounce_signal — ideal para estudar padrão pós-bounce."""
     with db._cursor() as cur:
@@ -374,12 +369,16 @@ def export_bounce_ticks():
             ORDER BY t.mint, t.ts
         """)
         rows = [dict(r) for r in cur.fetchall()]
-    if not rows:
-        return "Sem ticks de bounces", 404
     output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=rows[0].keys())
-    writer.writeheader()
-    writer.writerows(rows)
+    if not rows:
+        # Permite download mesmo quando não há dados.
+        writer = csv.writer(output)
+        writer.writerow(["message"])
+        writer.writerow(["Sem ticks de bounces"])
+    else:
+        writer = csv.DictWriter(output, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
     return Response(
         output.getvalue(),
         mimetype="text/csv",
