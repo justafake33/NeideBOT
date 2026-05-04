@@ -140,6 +140,7 @@ class HotMonitor:
         if mc < state["mc_migration"] * 0.20:
             logger.info("Rug %s: queda >=80%%", state["symbol"])
             self.cancel(mint)
+            db.set_recovery_false(mint)
             return
 
         if mc < state["mc_min"]:
@@ -253,6 +254,12 @@ class HotMonitor:
         Usa total_supply=1B (padrão para tokens pump-style Solana).
         """
         time.sleep(5)  # aguarda scheduler e conexões estabilizarem
+
+        # Backfill histórico: tokens mortos antes do checkpoint de 1h
+        n_fixed = db.backfill_recovery_false()
+        if n_fixed:
+            logger.info("Backfill recovery=FALSE: %d tokens sem mc_1h marcados como não recuperados", n_fixed)
+
         tokens = db.get_tokens_for_backfill()
         if not tokens:
             logger.info("Backfill startup: nenhum token pendente")

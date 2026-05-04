@@ -488,6 +488,35 @@ def update_checkpoint(mint: str, label: str, mc: float, var: Optional[float]):
             """, {"mint": mint})
 
 
+def set_recovery_false(mint: str):
+    """Marca recovery=FALSE para token cancelado (rug/morto) sem mc_1h."""
+    with _cursor() as cur:
+        cur.execute("""
+            UPDATE migrations
+            SET recovery = FALSE
+            WHERE mint = %(mint)s
+              AND recovery IS NULL
+              AND mc_bottom IS NOT NULL
+        """, {"mint": mint})
+
+
+def backfill_recovery_false():
+    """
+    Backfill histórico: tokens com mc_bottom mas sem mc_1h há mais de 2h
+    são implicitamente recovery=FALSE (morreram antes do checkpoint de 1h).
+    """
+    with _cursor() as cur:
+        cur.execute("""
+            UPDATE migrations
+            SET recovery = FALSE
+            WHERE recovery IS NULL
+              AND mc_bottom IS NOT NULL
+              AND mc_1h IS NULL
+              AND ts_migration < NOW() - INTERVAL '2 hours'
+        """)
+        return cur.rowcount
+
+
 def insert_bounce_signal(data: dict):
     """Registra um sinal de bounce. UNIQUE(mint) — um sinal por token."""
     with _cursor() as cur:
