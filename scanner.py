@@ -20,20 +20,22 @@ HOT_WINDOW_MIN     = 60
 
 # ------------------------------------------------------------------
 # Filtros (configuráveis via env vars no Railway sem redeploy)
+# Defaults baseados em análise de 1134 tokens (recovery rate por faixa)
 # ------------------------------------------------------------------
-F_RUG_MAX        = float(os.getenv("FILTER_RUG_MAX",        "0.15"))
-F_BUNDLER_MAX    = float(os.getenv("FILTER_BUNDLER_MAX",    "0.20"))  # bundler_trader_amount_rate
-F_BOT_MAX        = float(os.getenv("FILTER_BOT_MAX",        "0.50"))  # bot_degen_rate
+F_RUG_MAX        = float(os.getenv("FILTER_RUG_MAX",        "0.50"))  # score interno GMGN (raramente >0.5)
+F_BUNDLER_MAX    = float(os.getenv("FILTER_BUNDLER_MAX",    "0.60"))  # dados: >60% recovery cai para 14%
+F_BOT_MAX        = float(os.getenv("FILTER_BOT_MAX",        "0.80"))  # dados: sweet spot 30-60%, só bloquear extremo
+F_SNIPER_MAX     = float(os.getenv("FILTER_SNIPER_MAX",     "0.05"))  # dados: >5% recovery cai de 33% para 14%
 F_RAT_MAX        = float(os.getenv("FILTER_RAT_MAX",        "0.20"))
-F_TOP10_MAX      = float(os.getenv("FILTER_TOP10_MAX",      "0.80"))
-F_SMART_MIN      = int(os.getenv(  "FILTER_SMART_MIN",      "1"))
+F_TOP10_MAX      = float(os.getenv("FILTER_TOP10_MAX",      "0.50"))  # dados: >40% recovery cai para 7-15%
+F_SMART_MIN      = int(os.getenv(  "FILTER_SMART_MIN",      "0"))     # dados: não discrimina — desativado
 F_WASH_BLOCK     = os.getenv(      "FILTER_WASH_BLOCK",     "true").lower() == "true"
 BC_MIN_WATCHLIST = float(os.getenv("BC_MIN_WATCHLIST",      "80"))
 F_MC_MIN         = float(os.getenv("FILTER_MC_MIN",         "5000"))
 F_MC_MAX         = float(os.getenv("FILTER_MC_MAX",         "200000"))
-F_LIQ_MIN        = float(os.getenv("FILTER_LIQ_MIN",        "10000"))  # liquidez minima em USD
-F_FEE_MIN        = float(os.getenv("FILTER_FEE_MIN",        "1.0"))    # total_fee minimo em SOL
-MAX_MIG_AGE_SEC  = int(os.getenv(  "MAX_MIG_AGE_SEC",       "600"))    # max 10min desde complete_timestamp
+F_LIQ_MIN        = float(os.getenv("FILTER_LIQ_MIN",        "10000"))
+F_FEE_MIN        = float(os.getenv("FILTER_FEE_MIN",        "1.0"))
+MAX_MIG_AGE_SEC  = int(os.getenv(  "MAX_MIG_AGE_SEC",       "600"))
 MIGRATION_SOL_UNITS = float(os.getenv("MIGRATION_SOL_UNITS", "410"))
 
 
@@ -41,7 +43,6 @@ def _passes_filter(token: dict) -> tuple[bool, str]:
     if F_WASH_BLOCK and token.get("is_wash_trading"):
         return False, "wash_trading"
 
-    # rug_ratio = score interno GMGN (0-1); bundler_trader_amount_rate = % bundlers real
     rug = _float(token.get("rug_ratio"))
     if rug is not None and rug > F_RUG_MAX:
         return False, f"rug_ratio={rug:.0%}>{F_RUG_MAX:.0%}"
@@ -53,6 +54,10 @@ def _passes_filter(token: dict) -> tuple[bool, str]:
     bot = _float(token.get("bot_degen_rate"))
     if bot is not None and bot > F_BOT_MAX:
         return False, f"bot_degen={bot:.0%}>{F_BOT_MAX:.0%}"
+
+    sniper = _float(token.get("top70_sniper_hold_rate"))
+    if sniper is not None and sniper > F_SNIPER_MAX:
+        return False, f"sniper={sniper:.0%}>{F_SNIPER_MAX:.0%}"
 
     rat = _float(token.get("rat_trader_amount_rate"))
     if rat is not None and rat > F_RAT_MAX:
@@ -594,11 +599,10 @@ class Scanner:
         thread.start()
         logger.info(
             "Scanner iniciado (poll=%ds) | bc_min=%.0f%% | mc=$%.0f-$%.0f | liq>=$%.0f | fee>=%.1fSOL | "
-            "filtros: rug<%.0f%% bundler<%.0f%% bot<%.0f%% rat<%.0f%% top10<%.0f%% smart>=%d wash=%s",
+            "filtros: bundler<%.0f%% bot<%.0f%% sniper<%.0f%% top10<%.0f%% rat<%.0f%% wash=%s",
             POLL_INTERVAL, BC_MIN_WATCHLIST, F_MC_MIN, F_MC_MAX, F_LIQ_MIN, F_FEE_MIN,
-            F_RUG_MAX*100, F_BUNDLER_MAX*100, F_BOT_MAX*100,
-            F_RAT_MAX*100, F_TOP10_MAX*100,
-            F_SMART_MIN, F_WASH_BLOCK,
+            F_BUNDLER_MAX*100, F_BOT_MAX*100, F_SNIPER_MAX*100,
+            F_TOP10_MAX*100, F_RAT_MAX*100, F_WASH_BLOCK,
         )
 
     def _loop(self):
