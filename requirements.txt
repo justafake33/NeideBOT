@@ -4,3 +4,4 @@ psycopg2-binary>=2.9
 requests>=2.31
 sentry-sdk[flask]>=2.0
 cryptography>=42.0
+base58>=2.1
