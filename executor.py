@@ -24,7 +24,9 @@ CALIBRATION_AMOUNT = float(os.getenv("CALIBRATION_AMOUNT_USD",  "1.0"))
 CALIBRATION_MAX    = int(os.getenv(  "CALIBRATION_MAX_TRADES",  "50"))
 TRADE_TP_PCT       = float(os.getenv("TRADE_TP_PCT",            "0.75"))
 TRADE_SL_PCT       = float(os.getenv("TRADE_SL_PCT",            "0.15"))
-SLIPPAGE_BPS       = int(os.getenv(  "TRADE_SLIPPAGE_BPS",      "500"))   # 5% max
+SLIPPAGE_BPS       = int(os.getenv(  "TRADE_SLIPPAGE_BPS",      "500"))    # 5% max slippage
+PRIORITY_FEE       = os.getenv(      "TRADE_PRIORITY_FEE",      "auto")    # "auto" ou microlamports
+TIP_LAMPORTS       = int(os.getenv(  "TRADE_TIP_LAMPORTS",      "1000000")) # 0.001 SOL Jito tip
 ORDER_POLL_SEC     = int(os.getenv(  "ORDER_POLL_SEC",           "2"))
 ORDER_TIMEOUT_SEC  = int(os.getenv(  "ORDER_TIMEOUT_SEC",        "30"))
 
@@ -125,6 +127,8 @@ class TradeExecutor:
                 token_mint=mint,
                 amount_sol=amount_sol,
                 slippage_bps=SLIPPAGE_BPS,
+                priority_fee=PRIORITY_FEE,
+                tip_lamports=TIP_LAMPORTS,
             )
             data     = swap_res.get("data") or swap_res
             order_id = data.get("order_id") or data.get("id")
