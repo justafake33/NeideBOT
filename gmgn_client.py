@@ -2,14 +2,38 @@ import os
 import time
 import logging
 import threading
+import json as _json
+import base64
 import requests
 from typing import Optional
 from uuid import uuid4
+from urllib.parse import urlencode
 
 logger = logging.getLogger(__name__)
 
-GMGN_HOST    = os.getenv("GMGN_HOST", "https://openapi.gmgn.ai")
-GMGN_API_KEY = os.getenv("GMGN_API_KEY", "")
+GMGN_HOST        = os.getenv("GMGN_HOST",        "https://openapi.gmgn.ai")
+GMGN_API_KEY     = os.getenv("GMGN_API_KEY",     "")
+GMGN_PRIVATE_KEY = os.getenv("GMGN_PRIVATE_KEY", "")
+
+
+def _load_ed25519_key(pem: str):
+    """Carrega chave Ed25519 PEM. Retorna None se pem vazio ou inválido."""
+    if not pem:
+        return None
+    try:
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+        pem_bytes = pem.encode() if isinstance(pem, str) else pem
+        if not pem_bytes.strip().startswith(b"-----"):
+            # Trata raw base64 — envolve em cabeçalho PEM PKCS8
+            pem_bytes = (
+                b"-----BEGIN PRIVATE KEY-----\n"
+                + base64.b64encode(pem_bytes) + b"\n"
+                + b"-----END PRIVATE KEY-----\n"
+            )
+        return load_pem_private_key(pem_bytes, password=None)
+    except Exception as e:
+        logger.error("GMGN_PRIVATE_KEY inválida: %s", e)
+        return None
 
 # Plataformas e quote address types por chain (fonte: GMGN OpenApiClient.ts)
 _PLATFORMS = {
@@ -47,6 +71,11 @@ class GmgnClient:
             "X-APIKEY": GMGN_API_KEY,
             "Content-Type": "application/json",
         })
+        self._private_key = _load_ed25519_key(GMGN_PRIVATE_KEY)
+        if GMGN_PRIVATE_KEY and not self._private_key:
+            logger.warning("GMGN_PRIVATE_KEY definida mas inválida — trade desabilitado")
+        elif self._private_key:
+            logger.info("GMGN_PRIVATE_KEY carregada — trade habilitado")
 
     def _params(self, extra: dict = None) -> dict:
         p = {
@@ -87,6 +116,87 @@ class GmgnClient:
             timeout=15,
         )
         return self._handle_response(resp)
+
+    # ------------------------------------------------------------------
+    # Assinatura Ed25519 para endpoints de trade
+    # ------------------------------------------------------------------
+
+    def _sign(self, subpath: str, params: dict, body: dict) -> str:
+        """
+        Ed25519 sobre: subpath + sorted_query_params + compact_json_body + timestamp
+        Signature codificada em base64.
+        """
+        ts          = params.get("timestamp", str(int(time.time())))
+        qs          = urlencode(sorted(params.items()))
+        body_str    = _json.dumps(body, separators=(",", ":"), sort_keys=True) if body else ""
+        message     = f"{subpath}{qs}{body_str}{ts}".encode("utf-8")
+        sig         = self._private_key.sign(message)
+        return base64.b64encode(sig).decode("ascii")
+
+    def _post_trade(self, path: str, body: dict = None,
+                    extra_params: dict = None) -> dict:
+        """POST com X-Signature (Ed25519) para endpoints de trade."""
+        if not self._private_key:
+            raise RuntimeError(
+                "GMGN_PRIVATE_KEY não configurada — endpoints de trade desabilitados"
+            )
+        body   = body or {}
+        params = self._params(extra_params)
+        sig    = self._sign(path, params, body)
+        resp   = self.session.post(
+            f"{self.host}{path}",
+            json=body,
+            params=params,
+            headers={"X-Signature": sig},
+            timeout=15,
+        )
+        return self._handle_response(resp)
+
+    # ------------------------------------------------------------------
+    # Trade endpoints — Fase 6-lite
+    # ------------------------------------------------------------------
+
+    def swap(self, token_mint: str, amount_sol: float,
+             slippage_bps: int = 500, chain: str = "sol") -> dict:
+        """
+        POST /v1/trade/swap — executa compra do token com SOL.
+        amount_sol: quantidade em SOL (ex: 0.005 ≈ $1 a $200/SOL).
+        slippage_bps: slippage máximo em basis points (500 = 5%).
+        Retorna dict com order_id e dados do fill.
+        """
+        lamports = int(round(amount_sol * 1_000_000_000))
+        body = {
+            "chain":         chain,
+            "token_address": token_mint,
+            "side":          "buy",
+            "amount":        str(lamports),
+            "slippage":      slippage_bps,
+        }
+        return self._post_trade("/v1/trade/swap", body, extra_params={"chain": chain})
+
+    def create_strategy(self, token_mint: str, tokens_amount: float,
+                        tp_pct: float = 0.75, sl_pct: float = 0.15,
+                        chain: str = "sol") -> dict:
+        """
+        POST /v1/trade/strategy/create — configura TP/SL automático.
+        tp_pct: take profit como fração (0.75 = +75%).
+        sl_pct: stop loss como fração (0.15 = -15%).
+        Retorna dict com strategy_id.
+        """
+        body = {
+            "chain":           chain,
+            "token_address":   token_mint,
+            "amount":          str(int(tokens_amount)),
+            "take_profit_pct": round(tp_pct * 100, 2),
+            "stop_loss_pct":   round(sl_pct * 100, 2),
+        }
+        return self._post_trade(
+            "/v1/trade/strategy/create", body, extra_params={"chain": chain}
+        )
+
+    def query_order(self, order_id: str, chain: str = "sol") -> dict:
+        """GET /v1/trade/query_order — status e fill de uma ordem."""
+        return self._get("/v1/trade/query_order", {"chain": chain, "order_id": order_id})
 
     def get_trenches(self, types: list = None, chain: str = "sol") -> dict:
         """
