@@ -385,6 +385,7 @@ def export_bounce_ticks():
         rows = [dict(r) for r in cur.fetchall()]
     output = io.StringIO()
     if not rows:
+        # Permite download mesmo quando não há dados.
         writer = csv.writer(output)
         writer.writerow(["message"])
         writer.writerow(["Sem ticks de bounces"])
