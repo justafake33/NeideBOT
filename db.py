@@ -465,15 +465,10 @@ def update_lock_percent(mint: str, lock_percent: float):
 
 
 def update_checkpoint(mint: str, label: str, mc: float, var: Optional[float]):
-    """Atualiza MC e variação % para checkpoints de 1h, 4h ou 24h."""
-    cols = {
-        "1h":  ("mc_1h",  "var_1h"),
-        "4h":  ("mc_4h",  "var_4h"),
-        "24h": ("mc_24h", "var_24h"),
-    }
-    if label not in cols:
+    """Atualiza MC e variação % para checkpoint de 1h."""
+    if label != "1h":
         return
-    col_mc, col_var = cols[label]
+    col_mc, col_var = "mc_1h", "var_1h"
     with _cursor() as cur:
         cur.execute(f"""
             UPDATE migrations
@@ -627,15 +622,14 @@ def cleanup_old_ticks(days: int = 30):
 
 
 def get_tokens_for_backfill() -> list:
-    """Retorna tokens que precisam de re-monitoramento ou backfill de checkpoints após restart."""
+    """Retorna tokens que precisam de re-monitoramento ou backfill de mc_1h após restart."""
     with _cursor() as cur:
         cur.execute("""
-            SELECT mint, token_nome, mc_migration, ts_migration,
-                   mc_1h, mc_4h, mc_24h
+            SELECT mint, token_nome, mc_migration, ts_migration, mc_1h
             FROM migrations
             WHERE ts_migration IS NOT NULL
-              AND ts_migration > NOW() - INTERVAL '26 hours'
-              AND (mc_1h IS NULL OR mc_4h IS NULL OR mc_24h IS NULL)
+              AND ts_migration > NOW() - INTERVAL '2 hours'
+              AND mc_1h IS NULL
             ORDER BY ts_migration ASC
         """)
         return [dict(row) for row in cur.fetchall()]

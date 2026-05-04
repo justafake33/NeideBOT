@@ -266,30 +266,24 @@ class HotMonitor:
                             symbol, (HOT_WINDOW_MIN * 60 - elapsed_sec) / 60)
                 continue
 
-            # Já passou da janela — backfill de checkpoints ausentes
-            for delay_min, label, already_done in [
-                (60,   "1h",  row.get("mc_1h")  is not None),
-                (240,  "4h",  row.get("mc_4h")  is not None),
-                (1440, "24h", row.get("mc_24h") is not None),
-            ]:
-                if already_done:
-                    continue
-                target_ts = ts_mig_unix + delay_min * 60
-                remaining = target_ts - now.timestamp()
-                if remaining <= 0:
-                    # Tempo já passou — busca imediata em thread separada
-                    threading.Thread(
-                        target=self._checkpoint,
-                        args=(mint, mc_migration, total_supply, label, symbol, ts_mig_unix),
-                        daemon=True,
-                    ).start()
-                    time.sleep(1.0)  # stagger entre tokens
-                else:
-                    self.scheduler.schedule(remaining, self._checkpoint,
-                                            mint, mc_migration, total_supply,
-                                            label, symbol, ts_mig_unix)
-                    logger.info("Backfill: agendado %s %s em %.0fmin",
-                                symbol, label, remaining / 60)
+            # Já passou da janela — backfill de mc_1h se ausente
+            if row.get("mc_1h") is not None:
+                continue
+            target_ts = ts_mig_unix + 3600
+            remaining = target_ts - now.timestamp()
+            if remaining <= 0:
+                threading.Thread(
+                    target=self._checkpoint,
+                    args=(mint, mc_migration, total_supply, "1h", symbol, ts_mig_unix),
+                    daemon=True,
+                ).start()
+                time.sleep(1.0)
+            else:
+                self.scheduler.schedule(remaining, self._checkpoint,
+                                        mint, mc_migration, total_supply,
+                                        "1h", symbol, ts_mig_unix)
+                logger.info("Backfill: agendado %s 1h em %.0fmin",
+                            symbol, remaining / 60)
 
     def _flush_tick_buffer(self):
         """Drena o buffer de ticks para o banco em uma única transação."""
@@ -502,13 +496,6 @@ class HotMonitor:
         else:
             logger.warning("Graduacao %s: todas as fontes falharam — 1h pulado", symbol)
 
-        for delay_min, label in [(240, "4h"), (1440, "24h")]:
-            remaining = delay_min * 60 - elapsed_sec
-            if remaining > 0:
-                self.scheduler.schedule(remaining, self._checkpoint,
-                                        mint, mc_migration, total_supply,
-                                        label, symbol, ts_mig_unix)
-
         logger.info("%s saiu da janela quente (bottom=$%.0f em %.1fmin)",
                     symbol, state["mc_min"], state["time_min"])
 
@@ -517,7 +504,7 @@ class HotMonitor:
         if mint in self._cancelled:
             return
 
-        delay_sec = {"1h": 3600, "4h": 14400, "24h": 86400}[label]
+        delay_sec = {"1h": 3600}[label]
         target_ts = ts_mig_unix + delay_sec
         mc        = None
         src       = "?"
