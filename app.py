@@ -4317,5 +4317,56 @@ def debug_my_ip():
     return f"<pre>Railway outbound IP: {ip}\n\nAdicione este IP na whitelist do GMGN OpenAPI.</pre>"
 
 
+@app.route("/debug/sign-test")
+def debug_sign_test():
+    """Testa assinatura GMGN com um swap simulado — não executa trade real."""
+    import json as _j
+    from gmgn_client import GMGN_WALLET_ADDRESS, GMGN_PRIVATE_KEY, SOL_NATIVE_MINT, _load_ed25519_key
+    import time, base64
+    from uuid import uuid4
+
+    lines = []
+    lines.append(f"GMGN_WALLET_ADDRESS : {GMGN_WALLET_ADDRESS or '❌ NÃO CONFIGURADO'}")
+    lines.append(f"GMGN_PRIVATE_KEY    : {'✅ SET (' + str(len(GMGN_PRIVATE_KEY)) + ' chars)' if GMGN_PRIVATE_KEY else '❌ NÃO CONFIGURADO'}")
+
+    pk = _load_ed25519_key(GMGN_PRIVATE_KEY)
+    lines.append(f"Chave carregada     : {'✅ OK' if pk else '❌ FALHOU'}")
+
+    if pk and GMGN_WALLET_ADDRESS:
+        # monta body idêntico ao swap real
+        dummy_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC como placeholder
+        lamports   = 5_000_000  # ~0.005 SOL
+        body       = {
+            "chain":        "sol",
+            "from_address": GMGN_WALLET_ADDRESS,
+            "input_token":  SOL_NATIVE_MINT,
+            "output_token": dummy_mint,
+            "input_amount": str(lamports),
+            "slippage":     500,
+        }
+        body_str = _j.dumps(body, separators=(",", ":"))
+        ts       = str(int(time.time()))
+        cid      = str(uuid4())
+        params   = {"timestamp": ts, "client_id": cid}
+        qs       = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        subpath  = "/v1/trade/swap"
+        message  = f"{subpath}:{qs}:{body_str}:{ts}"
+        sig      = base64.b64encode(pk.sign(message.encode("utf-8"))).decode("ascii")
+
+        lines.append("")
+        lines.append(f"Body JSON           : {body_str}")
+        lines.append(f"Sorted QS           : {qs}")
+        lines.append(f"Message (signed)    : {message}")
+        lines.append(f"Signature (b64)     : {sig[:30]}...")
+        lines.append("")
+        lines.append("✅ Assinatura gerada com sucesso — formato OK")
+        lines.append("Se ainda receber 401, o problema é:")
+        lines.append("  1. GMGN_WALLET_ADDRESS não corresponde à GMGN_PRIVATE_KEY")
+        lines.append("  2. IP não está na whitelist GMGN")
+        lines.append("  3. A chave não está registrada na conta GMGN")
+
+    return "<pre>" + "\n".join(lines) + "</pre>"
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)

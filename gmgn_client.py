@@ -184,13 +184,13 @@ class GmgnClient:
         ts      = params.get("timestamp", str(int(time.time())))
         qs      = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
         message = f"{subpath}:{qs}:{body_str}:{ts}".encode("utf-8")
+        logger.debug("SIGN message: %s", message.decode("utf-8"))
         sig     = self._private_key.sign(message)
         return base64.b64encode(sig).decode("ascii")
 
     def _post_trade(self, path: str, body: dict = None) -> dict:
         """POST com X-Signature (Ed25519) para endpoints de trade.
         O body é serializado UMA vez e o mesmo string é usado na assinatura e no HTTP body.
-        (se usássemos json=body no requests, a serialização interna poderia diferir da assinada)
         """
         if not self._private_key:
             raise RuntimeError(
@@ -202,6 +202,9 @@ class GmgnClient:
             )
         body_str = _json.dumps(body or {}, separators=(",", ":"))
         params   = self._params()  # só timestamp + client_id
+        logger.info("TRADE POST %s | wallet=%s | body=%s", path,
+                    GMGN_WALLET_ADDRESS[:8] + "..." if GMGN_WALLET_ADDRESS else "N/A",
+                    body_str)
         sig      = self._sign(path, params, body_str)
         resp     = self.session.post(
             f"{self.host}{path}",
