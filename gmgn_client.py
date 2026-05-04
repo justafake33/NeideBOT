@@ -22,6 +22,9 @@ def _load_ed25519_key(pem: str):
         return None
     try:
         from cryptography.hazmat.primitives.serialization import load_pem_private_key
+        # Railway/env vars costumam substituir newlines reais por \n literais
+        if isinstance(pem, str):
+            pem = pem.replace("\\n", "\n")
         pem_bytes = pem.encode() if isinstance(pem, str) else pem
         if not pem_bytes.strip().startswith(b"-----"):
             # Trata raw base64 — envolve em cabeçalho PEM PKCS8

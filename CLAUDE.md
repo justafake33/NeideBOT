@@ -35,9 +35,9 @@ Swap/orders: adiciona header `X-Signature` (Ed25519 sobre subpath+params+body+ti
 | `/v1/market/rank` | GET | Trending tokens |
 | `/v1/market/token_kline` | GET | Candlestick OHLCV — **NÃO funciona historicamente para Meteora DAMM v2** |
 | `/v1/market/token_signal` | POST | Sinais em tempo real — type 12 = SmartDegenBuy (**IMPLEMENTADO Fase 2**) |
-| `/v1/trade/swap` | POST | Execução de swap (Fase 6) |
-| `/v1/trade/strategy/create` | POST | TP/SL automático (Fase 6) |
-| `/v1/trade/query_order` | GET | Status de ordem (Fase 6) |
+| `/v1/trade/swap` | POST | Execução de swap (**ATIVO Fase 6**) |
+| `/v1/trade/strategy/create` | POST | TP/SL automático (**ATIVO Fase 6**) |
+| `/v1/trade/query_order` | GET | Status de ordem (**ATIVO Fase 6**) |
 
 ### Rate limits (leaky bucket, capacity 10)
 | Endpoint | Peso | Taxa sustentada |
@@ -54,12 +54,19 @@ Swap/orders: adiciona header `X-Signature` (Ed25519 sobre subpath+params+body+ti
 ### Mapeamento de campos — trenches
 
 ```python
-# POST /v1/trenches — body example
+# POST /v1/trenches — body v2 (formato atual)
 {
-  "chain": "sol",
-  "type": ["near_completion", "completed"],
-  "filters": {}
+  "version": "v2",
+  "near_completion": {
+    "filters": ["offchain", "onchain"],
+    "launchpad_platform": ["Pump.fun", "letsbonk", "bonkers", ...],
+    "quote_address_type": [4, 5, 3, 1, 13, 0],
+    "launchpad_platform_v2": True,
+    "limit": 80,
+  },
+  "completed": { ... mesmo formato ... }
 }
+# chain é query param, não body
 
 # Response keys:
 # near_completion → data["pump"]      (NÃO data["near_completion"]!)
@@ -181,7 +188,7 @@ ESTÁGIO 2 — Migração detectada
     │
     ├─ POST /v1/trenches type=completed → data["completed"]
     ├─ Filtros de MC ($5k-$200k), liquidez (≥$10k), fee (≥1 SOL)
-    ├─ MC preciso via kline no complete_timestamp (fallback: trenches)
+    ├─ mc_migration = bonding_curve_ref (MIGRATION_SOL_UNITS × SOL/USD) ou kline open ou trenches
     └─ Token entra no HotMonitor por 60 minutos
 
 HotMonitor (janela 60min)
@@ -194,28 +201,29 @@ FASE 2 — coleta ativa (IMPLEMENTADO 2026-05-03)
     ├─ Feed global → filtra por mints ativos no HotMonitor
     ├─ Persiste em token_signals (mint, trigger_at UNIQUE, trigger_mc, wallets_json)
     ├─ Objetivo: H9 — correlacionar trigger_mc < mc_migration com recovery=TRUE
-    └─ Próximo: validar H9 com ≥100 tokens com sinais → Fase 6 (swap)
+    └─ Próximo: validar H9 com ≥100 tokens com sinais
 
-BOUNCE DETECTOR — tempo real, sem capital (IMPLEMENTADO 2026-05-03)
+BOUNCE DETECTOR + FASE 6 — execução real (ATIVO 2026-05-04)
     ├─ _check_bounce() chamado em cada push_mc
     ├─ Condições: drop ≥ 30% + bounce ≥ 15% do fundo + elapsed ≤ 30min
     ├─ One-shot por token (bounce_fired = True após primeiro disparo)
     ├─ Persiste em bounce_signals (UNIQUE mint) + alerta Telegram
-    └─ Usado pelo backtester tick-level para definir entry = mc_bottom * 1.15
+    ├─ Chama TradeExecutor.on_bounce() → thread _execute()
+    └─ _execute(): swap() → _wait_fill() → create_strategy() → log em trades
 ```
 
 ---
 
 ## 🔍 ESTADO ATUAL — Coleta de Dados
 
-### Situação (2026-05-03)
+### Situação (2026-05-04)
 - **1015+ tokens** coletados no banco, **425** com `recovery` definido
 - **~91%** com `mc_bottom`, **~52%** com `recovery=TRUE` (baseline)
 - Campos Fase 1 coletados desde deploy anterior
-- `mc_4h` e `mc_24h` **descartados** — trade é de minutos, não horas
 - **Fase 2 ativa**: sinais type 12 coletados em `token_signals` a cada 5s durante janela quente
-- **Volume fix aplicado**: `volume_1m` back-fillado via kline no hot-precise (a partir deste deploy)
+- **Volume fix aplicado**: `volume_1m` back-fillado via kline no hot-precise
 - **Bounce detector ativo**: `bounce_signals` populando em produção, alertas Telegram ao vivo
+- **Fase 6 ativa**: `TradeExecutor` integrado — trades reais disparados pelo bounce detector (TRADING_ENABLED=true no Railway)
 
 ### Campos coletados por migração
 
@@ -226,7 +234,10 @@ BOUNCE DETECTOR — tempo real, sem capital (IMPLEMENTADO 2026-05-03)
 | ts_detected | Sistema | Timestamp watchlist (bc ≥ 80%) |
 | bc_progress_at_detection | trenches | % BC quando detectado |
 | ts_migration | Sistema | Timestamp da migração |
-| mc_migration | kline ou trenches | MC no momento da migração |
+| mc_migration | bonding_curve/kline/trenches | MC oficial (ver fontes abaixo) |
+| mc_migration_observed | kline ou trenches | MC observado no momento da captura |
+| mc_migration_bc_ref | SOL/USD × MIGRATION_SOL_UNITS | Referência teórica da bonding curve |
+| mc_migration_source | "bonding_curve"/"kline"/"trenches" | Qual fonte foi usada |
 | mc_peak | HotMonitor | MC máximo na janela quente |
 | time_to_peak | HotMonitor | Minutos até o pico |
 | pct_gain | Calculado | (mc_peak - mc_migration) / mc_migration |
@@ -262,6 +273,11 @@ BOUNCE DETECTOR — tempo real, sem capital (IMPLEMENTADO 2026-05-03)
 | **cto_flag** | trenches | Comunidade assumiu o projeto |
 | **has_social** | trenches | Tem rede social |
 | **x_follower_count** | trenches | Seguidores no Twitter |
+| exchange | trenches | Raydium, Meteora, etc. |
+| rat_trader_rate | trenches | % rat traders |
+| total_fee_sol | trenches | Fee total em SOL |
+| bc_progress_migration | trenches | % BC no momento da migração |
+| complete_timestamp | trenches | Unix timestamp da migração (GMGN) |
 
 ---
 
@@ -336,7 +352,7 @@ Scanner (poll 5s)
     │
     ├─ POST /v1/trenches completed → data["completed"]
     │       └─ Filtros MC/liq/fee → upsert_migration
-    │       └─ mc_migration via kline (fallback: trenches)
+    │       └─ mc_migration = bonding_curve_ref (MIGRATION_SOL_UNITS × SOL/USD) || kline open || trenches
     │       └─ HotMonitor.add()
     │       └─ push_mc para TODOS os completed já vistos (atualiza _mc_live)
     │
@@ -349,11 +365,25 @@ Scanner (poll 5s)
     └─ HotMonitor (janela 60min)
             ├─ push_mc (5s): rastreia mc_min, mc_max, mc_last, _mc_live
             │       └─ _check_bounce(): dispara bounce_signal se drop≥30% e bounce≥15%
+            │               └─ TradeExecutor.on_bounce() → thread _execute() [Fase 6]
             ├─ hot-precise (60s): kline low/high + backfill_tick_volumes()
             └─ _tick (30s): graduação após 60min
                     └─ kline scan 1h completo → mc_bottom, mc_peak, mc_1h
                     └─ token/info sempre chamado: fallback mc_1h + lock_percent (locked_ratio)
                     └─ Fallback final mc_1h: push_mc (mc_last)
+
+TradeExecutor (Fase 6 — ATIVO)
+    ├─ on_bounce(): verifica TRADING_ENABLED + count_trades < CALIBRATION_MAX
+    ├─ insert_trade(): cria registro com status='pending'
+    └─ _execute() [thread própria]:
+            ├─ swap(): POST /v1/trade/swap (Ed25519 signed)
+            ├─ _wait_fill(): poll query_order até filled/completed (timeout: ORDER_TIMEOUT_SEC)
+            └─ create_strategy(): POST /v1/trade/strategy/create com TP/SL
+
+get_sol_usd() [gmgn_client.py]
+    ├─ Cache 5min (_sol_usd_value / _sol_usd_ts)
+    ├─ Fonte primária: CoinGecko API
+    └─ Fallback: GMGN token/info da SOL mint
 ```
 
 ### Tabelas do banco
@@ -363,7 +393,7 @@ Scanner (poll 5s)
 | `token_ticks` | Série temporal por token. `source='trenches'` (~30s) ou `source='kline'` (60s, com OHLC). |
 | `token_signals` | **Fase 2** — sinais type 12 por token durante janela quente |
 | `bounce_signals` | **Fase 2** — um registro por token quando bounce detector dispara (UNIQUE mint) |
-| `trades` | **Fase 6-lite** — log completo de cada trade live ($1/trade calibração) |
+| `trades` | **Fase 6** — log completo de cada trade live ($1/trade calibração) |
 
 ### HeapScheduler
 - Thread única com heap de eventos futuros
@@ -373,12 +403,13 @@ Scanner (poll 5s)
 ### Fontes de dados por prioridade
 | Dado | 1ª fonte | 2ª fonte | 3ª fonte |
 |------|----------|----------|----------|
-| mc_migration | kline (open no complete_ts) | trenches usd_market_cap | — |
+| mc_migration | bonding_curve_ref (MIGRATION_SOL_UNITS × SOL/USD) | kline (open no complete_ts) | trenches usd_market_cap |
 | mc_bottom / mc_peak | kline 1m (hot-precise) | push_mc (trenches 5s) | — |
 | mc_1h | kline (ts_mig a ts_mig+3660) | token/info | push_mc (mc_last) |
 | volume_1m (token_ticks) | kline candle volume (hot-precise back-fill) | — | — |
 | lock_percent | token/info locked_ratio (graduação 1h) | — | — |
 | bluechip_owner_pct | ⚠️ N/A — apenas em /v1/market/rank | — | — |
+| SOL/USD | CoinGecko API (cache 5min) | GMGN token/info SOL mint | — |
 
 ---
 
@@ -387,7 +418,7 @@ Scanner (poll 5s)
 ```
 DATABASE_URL=postgres://...
 GMGN_API_KEY=xxxx
-GMGN_PRIVATE_KEY=xxxx        # Ed25519 PEM — necessário na Fase 6
+GMGN_PRIVATE_KEY=xxxx        # Ed25519 PEM — necessário para Fase 6
 GMGN_HOST=https://openapi.gmgn.ai
 TELEGRAM_TOKEN=xxxx
 TELEGRAM_CHAT=xxxx
@@ -407,11 +438,22 @@ BC_MIN_WATCHLIST=80          # % BC mínimo para watchlist
 MAX_MIG_AGE_SEC=600          # ignorar migrações > 10min no restart
 POLL_INTERVAL_SEC=5          # intervalo do scanner
 HOT_PRECISE_SEC=60           # intervalo kline hot-precise
+MIGRATION_SOL_UNITS=410      # SOL teórico da bonding curve → mc_migration_bc_ref
 
 # Bounce detector (configuráveis sem redeploy)
 BOUNCE_MIN_PCT=0.15          # bounce mínimo do fundo para disparar sinal (15%)
 BOUNCE_DROP_MIN=0.30         # drop mínimo da migração para considerar (30%)
 BOUNCE_TIME_MAX=30.0         # janela máxima em minutos (30min = H10 time-stop)
+
+# Fase 6 — Execução de trades (configuráveis sem redeploy)
+TRADING_ENABLED=false        # true para ativar trades reais
+CALIBRATION_AMOUNT_USD=1.0   # tamanho de cada trade em USD
+CALIBRATION_MAX_TRADES=50    # limite total de trades de calibração
+TRADE_TP_PCT=0.75            # take profit (75%)
+TRADE_SL_PCT=0.15            # stop loss (15%)
+TRADE_SLIPPAGE_BPS=500       # slippage máximo em basis points (5%)
+ORDER_POLL_SEC=2             # intervalo de poll do fill (segundos)
+ORDER_TIMEOUT_SEC=30         # timeout do fill (segundos)
 ```
 
 ---
@@ -438,7 +480,7 @@ BOUNCE_TIME_MAX=30.0         # janela máxima em minutos (30min = H10 time-stop)
 
 ## ⚠️ Notas Críticas de Implementação
 
-1. **Não executar capital antes do backtest** — mínimo 200 migrações com dados completos
+1. **Não escalar capital antes de 50 trades de calibração** — friction real (slippage, MEV, latência) só mensurável em live trading
 2. **Threading**: heap scheduler — nunca `threading.Timer` por evento
 3. **GMGN rate limit**: trenches peso 3, kline peso 2, token info peso 1, signal peso 3. 429 → ler `reset_at` do body
 4. **data["pump"]**: near_completion retorna nessa chave, não "near_completion"
@@ -451,7 +493,7 @@ BOUNCE_TIME_MAX=30.0         # janela máxima em minutos (30min = H10 time-stop)
 11. **is_wash_trading**: campo nativo do trenches, não calcular manualmente
 12. **logging.basicConfig** deve ser chamado ANTES de `init_sentry()` para logs aparecerem
 13. **_mc_live**: captura MC de TODOS os completed já vistos (sem filtro de range)
-14. **4h/24h descartados**: trade é de minutos. Checkpoints de 4h/24h removidos da arquitetura
+14. **Checkpoints 4h/24h removidos**: o código não agenda mais. Colunas mc_4h/mc_24h existem no banco (dados históricos) mas não são mais populadas.
 15. **signal type 12**: NÃO usar signal_type 14, 15 ou 16 — API retorna 400
 16. **Campos Fase 1**: chegam no poll do trenches sem custo adicional de API — nunca recalcular manualmente
 17. **bluechip_owner_pct**: NÃO está no trenches — apenas em `/v1/market/rank` (trending). Coluna fica NULL, não remover do schema.
@@ -476,6 +518,12 @@ BOUNCE_TIME_MAX=30.0         # janela máxima em minutos (30min = H10 time-stop)
 36. **Win rate ≥50% é critério errado para esta estratégia**: com payoff 8.7x (TP=100%, SL=15%), o break-even é win rate de 11%. Win rate de 23% gera EV=+14.7%. Exigir 50% rejeitaria uma estratégia matematicamente lucrativa. Critério correto: EV_real > friction_total.
 37. **$1 trades são o walk-forward real**: backtest não captura slippage, MEV, priority fee, latência. 50 trades de $1 medem friction_total real e calibram o modelo. EV_real = EV_backtest − friction_total. Só após calibração escalar o size.
 38. **Kline ticks cobrem tokens que saem do feed trenches**: após dump, token sai do trenches completed → push_mc para de chamar → sem ticks trenches. `_precise_bottom_tick()` chama kline independentemente — garante cobertura durante toda a janela quente de 60min.
+39. **mc_migration usa bonding_curve_ref como 1ª fonte**: `MIGRATION_SOL_UNITS` (padrão 410) × preço SOL/USD = MC teórico da bonding curve completa. Salvo em `mc_migration_bc_ref`. `mc_migration_observed` = kline open ou trenches. `mc_migration_source` = "bonding_curve" | "kline" | "trenches".
+40. **get_trenches() usa formato v2**: body inclui `version: "v2"`, `launchpad_platform` (lista extensa de plataformas), `quote_address_type`, `launchpad_platform_v2: True`, `limit: 80`. `chain` é query param.
+41. **get_sol_usd() tem cache de 5min**: fonte primária CoinGecko, fallback GMGN token/info da SOL mint. Usado pelo executor para converter USD → SOL no momento do trade.
+42. **TradeExecutor é thread-safe**: `on_bounce()` usa `_lock` para checar limite antes de despachar. Cada trade roda em thread própria (`trade-{id}`). Falha no fill não impede o próximo bounce.
+43. **Priority fee NÃO é enviado no swap**: GMGN gerencia internamente. Enviar com unidade errada pode causar fees absurdos (ex: 100000 microlamports/CU × 300k CU = $6+ por trade).
+44. **_checkpoint só aceita label="1h"**: após remoção dos checkpoints 4h/24h, o dict de labels foi simplificado. Chamar com outro label retorna sem fazer nada.
 
 ---
 
@@ -488,7 +536,7 @@ BOUNCE_TIME_MAX=30.0         # janela máxima em minutos (30min = H10 time-stop)
 | Análise | H10 validada | delta_pp ≥ 20pp | ✅ +21.8pp |
 | Backtester | EV positivo com SL=15% | EV > 0 em TP ≥ 30% | ✅ confirmado (n=68) |
 | Backtester | Cobertura de ticks | n_trades ≥ 200 | ⏳ kline OHLC acumulando |
-| Fase 6-lite | Friction total medida | 50 trades de $1 | ⏳ próximo passo |
+| Fase 6-lite | Friction total medida | 50 trades de $1 | ⏳ em andamento |
 | Fase 6-lite | EV_real > 0 após friction | EV_real > 0 | ⏳ depende de friction |
 | Fase 6 | Win rate live | ≥20% (break-even = 11% com payoff 8.7x) | ⏳ |
 | Fase 6 | Payoff ratio live | ≥3× | ⏳ |
