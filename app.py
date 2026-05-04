@@ -2250,14 +2250,16 @@ def analise_dump_depth():
 @app.route("/analise/backtest")
 def analise_backtest():
     """
-    Backtester tick-level: usa token_ticks reais (~30s) para simular TP/SL.
+    Backtester TP/SL com dois modos:
 
-    Lógica por trade:
-      - entry_price  = mc_bottom * (1 + bounce_pct)
-      - Caminha pelos ticks APOS o fundo em ordem cronologica
-      - Primeiro tick com mc <= entry*(1-sl)  -> SL acionado -> loss = -sl
-      - Primeiro tick com mc >= entry*(1+tp)  -> TP acionado -> gain = +tp
-      - Nenhum hit ate fim da janela           -> saida no ultimo tick (P&L real)
+    ?mode=ticks (padrao): tick-level usando token_ticks (~30s).
+      Preciso — detecta ordem SL/TP. Limitado a ~68 tokens com ticks.
+
+    ?mode=full: usa toda a base migrations (~400 tokens).
+      Usa mc_peak para TP e mc_1h como saida quando TP nao atingido.
+      Ligeiramente otimista (nao detecta SL antes do TP), mas 6x mais dados.
+
+    Comparar os dois: se apontam na mesma direcao, confianca alta.
     """
     import collections
     from flask import request
@@ -2265,10 +2267,12 @@ def analise_backtest():
     bounce_pct = float(request.args.get("bounce", "0.15"))
     min_drop   = float(request.args.get("min_drop", "0.30"))
     max_time   = float(request.args.get("max_time", "30"))
+    mode       = request.args.get("mode", "ticks")
 
     with db._cursor() as cur:
         cur.execute("""
-            SELECT mint, pct_drop, time_to_bottom, mc_bottom, mc_migration
+            SELECT mint, pct_drop, time_to_bottom, time_to_peak,
+                   mc_bottom, mc_peak, mc_1h, mc_migration
             FROM migrations
             WHERE pct_drop       IS NOT NULL
               AND time_to_bottom IS NOT NULL
@@ -2287,6 +2291,87 @@ def analise_backtest():
     if not eligible:
         return {"erro": "Nenhum token elegivel com os filtros informados"}, 200
 
+    tp_values = [0.15, 0.20, 0.30, 0.40, 0.50, 0.75, 1.00]
+    sl_values = [0.10, 0.15, 0.20, 0.25, 0.30]
+
+    # ── MODO FULL: usa migrations completas (~400 tokens) ─────────────────
+    if mode == "full":
+        eligible_full = [r for r in eligible if r["mc_peak"] is not None and r["mc_1h"] is not None]
+
+        def simulate_full(tp: float, sl: float):
+            wins, losses = [], []
+            n_tp_hit, n_sl_exit, n_time_exit, n_sem_dados = 0, 0, 0, 0
+
+            for r in eligible_full:
+                mc_bottom = float(r["mc_bottom"])
+                entry     = mc_bottom * (1 + bounce_pct)
+                tp_target = entry * (1 + tp)
+                sl_floor  = entry * (1 - sl)
+
+                peak_after = (
+                    r["time_to_peak"] is not None and
+                    float(r["time_to_peak"]) >= float(r["time_to_bottom"])
+                )
+                tp_hit = peak_after and float(r["mc_peak"]) >= tp_target
+
+                if tp_hit:
+                    wins.append(tp)
+                    n_tp_hit += 1
+                else:
+                    exit_mc  = float(r["mc_1h"])
+                    pnl      = (exit_mc - entry) / entry
+                    capped   = max(pnl, -sl)
+                    losses.append(capped)
+                    if capped == -sl:
+                        n_sl_exit += 1
+                    else:
+                        n_time_exit += 1
+
+            n      = len(wins) + len(losses)
+            wr     = len(wins) / n if n else 0
+            ag     = sum(wins)   / len(wins)   if wins   else 0
+            al     = sum(losses) / len(losses) if losses else 0
+            ev     = wr * ag + (1 - wr) * al
+            payoff = abs(ag / al)              if al != 0 else None
+
+            return {
+                "tp":             f"{tp:.0%}",
+                "sl":             f"{sl:.0%}",
+                "n_trades":       n,
+                "n_tp_hit":       n_tp_hit,
+                "n_sl_exit":      n_sl_exit,
+                "n_time_exit":    n_time_exit,
+                "win_rate":       round(wr,     3),
+                "avg_gain":       round(ag,     3),
+                "avg_loss":       round(al,     3),
+                "payoff_ratio":   round(payoff, 2) if payoff else None,
+                "expected_value": round(ev,     4),
+            }
+
+        grid = [simulate_full(tp, sl) for tp in tp_values for sl in sl_values]
+        best_ev = max((r for r in grid if r["n_trades"] >= 50),
+                      key=lambda x: x["expected_value"], default=None)
+        best_wr = max((r for r in grid if r["n_trades"] >= 50),
+                      key=lambda x: x["win_rate"], default=None)
+
+        return {
+            "modo": "full — migrations completas (mc_peak/mc_1h). "
+                    "Aviso: nao detecta SL antes do TP (ligeiramente otimista).",
+            "parametros": {
+                "bounce_entry_pct": f"{bounce_pct:.0%}",
+                "min_drop_filter":  f"{min_drop:.0%}",
+                "max_time_filter":  f"{max_time:.0f}min",
+            },
+            "dataset": {
+                "tokens_elegiveis":       len(eligible),
+                "tokens_com_mc_peak_1h":  len(eligible_full),
+            },
+            "melhor_ev":       best_ev,
+            "melhor_win_rate": best_wr,
+            "grid_tp_sl":      grid,
+        }, 200
+
+    # ── MODO TICKS: tick-level (~68 tokens) ───────────────────────────────
     mints = [r["mint"] for r in eligible]
 
     with db._cursor() as cur:
@@ -2303,9 +2388,6 @@ def analise_backtest():
     for row in tick_rows:
         rd = dict(row)
         ticks_by_mint[rd["mint"]].append((rd["elapsed_sec"], float(rd["mc"])))
-
-    tp_values = [0.15, 0.20, 0.30, 0.40, 0.50, 0.75, 1.00]
-    sl_values = [0.10, 0.15, 0.20, 0.25, 0.30]
 
     def simulate(tp: float, sl: float):
         wins, losses = [], []
@@ -2385,7 +2467,6 @@ def analise_backtest():
 
     eligible_with_ticks = sum(1 for r in eligible if ticks_by_mint.get(r["mint"]))
 
-    # Diagnostico: tokens sem ticks — antigos ou morreram rapido?
     no_tick_tokens = [r for r in eligible if not ticks_by_mint.get(r["mint"])]
     no_tick_recovery_dist = {}
     if no_tick_tokens:
@@ -2404,24 +2485,25 @@ def analise_backtest():
             """, (nt_mints,))
             nd = dict(cur.fetchone())
             no_tick_recovery_dist = {
-                "recovery_true":  nd["rec_true"],
-                "recovery_false": nd["rec_false"],
-                "recovery_null":  nd["rec_null"],
-                "older_than_7d":  nd["old_tokens"],
-                "avg_drop":       round(float(nd["avg_drop"] or 0), 3),
-                "avg_time_to_bottom": round(float(nd["avg_ttb"] or 0), 1),
+                "recovery_true":       nd["rec_true"],
+                "recovery_false":      nd["rec_false"],
+                "recovery_null":       nd["rec_null"],
+                "older_than_7d":       nd["old_tokens"],
+                "avg_drop":            round(float(nd["avg_drop"] or 0), 3),
+                "avg_time_to_bottom":  round(float(nd["avg_ttb"]  or 0), 1),
             }
 
     return {
+        "modo": "ticks — simulacao tick-level precisa. Use ?mode=full para base completa.",
         "parametros": {
             "bounce_entry_pct": f"{bounce_pct:.0%}",
             "min_drop_filter":  f"{min_drop:.0%}",
             "max_time_filter":  f"{max_time:.0f}min",
         },
         "dataset": {
-            "tokens_elegiveis":  len(eligible),
-            "tokens_com_ticks":  eligible_with_ticks,
-            "tokens_sem_ticks":  len(eligible) - eligible_with_ticks,
+            "tokens_elegiveis":      len(eligible),
+            "tokens_com_ticks":      eligible_with_ticks,
+            "tokens_sem_ticks":      len(eligible) - eligible_with_ticks,
             "sem_ticks_diagnostico": no_tick_recovery_dist,
         },
         "melhor_ev":       best_ev,
