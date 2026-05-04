@@ -242,6 +242,151 @@ def export_csv():
     )
 
 
+@app.route("/export/ticks")
+def export_ticks():
+    """Exporta token_ticks com join de migrations (mc_migration, recovery, symbol)."""
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                t.mint,
+                m.token_nome      AS symbol,
+                m.mc_migration,
+                m.mc_bottom,
+                m.mc_peak,
+                m.time_to_bottom,
+                m.recovery,
+                t.ts,
+                t.mc,
+                t.mc_open,
+                t.mc_high,
+                t.mc_low,
+                t.volume_1m,
+                t.smart_count,
+                t.renowned_count,
+                t.holders,
+                t.source,
+                EXTRACT(EPOCH FROM (t.ts - m.ts_migration)) AS sec_since_migration
+            FROM token_ticks t
+            JOIN migrations m ON m.mint = t.mint
+            ORDER BY t.mint, t.ts
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
+    if not rows:
+        return "Sem ticks", 404
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=rows[0].keys())
+    writer.writeheader()
+    writer.writerows(rows)
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=token_ticks.csv"},
+    )
+
+
+@app.route("/export/bounces")
+def export_bounces():
+    """Exporta bounce_signals com todos os campos de qualidade da migração."""
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                b.mint,
+                b.symbol,
+                b.ts_signal,
+                b.mc_bottom,
+                b.mc_migration,
+                b.elapsed_sec,
+                b.elapsed_sec / 60.0          AS elapsed_min,
+                (b.mc_migration - b.mc_bottom)
+                  / NULLIF(b.mc_migration,0)   AS pct_drop,
+                m.mc_peak,
+                m.mc_1h,
+                m.time_to_bottom,
+                m.time_to_peak,
+                m.recovery,
+                CASE
+                  WHEN m.mc_1h IS NOT NULL AND b.mc_bottom IS NOT NULL
+                  THEN (m.mc_1h - b.mc_bottom) / NULLIF(b.mc_bottom,0)
+                END                            AS gain_at_1h,
+                m.smart_wallets,
+                m.renowned_wallets,
+                m.sniper_wallets,
+                m.rug_ratio                    AS bundler_rate,
+                m.top10_holder_rate,
+                m.bot_degen_rate,
+                m.top70_sniper_hold_rate,
+                m.rat_trader_rate,
+                m.is_wash_trading,
+                m.creator_token_status,
+                m.creator_balance_rate,
+                m.entrapment_ratio,
+                m.liq_migration,
+                m.exchange
+            FROM bounce_signals b
+            LEFT JOIN migrations m ON m.mint = b.mint
+            ORDER BY b.ts_signal DESC
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
+    if not rows:
+        return "Sem bounces", 404
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=rows[0].keys())
+    writer.writeheader()
+    writer.writerows(rows)
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=bounces.csv"},
+    )
+
+
+@app.route("/export/bounce-ticks")
+def export_bounce_ticks():
+    """Exporta ticks dos tokens que tiveram bounce_signal — ideal para estudar padrão pós-bounce."""
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                t.mint,
+                m.token_nome                    AS symbol,
+                b.ts_signal                     AS ts_bounce,
+                b.mc_bottom,
+                b.mc_migration,
+                b.elapsed_sec / 60.0            AS elapsed_min_at_bounce,
+                (b.mc_migration - b.mc_bottom)
+                  / NULLIF(b.mc_migration,0)    AS pct_drop,
+                m.recovery,
+                t.ts,
+                EXTRACT(EPOCH FROM (t.ts - b.ts_signal)) AS sec_after_bounce,
+                t.mc,
+                t.mc_open,
+                t.mc_high,
+                t.mc_low,
+                t.volume_1m,
+                t.source,
+                -- preço relativo ao fundo
+                (t.mc - b.mc_bottom) / NULLIF(b.mc_bottom,0) AS gain_vs_bottom,
+                -- preço relativo à entrada alvo (mc_bottom × 1.15)
+                (t.mc - b.mc_bottom * 1.15) / NULLIF(b.mc_bottom * 1.15,0) AS gain_vs_entry
+            FROM token_ticks t
+            JOIN bounce_signals b ON b.mint = t.mint
+            JOIN migrations m ON m.mint = t.mint
+            WHERE t.ts >= b.ts_signal - INTERVAL '2 minutes'  -- 2min antes do bounce p/ contexto
+            ORDER BY t.mint, t.ts
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
+    if not rows:
+        return "Sem ticks de bounces", 404
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=rows[0].keys())
+    writer.writeheader()
+    writer.writerows(rows)
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=bounce_ticks.csv"},
+    )
+
+
 @app.route("/health")
 def health():
     return {"status": "ok"}, 200
