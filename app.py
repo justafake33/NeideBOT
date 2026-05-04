@@ -2371,12 +2371,12 @@ def analise_backtest():
             "grid_tp_sl":      grid,
         }, 200
 
-    # ── MODO TICKS: tick-level (~68 tokens) ───────────────────────────────
+    # ── MODO TICKS: tick-level com OHLC ───────────────────────────────────
     mints = [r["mint"] for r in eligible]
 
     with db._cursor() as cur:
         cur.execute("""
-            SELECT mint, elapsed_sec, mc
+            SELECT mint, elapsed_sec, mc, mc_open, mc_high, mc_low, source
             FROM token_ticks
             WHERE mint = ANY(%s)
               AND mc IS NOT NULL AND mc > 0
@@ -2384,10 +2384,18 @@ def analise_backtest():
         """, (mints,))
         tick_rows = cur.fetchall()
 
+    # Cada tick: (elapsed_sec, mc_close, mc_open, mc_high, mc_low, source)
     ticks_by_mint: dict = collections.defaultdict(list)
     for row in tick_rows:
         rd = dict(row)
-        ticks_by_mint[rd["mint"]].append((rd["elapsed_sec"], float(rd["mc"])))
+        ticks_by_mint[rd["mint"]].append((
+            rd["elapsed_sec"],
+            float(rd["mc"]),
+            rd["mc_open"],
+            rd["mc_high"],
+            rd["mc_low"],
+            rd.get("source", "trenches"),
+        ))
 
     def simulate(tp: float, sl: float):
         wins, losses = [], []
@@ -2402,7 +2410,7 @@ def analise_backtest():
             sl_floor   = entry * (1 - sl)
 
             ticks       = ticks_by_mint.get(mint, [])
-            post_bottom = [(es, mc) for es, mc in ticks if es > bottom_sec]
+            post_bottom = [t for t in ticks if t[0] > bottom_sec]
 
             if not post_bottom:
                 n_no_ticks += 1
@@ -2410,12 +2418,33 @@ def analise_backtest():
 
             sl_hit = False
             tp_hit = False
-            for _es, mc in post_bottom:
-                if mc <= sl_floor:
-                    sl_hit = True
-                    break
-                if mc >= tp_target:
-                    tp_hit = True
+            for (_es, mc_close, mc_open, mc_high, mc_low, source) in post_bottom:
+                # Kline ticks: usa OHLC para detectar cruzamentos intra-vela
+                if source == "kline" and mc_high is not None and mc_low is not None:
+                    low_hit  = float(mc_low)  <= sl_floor
+                    high_hit = float(mc_high) >= tp_target
+                    if low_hit and high_hit:
+                        # Ambos cruzados na mesma vela — usa open para inferir ordem
+                        # Se open < midpoint entry→tp: token caiu primeiro (SL)
+                        # Se open > midpoint entry→sl: token subiu primeiro (TP)
+                        mid = (sl_floor + tp_target) / 2
+                        op  = float(mc_open) if mc_open else mc_close
+                        if op <= mid:
+                            sl_hit = True
+                        else:
+                            tp_hit = True
+                    elif low_hit:
+                        sl_hit = True
+                    elif high_hit:
+                        tp_hit = True
+                else:
+                    # Trenches ticks: só tem close
+                    if mc_close <= sl_floor:
+                        sl_hit = True
+                    elif mc_close >= tp_target:
+                        tp_hit = True
+
+                if sl_hit or tp_hit:
                     break
 
             if tp_hit:
