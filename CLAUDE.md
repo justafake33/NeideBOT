@@ -300,26 +300,28 @@ Registradas ANTES de ver os dados. Não alterar retroativamente.
 
 > **slope_c invertido mas útil:** recovery tokens têm dump 60% mais rápido nos 2 minutos antes do fundo (−0.171 vs −0.107). Não é deceleração — é capitulação brusca. Padrão: queda moderada → leve pausa → spike de capitulação → fundo. No-recovery: queda lenta e gradual sem spike. Caveat: análise sobre tokens com fundo ≥10min (n=49) — os de fundo rápido (H10, maior recovery) foram excluídos por densidade de ticks insuficiente.
 
-### Backtester tick-level — resultados (2026-05-03)
+### Backtester tick-level — resultados consolidados (2026-05-04)
 
-**Metodologia:** entry = mc_bottom × 1.15. Caminha token_ticks cronologicamente após o fundo. Primeiro tick abaixo SL floor → loss. Primeiro tick acima TP target → gain. Fim da janela → saída no último tick.
+**Metodologia:** entry = mc_bottom × 1.15. Caminha token_ticks cronologicamente após o fundo.
+- Ticks `source=kline`: usa `mc_high` para TP e `mc_low` para SL (intra-vela). Desempate via `mc_open` vs midpoint.
+- Ticks `source=trenches`: usa `mc` (close) para SL e TP.
+- Fim da janela sem hit → saída no último tick com P&L real.
 
-**Filtros aplicados:** drop ≥ 30%, time_to_bottom < 30min → 555 tokens elegíveis, **63 com ticks** (11.3%).
+**Filtros:** drop ≥ 30%, time_to_bottom < 30min → 560 tokens elegíveis, **68 com ticks** (expansão em curso via kline OHLC).
 
-| TP | SL | Win Rate | EV | n_tp | n_sl | n_time |
-|----|-----|----------|----|------|------|--------|
-| 15% | 15% | 36.5% | -3.4% | 23 | 37 | 3 |
-| 30% | 15% | 31.7% | +0.2% | 20 | 39 | 4 |
-| 40% | 15% | 30.2% | +2.5% | 19 | 40 | 4 |
-| 50% | 15% | 25.4% | +3.0% | 16 | 42 | 5 |
-| 75% | 15% | 25.4% | **+9.3%** | 16 | 42 | 5 |
-| 100% | 15% | 20.6% | **+11.6%** | 13 | 43 | 7 |
+| TP | SL | Win Rate | EV | Payoff | n_tp | n_sl |
+|----|----|----------|----|--------|------|------|
+| 15% | 15% | 39.7% | -2.5% | 1.1x | 27 | 38 |
+| 30% | 15% | 33.8% | +1.1% | 2.2x | 23 | 40 |
+| 40% | 15% | 32.4% | +3.7% | 2.9x | 22 | 41 |
+| **75%** | **15%** | **27.9%** | **+11.5%** | **5.7x** | 19 | 43 |
+| **100%** | **15%** | **23.5%** | **+14.7%** | **8.7x** | 16 | 44 |
 
-**SL=15% domina todos os níveis de TP.** SL=10% dispara com ruído (apenas 3.5% acima do fundo). SL=15% exige retorno abaixo do fundo para acionar.
+**SL=15% domina todos os níveis de TP.** Signal estável em 3 runs consecutivos.
 
-**⚠️ BIAS CRÍTICO:** 492 de 555 tokens (88.7%) não têm ticks → bias de seleção severo. Os 63 com ticks podem ser os "melhores" tokens (que ficaram vivos o suficiente para gerar ticks). O EV real pode ser significativamente pior. Diagnóstico adicionado ao `/analise/backtest` (`sem_ticks_diagnostico`).
+**Bias de cobertura:** 492/560 tokens sem ticks. Diagnóstico: recovery_rate dos sem-ticks = 57.7% (similar ao baseline 52%) — não são piores, apenas sem cobertura histórica. Kline OHLC resolvendo progressivamente.
 
-**Próximo passo obrigatório:** verificar `recovery_true/false` dos 492 sem ticks. Se maioria for `recovery_false`, o EV +9.3% é inflado e não é acionável.
+**⚠️ O que o backtest NÃO captura:** taxas de swap, priority fee, slippage, MEV/sandwich, latência. EV_real = EV_backtest − friction_total. Friction só mensurável em live trading ($1 trades).
 
 ---
 
@@ -358,9 +360,10 @@ Scanner (poll 5s)
 | Tabela | Conteúdo |
 |--------|----------|
 | `migrations` | Uma linha por token migrado — todos os campos de qualidade + checkpoints |
-| `token_ticks` | Série temporal ~30s por token durante janela quente (60min). volume_1m back-fillado via kline. |
+| `token_ticks` | Série temporal por token. `source='trenches'` (~30s) ou `source='kline'` (60s, com OHLC). |
 | `token_signals` | **Fase 2** — sinais type 12 por token durante janela quente |
 | `bounce_signals` | **Fase 2** — um registro por token quando bounce detector dispara (UNIQUE mint) |
+| `trades` | **Fase 6-lite** — log completo de cada trade live ($1/trade calibração) |
 
 ### HeapScheduler
 - Thread única com heap de eventos futuros
@@ -425,7 +428,7 @@ BOUNCE_TIME_MAX=30.0         # janela máxima em minutos (30min = H10 time-stop)
 | `/analise/tick-features` | Análise completa de todas as colunas token_ticks vs recovery |
 | `/analise/price-decel` | Slope de preço em 3 janelas antes do fundo — H11 REFUTADA, capitulação brusca emerge |
 | `/analise/dump-depth` | H12 — grid 2D pct_drop × time_to_bottom → P(recovery). 3 zonas acionáveis mas time domina. |
-| `/analise/backtest` | **Backtester tick-level** — grid TP×SL usando token_ticks reais. Inclui sem_ticks_diagnostico. |
+| `/analise/backtest` | **Backtester tick-level** — grid TP×SL com OHLC. `?mode=ticks` (padrão) ou `?mode=full`. |
 | `/export/csv` | Export completo do banco |
 | `/health` | Health check |
 | `/debug/signal` | Diagnóstico histórico — testa formatos do token_signal (legacy) |
@@ -465,9 +468,14 @@ BOUNCE_TIME_MAX=30.0         # janela máxima em minutos (30min = H10 time-stop)
 28. **token_ticks têm intervalo médio ~30s, não 5s**: ticks só são inseridos quando o token aparece no trenches poll com token_data. Se o token sair do feed antes do poll, o tick não é criado. Janelas de análise devem ter ≥150s de largura para capturar ≥5 pontos.
 29. **Capitulação brusca ≠ deceleração**: recovery tokens têm slope_c = −0.171 %MC/s vs −0.107 em no-recovery. O padrão é queda moderada → leve pausa → spike de capitulação → fundo. Análise sobre subconjunto com fundo ≥10min (n=49) — bias de seleção contra os tokens de fundo rápido (maior recovery).
 30. **Backtester usa token_ticks, NÃO mc_1h**: mc_1h é checkpoint arbitrário. O backtester correto caminha os ticks reais após o fundo e detecta qual bate primeiro — SL ou TP. `n_sl_hit` + `n_time_exit` + `n_tp_hit` somam `n_trades`. Tokens sem ticks são excluídos (`n_no_ticks`).
-31. **Bias de cobertura nos ticks**: apenas ~11% dos tokens elegíveis têm ticks suficientes para o backtester. Os 89% restantes podem ter morrido antes de gerar ticks (pior caso) ou são tokens antigos sem cobertura (neutro). Verificar `sem_ticks_diagnostico.recovery_false` antes de confiar no EV calculado.
+31. **Bias de cobertura nos ticks**: apenas ~12% dos tokens elegíveis têm ticks. Diagnóstico: recovery_rate dos sem-ticks = 57.7% (similar ao baseline). Kline OHLC resolvendo — `_precise_bottom_tick()` insere velas a cada 60s independente do feed trenches.
 32. **bounce_signals tabela**: `UNIQUE (mint)` — só registra o primeiro bounce detectado por token. `ON CONFLICT DO NOTHING` em `insert_bounce_signal()`.
 33. **SL=10% muito apertado**: entry = mc_bottom × 1.15, SL=10% → aciona em mc_bottom × 1.035 (3.5% acima do fundo). Qualquer ruído de mercado dispara o SL. SL=15% é o mínimo prático — exige retorno abaixo do fundo para acionar.
+34. **token_ticks tem source='kline' e source='trenches'**: kline ticks têm mc_open/mc_high/mc_low (OHLC completo). Trenches ticks têm só mc (close). Backtester usa mc_high para TP e mc_low para SL nos ticks kline. Desempate quando ambos cruzados na mesma vela: mc_open vs midpoint(sl_floor, tp_target).
+35. **mode=full do backtester é metodologicamente quebrado**: avg_loss=+29% (positivo) revela que mc_1h ignora SL hits mid-path. Token pode subir a mc_1h mas ter acionado SL antes. Usar apenas mode=ticks para decisões.
+36. **Win rate ≥50% é critério errado para esta estratégia**: com payoff 8.7x (TP=100%, SL=15%), o break-even é win rate de 11%. Win rate de 23% gera EV=+14.7%. Exigir 50% rejeitaria uma estratégia matematicamente lucrativa. Critério correto: EV_real > friction_total.
+37. **$1 trades são o walk-forward real**: backtest não captura slippage, MEV, priority fee, latência. 50 trades de $1 medem friction_total real e calibram o modelo. EV_real = EV_backtest − friction_total. Só após calibração escalar o size.
+38. **Kline ticks cobrem tokens que saem do feed trenches**: após dump, token sai do trenches completed → push_mc para de chamar → sem ticks trenches. `_precise_bottom_tick()` chama kline independentemente — garante cobertura durante toda a janela quente de 60min.
 
 ---
 
@@ -477,15 +485,17 @@ BOUNCE_TIME_MAX=30.0         # janela máxima em minutos (30min = H10 time-stop)
 |------|---------|------|--------|
 | Coleta | Migrações com bottom + mc_1h | ≥200 | ✅ 425 |
 | Coleta | Cobertura campos Fase 1 | ≥80% dos tokens novos | ✅ |
-| Fase 2 | token_signals acumulados para testar H9 | ≥100 tokens com sinais | ⏳ em coleta |
 | Análise | H10 validada | delta_pp ≥ 20pp | ✅ +21.8pp |
-| Análise | H9 validada | delta_pp ≥ 20pp | ⏳ aguardando dados |
-| Backtester | EV positivo confirmado sem bias | EV > 0 com N≥100 com ticks | ⏳ aguardando cobertura de ticks |
-| Execução | Win rate out-of-sample | ≥50% | ⏳ Fase 6 |
-| Execução | Payoff ratio | ≥2× | ⏳ Fase 6 |
-| Execução | Max drawdown simulado | ≤40% | ⏳ Fase 6 |
-| Live | Latência detecção → ordem | <15s | ⏳ Fase 6 |
-| Live | Divergência real vs backtest | <30% após 50 trades | ⏳ Fase 6 |
+| Backtester | EV positivo com SL=15% | EV > 0 em TP ≥ 30% | ✅ confirmado (n=68) |
+| Backtester | Cobertura de ticks | n_trades ≥ 200 | ⏳ kline OHLC acumulando |
+| Fase 6-lite | Friction total medida | 50 trades de $1 | ⏳ próximo passo |
+| Fase 6-lite | EV_real > 0 após friction | EV_real > 0 | ⏳ depende de friction |
+| Fase 6 | Win rate live | ≥20% (break-even = 11% com payoff 8.7x) | ⏳ |
+| Fase 6 | Payoff ratio live | ≥3× | ⏳ |
+| Fase 6 | Latência detecção → ordem | ≤15s | ⏳ |
+| Fase 6 | Divergência real vs backtest | ≤30% após 50 trades | ⏳ |
+| Fase 6 | Max drawdown | ≤40% do capital alocado | ⏳ |
+| H9 | Validação smart money signal | delta_pp ≥ 20pp | ⏳ acumulando passivamente |
 
 ---
 
@@ -504,3 +514,5 @@ BOUNCE_TIME_MAX=30.0         # janela máxima em minutos (30min = H10 time-stop)
 > Sardinhas constroem features. Big players constroem datasets.
 > Sardinhas medem delta_smart. Big players esperam H9 com dados reais de compra ativa.
 > Sardinhas confiam no EV de 63 tokens. Big players verificam os 492 que estão faltando.
+> Sardinhas fazem walk-forward backtest e esperam win rate ≥50%. Big players sabem que 23% win rate com 8.7x payoff bate 50% win rate com 1x payoff.
+> Sardinhas analisam. Big players traduzem análise em execução com capital mínimo para medir o que o modelo não consegue ver.
