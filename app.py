@@ -1007,24 +1007,24 @@ def analise_filter_thresholds():
                 liq_migration,
                 volume_1m,
                 recovery,
-                bundler_trader_amount_rate
+                rug_ratio AS bundler_trader_amount_rate
             FROM migrations
             WHERE recovery IS NOT NULL
         """)
         rows = [dict(r) for r in cur.fetchall()]
 
     # Campos a analisar: (coluna_db, label, faixas, maior_é_pior)
+    # Nota: rug_ratio no banco = bundler_trader_amount_rate do trenches (salvo assim em upsert_migration)
     FIELDS = [
-        ("rug_ratio",               "Rug ratio (GMGN score)",     [0,.05,.10,.15,.20,.30,.50,1], True),
-        ("bot_degen_rate",          "Bot degen rate",              [0,.10,.20,.30,.40,.50,.60,.70,.80,1], True),
-        ("rat_trader_rate",         "Rat trader rate",             [0,.05,.10,.15,.20,.30,.40,.50,1], True),
-        ("top10_holder_rate",       "Top 10 holders",              [0,.40,.50,.60,.70,.75,.80,.85,.90,1], True),
-        ("suspected_insider_rate",  "Suspected insiders",          [0,.02,.05,.10,.15,.20,.30,1], True),
-        ("top70_sniper_hold_rate",  "Top 70 snipers hold",         [0,.02,.05,.10,.15,.20,.30,1], True),
-        ("entrapment_ratio",        "Entrapment ratio",            [0,.01,.05,.10,.20,.30,1], True),
-        ("smart_wallets",           "Smart wallets",               [-1,0,1,2,3,5,10,999], False),
-        ("bundler_trader_amount_rate","Bundler trader rate",         [0,.10,.15,.20,.25,.30,.40,.50,.60,1], True),
-        ("liq_migration",           "Liquidez migração ($)",       [0,5000,10000,15000,25000,50000,999999], False),
+        ("bundler_trader_amount_rate", "Bundler rate (col rug_ratio)", [0,.10,.15,.20,.25,.30,.40,.50,.60,1], True),
+        ("bot_degen_rate",             "Bot degen rate",               [0,.10,.20,.30,.40,.50,.60,.70,.80,1], True),
+        ("rat_trader_rate",            "Rat trader rate",              [0,.05,.10,.15,.20,.30,.40,.50,1], True),
+        ("top10_holder_rate",          "Top 10 holders",               [0,.40,.50,.60,.70,.75,.80,.85,.90,1], True),
+        ("suspected_insider_rate",     "Suspected insiders",           [0,.02,.05,.10,.15,.20,.30,1], True),
+        ("top70_sniper_hold_rate",     "Top 70 snipers hold",          [0,.02,.05,.10,.15,.20,.30,1], True),
+        ("entrapment_ratio",           "Entrapment ratio",             [0,.01,.05,.10,.20,.30,1], True),
+        ("smart_wallets",              "Smart wallets",                [-1,0,1,2,3,5,10,999], False),
+        ("liq_migration",              "Liquidez migração ($)",        [0,5000,10000,15000,25000,50000,999999], False),
     ]
 
     def bucket_label(lo, hi, is_int=False):
