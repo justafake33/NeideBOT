@@ -125,6 +125,15 @@ def init_db():
         ]:
             cur.execute(f"ALTER TABLE migrations {col}")
 
+        # token_ticks — colunas OHLC e source (adicionadas para kline ticks)
+        for col in [
+            "ADD COLUMN IF NOT EXISTS mc_open   FLOAT",
+            "ADD COLUMN IF NOT EXISTS mc_high   FLOAT",
+            "ADD COLUMN IF NOT EXISTS mc_low    FLOAT",
+            "ADD COLUMN IF NOT EXISTS source    TEXT NOT NULL DEFAULT 'trenches'",
+        ]:
+            cur.execute(f"ALTER TABLE token_ticks {col}")
+
         # Série temporal — ticks a cada 5s durante os 60min de monitoramento
         cur.execute("""
             CREATE TABLE IF NOT EXISTS token_ticks (
@@ -133,6 +142,10 @@ def init_db():
                 tick_ts        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 elapsed_sec    INT         NOT NULL,
                 mc             FLOAT,
+                mc_open        FLOAT,
+                mc_high        FLOAT,
+                mc_low         FLOAT,
+                source         TEXT        NOT NULL DEFAULT 'trenches',
                 smart_count    INT,
                 renowned_count INT,
                 volume_1m      FLOAT,
@@ -452,17 +465,41 @@ def insert_bounce_signal(data: dict):
 
 
 def insert_ticks_batch(ticks: list):
-    """Insere múltiplos ticks em uma única transação (batch do buffer de 30s)."""
+    """Insere ticks de trenches (source='trenches') — mc = preco no momento do poll."""
     if not ticks:
         return
     with _cursor() as cur:
         cur.executemany("""
             INSERT INTO token_ticks
-                (mint, elapsed_sec, mc, smart_count, renowned_count,
+                (mint, elapsed_sec, mc, source,
+                 smart_count, renowned_count,
                  volume_1m, volume_5m, volume_15m, holders_count, liquidity)
             VALUES
-                (%(mint)s, %(elapsed_sec)s, %(mc)s, %(smart_count)s, %(renowned_count)s,
-                 %(volume_1m)s, %(volume_5m)s, %(volume_15m)s, %(holders_count)s, %(liquidity)s)
+                (%(mint)s, %(elapsed_sec)s, %(mc)s, 'trenches',
+                 %(smart_count)s, %(renowned_count)s,
+                 %(volume_1m)s, %(volume_5m)s, %(volume_15m)s,
+                 %(holders_count)s, %(liquidity)s)
+            ON CONFLICT DO NOTHING
+        """, ticks)
+
+
+def insert_kline_ticks_batch(ticks: list):
+    """
+    Insere ticks de kline (source='kline') com OHLC completo.
+    Cada tick = uma vela 1m. mc = close, mc_open/mc_high/mc_low da vela.
+    ON CONFLICT DO NOTHING para nao duplicar velas ja inseridas.
+    """
+    if not ticks:
+        return
+    with _cursor() as cur:
+        cur.executemany("""
+            INSERT INTO token_ticks
+                (mint, elapsed_sec, mc, mc_open, mc_high, mc_low,
+                 source, volume_1m)
+            VALUES
+                (%(mint)s, %(elapsed_sec)s, %(mc)s, %(mc_open)s, %(mc_high)s, %(mc_low)s,
+                 'kline', %(volume_1m)s)
+            ON CONFLICT DO NOTHING
         """, ticks)
 
 

@@ -391,7 +391,34 @@ class HotMonitor:
                                         (mc_high / state["mc_migration"] - 1) * 100)
                             state["mc_max"] = mc_high
 
-                # Back-filla volume_1m nos ticks existentes via candles kline
+                # Insere ticks kline com OHLC completo para cada vela
+                kline_ticks = []
+                for c in candles:
+                    candle_ts   = int(c.get("time", 0)) / 1000
+                    elapsed_sec = int(candle_ts - state["ts_mig_unix"])
+                    if elapsed_sec < 0 or elapsed_sec > 3660:
+                        continue
+                    close_p = _float(c.get("close"))
+                    open_p  = _float(c.get("open"))
+                    high_p  = _float(c.get("high"))
+                    low_p   = _float(c.get("low"))
+                    vol     = _float(c.get("volume"))
+                    supply  = state["total_supply"]
+                    if not close_p or close_p <= 0 or not supply:
+                        continue
+                    kline_ticks.append({
+                        "mint":        mint,
+                        "elapsed_sec": elapsed_sec,
+                        "mc":          close_p * supply,
+                        "mc_open":     open_p  * supply if open_p  else None,
+                        "mc_high":     high_p  * supply if high_p  else None,
+                        "mc_low":      low_p   * supply if low_p   else None,
+                        "volume_1m":   vol,
+                    })
+                if kline_ticks:
+                    db.insert_kline_ticks_batch(kline_ticks)
+
+                # Back-filla volume_1m nos ticks trenches existentes
                 db.backfill_tick_volumes(mint, candles, state["ts_mig_unix"])
             except Exception as e:
                 logger.debug("precise bottom %s: %s", mint[:8], e)
