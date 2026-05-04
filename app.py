@@ -984,6 +984,259 @@ def analise_bounce_quality():
 
 
 # ==============================================================================
+# /analise/sniper-entry — Simula entrada na primeira queda pós-migração
+# ==============================================================================
+
+@app.route("/analise/sniper-entry")
+def analise_sniper_entry():
+    """
+    Bigplayer thesis: token migra → early buyers vendem → dump em segundos.
+    Entra na primeira queda (sem esperar bounce). Analisa múltiplos thresholds.
+    Usa token_ticks reais: mc_low para trigger e SL, mc_high para TP.
+    """
+    TP_PCT  = 0.75
+    SL_PCT  = 0.15
+    THRESHOLDS = [0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65]
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT m.mint, m.token_nome, m.mc_migration, m.ts_migration,
+                   m.time_to_bottom, m.pct_drop, m.recovery, m.mc_1h,
+                   m.bot_degen_rate, m.rug_ratio
+            FROM migrations m
+            WHERE m.mc_migration IS NOT NULL AND m.mc_migration > 0
+              AND m.ts_migration IS NOT NULL
+              AND EXISTS (SELECT 1 FROM token_ticks t WHERE t.mint = m.mint)
+            ORDER BY m.ts_migration DESC
+        """)
+        tokens = [dict(r) for r in cur.fetchall()]
+
+        cur.execute("""
+            SELECT mint, elapsed_sec, mc, mc_high, mc_low, source
+            FROM token_ticks
+            WHERE mint = ANY(%s)
+            ORDER BY mint, elapsed_sec
+        """, ([t["mint"] for t in tokens],))
+        all_ticks = cur.fetchall()
+
+    ticks_by_mint = {}
+    for t in all_ticks:
+        ticks_by_mint.setdefault(t["mint"], []).append(t)
+
+    # Para cada threshold simula entradas
+    grid = {}
+    detail_by_threshold = {}
+
+    for thr in THRESHOLDS:
+        results = []
+        for tok in tokens:
+            mint    = tok["mint"]
+            mc_mig  = tok["mc_migration"]
+            ticks   = ticks_by_mint.get(mint, [])
+            if not ticks or not mc_mig:
+                continue
+
+            entry_level = mc_mig * (1 - thr)
+            tp_target   = entry_level * (1 + TP_PCT)
+            sl_floor    = entry_level * (1 - SL_PCT)
+
+            # Acha o primeiro tick onde price toca entry_level
+            entry_idx   = None
+            entry_time  = None
+            for i, t in enumerate(ticks):
+                low = t["mc_low"] if t["mc_low"] else t["mc"]
+                if low is not None and low <= entry_level:
+                    entry_idx  = i
+                    entry_time = t["elapsed_sec"]
+                    break
+
+            if entry_idx is None:
+                continue  # Nunca chegou nesse nível
+
+            # Verifica o mesmo candle da entrada: SL pode acionar imediatamente
+            outcome = None
+            pnl     = None
+            exit_at = None
+
+            entry_tick = ticks[entry_idx]
+            entry_low  = entry_tick["mc_low"]  if entry_tick["mc_low"]  else entry_tick["mc"]
+            entry_high = entry_tick["mc_high"] if entry_tick["mc_high"] else entry_tick["mc"]
+
+            if entry_low is not None and entry_low <= sl_floor:
+                # SL na mesma vela da entrada (dump continuou)
+                outcome = "SL_imediato"
+                pnl     = -SL_PCT
+                exit_at = entry_time
+            elif entry_high is not None and entry_high >= tp_target:
+                outcome = "TP"
+                pnl     = TP_PCT
+                exit_at = entry_time
+            else:
+                # Caminha ticks seguintes
+                for t in ticks[entry_idx + 1:]:
+                    high = t["mc_high"] if t["mc_high"] else t["mc"]
+                    low  = t["mc_low"]  if t["mc_low"]  else t["mc"]
+                    if low is not None and low <= sl_floor:
+                        outcome = "SL"
+                        pnl     = -SL_PCT
+                        exit_at = t["elapsed_sec"]
+                        break
+                    if high is not None and high >= tp_target:
+                        outcome = "TP"
+                        pnl     = TP_PCT
+                        exit_at = t["elapsed_sec"]
+                        break
+                else:
+                    last = ticks[-1]
+                    if last["mc"] and entry_level:
+                        pnl     = last["mc"] / entry_level - 1
+                        exit_at = last["elapsed_sec"]
+                        outcome = "exit"
+
+            if pnl is not None:
+                results.append({
+                    **tok,
+                    "thr":        thr,
+                    "entry_time": entry_time,
+                    "outcome":    outcome,
+                    "pnl":        pnl,
+                    "exit_at":    exit_at,
+                })
+
+        wins   = [r for r in results if r["outcome"] == "TP"]
+        sl_imm = [r for r in results if r["outcome"] == "SL_imediato"]
+        sls    = [r for r in results if r["outcome"] in ("SL", "SL_imediato")]
+        exits  = [r for r in results if r["outcome"] == "exit"]
+        n      = len(results)
+
+        ev       = sum(r["pnl"] for r in results) / n if n else 0
+        win_rate = len(wins) / n if n else 0
+        avg_t    = sum(r["entry_time"] for r in results) / n if n else 0
+
+        grid[thr] = {
+            "n": n, "wins": len(wins), "sls": len(sls),
+            "sl_imm": len(sl_imm), "exits": len(exits),
+            "win_rate": win_rate, "ev": ev, "avg_entry_sec": avg_t,
+        }
+        detail_by_threshold[thr] = results
+
+    # Melhor EV
+    best_thr = max(grid, key=lambda k: grid[k]["ev"]) if grid else None
+
+    # ---- Referência bounce approach ----
+    bounce_ref = {"win_rate": 0.125, "ev": -0.04, "n": 48}
+    bounce_filt= {"win_rate": 0.313, "ev": 0.131, "n": 16}
+
+    CSS = """<style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;font-size:12px}
+    h1,h2{padding:12px 16px;color:#58a6ff}
+    h2{font-size:13px;color:#8b949e;padding:8px 16px;border-top:1px solid #21262d;margin-top:8px}
+    .grid{display:flex;gap:10px;padding:0 16px 12px;flex-wrap:wrap}
+    .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px 14px;min-width:110px}
+    .card .lbl{color:#8b949e;font-size:10px;margin-bottom:3px}
+    .card .val{font-size:15px;font-weight:bold}
+    .green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}.blue{color:#58a6ff}
+    table{width:100%;border-collapse:collapse}
+    th{background:#161b22;color:#8b949e;padding:5px 8px;text-align:right;
+       border-bottom:1px solid #30363d;font-size:11px;white-space:nowrap}
+    th:first-child{text-align:left}
+    td{padding:4px 8px;border-bottom:1px solid #21262d;text-align:right}
+    td:first-child{text-align:left}
+    tr:hover td{background:#161b22}
+    .sec{padding:0 16px 16px}
+    .best{background:#1a2a1a!important}
+    .note{background:#1a1a2e;border:1px solid #30363d;border-radius:4px;
+          padding:10px 14px;margin:8px 16px;font-size:11px;color:#8b949e;line-height:1.6}
+    </style>"""
+
+    h = f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Sniper Entry</title>{CSS}</head><body>"
+    h += "<h1>Sniper Entry — primeira queda pós-migração (sem esperar bounce)</h1>"
+
+    h += "<div class='note'>"
+    h += "<b>Hipótese:</b> token migra → early buyers vendem → dump em segundos → entrar durante a queda.<br>"
+    h += f"<b>Universo:</b> {len(tokens)} tokens com ticks &nbsp;|&nbsp; TP={TP_PCT:.0%} &nbsp;|&nbsp; SL={SL_PCT:.0%}<br>"
+    h += "<b>SL_imediato:</b> candle de entrada já perfurou o SL — dump continuou sem pausa."
+    h += "</div>"
+
+    # --- Grid de thresholds ---
+    h += "<h2>▸ Grade de thresholds — entrada na primeira queda</h2>"
+    h += "<div class='sec'><table><thead><tr>"
+    h += "<th>Threshold entrada</th><th>Trades</th><th>TPs</th><th>SLs</th>"
+    h += "<th>SL imediato</th><th>Win rate</th><th>EV</th><th>Tempo médio entrada</th></tr></thead><tbody>"
+
+    for thr in THRESHOLDS:
+        g   = grid[thr]
+        cls = "best" if thr == best_thr else ""
+        ev_cls  = "green" if g["ev"] > 0 else "red"
+        wr_cls  = "green" if g["win_rate"] >= 0.25 else "red"
+        mark    = " ◀ melhor EV" if thr == best_thr else ""
+        h += f"<tr class='{cls}'>"
+        h += f"<td><b>-{thr:.0%}</b>{mark}</td>"
+        h += f"<td>{g['n']}</td>"
+        h += f"<td class='green'>{g['wins']}</td>"
+        h += f"<td class='red'>{g['sls']}</td>"
+        h += f"<td class='yellow'>{g['sl_imm']}</td>"
+        h += f"<td class='{wr_cls}'>{g['win_rate']:.1%}</td>"
+        h += f"<td class='{ev_cls}'>{g['ev']:+.1%}</td>"
+        h += f"<td>{g['avg_entry_sec']:.0f}s ({g['avg_entry_sec']/60:.1f}min)</td>"
+        h += "</tr>"
+
+    # Linha separadora — bounce approach
+    h += f"<tr style='border-top:2px solid #58a6ff'>"
+    h += f"<td><b>[REFERÊNCIA] Bounce atual</b></td>"
+    h += f"<td>{bounce_ref['n']}</td><td class='green'>6</td><td class='red'>42</td>"
+    h += f"<td class='yellow'>—</td>"
+    h += f"<td class='red'>{bounce_ref['win_rate']:.1%}</td>"
+    h += f"<td class='red'>{bounce_ref['ev']:+.1%}</td>"
+    h += f"<td>~{15*60:.0f}s (~15min)</td></tr>"
+    h += f"<tr>"
+    h += f"<td><b>[REFERÊNCIA] Bounce + drop≤65%</b></td>"
+    h += f"<td>{bounce_filt['n']}</td><td class='green'>5</td><td class='red'>11</td>"
+    h += f"<td class='yellow'>—</td>"
+    h += f"<td class='green'>{bounce_filt['win_rate']:.1%}</td>"
+    h += f"<td class='green'>{bounce_filt['ev']:+.1%}</td>"
+    h += f"<td>~{15*60:.0f}s (~15min)</td></tr>"
+    h += "</tbody></table></div>"
+
+    # --- Detalhe do melhor threshold ---
+    if best_thr is not None:
+        best_results = detail_by_threshold[best_thr]
+        h += f"<h2>▸ Resultados individuais — threshold -{best_thr:.0%} (melhor EV)</h2>"
+        h += "<div class='sec'><table><thead><tr>"
+        h += "<th>Token</th><th>Outcome</th><th>P&L</th><th>Entrada (s)</th>"
+        h += "<th>Saída (s)</th><th>Drop real</th><th>T bottom</th><th>Bot</th><th>Bundler</th></tr></thead><tbody>"
+        for r in sorted(best_results, key=lambda x: x["entry_time"] or 0):
+            oc  = r["outcome"]
+            oc_cls = "green" if oc == "TP" else ("yellow" if oc == "exit" else "red")
+            pnl = r["pnl"]
+            pnl_cls = "green" if (pnl or 0) > 0 else "red"
+            h += "<tr>"
+            h += f"<td><b>{r['token_nome']}</b></td>"
+            h += f"<td class='{oc_cls}'>{oc}</td>"
+            h += f"<td class='{pnl_cls}'>{pnl:+.0%}</td>" if pnl is not None else "<td>—</td>"
+            h += f"<td>{r['entry_time']}s</td>"
+            h += f"<td>{r['exit_at']}s</td>" if r.get("exit_at") else "<td>—</td>"
+            h += f"<td>{r['pct_drop']:.0%}</td>" if r.get("pct_drop") else "<td>—</td>"
+            h += f"<td>{r['time_to_bottom']:.1f}min</td>" if r.get("time_to_bottom") else "<td>—</td>"
+            h += f"<td>{r['bot_degen_rate']:.0%}</td>" if r.get("bot_degen_rate") is not None else "<td>—</td>"
+            h += f"<td>{r['rug_ratio']:.0%}</td>" if r.get("rug_ratio") is not None else "<td>—</td>"
+            h += "</tr>"
+        h += "</tbody></table></div>"
+
+    h += "<div class='note' style='margin-top:12px'>"
+    h += "<b>Legenda:</b><br>"
+    h += "• <b>SL_imediato</b>: dump não parou no nível de entrada — candle perfurou diretamente o SL. Sniper chegou cedo demais.<br>"
+    h += "• <b>SL</b>: entrou, preço devolveu. Fundo ainda não havia sido atingido.<br>"
+    h += "• <b>TP</b>: entrou e bounce atingiu +75%.<br>"
+    h += "• <b>exit</b>: sem TP nem SL — saída no último tick disponível."
+    h += "</div>"
+
+    h += "</body></html>"
+    return h
+
+
+# ==============================================================================
 # /analise/bottom-score — Backtest retroativo do Bottom Score
 # ==============================================================================
 
