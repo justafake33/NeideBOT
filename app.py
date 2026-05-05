@@ -293,20 +293,21 @@ def export_bounces():
                 b.mint,
                 b.symbol,
                 b.ts_signal,
-                b.mc_bottom,
+                b.mc_min                       AS mc_bottom,
+                b.mc_at_signal                 AS mc_entry,
                 b.mc_migration,
                 b.elapsed_sec,
-                b.elapsed_sec / 60.0          AS elapsed_min,
-                (b.mc_migration - b.mc_bottom)
-                  / NULLIF(b.mc_migration,0)   AS pct_drop,
+                b.elapsed_sec / 60.0           AS elapsed_min,
+                b.drop_from_mig                AS pct_drop,
+                b.bounce_pct,
                 m.mc_peak,
                 m.mc_1h,
                 m.time_to_bottom,
                 m.time_to_peak,
                 m.recovery,
                 CASE
-                  WHEN m.mc_1h IS NOT NULL AND b.mc_bottom IS NOT NULL
-                  THEN (m.mc_1h - b.mc_bottom) / NULLIF(b.mc_bottom,0)
+                  WHEN m.mc_1h IS NOT NULL AND b.mc_min IS NOT NULL
+                  THEN (m.mc_1h - b.mc_min) / NULLIF(b.mc_min, 0)
                 END                            AS gain_at_1h,
                 m.smart_wallets,
                 m.renowned_wallets,
@@ -349,11 +350,11 @@ def export_bounce_ticks():
                 t.mint,
                 m.token_nome                    AS symbol,
                 b.ts_signal                     AS ts_bounce,
-                b.mc_bottom,
+                b.mc_min                        AS mc_bottom,
                 b.mc_migration,
                 b.elapsed_sec / 60.0            AS elapsed_min_at_bounce,
-                (b.mc_migration - b.mc_bottom)
-                  / NULLIF(b.mc_migration,0)    AS pct_drop,
+                b.drop_from_mig                 AS pct_drop,
+                b.bounce_pct,
                 m.recovery,
                 t.ts,
                 EXTRACT(EPOCH FROM (t.ts - b.ts_signal)) AS sec_after_bounce,
@@ -363,14 +364,12 @@ def export_bounce_ticks():
                 t.mc_low,
                 t.volume_1m,
                 t.source,
-                -- preço relativo ao fundo
-                (t.mc - b.mc_bottom) / NULLIF(b.mc_bottom,0) AS gain_vs_bottom,
-                -- preço relativo à entrada alvo (mc_bottom × 1.15)
-                (t.mc - b.mc_bottom * 1.15) / NULLIF(b.mc_bottom * 1.15,0) AS gain_vs_entry
+                (t.mc - b.mc_min) / NULLIF(b.mc_min,0)              AS gain_vs_bottom,
+                (t.mc - b.mc_min * 1.15) / NULLIF(b.mc_min * 1.15,0) AS gain_vs_entry
             FROM token_ticks t
             JOIN bounce_signals b ON b.mint = t.mint
             JOIN migrations m ON m.mint = t.mint
-            WHERE t.ts >= b.ts_signal - INTERVAL '2 minutes'  -- 2min antes do bounce p/ contexto
+            WHERE t.ts >= b.ts_signal - INTERVAL '2 minutes'
             ORDER BY t.mint, t.ts
         """)
         rows = [dict(r) for r in cur.fetchall()]
