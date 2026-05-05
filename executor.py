@@ -208,38 +208,47 @@ class TradeExecutor:
             _fail(trade_id, str(e))
             return
 
-        # 2. Aguarda fill — com recovery: se timeout, continua tentando por mais 5min
-        fill_res = None
+        # 2. Aguarda confirmação on-chain (fixo) + tenta obter dados do fill
+        SWAP_CONFIRM_SEC = 30
+        logger.info("Swap #%d %s — aguardando %ds confirmação on-chain", trade_id, symbol, SWAP_CONFIRM_SEC)
+        time.sleep(SWAP_CONFIRM_SEC)
+
+        # Tenta obter dados reais do fill via query_order — não bloqueia se não vier
+        tokens_received  = None
+        entry_price_sol  = None
+        fee_sol          = None
+        slippage_pct     = None
+        fill_sol         = amount_sol  # fallback: assume executou pelo valor enviado
+
         try:
-            fill_res  = self._wait_fill(order_id)
-        except TimeoutError:
-            logger.warning("Fill #%d %s timeout em %ds — continuando em background por até 5min",
-                           trade_id, symbol, ORDER_TIMEOUT_SEC)
-            db.update_trade(trade_id, {"status": "fill_pending", "error_msg": f"fill timeout {ORDER_TIMEOUT_SEC}s — retrying"})
-            fill_res = self._wait_fill_extended(order_id, extra_sec=270)  # +4.5min
-            if fill_res is None:
-                logger.error("Fill #%d %s não confirmado após 5min — trade perdido", trade_id, symbol)
-                _fail(trade_id, f"fill timeout após {ORDER_TIMEOUT_SEC + 270}s")
+            qr       = self.gmgn.query_order(order_id)
+            qd       = qr.get("data") or qr
+            status   = str(qd.get("status") or "").lower()
+            logger.info("query_order #%d %s → status='%s' data=%s", trade_id, symbol, status, qd)
+
+            if status in ("failed", "cancelled", "rejected", "expired"):
+                logger.warning("Swap #%d %s cancelado pela chain (status=%s)", trade_id, symbol, status)
+                _fail(trade_id, f"swap cancelado: {status}")
                 return
+
+            out_raw = _safe_float(qd.get("out_amount"))
+            if out_raw and out_raw > 0:
+                tokens_received = out_raw
+            in_raw = _safe_float(qd.get("in_amount"))
+            if in_raw:
+                fill_sol = in_raw / 1e9 if in_raw > 1000 else in_raw
+                slippage_pct = (fill_sol - amount_sol) / amount_sol if amount_sol else None
+            fee_raw = _safe_float(qd.get("fee"))
+            if fee_raw:
+                fee_sol = fee_raw / 1e9 if fee_raw > 1000 else fee_raw
         except Exception as e:
-            logger.error("Fill #%d %s erro: %s", trade_id, symbol, e)
-            _fail(trade_id, str(e))
-            return
-        fill_data = fill_res.get("data") or fill_res
+            logger.warning("query_order #%d %s: %s — usando fallbacks", trade_id, symbol, e)
 
-        ts_confirmed    = datetime.now(timezone.utc)
-        latency_sec     = (ts_confirmed - ts_signal).total_seconds()
-        tokens_received = _safe_float(fill_data.get("out_amount"))
-        fee_sol_raw     = _safe_float(fill_data.get("fee"))
-        fee_sol         = fee_sol_raw / 1e9 if fee_sol_raw and fee_sol_raw > 1000 else fee_sol_raw
-        in_lamports     = _safe_float(fill_data.get("in_amount"))
-        fill_sol        = in_lamports / 1e9 if in_lamports and in_lamports > 1000 else (in_lamports or amount_sol)
+        ts_confirmed = datetime.now(timezone.utc)
+        latency_sec  = (ts_confirmed - ts_signal).total_seconds()
 
-        slippage_pct = None
-        if fill_sol and amount_sol:
-            slippage_pct = (fill_sol - amount_sol) / amount_sol
-
-        entry_price_sol = fill_sol / tokens_received if tokens_received else None
+        if tokens_received and fill_sol:
+            entry_price_sol = fill_sol / tokens_received
 
         db.update_trade(trade_id, {
             "ts_order_confirmed": ts_confirmed,
@@ -252,15 +261,18 @@ class TradeExecutor:
             "status":             "strategy_pending",
         })
         logger.info(
-            "Fill #%d %s — tokens=%.0f latência=%.1fs slippage=%.2f%%",
-            trade_id, symbol, tokens_received or 0, latency_sec,
-            (slippage_pct or 0) * 100,
+            "Fill #%d %s — tokens=%s latência=%.1fs slippage=%s",
+            trade_id, symbol,
+            f"{tokens_received:.0f}" if tokens_received else "desconhecido",
+            latency_sec,
+            f"{slippage_pct*100:.2f}%" if slippage_pct else "n/a",
         )
-
         # 3. Cria estratégia TP/SL
+        # Se não temos tokens_received, não conseguimos criar estratégia por quantidade.
+        # Loga como open sem strategy — _recover_pending vai tentar novamente no próximo restart.
         if not tokens_received or tokens_received <= 0:
-            logger.warning("Trade #%d tokens_received=0 — skip create_strategy", trade_id)
-            db.update_trade(trade_id, {"status": "open", "strategy_id": None})
+            logger.warning("Trade #%d %s — tokens_received desconhecido, strategy pendente", trade_id, symbol)
+            db.update_trade(trade_id, {"status": "open", "error_msg": "tokens_received indisponível — aguardando recover"})
             return
 
         try:
