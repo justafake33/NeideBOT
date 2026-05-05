@@ -53,25 +53,29 @@ def _load_ed25519_key(pem: str):
         except Exception as e:
             logger.debug("JSON array falhou: %s", e)
 
-    # 3. Tenta base64 puro
+    # 3. Tenta base58 (Phantom/Solflare export: 64 bytes = seed+pubkey, ~88 chars Base58)
+    # ⚠️ deve vir ANTES do Base64: alfabetos se sobrepõem e Base64 decodifica Base58 erroneamente
+    try:
+        import base58 as _b58
+        _raw_b58 = raw.replace(" ", "").replace("\n", "")
+        decoded = _b58.b58decode(_raw_b58)
+        if len(decoded) in (32, 64):
+            seed = decoded[:32]
+            return Ed25519PrivateKey.from_private_bytes(seed)
+    except Exception as e:
+        logger.debug("Base58 falhou: %s", e)
+
+    # 4. Tenta base64 puro (apenas se tamanho decodificado = 32 ou 64 bytes)
     try:
         raw_b64 = raw.replace(" ", "").replace("\n", "")
-        # Corrige padding faltante
         raw_b64 += "=" * (-len(raw_b64) % 4)
         decoded = base64.b64decode(raw_b64)
+        if len(decoded) not in (32, 64):
+            raise ValueError(f"Base64 decodificou {len(decoded)} bytes — esperado 32 ou 64")
         seed = decoded[:32]
         return Ed25519PrivateKey.from_private_bytes(seed)
     except Exception as e:
         logger.debug("Base64 raw falhou: %s", e)
-
-    # 4. Tenta base58 (Solana keypair exportado)
-    try:
-        import base58 as _b58
-        decoded = _b58.b58decode(raw)
-        seed = decoded[:32]
-        return Ed25519PrivateKey.from_private_bytes(seed)
-    except Exception as e:
-        logger.debug("Base58 falhou: %s", e)
 
     logger.error(
         "GMGN_PRIVATE_KEY inválida — nenhum formato reconhecido. "
