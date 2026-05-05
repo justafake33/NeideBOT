@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 POLL_INTERVAL      = int(os.getenv("POLL_INTERVAL_SEC",    "5"))
 HOT_INTERVAL       = 30
-HOT_PRECISE_SEC    = int(os.getenv("HOT_PRECISE_SEC",      "60"))   # kline bottom scan
+HOT_PRECISE_SEC    = int(os.getenv("HOT_PRECISE_SEC",      "30"))   # B.4: 60→30s dobra cobertura de ticks
 HOT_WINDOW_MIN     = 60
 
 # ------------------------------------------------------------------
@@ -214,6 +214,20 @@ class HotMonitor:
             logger.debug("BOUNCE skip %s — entry ratio=%.2f (dead zone 50-65%%)", mint[:8], entry_ratio)
             return
 
+        # B.3 — Backfill retroativo: na primeira detecção de bounce elegível, busca o kline
+        # completo desde a migração e insere todos os ticks antes de rodar o slope filter.
+        # O slope filter roda a partir do SEGUNDO poll elegível (5s depois), com dados garantidos.
+        if not state.get("slope_backfill_triggered"):
+            state["slope_backfill_triggered"] = True
+            threading.Thread(
+                target=self._backfill_slope_ticks,
+                args=(mint, dict(state)),
+                daemon=True,
+                name=f"backfill-{mint[:8]}",
+            ).start()
+            logger.debug("BOUNCE %s — backfill retroativo disparado, aguardando próximo poll", mint[:8])
+            return  # aguarda 5s para ticks estarem no DB
+
         # A.1 — Slope filter: capitulação íngreme (≤ -0.0008 %/s) → WR 66.7%.
         # Mede slope dos 2min ANTES do fundo (ts_min), não antes do sinal.
         # Requer cobertura de ticks ≥ BOUNCE_SLOPE_MIN_TICKS; se insuficiente, passa sem filtrar.
@@ -300,6 +314,57 @@ class HotMonitor:
         if slope > self.BOUNCE_SLOPE_MIN:
             return f"slope={slope:.6f} > threshold={self.BOUNCE_SLOPE_MIN} (dump gradual)"
         return None
+
+    def _backfill_slope_ticks(self, mint: str, state: dict):
+        """
+        B.3: Busca kline completo desde a migração até agora e insere todos os ticks.
+        Chamado em thread própria na primeira detecção de bounce elegível.
+        Garante que o slope filter tenha dados no próximo poll (5s depois).
+        """
+        try:
+            now_ts      = int(datetime.now(timezone.utc).timestamp())
+            ts_mig_unix = state["ts_mig_unix"]
+            total_supply = state["total_supply"]
+
+            candles = self.gmgn.get_token_kline(
+                mint, "sol", "1m",
+                from_ts=ts_mig_unix,
+                to_ts=now_ts,
+            )
+            if not candles:
+                logger.debug("backfill %s: kline vazio", mint[:8])
+                return
+
+            kline_ticks = []
+            for c in candles:
+                candle_ts   = int(c.get("time", 0)) / 1000
+                elapsed_sec = int(candle_ts - ts_mig_unix)
+                if elapsed_sec < 0 or elapsed_sec > 3660:
+                    continue
+                close_p = _float(c.get("close"))
+                open_p  = _float(c.get("open"))
+                high_p  = _float(c.get("high"))
+                low_p   = _float(c.get("low"))
+                vol     = _float(c.get("volume"))
+                if not close_p or close_p <= 0 or not total_supply:
+                    continue
+                kline_ticks.append({
+                    "mint":        mint,
+                    "elapsed_sec": elapsed_sec,
+                    "mc":          close_p * total_supply,
+                    "mc_open":     open_p  * total_supply if open_p  else None,
+                    "mc_high":     high_p  * total_supply if high_p  else None,
+                    "mc_low":      low_p   * total_supply if low_p   else None,
+                    "volume_1m":   vol,
+                })
+
+            if kline_ticks:
+                db.insert_kline_ticks_batch(kline_ticks)
+                logger.info("backfill %s: %d ticks inseridos (%.0fmin de histórico)",
+                            mint[:8], len(kline_ticks),
+                            (now_ts - ts_mig_unix) / 60)
+        except Exception as e:
+            logger.debug("backfill %s: %s", mint[:8], e)
 
     # ------------------------------------------------------------------
     # Threads
@@ -442,7 +507,7 @@ class HotMonitor:
             try:
                 candles = self.gmgn.get_token_kline(
                     mint, "sol", "1m",
-                    from_ts=now_ts - 120,
+                    from_ts=now_ts - 300,   # B.2: 2min→5min — cobre gaps entre polls
                     to_ts=now_ts,
                 )
                 for c in candles:
@@ -455,11 +520,13 @@ class HotMonitor:
                     if low_price and low_price > 0:
                         mc_low = low_price * state["total_supply"]
                         if mc_low < state["mc_min"]:
+                            candle_dt = datetime.fromtimestamp(candle_ts, tz=timezone.utc)
                             with self._lock:
                                 inner = self._tokens.get(mint)
                                 if inner and mc_low < inner["mc_min"]:
-                                    inner["mc_min"] = mc_low
+                                    inner["mc_min"]   = mc_low
                                     inner["time_min"] = elapsed_min
+                                    inner["ts_min"]   = candle_dt  # B.1: fix — slope filter precisa deste timestamp
                             db.update_bottom(mint, mc_low, elapsed_min)
                             logger.info("Fundo(kline) %s: $%.0f em %.1fmin (%.0f%% abaixo ATH)",
                                         state["symbol"], mc_low, elapsed_min,
