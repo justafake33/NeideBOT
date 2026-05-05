@@ -346,23 +346,6 @@ def export_bounce_ticks():
     """Exporta ticks dos tokens que tiveram bounce_signal — ideal para estudar padrão pós-bounce."""
     with db._cursor() as cur:
         cur.execute("""
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = 'token_ticks'
-        """)
-        tick_cols = {r["column_name"] for r in cur.fetchall()}
-
-        def col(name: str) -> str:
-            return f"t.{name}" if name in tick_cols else f"NULL AS {name}"
-
-        if "tick_ts" in tick_cols:
-            tick_ts_expr = "t.tick_ts"
-        elif "ts" in tick_cols:
-            tick_ts_expr = "t.ts"
-        else:
-            tick_ts_expr = "NULL::timestamptz"
-
-        cur.execute(f"""
             SELECT
                 t.mint,
                 m.token_nome                    AS symbol,
@@ -372,26 +355,26 @@ def export_bounce_ticks():
                 b.elapsed_sec / 60.0            AS elapsed_min_at_bounce,
                 b.drop_from_mig                 AS pct_drop,
                 m.recovery,
-                {tick_ts_expr}                  AS ts,
-                EXTRACT(EPOCH FROM ({tick_ts_expr} - b.ts_signal)) AS sec_after_bounce,
+                t.tick_ts                       AS ts,
+                EXTRACT(EPOCH FROM (t.tick_ts - b.ts_signal)) AS sec_after_bounce,
                 t.mc,
-                {col('mc_open')},
-                {col('mc_high')},
-                {col('mc_low')},
-                {col('volume_1m')},
-                {col('source')},
+                t.mc_open,
+                t.mc_high,
+                t.mc_low,
+                t.volume_1m,
+                t.source,
                 (t.mc - b.mc_min) / NULLIF(b.mc_min,0) AS gain_vs_bottom,
                 (t.mc - b.mc_min * 1.15) / NULLIF(b.mc_min * 1.15,0) AS gain_vs_entry
             FROM token_ticks t
             JOIN bounce_signals b ON b.mint = t.mint
             JOIN migrations m ON m.mint = t.mint
-            WHERE {tick_ts_expr} >= b.ts_signal - INTERVAL '2 minutes'
-            ORDER BY t.mint, {tick_ts_expr}
+            WHERE t.tick_ts >= b.ts_signal - INTERVAL '2 minutes'
+            ORDER BY t.mint, t.tick_ts
         """)
         rows = [dict(r) for r in cur.fetchall()]
+
     output = io.StringIO()
     if not rows:
-        # Permite download mesmo quando não há dados.
         writer = csv.writer(output)
         writer.writerow(["message"])
         writer.writerow(["Sem ticks de bounces"])
@@ -399,6 +382,7 @@ def export_bounce_ticks():
         writer = csv.DictWriter(output, fieldnames=rows[0].keys())
         writer.writeheader()
         writer.writerows(rows)
+
     return Response(
         output.getvalue(),
         mimetype="text/csv",
