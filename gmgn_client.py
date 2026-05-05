@@ -226,7 +226,7 @@ class GmgnClient:
                 "GMGN_PRIVATE_KEY não configurada — endpoints de trade desabilitados"
             )
         params = self._params(extra_params)
-        sig    = self._sign(path, params, None)  # GET: body=None → ""
+        sig    = self._sign(path, params, "")  # GET: body="" (não None — evita "None" literal no f-string)
         resp   = self.session.get(
             f"{self.host}{path}",
             params=params,
