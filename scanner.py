@@ -101,6 +101,7 @@ class HotMonitor:
                     "symbol":       symbol,
                     "mc_min":       mc_migration,
                     "time_min":     0.0,
+                    "ts_min":       ts_migration,   # timestamp quando mc_min foi visto pela última vez
                     "mc_max":       mc_migration,
                     "time_max":     0.0,
                     "mc_last":      mc_migration,
@@ -151,6 +152,7 @@ class HotMonitor:
         if mc < state["mc_min"]:
             state["mc_min"] = mc
             state["time_min"] = elapsed_min
+            state["ts_min"]   = datetime.now(timezone.utc)
             db.update_bottom(mint, mc, elapsed_min)
             logger.info("Fundo(poll) %s: $%.0f em %.1fmin (%.0f%% abaixo ATH)",
                         state["symbol"], mc, elapsed_min,
@@ -213,8 +215,10 @@ class HotMonitor:
             return
 
         # A.1 — Slope filter: capitulação íngreme (≤ -0.0008 %/s) → WR 66.7%.
+        # Mede slope dos 2min ANTES do fundo (ts_min), não antes do sinal.
         # Requer cobertura de ticks ≥ BOUNCE_SLOPE_MIN_TICKS; se insuficiente, passa sem filtrar.
-        skip_reason = self._check_slope(mint, mc_min)
+        ts_min = state.get("ts_min")
+        skip_reason = self._check_slope(mint, ts_min)
         if skip_reason:
             logger.debug("BOUNCE skip %s — slope gradual: %s", mint[:8], skip_reason)
             return
@@ -264,15 +268,16 @@ class HotMonitor:
             except Exception as e:
                 logger.error("executor.on_bounce %s: %s", symbol, e)
 
-    def _check_slope(self, mint: str, mc_min: float) -> str | None:
+    def _check_slope(self, mint: str, ts_min) -> str | None:
         """
-        A.1: Calcula slope dos últimos 2min de ticks antes do fundo.
+        A.1: Calcula slope dos 2min de ticks ANTES DO FUNDO (ts_min).
+        Mede a velocidade do dump antes do bottom, não da recuperação.
         Retorna motivo de rejeição (str) ou None se aprovado / ticks insuficientes.
         Slope em %MC/s. Threshold: BOUNCE_SLOPE_MIN (padrão -0.0008).
-        Capitulação brusca tem slope muito negativo (≤ -0.0008). Dump gradual > -0.0008.
+        Capitulação brusca: slope ≤ -0.0008 → WR 66.7%. Dump gradual > -0.0008 → WR 0%.
         """
         try:
-            ticks = db.get_recent_ticks(mint, window_sec=120)
+            ticks = db.get_recent_ticks(mint, window_sec=120, max_ts=ts_min)
         except Exception as e:
             logger.debug("_check_slope %s: db error %s — skip filter", mint[:8], e)
             return None
@@ -289,7 +294,7 @@ class HotMonitor:
             return None
 
         slope = ((mc1 - mc0) / mc0) / dt  # %/s (negativo = queda)
-        logger.debug("SLOPE %s: slope=%.6f (threshold=%.6f) n=%d ticks",
+        logger.debug("SLOPE %s: slope=%.6f (threshold=%.6f) n=%d ticks (até fundo)",
                      mint[:8], slope, self.BOUNCE_SLOPE_MIN, len(ticks))
 
         if slope > self.BOUNCE_SLOPE_MIN:

@@ -123,13 +123,13 @@ class TradeExecutor:
                  amount_sol: float, sol_usd: float, entry_expected: float = 0.0):
         ts_signal = datetime.now(timezone.utc)
 
-        # A.4 — Persistência: aguarda 90s e verifica que os últimos 3 ticks estão acima do entry.
+        # A.4 — Persistência: aguarda 90s e verifica que os últimos 3 ticks APÓS o sinal estão acima do entry.
         # 3 ticks consecutivos acima do entry → WR 36.4% vs 12.1% sem o filtro (+24.3pp).
         if PERSISTENCE_WAIT_SEC > 0 and entry_expected > 0:
             logger.info("TRADE #%d %s — aguardando %ds para verificar persistência (entry=$%.0f)",
                         trade_id, symbol, PERSISTENCE_WAIT_SEC, entry_expected)
             time.sleep(PERSISTENCE_WAIT_SEC)
-            if not self._check_persistence(mint, entry_expected):
+            if not self._check_persistence(mint, entry_expected, ts_signal):
                 logger.info("TRADE #%d %s — cancelado: preço não manteve acima do entry em %ds",
                             trade_id, symbol, PERSISTENCE_WAIT_SEC)
                 _fail(trade_id, f"persistence_fail: preço abaixo do entry após {PERSISTENCE_WAIT_SEC}s")
@@ -228,25 +228,27 @@ class TradeExecutor:
                 "error_msg": f"create_strategy: {e}",
             })
 
-    def _check_persistence(self, mint: str, entry_expected: float) -> bool:
+    def _check_persistence(self, mint: str, entry_expected: float, ts_signal) -> bool:
         """
-        A.4: Verifica que os últimos PERSISTENCE_MIN_TICKS ticks estão acima do entry_expected.
-        Retorna True se o preço persistiu acima do entry (sinal forte) ou se não há ticks suficientes.
+        A.4: Verifica que os ticks APÓS ts_signal (exclusive) estão acima do entry_expected.
+        Filtra por min_ts=ts_signal para excluir ticks do dump que precedem o sinal.
+        Retorna True se PERSISTENCE_MIN_TICKS ticks pós-sinal estão todos acima do entry,
+        ou se não há ticks suficientes (fallback conservador: aprova).
         """
         try:
-            ticks = db.get_recent_ticks(mint, window_sec=PERSISTENCE_WAIT_SEC + 60)
+            ticks = db.get_recent_ticks(mint, min_ts=ts_signal)
         except Exception as e:
             logger.warning("_check_persistence %s: db error %s — aprovando por falta de dados", mint[:8], e)
             return True
 
         if len(ticks) < PERSISTENCE_MIN_TICKS:
-            logger.debug("_check_persistence %s: apenas %d ticks — aprovando por falta de dados",
+            logger.debug("_check_persistence %s: apenas %d ticks pós-sinal — aprovando por falta de dados",
                          mint[:8], len(ticks))
             return True
 
         recent = ticks[-PERSISTENCE_MIN_TICKS:]
         all_above = all(mc >= entry_expected for _, mc in recent)
-        logger.debug("_check_persistence %s: %d/%d ticks acima do entry ($%.0f) — %s",
+        logger.debug("_check_persistence %s: %d/%d ticks pós-sinal acima do entry ($%.0f) — %s",
                      mint[:8], sum(1 for _, mc in recent if mc >= entry_expected),
                      len(recent), entry_expected, "OK" if all_above else "FAIL")
         return all_above
