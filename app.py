@@ -5226,8 +5226,8 @@ def debug_sign_test():
     pk = _load_ed25519_key(GMGN_PRIVATE_KEY)
     lines.append(f"Chave carregada     : {'✅ OK' if pk else '❌ FALHOU'}")
 
-    # Verifica se o keypair bate: deriva public key da private key e compara com wallet address
-    if pk:
+    # Verifica keypair apenas para chaves Base58/Base64 (não PEM — GMGN emite signing key separada da wallet)
+    if pk and not GMGN_PRIVATE_KEY.strip().startswith("-----"):
         try:
             from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
             import base58 as _b58
@@ -5244,6 +5244,8 @@ def debug_sign_test():
                 lines.append("  → Solução: usar a private key do wallet DJVwyki... ou corrigir GMGN_WALLET_ADDRESS")
         except Exception as e:
             lines.append(f"Keypair check       : ⚠️ não verificado ({e})")
+    elif pk and GMGN_PRIVATE_KEY.strip().startswith("-----"):
+        lines.append("Keypair             : ℹ️ PEM (chave de signing GMGN — separada da wallet Solana, OK)")
 
     if pk and GMGN_WALLET_ADDRESS:
         dummy_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC como placeholder
