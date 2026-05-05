@@ -5272,10 +5272,39 @@ def debug_sign_test():
         lines.append(f"Signature (b64)     : {sig[:30]}...")
         lines.append("")
         lines.append("✅ Assinatura gerada com sucesso — formato OK")
-        lines.append("Se ainda receber 401, o problema é:")
-        lines.append("  1. ❌ Keypair não corresponde (ver 'Endereço derivado' acima)")
-        lines.append("  2. IP não está na whitelist GMGN")
-        lines.append("  3. A chave não está registrada na conta GMGN")
+
+        # --- Teste LIVE: chama query_order com ID fictício ---
+        # Testa a assinatura contra o servidor real sem gastar dinheiro.
+        # Se auth OK → resposta "order not found" / 4xx diferente de 401.
+        # Se auth falha → 401 AUTH_SIGNATURE_INVALID.
+        lines.append("")
+        lines.append("--- Teste LIVE (query_order) ---")
+        try:
+            import requests as _req
+            from gmgn_client import GMGN_HOST, GMGN_API_KEY
+            fake_order = "test-sign-check-000"
+            live_path  = "/v1/trade/query_order"
+            live_ts    = str(int(time.time()))
+            live_cid   = str(uuid4())
+            live_params = {"timestamp": live_ts, "client_id": live_cid, "order_id": fake_order}
+            live_qs     = "&".join(f"{k}={v}" for k, v in sorted(live_params.items()))
+            live_msg    = f"{live_path}:{live_qs}::{live_ts}"
+            live_sig    = base64.b64encode(pk.sign(live_msg.encode("utf-8"))).decode("ascii")
+            resp = _req.get(
+                f"{GMGN_HOST.rstrip('/')}{live_path}",
+                params=live_params,
+                headers={"X-APIKEY": GMGN_API_KEY, "X-Signature": live_sig},
+                timeout=10,
+            )
+            lines.append(f"HTTP status  : {resp.status_code}")
+            lines.append(f"Body         : {resp.text[:300]}")
+            if resp.status_code == 401:
+                lines.append("Resultado    : ❌ AUTH_SIGNATURE_INVALID — assinatura rejeitada pelo servidor")
+                lines.append("  → IP não está na whitelist OU wallet não registrada na conta GMGN")
+            else:
+                lines.append("Resultado    : ✅ AUTH OK — assinatura aceita pelo servidor (erro esperado sobre order_id)")
+        except Exception as e:
+            lines.append(f"Erro na chamada live: {e}")
 
     return "<pre>" + "\n".join(lines) + "</pre>"
 
