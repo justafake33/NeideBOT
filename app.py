@@ -255,7 +255,8 @@ def export_ticks():
                 m.mc_peak,
                 m.time_to_bottom,
                 m.recovery,
-                t.ts,
+                t.tick_ts         AS ts,
+                t.elapsed_sec,
                 t.mc,
                 t.mc_open,
                 t.mc_high,
@@ -263,12 +264,12 @@ def export_ticks():
                 t.volume_1m,
                 t.smart_count,
                 t.renowned_count,
-                t.holders,
+                t.holders_count,
                 t.source,
-                EXTRACT(EPOCH FROM (t.ts - m.ts_migration)) AS sec_since_migration
+                EXTRACT(EPOCH FROM (t.tick_ts - m.ts_migration)) AS sec_since_migration
             FROM token_ticks t
             JOIN migrations m ON m.mint = t.mint
-            ORDER BY t.mint, t.ts
+            ORDER BY t.mint, t.tick_ts
         """)
         rows = [dict(r) for r in cur.fetchall()]
     if not rows:
@@ -356,8 +357,9 @@ def export_bounce_ticks():
                 b.drop_from_mig                 AS pct_drop,
                 b.bounce_pct,
                 m.recovery,
-                t.ts,
-                EXTRACT(EPOCH FROM (t.ts - b.ts_signal)) AS sec_after_bounce,
+                t.tick_ts                                  AS ts,
+                t.elapsed_sec,
+                EXTRACT(EPOCH FROM (t.tick_ts - b.ts_signal)) AS sec_after_bounce,
                 t.mc,
                 t.mc_open,
                 t.mc_high,
@@ -369,8 +371,8 @@ def export_bounce_ticks():
             FROM token_ticks t
             JOIN bounce_signals b ON b.mint = t.mint
             JOIN migrations m ON m.mint = t.mint
-            WHERE t.ts >= b.ts_signal - INTERVAL '2 minutes'
-            ORDER BY t.mint, t.ts
+            WHERE t.tick_ts >= b.ts_signal - INTERVAL '2 minutes'
+            ORDER BY t.mint, t.tick_ts
         """)
         rows = [dict(r) for r in cur.fetchall()]
     if not rows:
