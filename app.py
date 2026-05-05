@@ -5214,6 +5214,7 @@ def debug_my_ip():
 def debug_sign_test():
     """Testa assinatura GMGN com um swap simulado — não executa trade real."""
     import json as _j
+    import html
     from gmgn_client import GMGN_WALLET_ADDRESS, GMGN_PRIVATE_KEY, SOL_NATIVE_MINT, _load_ed25519_key
     import time, base64
     from uuid import uuid4
@@ -5225,8 +5226,26 @@ def debug_sign_test():
     pk = _load_ed25519_key(GMGN_PRIVATE_KEY)
     lines.append(f"Chave carregada     : {'✅ OK' if pk else '❌ FALHOU'}")
 
+    # Verifica se o keypair bate: deriva public key da private key e compara com wallet address
+    if pk:
+        try:
+            from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+            import base58 as _b58
+            pub_bytes = pk.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+            derived_address = _b58.b58encode(pub_bytes).decode("ascii")
+            match = derived_address == GMGN_WALLET_ADDRESS
+            lines.append(f"Endereço derivado   : {derived_address}")
+            if match:
+                lines.append("Keypair             : ✅ CORRESPONDE — private key gera este wallet address")
+            else:
+                lines.append("Keypair             : ❌ NÃO CORRESPONDE — private key não gera este wallet!")
+                lines.append(f"  → Esperado: {GMGN_WALLET_ADDRESS}")
+                lines.append(f"  → Derivado: {derived_address}")
+                lines.append("  → Solução: usar a private key do wallet DJVwyki... ou corrigir GMGN_WALLET_ADDRESS")
+        except Exception as e:
+            lines.append(f"Keypair check       : ⚠️ não verificado ({e})")
+
     if pk and GMGN_WALLET_ADDRESS:
-        # monta body idêntico ao swap real
         dummy_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC como placeholder
         lamports   = 5_000_000  # ~0.005 SOL
         body       = {
@@ -5248,13 +5267,13 @@ def debug_sign_test():
 
         lines.append("")
         lines.append(f"Body JSON           : {body_str}")
-        lines.append(f"Sorted QS           : {qs}")
-        lines.append(f"Message (signed)    : {message}")
+        lines.append(f"Sorted QS           : {html.escape(qs)}")   # fix: &timestamp não vira ×tamp no browser
+        lines.append(f"Message (signed)    : {html.escape(message)}")
         lines.append(f"Signature (b64)     : {sig[:30]}...")
         lines.append("")
         lines.append("✅ Assinatura gerada com sucesso — formato OK")
         lines.append("Se ainda receber 401, o problema é:")
-        lines.append("  1. GMGN_WALLET_ADDRESS não corresponde à GMGN_PRIVATE_KEY")
+        lines.append("  1. ❌ Keypair não corresponde (ver 'Endereço derivado' acima)")
         lines.append("  2. IP não está na whitelist GMGN")
         lines.append("  3. A chave não está registrada na conta GMGN")
 
