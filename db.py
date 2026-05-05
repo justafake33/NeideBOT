@@ -787,3 +787,17 @@ def get_trades(limit: int = 200) -> list:
             SELECT * FROM trades ORDER BY created_at DESC LIMIT %(limit)s
         """, {"limit": limit})
         return [dict(row) for row in cur.fetchall()]
+
+
+def get_trades_without_strategy() -> list:
+    """Trades com order_id mas sem strategy_id — candidatos a recuperação de TP/SL."""
+    with _cursor() as cur:
+        cur.execute("""
+            SELECT * FROM trades
+            WHERE order_id IS NOT NULL
+              AND strategy_id IS NULL
+              AND status NOT IN ('pending', 'cancelled')
+            ORDER BY created_at DESC
+            LIMIT 20
+        """)
+        return [dict(row) for row in cur.fetchall()]
