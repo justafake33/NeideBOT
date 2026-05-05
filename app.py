@@ -352,8 +352,8 @@ def export_bounce_ticks():
         """)
         tick_cols = {r["column_name"] for r in cur.fetchall()}
 
-        def col(name: str, fallback: str = "NULL") -> str:
-            return f"t.{name}" if name in tick_cols else f"{fallback} AS {name}"
+        def col(name: str) -> str:
+            return f"t.{name}" if name in tick_cols else f"NULL AS {name}"
 
         tick_ts_expr = "t.tick_ts" if "tick_ts" in tick_cols else ("t.ts" if "ts" in tick_cols else "NULL::timestamptz")
 
