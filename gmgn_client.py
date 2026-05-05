@@ -267,37 +267,55 @@ class GmgnClient:
                         tp_pct: float = 0.75, sl_pct: float = 0.15,
                         chain: str = "sol") -> dict:
         """
-        POST /v1/trade/strategy/create — cria ordens condicionais de TP e SL.
-        Formato conforme StrategyCreateParams do OpenApiClient.ts.
-        entry_price_sol: preço de entrada em SOL/token (calculado no fill).
-        tp_pct: take profit como fração (0.75 = +75%).
-        sl_pct: stop loss como fração (0.15 = -15%).
+        Cria TP e SL como duas ordens separadas em /v1/trade/strategy/create.
+
+        Formato correto conforme OpenApiClient.ts StrategyCreateParams:
+          order_type = "limit_order"
+          sub_order_type = "take_profit" | "stop_loss"
+          check_price = preço trigger em SOL/token
+          priority_fee + tip_fee obrigatórios no SOL (retorna 400 sem eles)
         """
-        body = {
+        tp_price  = entry_price_sol * (1 + tp_pct)
+        sl_price  = entry_price_sol * (1 - sl_pct)
+        amt_str   = str(int(tokens_amount))
+        prio_fee  = os.getenv("STRATEGY_PRIORITY_FEE", "0.0001")
+        tip_fee   = os.getenv("STRATEGY_TIP_FEE",      "0.0001")
+
+        tp_body = {
             "chain":         chain,
             "from_address":  GMGN_WALLET_ADDRESS,
             "base_token":    token_mint,
             "quote_token":   SOL_NATIVE_MINT,
-            "order_type":    "sell",
-            "sub_order_type": "condition",
-            "check_price":   str(entry_price_sol),
-            "amount_in":     str(int(tokens_amount)),
-            "condition_orders": [
-                {
-                    "order_type": "profit_stop",
-                    "side":       "sell",
-                    "price_scale": str(round(tp_pct, 4)),
-                    "sell_ratio":  "1",
-                },
-                {
-                    "order_type": "loss_stop",
-                    "side":       "sell",
-                    "price_scale": str(round(-sl_pct, 4)),
-                    "sell_ratio":  "1",
-                },
-            ],
+            "order_type":    "limit_order",
+            "sub_order_type": "take_profit",
+            "check_price":   str(tp_price),
+            "amount_in":     amt_str,
+            "auto_slippage": True,
+            "priority_fee":  prio_fee,
+            "tip_fee":       tip_fee,
         }
-        return self._post_trade("/v1/trade/strategy/create", body)
+        sl_body = {
+            "chain":         chain,
+            "from_address":  GMGN_WALLET_ADDRESS,
+            "base_token":    token_mint,
+            "quote_token":   SOL_NATIVE_MINT,
+            "order_type":    "limit_order",
+            "sub_order_type": "stop_loss",
+            "check_price":   str(sl_price),
+            "amount_in":     amt_str,
+            "auto_slippage": True,
+            "priority_fee":  prio_fee,
+            "tip_fee":       tip_fee,
+        }
+
+        tp_res = self._post_trade("/v1/trade/strategy/create", tp_body)
+        sl_res = self._post_trade("/v1/trade/strategy/create", sl_body)
+
+        tp_data = tp_res.get("data") or tp_res
+        sl_data = sl_res.get("data") or sl_res
+        logger.info("Estratégia criada — TP order_id=%s SL order_id=%s",
+                    tp_data.get("order_id"), sl_data.get("order_id"))
+        return {"tp": tp_data, "sl": sl_data}
 
     def query_order(self, order_id: str, chain: str = "sol") -> dict:
         """GET /v1/trade/query_order — status e fill de uma ordem (signed)."""
