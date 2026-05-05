@@ -580,6 +580,9 @@ PERSISTENCE_MIN_TICKS=3      # A.4: ticks pós-sinal acima do entry para confirm
 49. **Bounce velocity NÃO discrimina**: testado com n=83. Todas as tercis de velocidade (lento/médio/rápido) têm WR 40% flat. TTB<25min+Slow tem WR MAIOR que TTB<25min+Fast (43% vs 29%). Não implementar filtro de velocity.
 50. **W-bottom é ubíquo (98%)**: 82/83 bounces têm double-dip. NÃO é filtro. A.4 (persistência 90s) trata implicitamente: se o W-bottom recupera antes de 90s, os ticks pós-sinal voltam acima do entry → persistência passa.
 51. **WR estimado pós-filtros A.2+A.3**: remover 32 trades (dead zone 20-30%) + 21 trades (entry 50-65%, ~8 overlap) → ~38 trades restantes com 11 TPs = **~29% WR estimado**. Confirmar com 30+ bounces após Fase A ativa.
+52. **Base58 deve ser verificado antes de Base64 em `_load_ed25519_key`**: o alfabeto Base58 é um subconjunto do Base64 — strings Base58 de 88 chars (Phantom export, 64 bytes) são decodificáveis por Base64, gerando ~66 bytes e seed errado. Fix: Base58 primeiro, com validação `len(decoded) in (32, 64)`. Base64 só aceita comprimentos exatos de 32 ou 64 bytes. Causa raiz do AUTH_SIGNATURE_INVALID original.
+53. **TP/SL fixo é piso, não teto**: `TRADE_TP_PCT=0.75` e `TRADE_SL_PCT=0.15` são os parâmetros da calibração inicial (50 × $1). A Fase F (Exit Engine Maleável) substitui isso por saídas parciais em camadas (30% em +30%, 30% em +60%, 40% trailing) + risk engine em tempo real. Não construir saída dinâmica antes de medir friction real nos 50 trades de calibração.
+54. **IP Railway muda a cada redeploy**: após cada redeploy, o IP de saída muda e a whitelist GMGN quebra → AUTH_SIGNATURE_INVALID retorna. Solução permanente: Railway Static Outbound IP (~$3/mês). Necessário antes de escalar para evitar interrupções de trading.
 
 ---
 
@@ -594,7 +597,7 @@ PERSISTENCE_MIN_TICKS=3      # A.4: ticks pós-sinal acima do entry para confirm
 | Backtester | Cobertura de ticks | n_trades ≥ 200 | ⏳ kline OHLC acumulando |
 | Fase A | WR pós-filtros ≥ 25% | WR ≥ 25% com 30+ bounces filtrados | ⏳ aguardando dados |
 | Fase B | Cobertura slope ≥ 50% | 50% dos bounces com slope calculável | ⏳ impacto esperado |
-| Fase 6-lite | Friction total medida | 50 trades de $1 | ⏳ bloqueado (signature) |
+| Fase 6-lite | Friction total medida | 50 trades de $1 | 🟡 ATIVO — aguardando primeiro trade |
 | Fase 6-lite | EV_real > 0 após friction | EV_real > 0 | ⏳ depende de friction |
 | Fase 6 | Win rate live | ≥20% (break-even = 11% com payoff 8.7x) | ⏳ |
 | Fase 6 | Payoff ratio live | ≥3× | ⏳ |
@@ -622,3 +625,4 @@ PERSISTENCE_MIN_TICKS=3      # A.4: ticks pós-sinal acima do entry para confirm
 > Sardinhas confiam no EV de 63 tokens. Big players verificam os 492 que estão faltando.
 > Sardinhas fazem walk-forward backtest e esperam win rate ≥50%. Big players sabem que 23% win rate com 8.7x payoff bate 50% win rate com 1x payoff.
 > Sardinhas analisam. Big players traduzem análise em execução com capital mínimo para medir o que o modelo não consegue ver.
+> Sardinhas definem TP fixo. Big players definem saída em camadas — realizam parcial no primeiro sinal de força e deixam o restante correr com proteção dinâmica.

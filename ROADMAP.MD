@@ -1,7 +1,7 @@
 # NeideBOT — ROADMAP
 
 > **Regra:** Não avance para o próximo passo sem validar o anterior com dados reais.
-> **Data:** 2026-05-05 (atualizado pós-análise 83 bounces)
+> **Data:** 2026-05-05 (atualizado — Fase 6-lite desbloqueada)
 
 ---
 
@@ -14,22 +14,21 @@
 | 2 | Flow Engine (token_signals type 12) | ✅ Ativo — acumulando |
 | **A** | **Bounce Detector v2** | ✅ **ATIVO** — aguardando 30+ bounces filtrados |
 | **B** | **Cobertura de Ticks** | ✅ **ATIVO** — impacto esperado nos próximos bounces |
-| 6-lite | Execução $1 calibração | 🔴 **BLOQUEADO** — AUTH_SIGNATURE_INVALID |
+| 6-lite | Execução $1 calibração | 🟡 **ATIVO** — aguardando primeiro trade |
 | C | Flow Continuation Score | ⏳ Depende de cobertura de ticks (Fase B maturando) |
 | D | Smart Netflow Live (H9) | ⏳ Depende de token_signals acumulados |
 | E | Score composto modular | ⏳ Após C+D validados individualmente |
 
 ---
 
-## 🔴 BLOQUEIO ATIVO — Signature GMGN
+## ✅ BLOQUEIO RESOLVIDO — Signature GMGN
 
-**Problema:** `AUTH_SIGNATURE_INVALID` em todos os swaps.
-**Causa raiz:** código correto (validado vs signer.ts oficial). GMGN_WALLET_ADDRESS precisa estar cadastrada + IP do Railway na whitelist.
+**Causa raiz:** `_load_ed25519_key` tentava Base64 antes de Base58. String Base58 de 88 chars (Phantom export) é decodificável por Base64, gerando seed errado → wallet errada → assinatura inválida.
+**Fix:** Base58 movido antes do Base64 + validação de comprimento (32 ou 64 bytes).
+**IP:** Railway IP cadastrado na whitelist GMGN.
+**Keypair:** `DJVwyki5hTqMSLVaSyS9MXo5pGVbx4qEowV3BDtqvEgy` ✅ CORRESPONDE.
 
-**Ação pendente do usuário:**
-1. Acessar `/debug/sign-test` → verificar que wallet e chave correspondem
-2. Cadastrar IP do Railway (`/debug/my-ip`) na whitelist GMGN
-3. Confirmar que GMGN_WALLET_ADDRESS está registrada na conta GMGN
+> ⚠️ **IP muda a cada redeploy Railway.** Solução permanente: Railway Static Outbound IP (~$3/mês). Necessário antes de escalar.
 
 ---
 
@@ -133,22 +132,42 @@ Dobra frequência de coleta kline. Impacto < 15% do rate limit mesmo com 10 toke
 
 ---
 
-## FASE F — Execução v2 (após calibração com 50 trades funcionando)
+## FASE F — Exit Engine Maleável (após calibração com 50 trades funcionando)
+
+> **Filosofia:** TP/SL fixo é estratégia de sardinha — define o teto do ganho antes de saber o que o mercado vai fazer.
+> Big player usa saída em camadas: realiza parcial no primeiro sinal de força, deixa o restante correr com proteção dinâmica.
+> O objetivo não é "acertar o TP" — é **maximizar o EV por trade** capturando os runners sem perder a proteção.
+
+**Pré-requisito:** 50 trades de calibração concluídos (friction medida, sistema estável).
 
 ### F.1 — Partial Take Profits
-- 30% em +30% (segurança rápida)
-- 30% em +60%
-- 40% trailing stop (captura runners)
+Dividir posição em 3 partes antes do swap:
+- **30% em +30%** — saída rápida, cobre o custo do trade, psicologia estabilizada
+- **30% em +60%** — segunda realização, lucro garantido mesmo se reverter
+- **40% trailing stop** — a parte que captura os runners (+200%, +500%)
 
-### F.2 — Trailing Stop
-- Proteção dinâmica após TP1 atingido
-- Sair se price cair >20% do pico pós-entrada
+**Por que:** dos 83 bounces analisados, a mediana de TP foi +75% — mas os TPs reais (11) tiveram distribuição larga. Fixar 75% deixa dinheiro na mesa nos runners e não protege nos casos que revertem antes de chegar lá.
+
+### F.2 — Trailing Stop dinâmico
+- Ativa após TP1 atingido (+30%)
+- Floor inicial: entry price (não perde o capital)
+- A cada novo high: floor sobe para `high × 0.80` (-20% do pico)
+- Sai automaticamente quando price cruza o floor
+
+**Diferença para SL fixo:** SL fixo aciona em posição absoluta (-15% do entry). Trailing protege lucro acumulado — se subiu +100%, sai com +80% no pior caso, não com -15%.
 
 ### F.3 — Risk Engine em tempo real
-Monitorar após entrada:
-- Smart sells via token_signals (type 12 sell side)
-- Queda de liquidez > 30% → exit emergencial
-- Creator vende após entrada → exit imediato
+Monitorar posição aberta a cada 5s via token_signals e kline:
+- **Smart sell detectado** (type 12 sell side, volume ≥ X) → exit parcial imediato
+- **Queda de liquidez > 30%** em 2 ticks consecutivos → exit emergencial total
+- **Creator vende após entrada** (creator_token_status muda para "creator_close") → exit imediato
+- **Sem novo high por N ticks** após TP1 → considerar saída antecipada
+
+### F.4 — Position Sizing dinâmico (após Fase F.1-F.3 validadas)
+- Score composto (Fase E) → define tamanho relativo da posição
+- Trade de alta convicção (slope + persistência + H9) → size maior
+- Trade de convicção média (apenas A.2/A.3/A.5 passam) → size mínimo
+- Cap absoluto por trade independente do score
 
 ---
 
@@ -177,7 +196,7 @@ Solução: Railway Static Outbound IP (~$3/mês) — necessário antes de escala
 | WR base do bounce detector | — | 🟡 13.3% (histórico sem filtros) |
 | WR estimado pós-filtros A.2+A.3 | ≥25% | ⏳ ~29% estimado — confirmar com 30+ bounces |
 | Slope filter cobertura | ≥50% | 🟡 20.5% — Fase B deve elevar |
-| Swaps executando sem erro | 50 trades | 🔴 BLOQUEADO (signature) |
+| Swaps executando sem erro | 50 trades | 🟡 ATIVO — aguardando primeiro trade |
 | EV real > 0 após friction | positivo | ⏳ depende swaps funcionando |
 | H9 validada | delta_pp ≥ 20pp | ⏳ acumulando passivamente |
 | H18 (velocity) | — | ❌ REFUTADA — não implementar |
