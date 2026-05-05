@@ -5311,5 +5311,114 @@ def debug_sign_test():
     return "<pre>" + "\n".join(lines) + "</pre>"
 
 
+@app.route("/debug/trade-analysis")
+def debug_trade_analysis():
+    """Analisa tokens comprados: o que aconteceu após o bounce signal."""
+    mints = request.args.getlist("mint")
+    if not mints:
+        # Default: últimos 20 trades no banco
+        trades = db.get_trades(limit=20)
+        mints = [t["mint"] for t in trades if t.get("mint")]
+
+    rows = []
+    with db._cursor() as cur:
+        for mint in mints:
+            cur.execute("""
+                SELECT token_nome, mc_migration, mc_bottom, mc_peak, time_to_bottom, pct_drop
+                FROM migrations WHERE mint = %s
+            """, (mint,))
+            mg = cur.fetchone()
+
+            cur.execute("""
+                SELECT ts_signal, mc_at_signal, bounce_pct, elapsed_min
+                FROM bounce_signals WHERE mint = %s
+            """, (mint,))
+            bs = cur.fetchone()
+
+            cur.execute("""
+                SELECT id, status, entry_expected, tokens_received,
+                       entry_price_sol, strategy_id, error_msg
+                FROM trades WHERE mint = %s ORDER BY id DESC LIMIT 1
+            """, (mint,))
+            tr = cur.fetchone()
+
+            ticks_after = []
+            if bs and bs["ts_signal"]:
+                cur.execute("""
+                    SELECT tick_ts,
+                           COALESCE(mc_high, mc) AS mc_high,
+                           COALESCE(mc_low,  mc) AS mc_low
+                    FROM token_ticks
+                    WHERE mint = %s AND tick_ts >= %s
+                    ORDER BY tick_ts ASC LIMIT 80
+                """, (mint, bs["ts_signal"]))
+                ticks_after = cur.fetchall()
+
+            name      = (mg["token_nome"] if mg else mint[:8])
+            entry_mc  = bs["mc_at_signal"] if bs else None
+            peak_mc   = max((t["mc_high"] for t in ticks_after), default=None)
+            low_mc    = min((t["mc_low"]  for t in ticks_after), default=None)
+            pct_up    = (peak_mc  - entry_mc) / entry_mc if (peak_mc  and entry_mc) else None
+            pct_dn    = (low_mc   - entry_mc) / entry_mc if (low_mc   and entry_mc) else None
+            hit_tp    = pct_up  >=  0.75 if pct_up  is not None else None
+            hit_sl    = pct_dn  <= -0.15 if pct_dn  is not None else None
+
+            rows.append({
+                "mint": mint, "name": name, "mg": mg, "bs": bs, "tr": tr,
+                "peak_mc": peak_mc, "low_mc": low_mc,
+                "pct_up": pct_up, "pct_dn": pct_dn,
+                "hit_tp": hit_tp, "hit_sl": hit_sl,
+                "n_ticks": len(ticks_after),
+            })
+
+    def fmt(v, pct=False, usd=False):
+        if v is None: return "—"
+        if pct: return f"{v:+.1%}"
+        if usd: return f"${v:,.0f}"
+        return str(v)
+
+    html_rows = ""
+    for r in rows:
+        bg = ""
+        result = "—"
+        if r["hit_tp"]:  bg = "background:#1a3a1a"; result = "✅ TP HIT"
+        elif r["hit_sl"]: bg = "background:#3a1a1a"; result = "❌ SL HIT"
+        elif r["pct_up"] is not None: result = "⏳ sem hit"
+
+        tr = r["tr"]
+        strat = tr["strategy_id"] if tr else "—"
+        strat_ok = "✅" if strat and strat != "—" else "❌ sem TP/SL"
+
+        html_rows += f"""<tr style="{bg}">
+  <td>{r['name']}</td>
+  <td>{fmt(r['bs']['elapsed_min'] if r['bs'] else None)}min</td>
+  <td>{fmt(r['bs']['bounce_pct'] if r['bs'] else None, pct=True)}</td>
+  <td>{fmt(r['entry_mc'] if r['bs'] else None, usd=True) if r['bs'] else '—'}</td>
+  <td>{fmt(r['peak_mc'], usd=True)}</td>
+  <td style="color:#4f4">{fmt(r['pct_up'], pct=True)}</td>
+  <td>{fmt(r['low_mc'], usd=True)}</td>
+  <td style="color:#f44">{fmt(r['pct_dn'], pct=True)}</td>
+  <td>{result}</td>
+  <td>{strat_ok}</td>
+  <td style="font-size:11px">{r['mint'][:12]}...</td>
+</tr>"""
+
+    tp_hits = sum(1 for r in rows if r["hit_tp"])
+    sl_hits = sum(1 for r in rows if r["hit_sl"])
+    no_hit  = sum(1 for r in rows if not r["hit_tp"] and not r["hit_sl"] and r["pct_up"] is not None)
+
+    return f"""<!DOCTYPE html><html><body style="background:#111;color:#eee;font-family:monospace;padding:20px">
+<h2>Análise de Trades — {len(rows)} tokens</h2>
+<p>TP hits: <b style="color:#4f4">{tp_hits}</b> | SL hits: <b style="color:#f44">{sl_hits}</b> | Sem hit (dados insuf.): {no_hit}</p>
+<table border=1 cellpadding=6 style="border-collapse:collapse;font-size:13px">
+<tr style="background:#222"><th>Token</th><th>Elapsed</th><th>Bounce%</th>
+<th>Entry MC</th><th>Peak MC</th><th>↑ Max</th>
+<th>Low MC</th><th>↓ Min</th><th>Resultado</th><th>TP/SL</th><th>Mint</th></tr>
+{html_rows}
+</table>
+<p style="color:#888;font-size:12px">Baseado em token_ticks após ts_signal. Sem ticks = sem dados pós-entrada.</p>
+</body></html>"""
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
