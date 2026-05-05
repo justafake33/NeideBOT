@@ -26,7 +26,7 @@ TRADE_TP_PCT       = float(os.getenv("TRADE_TP_PCT",            "0.75"))
 TRADE_SL_PCT       = float(os.getenv("TRADE_SL_PCT",            "0.15"))
 SLIPPAGE_BPS       = int(os.getenv(  "TRADE_SLIPPAGE_BPS",      "500"))  # 5% max slippage
 ORDER_POLL_SEC     = int(os.getenv(  "ORDER_POLL_SEC",           "2"))
-ORDER_TIMEOUT_SEC  = int(os.getenv(  "ORDER_TIMEOUT_SEC",        "30"))
+ORDER_TIMEOUT_SEC  = int(os.getenv(  "ORDER_TIMEOUT_SEC",        "60"))
 
 # A.4 — Persistência: aguarda N segundos e verifica que os últimos K ticks estão acima do entry.
 # 3 ticks consecutivos acima do entry → WR 36.4% vs 12.1% (+24.3pp).
