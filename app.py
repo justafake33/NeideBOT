@@ -1033,6 +1033,13 @@ def analise_bounce_quality():
 
     h = f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Bounce Quality</title>{CSS}</head><body>"
     h += "<h1>Bounce Quality — o que discrimina bounces bons de ruins</h1>"
+    h += "<div style='padding:6px 16px;display:flex;gap:10px;flex-wrap:wrap;border-bottom:1px solid #21262d;margin-bottom:4px'>"
+    h += "<a href='/analise' style='color:#58a6ff;font-size:11px;text-decoration:none'>Analise</a>"
+    h += "<a href='/analise/deep-bounce' style='color:#58a6ff;font-size:11px;text-decoration:none'>Deep Bounce ↗</a>"
+    h += "<a href='/analise/backtest' style='color:#58a6ff;font-size:11px;text-decoration:none'>Backtest</a>"
+    h += "<a href='/analise/h10' style='color:#58a6ff;font-size:11px;text-decoration:none'>H10</a>"
+    h += "<a href='/scanner' style='color:#58a6ff;font-size:11px;text-decoration:none'>Scanner</a>"
+    h += "</div>"
 
     # --- summary cards ---
     h += "<div class='grid'>"
@@ -4277,6 +4284,891 @@ def trades_dashboard():
         calibration_max=CALIBRATION_MAX,
         fmt_mc=fmt_mc,
     )
+
+
+# ==============================================================================
+# /analise/deep-bounce — Análise quant profunda dos bounce signals
+# ==============================================================================
+
+@app.route("/analise/deep-bounce")
+def analise_deep_bounce():
+    """
+    Análise quant de segunda camada: o que discrimina bounces bons de ruins
+    ALÉM dos campos estáticos de qualidade já analisados em bounce-quality.
+
+    Hipóteses investigadas:
+      A. Bounce velocity: rapidez do bounce prediz recuperação sustentada?
+      B. Entry delay: esperar 2/5/10min melhora o EV?
+      C. Dump shape: slope pré-fundo (capitulação vs distribuição)
+      D. Bounce persistence: 3 ticks consecutivos acima do entry nível
+      E. W-bottom / double-dip: segunda testada do fundo melhora WR?
+      F. Dump depth × time_to_bottom grid: zona de maior probabilidade
+      G. Bounce size at signal: bounce% grande = momentum ou dead-cat?
+      H. TP hit timing: em quantos minutos o TP é atingido (quem apertou o trigger)
+      I. MC level at signal vs migration: onde o sinal dispara relativo à migração
+    """
+    TP_PCT = 0.75
+    SL_PCT = 0.15
+    MIN_SAMPLE = 5  # abaixo disso, mostrar aviso em vez de stats
+
+    _CSS = """<style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;font-size:12px}
+    h1{padding:14px 16px;color:#58a6ff;font-size:18px;border-bottom:1px solid #21262d}
+    h2{font-size:13px;color:#58a6ff;padding:10px 16px 4px;margin-top:16px;border-top:1px solid #21262d}
+    h3{font-size:11px;color:#8b949e;padding:4px 16px 2px}
+    .grid{display:flex;gap:10px;padding:8px 16px;flex-wrap:wrap}
+    .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 14px;min-width:110px}
+    .card .lbl{color:#8b949e;font-size:10px;margin-bottom:2px}
+    .card .val{font-size:15px;font-weight:bold}
+    .green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}.muted{color:#8b949e}
+    table{width:100%;border-collapse:collapse}
+    th{background:#161b22;color:#8b949e;padding:5px 8px;text-align:left;
+       border-bottom:1px solid #30363d;font-size:10px;white-space:nowrap}
+    td{padding:4px 8px;border-bottom:1px solid #21262d;font-size:11px}
+    tr:hover td{background:#161b22}
+    .sec{padding:4px 16px 12px}
+    .warn{background:#3d3b00;color:#d29922;padding:6px 14px;margin:6px 16px;border-radius:4px;font-size:11px}
+    .insight{background:#0d2137;color:#79c0ff;padding:6px 14px;margin:4px 16px;border-radius:4px;font-size:11px;border-left:3px solid #58a6ff}
+    .nav{padding:8px 16px;display:flex;gap:10px;flex-wrap:wrap;border-bottom:1px solid #21262d}
+    .nav a{color:#58a6ff;font-size:11px;text-decoration:none}
+    .nav a:hover{text-decoration:underline}
+    .zone-hot{background:#1a3a1a;color:#3fb950}
+    .zone-cold{background:#3a1a1a;color:#f85149}
+    .zone-mid{background:#2a2a1a;color:#d29922}
+    </style>"""
+
+    h = f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Deep Bounce Analysis</title>{_CSS}</head><body>"
+    h += "<h1>Deep Bounce Analysis — camada quant</h1>"
+    h += "<div class='nav'>"
+    h += "<a href='/analise'>Analise</a>"
+    h += "<a href='/analise/bounce-quality'>Bounce Quality</a>"
+    h += "<a href='/analise/backtest'>Backtest</a>"
+    h += "<a href='/analise/h10'>H10 (TTB)</a>"
+    h += "<a href='/analise/dump-depth'>Dump Depth</a>"
+    h += "<a href='/scanner'>Scanner</a>"
+    h += "</div>"
+
+    # ------------------------------------------------------------------ #
+    # Carrega bounce_signals + migrations + ticks de uma vez
+    # ------------------------------------------------------------------ #
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                b.mint,
+                b.symbol,
+                b.elapsed_sec          AS bounce_elapsed,
+                b.mc_min               AS bottom,
+                b.mc_at_signal         AS entry,
+                b.bounce_pct,
+                b.drop_from_mig,
+                b.ts_signal,
+                m.mc_migration,
+                m.time_to_bottom,
+                m.pct_drop,
+                m.mc_1h,
+                m.recovery,
+                m.liq_migration,
+                m.exchange,
+                m.ts_migration,
+                m.smart_wallets,
+                m.bot_degen_rate,
+                m.top10_holder_rate,
+                m.rug_ratio,
+                m.rat_trader_rate,
+                m.creator_token_status
+            FROM bounce_signals b
+            JOIN migrations m ON m.mint = b.mint
+            WHERE b.mc_at_signal IS NOT NULL
+              AND b.mc_at_signal > 0
+              AND b.mc_min > 0
+            ORDER BY b.ts_signal DESC
+        """)
+        bounces = [dict(r) for r in cur.fetchall()]
+
+        if not bounces:
+            return h + "<div class='warn'>Nenhum bounce_signal disponível ainda.</div></body></html>"
+
+        mints = [b["mint"] for b in bounces]
+
+        # Todos os ticks de todos os tokens com bounce
+        cur.execute("""
+            SELECT mint, elapsed_sec, mc, mc_open, mc_high, mc_low, source, tick_ts
+            FROM token_ticks
+            WHERE mint = ANY(%s)
+            ORDER BY mint, elapsed_sec
+        """, (mints,))
+        all_ticks_raw = cur.fetchall()
+
+    # Organiza ticks por mint
+    ticks_by_mint = {}
+    for t in all_ticks_raw:
+        ticks_by_mint.setdefault(t["mint"], []).append(dict(t))
+
+    # ------------------------------------------------------------------ #
+    # Função: determina outcome para uma entrada num dado elapsed
+    # ------------------------------------------------------------------ #
+    def _resolve_outcome(ticks_post, entry_mc, tp_pct=TP_PCT, sl_pct=SL_PCT):
+        """Caminha ticks_post e retorna (outcome, pnl, exit_elapsed)."""
+        if not entry_mc or entry_mc <= 0:
+            return "no_entry", None, None
+        tp_tgt = entry_mc * (1 + tp_pct)
+        sl_flr = entry_mc * (1 - sl_pct)
+        for t in ticks_post:
+            high = t.get("mc_high") or t.get("mc")
+            low  = t.get("mc_low")  or t.get("mc")
+            if low is not None and low <= sl_flr:
+                return "SL", -sl_pct, t["elapsed_sec"]
+            if high is not None and high >= tp_tgt:
+                return "TP", tp_pct, t["elapsed_sec"]
+        # time exit
+        if ticks_post:
+            last_mc = ticks_post[-1].get("mc")
+            if last_mc and last_mc > 0:
+                pnl = last_mc / entry_mc - 1
+                return "exit", pnl, ticks_post[-1]["elapsed_sec"]
+        return "no_ticks", None, None
+
+    # ------------------------------------------------------------------ #
+    # Computa outcome base + features derivadas para cada bounce
+    # ------------------------------------------------------------------ #
+    records = []
+    for b in bounces:
+        mint    = b["mint"]
+        entry   = b["entry"]
+        bottom  = b["bottom"]
+        elapsed = b["bounce_elapsed"]
+        ttb_sec = (b["time_to_bottom"] or 0) * 60  # minutos → segundos
+
+        all_ticks = ticks_by_mint.get(mint, [])
+        ticks_post = [t for t in all_ticks if t["elapsed_sec"] > elapsed]
+        ticks_pre  = [t for t in all_ticks if t["elapsed_sec"] <= elapsed]
+        ticks_bottom_window = [t for t in ticks_pre
+                               if t["elapsed_sec"] >= max(0, ttb_sec - 120)]
+
+        outcome, pnl, exit_elapsed = _resolve_outcome(ticks_post, entry)
+
+        # ---- A. Bounce velocity ----
+        # velocity = bounce_pct / seconds_from_bottom_to_signal
+        time_bottom_to_signal = elapsed - ttb_sec
+        velocity = None
+        if time_bottom_to_signal and time_bottom_to_signal > 5:
+            velocity = (b["bounce_pct"] or 0) / time_bottom_to_signal  # pct/s
+
+        # ---- C. Dump shape — slope pré-fundo (últimos 2min antes do bottom) ----
+        pre_slope = None
+        if len(ticks_bottom_window) >= 3:
+            mc_vals    = [t["mc"] for t in ticks_bottom_window if t.get("mc")]
+            elap_vals  = [t["elapsed_sec"] for t in ticks_bottom_window if t.get("mc")]
+            if len(mc_vals) >= 3:
+                # Regressão linear simples: slope = cov(x,y)/var(x)
+                n     = len(mc_vals)
+                mx    = sum(elap_vals) / n
+                my    = sum(mc_vals) / n
+                cov   = sum((elap_vals[i] - mx) * (mc_vals[i] - my) for i in range(n))
+                var_x = sum((elap_vals[i] - mx) ** 2 for i in range(n))
+                if var_x > 0:
+                    pre_slope = cov / var_x  # USD/sec — negativo = queda
+                    # Normaliza pelo mc para obter %mc/sec
+                    if my > 0:
+                        pre_slope = pre_slope / my  # %/sec
+
+        # ---- D. Bounce persistence — 3 primeiros ticks após sinal ----
+        first3 = ticks_post[:3]
+        persistent = None
+        if len(first3) >= 3:
+            persistent = all(
+                (t.get("mc_low") or t.get("mc") or 0) >= entry * 0.98
+                for t in first3
+            )
+
+        # ---- E. W-bottom (double-dip) — dip de volta a 115% do bottom antes de subir ----
+        w_bottom_dip = None
+        if ticks_post:
+            dip_threshold = bottom * 1.15  # "volta perto do fundo"
+            found_dip = False
+            dipped_back = False
+            for t in ticks_post:
+                low = t.get("mc_low") or t.get("mc") or 0
+                if low <= dip_threshold and not found_dip:
+                    found_dip = True
+                elif found_dip:
+                    high = t.get("mc_high") or t.get("mc") or 0
+                    if high >= entry * 1.05:
+                        dipped_back = True
+                        break
+            w_bottom_dip = found_dip  # True = houve dip de volta ao nível do fundo
+
+        # ---- I. MC at signal vs migration ratio ----
+        mc_ratio_signal_mig = None
+        if b.get("mc_migration") and b["mc_migration"] > 0 and entry:
+            mc_ratio_signal_mig = entry / b["mc_migration"]
+
+        records.append({
+            **b,
+            "ticks_post": ticks_post,
+            "ticks_pre":  ticks_pre,
+            "outcome":    outcome,
+            "pnl":        pnl,
+            "exit_elapsed": exit_elapsed,
+            "n_ticks_post": len(ticks_post),
+            "n_ticks_pre":  len(ticks_pre),
+            "velocity":   velocity,
+            "pre_slope":  pre_slope,
+            "persistent": persistent,
+            "w_bottom_dip": w_bottom_dip,
+            "mc_ratio_signal_mig": mc_ratio_signal_mig,
+            "time_bottom_to_signal": time_bottom_to_signal,
+        })
+
+    # ---- Subsets de trabalho ----
+    with_outcome = [r for r in records if r["pnl"] is not None]
+    wins  = [r for r in with_outcome if r["outcome"] == "TP"]
+    losses= [r for r in with_outcome if r["outcome"] == "SL"]
+
+    n_total   = len(records)
+    n_data    = len(with_outcome)
+    n_no_data = n_total - n_data
+    wr_base   = len(wins) / n_data * 100 if n_data else 0
+    ev_base   = sum(r["pnl"] for r in with_outcome) / n_data if n_data else 0
+
+    # ---- Helpers ----
+    def _avg(lst, key):
+        vals = [r[key] for r in lst if r.get(key) is not None]
+        return sum(vals) / len(vals) if vals else None
+
+    def _f(v, fmt=".1f"):
+        return f"{v:{fmt}}" if v is not None else "—"
+
+    def _wr(lst):
+        """Win rate de uma sublista que já tem outcome."""
+        with_o = [r for r in lst if r["pnl"] is not None]
+        if not with_o:
+            return None, 0
+        tp = [r for r in with_o if r["outcome"] == "TP"]
+        return len(tp) / len(with_o) * 100, len(with_o)
+
+    def _ev(lst):
+        with_o = [r for r in lst if r["pnl"] is not None]
+        if not with_o:
+            return None
+        return sum(r["pnl"] for r in with_o) / len(with_o)
+
+    def _row_stat(label, subset_a, label_a, subset_b, label_b, warn_n=MIN_SAMPLE):
+        """Gera linha de tabela comparando WR/EV de dois subsets."""
+        wr_a, na = _wr(subset_a)
+        wr_b, nb = _wr(subset_b)
+        ev_a = _ev(subset_a)
+        ev_b = _ev(subset_b)
+        delta_wr = (wr_a - wr_b) if (wr_a is not None and wr_b is not None) else None
+        small = na < warn_n or nb < warn_n
+
+        def _fmt_wr(wr, n):
+            if wr is None: return "—"
+            cls = "green" if wr >= 30 else ("yellow" if wr >= 20 else "red")
+            warn = " ⚠" if n < warn_n else ""
+            return f"<span class='{cls}'>{wr:.1f}%</span> (n={n}{warn})"
+
+        def _fmt_ev(ev):
+            if ev is None: return "—"
+            cls = "green" if ev > 0 else "red"
+            return f"<span class='{cls}'>{ev:+.0%}</span>"
+
+        delta_cls = "green" if (delta_wr or 0) > 5 else ("red" if (delta_wr or 0) < -5 else "yellow")
+        delta_str = f"<span class='{delta_cls}'>{delta_wr:+.1f}pp</span>" if delta_wr is not None else "—"
+
+        row  = f"<tr><td><b>{label_a}</b></td><td>{_fmt_wr(wr_a,na)}</td><td>{_fmt_ev(ev_a)}</td></tr>"
+        row += f"<tr><td><b>{label_b}</b></td><td>{_fmt_wr(wr_b,nb)}</td><td>{_fmt_ev(ev_b)}</td></tr>"
+        row += f"<tr style='border-top:1px solid #30363d'><td style='color:#8b949e'>Delta</td><td colspan='2'>{delta_str}</td></tr>"
+        return row, delta_wr
+
+    # ================================================================== #
+    # HEADER — cards de resumo
+    # ================================================================== #
+    h += "<div class='grid'>"
+    h += f"<div class='card'><div class='lbl'>Total bounces</div><div class='val'>{n_total}</div></div>"
+    h += f"<div class='card'><div class='lbl'>Com tick data</div><div class='val'>{n_data}</div></div>"
+    h += f"<div class='card'><div class='lbl'>Sem ticks</div><div class='val yellow'>{n_no_data}</div></div>"
+    wrcls = "green" if wr_base >= 25 else ("yellow" if wr_base >= 15 else "red")
+    h += f"<div class='card'><div class='lbl'>Win rate base</div><div class='val {wrcls}'>{wr_base:.1f}%</div></div>"
+    evcls = "green" if ev_base > 0 else "red"
+    h += f"<div class='card'><div class='lbl'>EV base (TP75/SL15)</div><div class='val {evcls}'>{ev_base:+.0%}</div></div>"
+    h += f"<div class='card'><div class='lbl'>TP hits</div><div class='val green'>{len(wins)}</div></div>"
+    h += f"<div class='card'><div class='lbl'>SL hits</div><div class='val red'>{len(losses)}</div></div>"
+    h += "</div>"
+
+    if n_no_data > n_data:
+        h += f"<div class='warn'>⚠ {n_no_data}/{n_total} bounces sem ticks — stats abaixo podem ter bias de seleção. Kline OHLC acumulando.</div>"
+
+    # ================================================================== #
+    # A. BOUNCE VELOCITY
+    # ================================================================== #
+    h += "<h2>A. Bounce Velocity — quão rápido o preço subiu do fundo ao sinal?</h2>"
+    h += "<h3>Hipótese: bounce rápido = capitulação terminou, compradores agressivos. bounce lento = distribuição continuada.</h3>"
+
+    vel_data = [r for r in with_outcome if r.get("velocity") is not None]
+    if len(vel_data) < MIN_SAMPLE:
+        h += f"<div class='warn'>Amostra insuficiente (n={len(vel_data)}) — aguardar mais bounces com time_to_bottom preenchido.</div>"
+    else:
+        # Mediana de velocity para split
+        sorted_vel = sorted(vel_data, key=lambda r: r["velocity"])
+        med_vel = sorted_vel[len(sorted_vel) // 2]["velocity"]
+        fast_bounce = [r for r in vel_data if r["velocity"] >= med_vel]
+        slow_bounce = [r for r in vel_data if r["velocity"] <  med_vel]
+
+        h += "<div class='grid'>"
+        h += f"<div class='card'><div class='lbl'>Velocidade mediana</div><div class='val'>{med_vel*100:.3f}%/s</div></div>"
+        h += f"<div class='card'><div class='lbl'>Fast (acima med)</div><div class='val'>{len(fast_bounce)}</div></div>"
+        h += f"<div class='card'><div class='lbl'>Slow (abaixo med)</div><div class='val'>{len(slow_bounce)}</div></div>"
+        h += "</div>"
+
+        h += "<div class='sec'><table><thead><tr><th>Grupo</th><th>Win Rate</th><th>EV</th></tr></thead><tbody>"
+        row_str, delta = _row_stat("velocity", fast_bounce, f"Fast (vel ≥ {med_vel*100:.3f}%/s)", slow_bounce, f"Slow (vel < {med_vel*100:.3f}%/s)")
+        h += row_str
+        h += "</tbody></table></div>"
+
+        # Tercis de velocity
+        n3 = len(vel_data) // 3
+        if n3 >= MIN_SAMPLE:
+            t1 = sorted_vel[:n3]
+            t2 = sorted_vel[n3:2*n3]
+            t3 = sorted_vel[2*n3:]
+            h += "<h3>Tercis de velocidade</h3>"
+            h += "<div class='sec'><table><thead><tr><th>Tercil</th><th>Vel range (%/s)</th><th>Win Rate</th><th>EV</th><th>n</th></tr></thead><tbody>"
+            for label, subset in [("Baixo (lento)", t1), ("Médio", t2), ("Alto (rápido)", t3)]:
+                wr, n = _wr(subset)
+                ev = _ev(subset)
+                vel_min = min(r["velocity"] for r in subset) * 100
+                vel_max = max(r["velocity"] for r in subset) * 100
+                wr_cls = "green" if (wr or 0) >= 30 else ("yellow" if (wr or 0) >= 20 else "red")
+                ev_cls = "green" if (ev or 0) > 0 else "red"
+                h += f"<tr><td>{label}</td><td>{vel_min:.3f}–{vel_max:.3f}</td>"
+                h += f"<td class='{wr_cls}'>{wr:.1f}%</td>" if wr is not None else "<td>—</td>"
+                h += f"<td class='{ev_cls}'>{ev:+.0%}</td>" if ev is not None else "<td>—</td>"
+                h += f"<td>{n}</td></tr>"
+            h += "</tbody></table></div>"
+
+        insight_delta = delta or 0
+        if abs(insight_delta) >= 10:
+            direction = "RÁPIDO" if insight_delta > 0 else "LENTO"
+            h += f"<div class='insight'>Sinal: bounces {direction} têm win rate {abs(insight_delta):.1f}pp {'maior' if insight_delta > 0 else 'menor'}. Filtro potencial.</div>"
+        else:
+            h += "<div class='insight'>Velocity não discrimina WR de forma clara nessa amostra. Acumular mais dados.</div>"
+
+    # ================================================================== #
+    # B. ENTRY DELAY SIMULATION
+    # ================================================================== #
+    h += "<h2>B. Entry Delay — esperar N minutos após o sinal melhora o EV?</h2>"
+    h += "<h3>Hipótese: entrar imediatamente pega dead-cat bounces. Esperar 5min filtra ruído sem perder muito upside.</h3>"
+
+    DELAYS = [0, 60, 120, 300, 600]  # segundos
+    delay_stats = []
+
+    for delay_sec in DELAYS:
+        sub_results = []
+        for r in records:
+            all_t = ticks_by_mint.get(r["mint"], [])
+            # Ticks após sinal + delay
+            ticks_delayed = [t for t in all_t if t["elapsed_sec"] > r["bounce_elapsed"] + delay_sec]
+            if not ticks_delayed:
+                continue
+            # Entry = primeiro tick disponível após delay
+            first_tick = ticks_delayed[0]
+            entry_mc = first_tick.get("mc_open") or first_tick.get("mc")
+            if not entry_mc or entry_mc <= 0:
+                continue
+            oc, pnl, _ = _resolve_outcome(ticks_delayed[1:], entry_mc)
+            if pnl is not None:
+                sub_results.append({"outcome": oc, "pnl": pnl, "entry_mc": entry_mc,
+                                     "original_entry": r["entry"],
+                                     "entry_change": (entry_mc / r["entry"] - 1) if r["entry"] else None})
+
+        n_sub = len(sub_results)
+        if n_sub < MIN_SAMPLE:
+            delay_stats.append({"delay": delay_sec, "n": n_sub, "wr": None, "ev": None, "avg_entry_change": None})
+            continue
+
+        tp_sub = [s for s in sub_results if s["outcome"] == "TP"]
+        wr_sub = len(tp_sub) / n_sub * 100
+        ev_sub = sum(s["pnl"] for s in sub_results) / n_sub
+        avg_entry_chg = sum(s["entry_change"] for s in sub_results if s.get("entry_change") is not None)
+        n_chg = sum(1 for s in sub_results if s.get("entry_change") is not None)
+        avg_entry_chg = avg_entry_chg / n_chg if n_chg else None
+
+        delay_stats.append({"delay": delay_sec, "n": n_sub, "wr": wr_sub, "ev": ev_sub,
+                             "avg_entry_change": avg_entry_chg})
+
+    h += "<div class='sec'><table><thead><tr>"
+    h += "<th>Delay entrada</th><th>n</th><th>Win Rate</th><th>EV (TP75/SL15)</th><th>Variação entry médio</th></tr></thead><tbody>"
+
+    best_ev_delay = max((d for d in delay_stats if d["ev"] is not None), key=lambda d: d["ev"], default=None)
+
+    for ds in delay_stats:
+        d_label = f"{ds['delay']//60}min" if ds['delay'] >= 60 else "t+0 (imediato)"
+        if ds["wr"] is None:
+            h += f"<tr><td>{d_label}</td><td class='yellow'>{ds['n']} ⚠</td><td colspan='3' class='muted'>amostra insuficiente</td></tr>"
+            continue
+        wr_cls = "green" if ds["wr"] >= 30 else ("yellow" if ds["wr"] >= 20 else "red")
+        ev_cls = "green" if ds["ev"] > 0 else "red"
+        best_marker = " ←MELHOR EV" if best_ev_delay and ds["delay"] == best_ev_delay["delay"] else ""
+        h += f"<tr><td><b>{d_label}{best_marker}</b></td><td>{ds['n']}</td>"
+        h += f"<td class='{wr_cls}'>{ds['wr']:.1f}%</td>"
+        h += f"<td class='{ev_cls}'>{ds['ev']:+.0%}</td>"
+        chg_str = f"{ds['avg_entry_change']:+.1%}" if ds['avg_entry_change'] is not None else "—"
+        chg_cls = "red" if (ds['avg_entry_change'] or 0) > 0 else "green"
+        h += f"<td class='{chg_cls}'>{chg_str}</td></tr>"
+
+    h += "</tbody></table></div>"
+
+    if best_ev_delay and best_ev_delay["delay"] > 0:
+        h += f"<div class='insight'>Aguardar {best_ev_delay['delay']//60}min melhora o EV (entry sobe em média {best_ev_delay.get('avg_entry_change', 0) or 0:+.1%}). Requer teste out-of-sample.</div>"
+    else:
+        h += "<div class='insight'>Entrada imediata tem EV similar ou melhor. Delay não parece ajudar nessa amostra.</div>"
+
+    # ================================================================== #
+    # C. DUMP SHAPE — slope pré-fundo
+    # ================================================================== #
+    h += "<h2>C. Dump Shape — inclinação do preço nos 2min antes do fundo</h2>"
+    h += "<h3>Hipótese: capitulação brusca (slope muito negativo) → fundo real. Distribuição gradual (slope suave) → fundo falso.</h3>"
+    h += "<h3>Baseado em H11: recovery tokens têm slope_c = -0.171 %MC/s vs -0.107 em no-recovery.</h3>"
+
+    slope_data = [r for r in with_outcome if r.get("pre_slope") is not None]
+    if len(slope_data) < MIN_SAMPLE:
+        h += f"<div class='warn'>Amostra insuficiente de ticks pré-fundo (n={len(slope_data)}). Necessário pelo menos {MIN_SAMPLE} tokens com 3+ ticks nos 2min antes do bottom.</div>"
+    else:
+        wins_slope  = [r for r in slope_data if r["outcome"] == "TP"]
+        losses_slope= [r for r in slope_data if r["outcome"] == "SL"]
+        avg_slope_win  = _avg(wins_slope, "pre_slope")
+        avg_slope_loss = _avg(losses_slope, "pre_slope")
+
+        h += "<div class='grid'>"
+        h += f"<div class='card'><div class='lbl'>Tokens com slope</div><div class='val'>{len(slope_data)}</div></div>"
+        h += f"<div class='card'><div class='lbl'>Slope avg (TP)</div><div class='val green'>{_f(avg_slope_win, '.4f')} %/s</div></div>"
+        h += f"<div class='card'><div class='lbl'>Slope avg (SL)</div><div class='val red'>{_f(avg_slope_loss, '.4f')} %/s</div></div>"
+        h += "</div>"
+
+        # Split por slope mediano
+        sorted_slope = sorted(slope_data, key=lambda r: r["pre_slope"])
+        med_slope = sorted_slope[len(sorted_slope) // 2]["pre_slope"]
+        steep  = [r for r in slope_data if r["pre_slope"] <= med_slope]   # mais negativo = mais íngreme
+        gradual= [r for r in slope_data if r["pre_slope"] >  med_slope]
+
+        h += "<div class='sec'><table><thead><tr><th>Dump Shape</th><th>Win Rate</th><th>EV</th></tr></thead><tbody>"
+        row_str, delta = _row_stat("slope", steep, f"Íngreme (slope ≤ {med_slope:.4f})", gradual, f"Gradual (slope > {med_slope:.4f})")
+        h += row_str
+        h += "</tbody></table></div>"
+
+        if delta is not None and abs(delta) >= 8:
+            winner = "ÍNGREME (capitulação)" if delta > 0 else "GRADUAL (distribuição)"
+            h += f"<div class='insight'>Dump shape discrimina: {winner} tem {abs(delta):.1f}pp a mais de WR. Consistente com H11 (capitulação brusca = fundo real).</div>"
+        else:
+            h += "<div class='insight'>Slope pré-fundo não discrimina claramente nessa amostra de bounces. Pode mudar com mais dados.</div>"
+
+    # ================================================================== #
+    # D. BOUNCE PERSISTENCE
+    # ================================================================== #
+    h += "<h2>D. Bounce Persistence — preço sustenta acima do entry nos primeiros 3 ticks?</h2>"
+    h += "<h3>Hipótese: 3 ticks consecutivos acima do entry → compradores reais. Confirmável em tempo real como filtro adicional.</h3>"
+
+    persist_data = [r for r in with_outcome if r.get("persistent") is not None]
+    if len(persist_data) < MIN_SAMPLE:
+        h += f"<div class='warn'>Amostra insuficiente (n={len(persist_data)}) para análise de persistência.</div>"
+    else:
+        persistent_yes = [r for r in persist_data if r["persistent"] is True]
+        persistent_no  = [r for r in persist_data if r["persistent"] is False]
+
+        h += "<div class='grid'>"
+        h += f"<div class='card'><div class='lbl'>Persistentes (3+ ticks ok)</div><div class='val green'>{len(persistent_yes)}</div></div>"
+        h += f"<div class='card'><div class='lbl'>Não-persistentes</div><div class='val red'>{len(persistent_no)}</div></div>"
+        h += f"<div class='card'><div class='lbl'>Sem 3 ticks</div><div class='val yellow'>{len(with_outcome) - len(persist_data)}</div></div>"
+        h += "</div>"
+
+        h += "<div class='sec'><table><thead><tr><th>Grupo</th><th>Win Rate</th><th>EV</th></tr></thead><tbody>"
+        row_str, delta = _row_stat("persist", persistent_yes, "Persistente (≥3 ticks ok)", persistent_no, "Não-persistente")
+        h += row_str
+        h += "</tbody></table></div>"
+
+        if delta is not None and delta >= 10:
+            h += f"<div class='insight'>FILTRO REAL-TIME: exigir 3 ticks acima do entry melhora WR em {delta:.1f}pp. Implementável sem latência extra (aguarda ~90s após sinal).</div>"
+        elif delta is not None and delta <= -10:
+            h += f"<div class='insight'>Curioso: bounces NÃO-persistentes têm WR {abs(delta):.1f}pp maior. Possível que movimento rápido (que volta e sobe de novo) seja o padrão de TP.</div>"
+        else:
+            h += "<div class='insight'>Persistência não discrimina de forma significativa nessa amostra.</div>"
+
+    # ================================================================== #
+    # E. W-BOTTOM / DOUBLE-DIP
+    # ================================================================== #
+    h += "<h2>E. W-Bottom (Double-Dip) — preço volta ao nível do fundo antes de subir?</h2>"
+    h += "<h3>Hipótese: segunda testada do fundo (W-shape) confirma suporte. Aguardar o W melhora WR?</h3>"
+
+    wbottom_data = [r for r in with_outcome if r.get("w_bottom_dip") is not None]
+    if len(wbottom_data) < MIN_SAMPLE:
+        h += f"<div class='warn'>Amostra insuficiente (n={len(wbottom_data)}) para análise de W-bottom.</div>"
+    else:
+        w_yes = [r for r in wbottom_data if r["w_bottom_dip"] is True]
+        w_no  = [r for r in wbottom_data if r["w_bottom_dip"] is False]
+        pct_w = len(w_yes) / len(wbottom_data) * 100
+
+        h += "<div class='grid'>"
+        h += f"<div class='card'><div class='lbl'>Com double-dip</div><div class='val'>{len(w_yes)} ({pct_w:.0f}%)</div></div>"
+        h += f"<div class='card'><div class='lbl'>Sem double-dip</div><div class='val'>{len(w_no)}</div></div>"
+        h += "</div>"
+
+        h += "<div class='sec'><table><thead><tr><th>Grupo</th><th>Win Rate</th><th>EV</th></tr></thead><tbody>"
+        row_str, delta = _row_stat("wbottom", w_yes, "Com W-bottom (dip de volta)", w_no, "Sem W-bottom (sobe direto)")
+        h += row_str
+        h += "</tbody></table></div>"
+
+        if delta is not None:
+            if delta >= 10:
+                h += f"<div class='insight'>W-bottom prediz melhor outcome (+{delta:.1f}pp). Estratégia: aguardar segunda testada antes de entrar.</div>"
+            elif delta <= -10:
+                h += f"<div class='insight'>Subida direta (sem W) tem WR {abs(delta):.1f}pp maior. Não esperar segunda testada — entra direto no primeiro bounce.</div>"
+            else:
+                h += "<div class='insight'>Padrão W-bottom não discrimina de forma significativa nessa amostra.</div>"
+
+    # ================================================================== #
+    # F. DUMP DEPTH × TIME_TO_BOTTOM GRID (para bounces detectados)
+    # ================================================================== #
+    h += "<h2>F. Dump Depth × Time-to-Bottom Grid — onde estão os bounces de maior qualidade?</h2>"
+    h += "<h3>Hipótese: zona ótima = drop 40-70% + fundo em <15min. Mostra win rate por célula do grid.</h3>"
+
+    DROP_BUCKETS = [
+        ("30-40%", 0.30, 0.40),
+        ("40-55%", 0.40, 0.55),
+        ("55-70%", 0.55, 0.70),
+        (">70%",   0.70, 1.01),
+    ]
+    TTB_BUCKETS = [
+        ("<10min",  0, 10),
+        ("10-20min", 10, 20),
+        ("20-30min", 20, 30),
+    ]
+
+    h += "<div class='sec'><table><thead><tr><th>Drop\\TTB</th>"
+    for tlabel, _, _ in TTB_BUCKETS:
+        h += f"<th>{tlabel}</th>"
+    h += "<th>Total Drop</th></tr></thead><tbody>"
+
+    for dlabel, dmin, dmax in DROP_BUCKETS:
+        h += f"<tr><td><b>{dlabel}</b></td>"
+        drop_row = [r for r in with_outcome if r.get("pct_drop") is not None
+                    and dmin <= r["pct_drop"] < dmax]
+        for tlabel, tmin, tmax in TTB_BUCKETS:
+            cell = [r for r in drop_row
+                    if r.get("time_to_bottom") is not None
+                    and tmin <= r["time_to_bottom"] < tmax]
+            wr, n = _wr(cell)
+            if n < MIN_SAMPLE:
+                h += f"<td class='muted'>n={n}</td>"
+            else:
+                wr_cls = "zone-hot" if (wr or 0) >= 40 else ("zone-mid" if (wr or 0) >= 25 else "zone-cold")
+                h += f"<td class='{wr_cls}'><b>{wr:.0f}%</b><br><small>n={n}</small></td>"
+        # row total
+        wr_tot, n_tot = _wr(drop_row)
+        wr_tot_cls = "green" if (wr_tot or 0) >= 30 else ("yellow" if (wr_tot or 0) >= 20 else "red")
+        h += f"<td class='{wr_tot_cls}'>{wr_tot:.0f}%</td>" if wr_tot is not None else "<td>—</td>"
+        h += "</tr>"
+
+    # Column totals
+    h += "<tr style='border-top:2px solid #30363d'><td><b>Total TTB</b></td>"
+    for tlabel, tmin, tmax in TTB_BUCKETS:
+        col = [r for r in with_outcome
+               if r.get("time_to_bottom") is not None
+               and tmin <= r["time_to_bottom"] < tmax]
+        wr, n = _wr(col)
+        wr_cls = "green" if (wr or 0) >= 30 else ("yellow" if (wr or 0) >= 20 else "red")
+        h += f"<td class='{wr_cls}'>{wr:.0f}% (n={n})</td>" if wr is not None else f"<td>n={n}</td>"
+    h += "<td>—</td></tr>"
+    h += "</tbody></table></div>"
+    h += "<div class='insight'>Zonas verdes (≥40% WR) são candidatas a filtro de entrada em tempo real. Comparar com grid geral em /analise/dump-depth (que usa recovery rate, não WR de bounce).</div>"
+
+    # ================================================================== #
+    # G. BOUNCE SIZE AT SIGNAL
+    # ================================================================== #
+    h += "<h2>G. Bounce Size no Sinal — bounce_pct maior é sinal de momentum ou dead-cat?</h2>"
+    h += "<h3>Hipótese: bounce de 30-50% pode indicar que compradores agressivos entraram. >60% pode indicar que já subiu demais.</h3>"
+
+    BOUNCE_BUCKETS = [
+        ("15-20%", 0.15, 0.20),
+        ("20-30%", 0.20, 0.30),
+        ("30-50%", 0.30, 0.50),
+        (">50%",   0.50, 10.0),
+    ]
+
+    h += "<div class='sec'><table><thead><tr><th>Bounce% no sinal</th><th>n</th><th>Win Rate</th><th>EV</th></tr></thead><tbody>"
+    for blabel, bmin, bmax in BOUNCE_BUCKETS:
+        bucket = [r for r in with_outcome
+                  if r.get("bounce_pct") is not None and bmin <= r["bounce_pct"] < bmax]
+        wr, n = _wr(bucket)
+        ev = _ev(bucket)
+        if n < MIN_SAMPLE:
+            h += f"<tr><td>{blabel}</td><td class='yellow'>{n} ⚠</td><td>—</td><td>—</td></tr>"
+        else:
+            wr_cls = "green" if (wr or 0) >= 30 else ("yellow" if (wr or 0) >= 20 else "red")
+            ev_cls = "green" if (ev or 0) > 0 else "red"
+            h += f"<tr><td>{blabel}</td><td>{n}</td>"
+            h += f"<td class='{wr_cls}'>{wr:.1f}%</td>"
+            h += f"<td class='{ev_cls}'>{ev:+.0%}</td></tr>"
+    h += "</tbody></table></div>"
+
+    # Correlação linear bounce_pct vs pnl
+    valid_pnl_bounce = [(r["bounce_pct"], r["pnl"]) for r in with_outcome
+                        if r.get("bounce_pct") is not None and r["pnl"] is not None]
+    if len(valid_pnl_bounce) >= MIN_SAMPLE:
+        bpcts = [x[0] for x in valid_pnl_bounce]
+        pnls  = [x[1] for x in valid_pnl_bounce]
+        mbp   = sum(bpcts) / len(bpcts)
+        mp    = sum(pnls)  / len(pnls)
+        cov   = sum((bpcts[i]-mbp)*(pnls[i]-mp) for i in range(len(bpcts)))
+        var_b = sum((b-mbp)**2 for b in bpcts)
+        corr_str = "—"
+        if var_b > 0:
+            var_p = sum((p-mp)**2 for p in pnls)
+            if var_p > 0:
+                corr = cov / ((var_b * var_p) ** 0.5)
+                corr_cls = "green" if corr > 0.15 else ("red" if corr < -0.15 else "yellow")
+                corr_str = f"<span class='{corr_cls}'>{corr:+.3f}</span>"
+        h += f"<div class='insight'>Correlação de Pearson bounce_pct × pnl: {corr_str} — {'+' if '+' in corr_str else ''}correlação positiva = bounce maior → melhor resultado; negativa = dead-cat.</div>"
+
+    # ================================================================== #
+    # H. TP HIT TIMING
+    # ================================================================== #
+    h += "<h2>H. TP Hit Timing — em quanto tempo após o sinal o TP é atingido?</h2>"
+    h += "<h3>Hipótese: a maioria dos TPs ocorre em <15min. Tokens que não atingem TP em 30min raramente atingem depois.</h3>"
+
+    tp_hits = [r for r in wins if r.get("exit_elapsed") is not None and r.get("bounce_elapsed") is not None]
+    if len(tp_hits) < MIN_SAMPLE:
+        h += f"<div class='warn'>Amostra insuficiente de TP hits (n={len(tp_hits)}) para análise de timing.</div>"
+    else:
+        # Tempo entre sinal e TP hit (em minutos)
+        tp_times = [(r["exit_elapsed"] - r["bounce_elapsed"]) / 60 for r in tp_hits]
+        tp_times_sorted = sorted(tp_times)
+
+        buckets_timing = [
+            ("<5min",   0, 5),
+            ("5-10min", 5, 10),
+            ("10-20min",10, 20),
+            ("20-40min",20, 40),
+            (">40min",  40, 9999),
+        ]
+        h += "<div class='grid'>"
+        med_tp_time = tp_times_sorted[len(tp_times_sorted)//2]
+        avg_tp_time = sum(tp_times) / len(tp_times)
+        h += f"<div class='card'><div class='lbl'>TP hits totais</div><div class='val green'>{len(tp_hits)}</div></div>"
+        h += f"<div class='card'><div class='lbl'>Mediana tempo TP</div><div class='val'>{med_tp_time:.1f}min</div></div>"
+        h += f"<div class='card'><div class='lbl'>Média tempo TP</div><div class='val'>{avg_tp_time:.1f}min</div></div>"
+        h += "</div>"
+
+        h += "<div class='sec'><table><thead><tr><th>Janela após sinal</th><th>TP hits</th><th>% dos TPs</th><th>Cumulativo</th></tr></thead><tbody>"
+        cumulative = 0
+        for btlabel, btmin, btmax in buckets_timing:
+            count = sum(1 for t in tp_times if btmin <= t < btmax)
+            pct   = count / len(tp_times) * 100
+            cumulative += count
+            cum_pct = cumulative / len(tp_times) * 100
+            h += f"<tr><td>{btlabel}</td><td>{count}</td>"
+            h += f"<td>{pct:.0f}%</td>"
+            cum_cls = "green" if cum_pct >= 70 else ("yellow" if cum_pct >= 40 else "red")
+            h += f"<td class='{cum_cls}'>{cum_pct:.0f}%</td></tr>"
+        h += "</tbody></table></div>"
+
+        pct_within_30 = sum(1 for t in tp_times if t <= 30) / len(tp_times) * 100
+        h += f"<div class='insight'>{pct_within_30:.0f}% dos TPs são atingidos em ≤30min após o sinal. "
+        if pct_within_30 >= 70:
+            h += "Time-stop de 30min captura a maioria dos wins — consistente com H10.</div>"
+        else:
+            h += "Alguns TPs ocorrem depois de 30min — time-stop pode estar descartando winners válidos.</div>"
+
+    # ================================================================== #
+    # I. MC LEVEL AT SIGNAL VS MIGRATION
+    # ================================================================== #
+    h += "<h2>I. MC Nível do Sinal vs Migração — onde o bounce dispara relativo ao preço inicial?</h2>"
+    h += "<h3>Hipótese: sinal em <40% da migração = dump profundo = chance maior de recovery forte. Sinal em >60% = dump superficial = menos potencial.</h3>"
+
+    ratio_data = [r for r in with_outcome if r.get("mc_ratio_signal_mig") is not None]
+    if len(ratio_data) < MIN_SAMPLE:
+        h += f"<div class='warn'>Amostra insuficiente (n={len(ratio_data)}) para análise de nível relativo.</div>"
+    else:
+        RATIO_BUCKETS = [
+            ("<20% mig",   0.00, 0.20),
+            ("20-30% mig", 0.20, 0.30),
+            ("30-40% mig", 0.30, 0.40),
+            ("40-50% mig", 0.40, 0.50),
+            ("50-65% mig", 0.50, 0.65),
+            (">65% mig",   0.65, 10.0),
+        ]
+        h += "<div class='sec'><table><thead><tr><th>Entry % da migração</th><th>n</th><th>Win Rate</th><th>EV</th><th>Drop médio</th></tr></thead><tbody>"
+        for rlabel, rmin, rmax in RATIO_BUCKETS:
+            bucket = [r for r in ratio_data if rmin <= r["mc_ratio_signal_mig"] < rmax]
+            wr, n = _wr(bucket)
+            ev = _ev(bucket)
+            avg_drop = _avg(bucket, "pct_drop")
+            if n < MIN_SAMPLE:
+                h += f"<tr><td>{rlabel}</td><td class='yellow'>{n} ⚠</td><td>—</td><td>—</td><td>—</td></tr>"
+            else:
+                wr_cls = "green" if (wr or 0) >= 30 else ("yellow" if (wr or 0) >= 20 else "red")
+                ev_cls = "green" if (ev or 0) > 0 else "red"
+                h += f"<tr><td>{rlabel}</td><td>{n}</td>"
+                h += f"<td class='{wr_cls}'>{wr:.1f}%</td>"
+                h += f"<td class='{ev_cls}'>{ev:+.0%}</td>"
+                h += f"<td>{avg_drop:.0%}</td>" if avg_drop else "<td>—</td>"
+                h += "</tr>"
+        h += "</tbody></table></div>"
+
+        # Distribuição dos ratios
+        ratios = [r["mc_ratio_signal_mig"] for r in ratio_data]
+        med_ratio = sorted(ratios)[len(ratios)//2]
+        h += f"<div class='insight'>Entry mediano a {med_ratio:.0%} do MC de migração. Sinal dispara quando preço caiu ~{(1-med_ratio):.0%} da migração.</div>"
+
+    # ================================================================== #
+    # J. NOVO: Time-to-bottom × Bounce Velocity 2D grid
+    # ================================================================== #
+    h += "<h2>J. TTB × Velocity 2D — grid ortogonal (novo)</h2>"
+    h += "<h3>Pergunta original: o melhor preditor (TTB < 25min) melhora ainda mais combinado com velocity rápida?</h3>"
+
+    grid_data = [r for r in with_outcome
+                 if r.get("time_to_bottom") is not None and r.get("velocity") is not None]
+
+    if len(grid_data) < MIN_SAMPLE * 2:
+        h += f"<div class='warn'>Amostra insuficiente (n={len(grid_data)}) para grid 2D TTB × Velocity.</div>"
+    else:
+        vel_vals = [r["velocity"] for r in grid_data]
+        med_v = sorted(vel_vals)[len(vel_vals)//2]
+
+        TTB_2 = [("<25min", 0, 25), ("≥25min", 25, 9999)]
+        VEL_2 = [(f"Fast (≥{med_v*100:.3f}%/s)", med_v, 1e9), (f"Slow (<{med_v*100:.3f}%/s)", 0, med_v)]
+
+        h += "<div class='sec'><table><thead><tr><th>TTB \\ Velocity</th>"
+        for vlabel, _, _ in VEL_2:
+            h += f"<th>{vlabel}</th>"
+        h += "</tr></thead><tbody>"
+
+        for tlabel, tmin, tmax in TTB_2:
+            h += f"<tr><td><b>{tlabel}</b></td>"
+            for vlabel, vmin, vmax in VEL_2:
+                cell = [r for r in grid_data
+                        if tmin <= r["time_to_bottom"] < tmax
+                        and vmin <= r["velocity"] < vmax]
+                wr, n = _wr(cell)
+                if n < MIN_SAMPLE:
+                    h += f"<td class='muted'>n={n}</td>"
+                else:
+                    wr_cls = "zone-hot" if (wr or 0) >= 40 else ("zone-mid" if (wr or 0) >= 25 else "zone-cold")
+                    h += f"<td class='{wr_cls}'><b>{wr:.0f}%</b> (n={n})</td>"
+            h += "</tr>"
+        h += "</tbody></table></div>"
+        h += "<div class='insight'>Célula TTB<25min + Fast velocity é a combinação teórica ideal (capitulação rápida + compradores agressivos). Se WR ≥ 45%, implementar como filtro adicional ao bounce detector.</div>"
+
+    # ================================================================== #
+    # K. NOVO: Snap quality — tempo entre migração e detecção do bounce
+    # ================================================================== #
+    h += "<h2>K. Capture Delay — tempo entre a migração e a detecção do bounce</h2>"
+    h += "<h3>Pergunta: bounces detectados mais cedo (menor elapsed_sec) têm melhor WR? Ou o bot está chegando tarde demais?</h3>"
+
+    delay_data = [r for r in with_outcome if r.get("bounce_elapsed") is not None]
+    if len(delay_data) < MIN_SAMPLE:
+        h += f"<div class='warn'>Amostra insuficiente (n={len(delay_data)}).</div>"
+    else:
+        ELAPSED_BUCKETS = [
+            ("<5min",    0,    300),
+            ("5-10min",  300,  600),
+            ("10-15min", 600,  900),
+            ("15-20min", 900,  1200),
+            (">20min",   1200, 9999),
+        ]
+        h += "<div class='sec'><table><thead><tr><th>Elapsed no sinal</th><th>n</th><th>Win Rate</th><th>EV</th></tr></thead><tbody>"
+        for el_label, el_min, el_max in ELAPSED_BUCKETS:
+            bucket = [r for r in delay_data
+                      if el_min <= r["bounce_elapsed"] < el_max]
+            wr, n = _wr(bucket)
+            ev = _ev(bucket)
+            if n < MIN_SAMPLE:
+                h += f"<tr><td>{el_label}</td><td class='yellow'>{n} ⚠</td><td>—</td><td>—</td></tr>"
+            else:
+                wr_cls = "green" if (wr or 0) >= 30 else ("yellow" if (wr or 0) >= 20 else "red")
+                ev_cls = "green" if (ev or 0) > 0 else "red"
+                h += f"<tr><td>{el_label}</td><td>{n}</td>"
+                h += f"<td class='{wr_cls}'>{wr:.1f}%</td>"
+                h += f"<td class='{ev_cls}'>{ev:+.0%}</td></tr>"
+        h += "</tbody></table></div>"
+
+        elaps_all = [r["bounce_elapsed"] for r in delay_data]
+        med_elap  = sorted(elaps_all)[len(elaps_all)//2]
+        h += f"<div class='insight'>Bounce mediano detectado em {med_elap//60:.0f}min {med_elap%60:.0f}s após migração. "
+        if med_elap < 600:
+            h += "Bot está capturando bounces precoces — bom sinal de latência."
+        else:
+            h += "Mediano > 10min — maioria dos bounces detectados tarde. Pode indicar dump lento (distribuição) dominando a amostra."
+        h += "</div>"
+
+    # ================================================================== #
+    # L. NOVO: creator_token_status × bounce outcome
+    # ================================================================== #
+    h += "<h2>L. Creator Status no momento do bounce — dev ainda segura?</h2>"
+    h += "<h3>Pergunta: bounces em tokens onde creator_hold=TRUE têm WR diferente? Dev segurando pode ser sinal de fé no projeto OU armadilha de saída.</h3>"
+
+    creator_data = [r for r in with_outcome if r.get("creator_token_status") is not None]
+    if len(creator_data) < MIN_SAMPLE:
+        h += f"<div class='warn'>Amostra insuficiente com creator_token_status (n={len(creator_data)}).</div>"
+    else:
+        dev_hold  = [r for r in creator_data if r["creator_token_status"] == "creator_hold"]
+        dev_close = [r for r in creator_data if r["creator_token_status"] == "creator_close"]
+
+        h += "<div class='sec'><table><thead><tr><th>Creator Status</th><th>Win Rate</th><th>EV</th></tr></thead><tbody>"
+        row_str, delta = _row_stat("creator", dev_hold, "creator_hold (dev segura)", dev_close, "creator_close (dev vendeu)")
+        h += row_str
+        h += "</tbody></table></div>"
+
+        if delta is not None:
+            if delta >= 10:
+                h += f"<div class='insight'>Dev segurando → +{delta:.1f}pp WR. Possível: dev ainda acredita no token. Usar como filtro confirmatório.</div>"
+            elif delta <= -10:
+                h += f"<div class='insight'>Dev JÁ vendeu → +{abs(delta):.1f}pp WR. Contra-intuitivo: mercado bounceou mesmo sem dev. Pode indicar CTO (comunidade assumiu).</div>"
+            else:
+                h += "<div class='insight'>Creator status não discrimina de forma significativa nessa amostra de bounces.</div>"
+
+    # ================================================================== #
+    # TABELA COMPLETA — todos os bounces com features derivadas
+    # ================================================================== #
+    h += "<h2>Tabela Completa — todos os bounces com features derivadas</h2>"
+    h += "<div class='sec'><table><thead><tr>"
+    h += "<th>Symbol</th><th>Outcome</th><th>P&L</th><th>Drop</th><th>Bounce%</th>"
+    h += "<th>TTB</th><th>Elapsed sinal</th><th>Entry%mig</th>"
+    h += "<th>Velocity (%/s)</th><th>Slope pré</th><th>Persist?</th><th>W-bot?</th>"
+    h += "<th>Exit (min após)</th></tr></thead><tbody>"
+
+    for r in sorted(records, key=lambda x: x.get("ts_signal") or 0, reverse=True):
+        oc  = r["outcome"]
+        oc_cls = "green" if oc == "TP" else ("red" if oc == "SL" else "yellow")
+        pnl = r["pnl"]
+        pnl_cls = "green" if (pnl or 0) > 0 else "red"
+
+        exit_min = None
+        if r.get("exit_elapsed") and r.get("bounce_elapsed"):
+            exit_min = (r["exit_elapsed"] - r["bounce_elapsed"]) / 60
+
+        h += "<tr>"
+        h += f"<td><b>{r.get('symbol') or r['mint'][:8]}</b></td>"
+        h += f"<td class='{oc_cls}'>{oc}</td>"
+        h += f"<td class='{pnl_cls}'>{pnl:+.0%}</td>" if pnl is not None else "<td class='muted'>—</td>"
+        h += f"<td>{r['pct_drop']:.0%}</td>" if r.get("pct_drop") else "<td>—</td>"
+        h += f"<td>{r['bounce_pct']:.0%}</td>" if r.get("bounce_pct") else "<td>—</td>"
+        h += f"<td>{r['time_to_bottom']:.1f}</td>" if r.get("time_to_bottom") else "<td>—</td>"
+        h += f"<td>{r['bounce_elapsed']//60}m{r['bounce_elapsed']%60:02d}s</td>"
+        h += f"<td>{r['mc_ratio_signal_mig']:.0%}</td>" if r.get("mc_ratio_signal_mig") else "<td>—</td>"
+        vel = r.get("velocity")
+        h += f"<td>{vel*100:.4f}</td>" if vel else "<td>—</td>"
+        slp = r.get("pre_slope")
+        h += f"<td>{slp:.4f}</td>" if slp else "<td>—</td>"
+        h += f"<td>{'✅' if r.get('persistent') else ('❌' if r.get('persistent') is False else '—')}</td>"
+        h += f"<td>{'✅' if r.get('w_bottom_dip') else ('❌' if r.get('w_bottom_dip') is False else '—')}</td>"
+        h += f"<td>{exit_min:.1f}min</td>" if exit_min else "<td>—</td>"
+        h += "</tr>"
+
+    h += "</tbody></table></div>"
+    h += "</body></html>"
+    return h
 
 
 # ==============================================================================
