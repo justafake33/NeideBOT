@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 POLL_INTERVAL      = int(os.getenv("POLL_INTERVAL_SEC",    "5"))
 HOT_INTERVAL       = 30
-HOT_PRECISE_SEC    = int(os.getenv("HOT_PRECISE_SEC",      "60"))   # kline bottom scan
+HOT_PRECISE_SEC    = int(os.getenv("HOT_PRECISE_SEC",      "30"))   # B.4: 60→30s dobra cobertura de ticks
 HOT_WINDOW_MIN     = 60
 
 # ------------------------------------------------------------------
@@ -101,6 +101,7 @@ class HotMonitor:
                     "symbol":       symbol,
                     "mc_min":       mc_migration,
                     "time_min":     0.0,
+                    "ts_min":       ts_migration,   # timestamp quando mc_min foi visto pela última vez
                     "mc_max":       mc_migration,
                     "time_max":     0.0,
                     "mc_last":      mc_migration,
@@ -151,6 +152,7 @@ class HotMonitor:
         if mc < state["mc_min"]:
             state["mc_min"] = mc
             state["time_min"] = elapsed_min
+            state["ts_min"]   = datetime.now(timezone.utc)
             db.update_bottom(mint, mc, elapsed_min)
             logger.info("Fundo(poll) %s: $%.0f em %.1fmin (%.0f%% abaixo ATH)",
                         state["symbol"], mc, elapsed_min,
@@ -172,10 +174,15 @@ class HotMonitor:
 
     BOUNCE_MIN_PCT   = float(os.getenv("BOUNCE_MIN_PCT",   "0.15"))  # bounce mínimo do mc_min
     BOUNCE_DROP_MIN  = float(os.getenv("BOUNCE_DROP_MIN",  "0.30"))  # queda mínima da migração
-    BOUNCE_TIME_MAX  = float(os.getenv("BOUNCE_TIME_MAX",  "30.0"))  # janela máxima em minutos
+    BOUNCE_TIME_MAX  = float(os.getenv("BOUNCE_TIME_MAX",  "20.0"))  # A.5: janela 30→20min (100% TPs em ≤20min)
+
+    # A.1 slope filter: slope (% mc/s) dos 2min pré-fundo. Capitulação ≤ -0.0008 → WR 66.7%.
+    # Gradual > -0.0008 → WR 0%. Threshold negativo = queda mais intensa = bom sinal.
+    BOUNCE_SLOPE_MIN = float(os.getenv("BOUNCE_SLOPE_MIN", "-0.0008"))  # slope máximo permitido (mais negativo = mais íngreme)
+    BOUNCE_SLOPE_MIN_TICKS = int(os.getenv("BOUNCE_SLOPE_MIN_TICKS", "3"))    # ticks mínimos para ativar filtro A.1
 
     def _check_bounce(self, mint: str, state: dict, mc: float, elapsed_sec: int):
-        """Detecta bounce em tempo real e dispara alerta no Telegram."""
+        """Detecta bounce em tempo real. Fase A: filtros slope, dead zone, entry ratio."""
         if state.get("bounce_fired"):
             return
 
@@ -194,6 +201,40 @@ class HotMonitor:
 
         bounce_pct = (mc - mc_min) / mc_min
         if bounce_pct < self.BOUNCE_MIN_PCT:
+            return
+
+        # A.2 — Dead zone: bounce 20-30% tem WR 4% e EV -10%. Permitir <20% ou ≥30%.
+        if 0.20 <= bounce_pct < 0.30:
+            logger.debug("BOUNCE skip %s — dead zone bounce=%.1f%%", mint[:8], bounce_pct * 100)
+            return
+
+        # A.3 — Entry ratio 50-65% da migração: WR 0% em 15 tokens. Rejeitar.
+        entry_ratio = mc / mc_migration if mc_migration > 0 else 0
+        if 0.50 <= entry_ratio <= 0.65:
+            logger.debug("BOUNCE skip %s — entry ratio=%.2f (dead zone 50-65%%)", mint[:8], entry_ratio)
+            return
+
+        # B.3 — Backfill retroativo: na primeira detecção de bounce elegível, busca o kline
+        # completo desde a migração e insere todos os ticks antes de rodar o slope filter.
+        # O slope filter roda a partir do SEGUNDO poll elegível (5s depois), com dados garantidos.
+        if not state.get("slope_backfill_triggered"):
+            state["slope_backfill_triggered"] = True
+            threading.Thread(
+                target=self._backfill_slope_ticks,
+                args=(mint, dict(state)),
+                daemon=True,
+                name=f"backfill-{mint[:8]}",
+            ).start()
+            logger.debug("BOUNCE %s — backfill retroativo disparado, aguardando próximo poll", mint[:8])
+            return  # aguarda 5s para ticks estarem no DB
+
+        # A.1 — Slope filter: capitulação íngreme (≤ -0.0008 %/s) → WR 66.7%.
+        # Mede slope dos 2min ANTES do fundo (ts_min), não antes do sinal.
+        # Requer cobertura de ticks ≥ BOUNCE_SLOPE_MIN_TICKS; se insuficiente, passa sem filtrar.
+        ts_min = state.get("ts_min")
+        skip_reason = self._check_slope(mint, ts_min)
+        if skip_reason:
+            logger.debug("BOUNCE skip %s — slope gradual: %s", mint[:8], skip_reason)
             return
 
         state["bounce_fired"] = True
@@ -240,6 +281,90 @@ class HotMonitor:
                 )
             except Exception as e:
                 logger.error("executor.on_bounce %s: %s", symbol, e)
+
+    def _check_slope(self, mint: str, ts_min) -> str | None:
+        """
+        A.1: Calcula slope dos 2min de ticks ANTES DO FUNDO (ts_min).
+        Mede a velocidade do dump antes do bottom, não da recuperação.
+        Retorna motivo de rejeição (str) ou None se aprovado / ticks insuficientes.
+        Slope em %MC/s. Threshold: BOUNCE_SLOPE_MIN (padrão -0.0008).
+        Capitulação brusca: slope ≤ -0.0008 → WR 66.7%. Dump gradual > -0.0008 → WR 0%.
+        """
+        try:
+            ticks = db.get_recent_ticks(mint, window_sec=120, max_ts=ts_min)
+        except Exception as e:
+            logger.debug("_check_slope %s: db error %s — skip filter", mint[:8], e)
+            return None
+
+        if len(ticks) < self.BOUNCE_SLOPE_MIN_TICKS:
+            # Cobertura insuficiente — não filtrar, passar o sinal
+            return None
+
+        # Slope linear simples: (y_last - y_first) / (t_last - t_first) em %MC/s
+        t0, mc0 = ticks[0]
+        t1, mc1 = ticks[-1]
+        dt = (t1 - t0).total_seconds()
+        if dt <= 0 or mc0 <= 0:
+            return None
+
+        slope = ((mc1 - mc0) / mc0) / dt  # %/s (negativo = queda)
+        logger.debug("SLOPE %s: slope=%.6f (threshold=%.6f) n=%d ticks (até fundo)",
+                     mint[:8], slope, self.BOUNCE_SLOPE_MIN, len(ticks))
+
+        if slope > self.BOUNCE_SLOPE_MIN:
+            return f"slope={slope:.6f} > threshold={self.BOUNCE_SLOPE_MIN} (dump gradual)"
+        return None
+
+    def _backfill_slope_ticks(self, mint: str, state: dict):
+        """
+        B.3: Busca kline completo desde a migração até agora e insere todos os ticks.
+        Chamado em thread própria na primeira detecção de bounce elegível.
+        Garante que o slope filter tenha dados no próximo poll (5s depois).
+        """
+        try:
+            now_ts      = int(datetime.now(timezone.utc).timestamp())
+            ts_mig_unix = state["ts_mig_unix"]
+            total_supply = state["total_supply"]
+
+            candles = self.gmgn.get_token_kline(
+                mint, "sol", "1m",
+                from_ts=ts_mig_unix,
+                to_ts=now_ts,
+            )
+            if not candles:
+                logger.debug("backfill %s: kline vazio", mint[:8])
+                return
+
+            kline_ticks = []
+            for c in candles:
+                candle_ts   = int(c.get("time", 0)) / 1000
+                elapsed_sec = int(candle_ts - ts_mig_unix)
+                if elapsed_sec < 0 or elapsed_sec > 3660:
+                    continue
+                close_p = _float(c.get("close"))
+                open_p  = _float(c.get("open"))
+                high_p  = _float(c.get("high"))
+                low_p   = _float(c.get("low"))
+                vol     = _float(c.get("volume"))
+                if not close_p or close_p <= 0 or not total_supply:
+                    continue
+                kline_ticks.append({
+                    "mint":        mint,
+                    "elapsed_sec": elapsed_sec,
+                    "mc":          close_p * total_supply,
+                    "mc_open":     open_p  * total_supply if open_p  else None,
+                    "mc_high":     high_p  * total_supply if high_p  else None,
+                    "mc_low":      low_p   * total_supply if low_p   else None,
+                    "volume_1m":   vol,
+                })
+
+            if kline_ticks:
+                db.insert_kline_ticks_batch(kline_ticks)
+                logger.info("backfill %s: %d ticks inseridos (%.0fmin de histórico)",
+                            mint[:8], len(kline_ticks),
+                            (now_ts - ts_mig_unix) / 60)
+        except Exception as e:
+            logger.debug("backfill %s: %s", mint[:8], e)
 
     # ------------------------------------------------------------------
     # Threads
@@ -382,7 +507,7 @@ class HotMonitor:
             try:
                 candles = self.gmgn.get_token_kline(
                     mint, "sol", "1m",
-                    from_ts=now_ts - 120,
+                    from_ts=now_ts - 300,   # B.2: 2min→5min — cobre gaps entre polls
                     to_ts=now_ts,
                 )
                 for c in candles:
@@ -395,11 +520,13 @@ class HotMonitor:
                     if low_price and low_price > 0:
                         mc_low = low_price * state["total_supply"]
                         if mc_low < state["mc_min"]:
+                            candle_dt = datetime.fromtimestamp(candle_ts, tz=timezone.utc)
                             with self._lock:
                                 inner = self._tokens.get(mint)
                                 if inner and mc_low < inner["mc_min"]:
-                                    inner["mc_min"] = mc_low
+                                    inner["mc_min"]   = mc_low
                                     inner["time_min"] = elapsed_min
+                                    inner["ts_min"]   = candle_dt  # B.1: fix — slope filter precisa deste timestamp
                             db.update_bottom(mint, mc_low, elapsed_min)
                             logger.info("Fundo(kline) %s: $%.0f em %.1fmin (%.0f%% abaixo ATH)",
                                         state["symbol"], mc_low, elapsed_min,

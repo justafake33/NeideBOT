@@ -1,246 +1,169 @@
 # NeideBOT — ROADMAP
 
-> **Regra:** Não avance para o próximo passo sem validar o anterior com dados reais!
+> **Regra:** Não avance para o próximo passo sem validar o anterior com dados reais.
+> **Data:** 2026-05-05
 
 ---
 
-## Prioridade prática (ordem real)
+## Status Geral
 
-| # | Fase | Passo |
-|---|------|-------|
-| 1 | 0 | Sentry |
-| 2 | 0 | Logs estruturados |
-| 3 | 1 | Holders API |
-| 4 | 1 | Security API |
-| 5 | 2 | Smart Flow |
-| 6 | 3 | Timing Engine |
-| 7 | 4 | Score modular |
-| 8 | 5 | Cluster Engine |
-| 9 | 6 | Execution Engine |
-| 10 | 7 | Risk Engine |
-| 11 | 8 | Arquitetura separada |
-| 12 | 9 | Dataset research |
+| Fase | Nome | Status |
+|------|------|--------|
+| 0 | Blindagem (Sentry, logs) | ✅ Completo |
+| 1 | Intelligence Layer (campos Fase 1) | ✅ Completo |
+| 2 | Flow Engine (token_signals type 12) | ✅ Ativo — acumulando |
+| 6-lite | Execução $1 calibração | 🔴 **BLOQUEADO** — AUTH_SIGNATURE_INVALID |
+| **A** | **Bounce Detector v2** | ⏳ **PRÓXIMO — amanhã** |
+| B | Flow Continuation Score | ⏳ Depende de cobertura de ticks |
+| C | Smart Netflow Live (H9) | ⏳ Depende de token_signals acumulados |
+| D | Score composto modular | ⏳ Após A+B+C validados |
 
 ---
 
-## FASE 0 — Blindagem
+## 🔴 BLOQUEIO ATIVO — Signature GMGN
 
-**Objetivo:** garantir estabilidade antes de crescer.
+**Problema:** `AUTH_SIGNATURE_INVALID` em todos os swaps.
+**Causa raiz:** corpo do swap enviado correto, assinatura correta, mas GMGN_WALLET_ADDRESS precisa estar cadastrada na conta GMGN OpenAPI + IP do Railway na whitelist.
 
-### 0.1 — Sentry
-- [x] Criar `monitoring.py`
-- [x] Configurar `SENTRY_DSN`
-- [x] Capturar exceptions: scanner, scheduler, hot monitor, executor
-
-→ Qualquer crash vira evento rastreável.
-
-### 0.2 — Logs estruturados
-- [x] Scanner: token encontrado / aprovado / reprovado / motivo
-- [x] HotMonitor: fundo detectado / rug detectado / recuperação detectada
-- [ ] Executor: entrada / TP / SL executados *(Fase 6)*
-
-→ Entender comportamento em produção.
-
-### 0.3 — Backup de produção
-- [ ] ~~Branch `stable-production`~~ *(descartado — Railway tem rollback nativo)*
+**Ação pendente do usuário:**
+1. Acessar `/debug/sign-test` → verificar que wallet e chave correspondem
+2. Cadastrar IP do Railway (`/debug/my-ip`) na whitelist GMGN
+3. Confirmar que GMGN_WALLET_ADDRESS está registrada na conta GMGN
 
 ---
 
-## FASE 1 — Intelligence Layer
+## FASE A — Bounce Detector v2 (implementar amanhã)
 
-**Objetivo:** melhorar qualidade da seleção.
+**Objetivo:** elevar WR de 15.5% para >35% sem mudar arquitetura.
+**Base:** análise `/analise/deep-bounce` com 71 bounces reais.
 
-### 1.1 — Holders API
-Buscar holders no momento de 90% BC.
+### A.1 — Slope Filter (🔴 maior impacto)
+**Dado:** slope íngreme (≤ -0.0008 %/s) → WR 66.7% vs slope gradual → WR 0.0% (+66.7pp)
+**Implementação:** calcular slope dos últimos 2min de ticks antes do sinal em `_check_bounce()`
+**Pré-requisito:** cobertura de ticks ≥ 70% (hoje: 22% — fix abaixo)
 
-Salvar:
-- `smart_supply_pct` — % do supply em mãos smart
-- `insider_hold_pct` — % insider
-- `whale_concentration` — concentração de whales
+### A.2 — Bloquear dead zone bounce 20-30%
+**Dado:** bounce_pct entre 20-30% tem WR 4% e EV -10% — pior zona de todas
+**Implementação:** em `_check_bounce()`, rejeitar se `15% < bounce < 20%` ou `bounce >= 30%` (manter 15-20% e 30%+)
+**Impacto estimado:** remove ~25/71 trades ruins sem tirar nenhum TP
 
-→ Filtrar bombas ruins.
+### A.3 — Bloquear entry 50-65% da migração
+**Dado:** quando `mc_at_signal / mc_migration` entre 50-65% → WR 0% em 15 tokens
+**Implementação:** calcular ratio no momento do sinal; se 0.50 ≤ ratio ≤ 0.65 → skip
+**Impacto estimado:** remove 15 trades com zero acertos
 
-### 1.2 — Security API
-Salvar:
-- `honeypot_risk`
-- `mint_authority`
-- `freeze_authority`
-- `lp_lock`
+### A.4 — Persistência como confirmação antes de executar
+**Dado:** 3 ticks consecutivos acima do entry → WR 36.4% vs 12.1% (+24.3pp)
+**Implementação:** `TradeExecutor` aguarda 90s após sinal e verifica últimos 3 ticks antes de executar swap
+**Risco:** pode perder bounces muito rápidos (V-shape) — monitorar
 
-→ Reduzir rugs.
-
-### 1.3 — Smart Wallet Quality
-Hoje: contagem bruta (`smart_degen_count`).
-
-Novo — separar por:
-- Wallet age
-- Wallet ROI
-- Wallet consistency
-- Wallet size
-
-Criar: **Smart Quality Score**
-
-→ Smart wallet deixa de ser métrica rasa.
+### A.5 — Time-stop 30min → 20min
+**Dado:** 100% dos TPs ocorrem em ≤20min após o sinal. Zero TPs entre 20-30min.
+**Implementação:** `BOUNCE_TIME_MAX=20.0`
+**Impacto:** apenas evita entrar em tokens que já demonstraram não funcionar
 
 ---
 
-## FASE 2 — Flow Engine
+## FASE B — Cobertura de Ticks (pré-requisito para A.1 e Flow Score)
 
-**Objetivo:** sair de snapshot e entrar em fluxo contínuo.
+**Problema atual:** apenas 22% dos bounces têm ticks suficientes para calcular slope.
+**Causa:** após dump, token sai do feed trenches → sem ticks trenches. kline back-fill a cada 60s resolve parcialmente.
 
-### 2.1 — Smart Flow Tracking
-Monitorar compras e vendas de smart wallets em tempo real.
+**Ações:**
+- [ ] Verificar se `_precise_bottom_tick()` está inserindo kline ticks durante todo o dump (não só após detecção)
+- [ ] Aumentar frequência do hot-precise de 60s para 30s (trade-off: dobra uso de rate limit kline)
+- [ ] Adicionar kline retroativo no momento da detecção de bounce (buscar últimos 5min de candles 1m)
 
-Métrica: **Smart Flow Delta** = compras − vendas
-
-→ Detectar absorção real.
-
-### 2.2 — KOL Flow
-Monitorar wallets influentes.
-
-Pergunta: quem relevante entrou?
-
-→ Antecipação narrativa.
-
-### 2.3 — Whale Flow
-Monitorar wallets grandes.
-
-Pergunta: whales acumulando ou distribuindo?
-
-→ Entender pressão futura.
+**Meta:** cobertura ≥ 70% dos bounces com slope calculável antes de implementar A.1
 
 ---
 
-## FASE 3 — Timing Engine
+## FASE C — Flow Continuation Score
 
-**Objetivo:** melhorar ponto de entrada.
+**Dependência:** cobertura de ticks resolvida (Fase B)
 
-### 3.1 — Entry Zone Dinâmica
-Hoje: fixo em −30%.
-Novo: zona entre −25% e −40%.
+**O que é:** após bounce signal, verificar nos primeiros 5 ticks:
+- Higher low em relação ao fundo
+- Higher high em relação ao tick anterior
+- Volume crescente (se disponível)
 
-→ Flexibilidade por contexto.
+**Por que:** é a evolução natural do filtro de persistência (A.4). Não só "preço acima do entry" mas "estrutura de uptrend formando".
 
-### 3.2 — Dump Velocity
-Medir velocidade da queda.
-
-Pergunta: queda acelerando ou desacelerando?
-
-→ Evitar faca caindo.
-
-### 3.3 — Bounce Strength
-Medir força da reação inicial.
-
-→ Confirmação de fundo.
-
-### 3.4 — Seller Exhaustion
-Sinais: volume cai + queda desacelera + smart absorvendo.
-
-→ Entrada mais precisa.
+**Implementação:** módulo separado `flow_score.py`, chamado pelo TradeExecutor antes de executar swap.
 
 ---
 
-## FASE 4 — Score Engine
+## FASE D — Smart Netflow Live (H9 em tempo real)
 
-**Objetivo:** formalizar a decisão em score modular.
+**Dependência:** token_signals acumulados (~100 tokens com sinal durante bounce)
 
-### 4.1 — Quality Score
-Base: holders, security, distribution.
+**O que é:** nos 3 minutos ao redor do bounce signal, houve smart buy (type 12)?
+- `trigger_mc < mc_min * 1.20` → smart wallet comprou perto do fundo → muito bullish
+- Múltiplos triggers na janela → acumulação real
 
-### 4.2 — Flow Score
-Base: smart flow, KOL flow, whale flow.
-
-### 4.3 — Risk Score
-Base: rug ratio, concentração, liquidez.
-
-### 4.4 — Timing Score
-Base: velocity, bounce strength, seller exhaustion.
-
-→ Score composto, modular e auditável.
+**Status:** token_signals já coletados a cada 5s. H9 pendente de volume de dados.
 
 ---
 
-## FASE 5 — Cluster Engine
+## FASE E — Scores Compostos (após A+B+C+D validados individualmente)
 
-**Objetivo:** parar de tratar todos os tokens iguais.
+Baseado nas propostas avaliadas (2026-05-05):
 
-| Cluster | Perfil |
-|---------|--------|
-| 5.1 | High smart / Low sniper |
-| 5.2 | High sniper / Low smart |
-| 5.3 | High concentration |
-| 5.4 | High liquidity |
+| Score | Componentes validados | Componentes pendentes |
+|-------|----------------------|----------------------|
+| **Dump Intensity** | slope (✅ +66.7pp) | volume_spike (dados insuficientes) |
+| **Supply Risk** | top70_sniper_hold_rate (✅), creator_close (✅ +10pp) | bundler, insider (não validados para bounce) |
+| **Buyer Quality** | token_signals type 12 (H9 pendente) | snapshot counts (❌ H3 refutou) |
+| **Flow Continuation** | persistência (✅ +24.3pp) | higher lows/highs (depende cobertura) |
 
-Cada cluster: entrada diferente, risco diferente, saída diferente.
-
----
-
-## FASE 6 — Execution Engine
-
-**Objetivo:** melhorar execução de ordens.
-
-### 6.1 — Condition Orders
-Entrar com TP e SL já embutidos.
-
-→ Menos risco operacional.
-
-### 6.2 — Partial Take Profits: 
-exemplo:
-25% em +20%
-25% em +40%
-50% trailing stop
-
-
-→ Maximizar runners.
-
-### 6.3 — Trailing Stop
-Proteção dinâmica de posição.
-
-→ Capturar pumps longos.
+> ⚠️ Não construir scores com pesos arbitrários. Cada componente deve ser validado individualmente antes de combinar. Compostos prematuros diluem o sinal mais forte.
 
 ---
 
-## FASE 7 — Risk Engine
+## FASE F — Execução v2 (após calibração com 50 trades funcionando)
 
-**Objetivo:** proteger capital após entrada.
+### F.1 — Partial Take Profits
+- 30% em +30% (segurança rápida)
+- 30% em +60%
+- 40% trailing stop (captura runners)
 
-Monitorar:
-- 7.1 — Smart sells
-- 7.2 — Whale sells
-- 7.3 — Redução de liquidez
-- 7.4 — Emergency exit (saída antecipada)
+### F.2 — Trailing Stop
+- Proteção dinâmica após TP1 atingido
+- Sair se price cair >20% do pico pós-entrada
 
-→ Sair antes do mercado perceber.
-
----
-
-## FASE 8 — Arquitetura
-
-**Objetivo:** escalar sem acoplamento.
-
-### 8.1 — Separar processos
-Hoje: Flask + scanner num processo.
-Novo: web / scanner / monitor / executor separados.
-
-### 8.2 — RAM Cache
-Decisão em RAM. Persistência em banco.
-
-### 8.3 — FSM (Finite State Machine)
-Estados por token: WATCHLIST → PREQUALIFIED → MIGRATED → DUMPING
-→ ENTRY_ZONE → POSITION_OPEN → EXITED
-
+### F.3 — Risk Engine em tempo real
+Monitorar após entrada:
+- Smart sells via token_signals (type 12 sell side)
+- Queda de liquidez > 30% → exit emergencial
+- Creator vende após entrada → exit imediato
 
 ---
 
-## FASE 9 — Dataset Próprio
+## FASE G — Arquitetura (quando volume aumentar)
 
-**Objetivo:** construir edge irreproduzível.
+### G.1 — Separar processos
+Scanner / Monitor / Executor em processos separados (hoje tudo no Flask)
 
-Coletar 1000+ migrações completas.
+### G.2 — FSM por token
+```
+WATCHLIST → MIGRATED → DUMPING → BOUNCE_DETECTED → CONFIRMING → POSITION_OPEN → EXITED
+```
 
-Responder:
-- Qual cluster reverte melhor?
-- Qual dump é saudável?
-- Qual smart flow realmente funciona?
+### G.3 — IP estático Railway
+Hoje: IP muda a cada redeploy → quebra whitelist GMGN
+Solução: Railway Static Outbound IP (~$3/mês) — necessário antes de escalar
 
-> Esse dataset é o ativo principal. Não tem atalho.
+---
+
+## KPIs atualizados (2026-05-05)
+
+| Métrica | Meta | Status |
+|---------|------|--------|
+| Tokens com recovery definido | ≥1000 | ✅ 1134 |
+| Bounce signals coletados | ≥50 | ✅ 71 |
+| WR live do bounce detector | ≥20% | 🔴 15.5% (precisa Fase A) |
+| Slope filter cobertura | ≥70% dos bounces | 🔴 22% (precisa Fase B) |
+| Swaps executando sem erro | 50 trades | 🔴 BLOQUEADO (signature) |
+| EV real > 0 após friction | positivo | ⏳ depende swaps funcionando |
+| H9 validada | delta_pp ≥ 20pp | ⏳ acumulando passivamente |
+| token_ticks cobertura | ≥70% dos bounces | 🔴 22% |

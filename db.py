@@ -605,6 +605,46 @@ def backfill_tick_volumes(mint: str, candles: list, ts_mig_unix: int):
                   "lo": r["elapsed"] - 30, "hi": r["elapsed"] + 30})
 
 
+def get_recent_ticks(mint: str, window_sec: int = 120, max_ts=None, min_ts=None) -> list:
+    """
+    Retorna lista de (tick_ts, mc) de uma janela de ticks para um token.
+    Ordenado por tick_ts ASC.
+
+    max_ts: limite superior (padrão NOW). Para slope pré-fundo, passar ts_min.
+    min_ts: limite inferior (padrão max_ts - window_sec). Para persistência pós-sinal.
+    """
+    with _cursor() as cur:
+        if max_ts is not None:
+            cur.execute("""
+                SELECT tick_ts, mc
+                FROM token_ticks
+                WHERE mint    = %(mint)s
+                  AND tick_ts <= %(max_ts)s
+                  AND tick_ts >= %(max_ts)s - (%(window)s || ' seconds')::INTERVAL
+                  AND mc IS NOT NULL
+                ORDER BY tick_ts ASC
+            """, {"mint": mint, "window": window_sec, "max_ts": max_ts})
+        elif min_ts is not None:
+            cur.execute("""
+                SELECT tick_ts, mc
+                FROM token_ticks
+                WHERE mint    = %(mint)s
+                  AND tick_ts >= %(min_ts)s
+                  AND mc IS NOT NULL
+                ORDER BY tick_ts ASC
+            """, {"mint": mint, "min_ts": min_ts})
+        else:
+            cur.execute("""
+                SELECT tick_ts, mc
+                FROM token_ticks
+                WHERE mint    = %(mint)s
+                  AND tick_ts >= NOW() - (%(window)s || ' seconds')::INTERVAL
+                  AND mc IS NOT NULL
+                ORDER BY tick_ts ASC
+            """, {"mint": mint, "window": window_sec})
+        return [(row["tick_ts"], float(row["mc"])) for row in cur.fetchall()]
+
+
 def get_tick_aggregates(max_elapsed_sec: int = 600) -> list:
     """
     Retorna métricas agregadas da série temporal dos primeiros N segundos por token.

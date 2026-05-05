@@ -171,9 +171,10 @@ Os early buyers realizam lucro → dump imediato.
 - **H10 CONFIRMADA**: tokens com fundo em < 25min têm 61% recovery vs 39% para > 25min (+22pp)
 - O sinal de compra ativa em tempo real (signal type 12) é a hipótese central ainda pendente (H9)
 
-### Regra de time-stop (H10 validada)
-> Se um token ainda estiver caindo após **30 minutos** da migração sem sinal de fundo → descartar.
-> Probabilidade de recovery cai para 37% após 30min. Dumps lentos = distribuição, não capitulação.
+### Regra de time-stop (H10 validada + refinada)
+> Se um token ainda estiver caindo após **20 minutos** do sinal de bounce sem hit de TP → descartar.
+> 100% dos TPs ocorrem em ≤20min após o sinal (análise de 71 bounces reais). Zero TPs entre 20-30min.
+> Time-stop do detector mantido em 30min (migração → bounce), mas time-stop da trade cai para 20min.
 
 ### Pipeline de execução
 ```
@@ -216,14 +217,14 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO 2026-05-04)
 
 ## 🔍 ESTADO ATUAL — Coleta de Dados
 
-### Situação (2026-05-04)
-- **1015+ tokens** coletados no banco, **425** com `recovery` definido
-- **~91%** com `mc_bottom`, **~52%** com `recovery=TRUE` (baseline)
-- Campos Fase 1 coletados desde deploy anterior
-- **Fase 2 ativa**: sinais type 12 coletados em `token_signals` a cada 5s durante janela quente
-- **Volume fix aplicado**: `volume_1m` back-fillado via kline no hot-precise
-- **Bounce detector ativo**: `bounce_signals` populando em produção, alertas Telegram ao vivo
-- **Fase 6 ativa**: `TradeExecutor` integrado — trades reais disparados pelo bounce detector (TRADING_ENABLED=true no Railway)
+### Situação (2026-05-05)
+- **1175+ tokens** coletados no banco, **1134** com `recovery` definido (baseline correto após fix dead tokens)
+- Recovery rate baseline: **23.5%** (não 52% — corrigido após marcar tokens mortos como FALSE)
+- **71 bounce signals** disparados em produção — analisados em `/analise/deep-bounce`
+- **Bounce detector WR atual: 15.5%**, EV ~0% com TP75/SL15 — Fase A vai corrigir
+- **Fase 2 ativa**: sinais type 12 coletados em `token_signals` a cada 5s
+- **Fase 6 BLOQUEADA**: `AUTH_SIGNATURE_INVALID` — problema de configuração GMGN (wallet/IP), não de código
+- **Cobertura de ticks**: 22% dos bounces têm dados suficientes para slope — principal limitação atual
 
 ### Campos coletados por migração
 
@@ -298,6 +299,11 @@ Registradas ANTES de ver os dados. Não alterar retroativamente.
 | H10 | time_to_bottom < 25min → recovery rate ≥20pp maior que time_to_bottom ≥ 25min | ✅ **+21.8pp** confirmado (61.2% vs 39.3%, n=425) |
 | H11 | Deceleração de preço (d²p/dt²→0) precede o fundo em recovery tokens | ❌ **REFUTADA** — direção invertida. Recovery tokens ACELERAM no fundo (capitulação brusca), não desaceleram |
 | H12 | dump_depth + time_elapsed definem zona probabilística de entrada (P(recovery) > 50%) | ⚠️ **PARCIAL** — time domina sobre depth. 3 zonas acionáveis (N≥15, rate≥60%) mas todas já cobertas por H10. Insight novo: zona 5-10min tem recovery 51% (dead zone). |
+| H13 | Slope íngreme pré-fundo (≤ -0.0008 %/s) → WR de bounce ≥40pp maior que slope gradual | ✅ **+66.7pp** confirmado (66.7% vs 0.0%, n=16 com dados). Caveat: cobertura 22% — validar com mais ticks |
+| H14 | bounce_pct entre 20-30% é dead zone — WR inferior a 15-20% e 30%+ | ✅ **confirmado** (4% WR vs 20% e 23.5% nas outras faixas, n=25). Dead-cat zone. |
+| H15 | Entry entre 50-65% do mc_migration tem WR=0% | ✅ **confirmado** (0/15 = 0% WR, n=15). Zona a evitar. |
+| H16 | 3 ticks consecutivos acima do entry pós-sinal → WR ≥20pp maior | ✅ **+24.3pp** confirmado (36.4% vs 12.1%, n=11/58). Filtro implementável em tempo real (~90s). |
+| H17 | 100% dos TPs ocorrem em ≤20min após o sinal de bounce | ✅ **confirmado** (11/11 TPs em ≤20min, 82% em ≤10min, n=71). Time-stop ideal = 20min. |
 
 ### Análises de tick-features — resultados documentados
 
@@ -311,6 +317,23 @@ Registradas ANTES de ver os dados. Não alterar retroativamente.
 | vol5m_slope | null | null | ⏳ dados indisponíveis — fix aplicado |
 | time_to_bottom | 19.5 min | 40.2 min | ✅ **maior discriminador encontrado** |
 | slope_c (2min antes do fundo) | **-0.171** %MC/s | -0.107 %MC/s | ⚡ **invertido útil** — recovery = capitulação mais brusca |
+
+### Análise de bounce quality — resultados (2026-05-05, n=71 bounces reais)
+
+| Feature | TP (n=11) | SL (n=58) | Conclusão |
+|---------|-----------|-----------|-----------|
+| slope pré-fundo ≤ -0.0008 | 66.7% WR | 0.0% WR | ✅ **maior discriminador de bounce** (n=16, cobertura 22%) |
+| bounce_pct 15-20% | 20% WR | — | ✅ faixa válida |
+| bounce_pct 20-30% | 4% WR | — | ❌ dead zone — evitar |
+| bounce_pct 30-50% | 23.5% WR | — | ✅ faixa válida |
+| 3 ticks persistentes acima entry | 36.4% WR | 12.1% WR | ✅ +24.3pp — filtro real-time |
+| entry 50-65% de mc_migration | 0% WR | — | ❌ zona morta — evitar |
+| entry >65% de mc_migration | 19.6% WR | — | ✅ zona normal |
+| creator_close (dev vendeu) | 17.9% WR | — | ✅ +10.2pp vs creator_hold |
+| tempo para TP hit | mediana 6.1min | — | ✅ time-stop ideal = 20min |
+| W-bottom (97% dos casos) | 13% WR | — | ⚠️ quase universal — não usar como filtro |
+
+> **Por que 58 SLs em <2min:** bounce dispara sinal, preço sobe 15-20%, imediatamente despenca. Não é bounce — é micro-recuperação dentro de downtrend que não terminou. O slope filter (A.1) resolve isso: capitulação real gera spike abrupto de venda antes do fundo.
 
 > **Por que delta_smart é invertido:** `smart_count` do trenches/ticks = snapshot de posições acumuladas (inclui quem comprou há dias e segura). NÃO é compra ativa. Tokens com dump longo (que não bounceam) acumulam mais smart wallets simplesmente porque o dump dura mais. O sinal correto de compra ativa é o signal type 12.
 
