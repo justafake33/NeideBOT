@@ -346,6 +346,14 @@ def export_bounce_ticks():
     """Exporta ticks dos tokens que tiveram bounce_signal — ideal para estudar padrão pós-bounce."""
     with db._cursor() as cur:
         cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'token_ticks'
+        """)
+        tick_cols = {r["column_name"] for r in cur.fetchall()}
+        ts_expr = "t.tick_ts" if "tick_ts" in tick_cols else "t.ts"
+
+        cur.execute(f"""
             SELECT
                 t.mint,
                 m.token_nome                    AS symbol,
@@ -355,8 +363,8 @@ def export_bounce_ticks():
                 b.elapsed_sec / 60.0            AS elapsed_min_at_bounce,
                 b.drop_from_mig                 AS pct_drop,
                 m.recovery,
-                t.tick_ts                       AS ts,
-                EXTRACT(EPOCH FROM (t.tick_ts - b.ts_signal)) AS sec_after_bounce,
+                {ts_expr}                       AS ts,
+                EXTRACT(EPOCH FROM ({ts_expr} - b.ts_signal)) AS sec_after_bounce,
                 t.mc,
                 t.mc_open,
                 t.mc_high,
@@ -368,8 +376,8 @@ def export_bounce_ticks():
             FROM token_ticks t
             JOIN bounce_signals b ON b.mint = t.mint
             JOIN migrations m ON m.mint = t.mint
-            WHERE t.tick_ts >= b.ts_signal - INTERVAL '2 minutes'
-            ORDER BY t.mint, t.tick_ts
+            WHERE {ts_expr} >= b.ts_signal - INTERVAL '2 minutes'
+            ORDER BY t.mint, {ts_expr}
         """)
         rows = [dict(r) for r in cur.fetchall()]
 
