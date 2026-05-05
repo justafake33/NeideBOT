@@ -111,6 +111,30 @@ class RateLimitError(Exception):
         super().__init__(f"Rate limited until {reset_at}")
 
 
+# Gate global — compartilhado por todas as threads e instâncias de GmgnClient.
+# Quando qualquer chamada recebe 429, TODAS as threads param até reset_at.
+_global_ban_until: float = 0.0
+_global_ban_lock  = threading.Lock()
+
+
+def _set_global_ban(reset_at: float):
+    global _global_ban_until
+    with _global_ban_lock:
+        if reset_at > _global_ban_until:
+            _global_ban_until = reset_at
+            logger.warning("Rate limit global — todas as threads pausadas até %.0fs (em %.1fs)",
+                           reset_at, reset_at - time.time())
+
+
+def _wait_global_ban():
+    """Bloqueia a thread atual até o ban global expirar."""
+    now = time.time()
+    if now < _global_ban_until:
+        wait = _global_ban_until - now + 0.2
+        logger.debug("Rate limit global ativo — aguardando %.1fs", wait)
+        time.sleep(wait)
+
+
 class GmgnClient:
     def __init__(self):
         self.host = GMGN_HOST.rstrip("/")
@@ -144,6 +168,7 @@ class GmgnClient:
                 reset_at = float(body.get("reset_at", time.time() + 10))
             except Exception:
                 reset_at = time.time() + 10
+            _set_global_ban(reset_at)   # para TODAS as threads imediatamente
             raise RateLimitError(reset_at)
         if not resp.ok:
             try:
@@ -158,6 +183,7 @@ class GmgnClient:
         return body
 
     def _get(self, path: str, params: dict = None) -> dict:
+        _wait_global_ban()
         resp = self.session.get(
             f"{self.host}{path}",
             params=self._params(params),
@@ -166,6 +192,7 @@ class GmgnClient:
         return self._handle_response(resp)
 
     def _post(self, path: str, body: dict = None, extra_params: dict = None) -> dict:
+        _wait_global_ban()
         resp = self.session.post(
             f"{self.host}{path}",
             json=body or {},
@@ -204,6 +231,7 @@ class GmgnClient:
             raise RuntimeError(
                 "GMGN_WALLET_ADDRESS não configurada — endpoints de trade desabilitados"
             )
+        _wait_global_ban()
         body_str = _json.dumps(body or {}, separators=(",", ":"))
         params   = self._params()  # só timestamp + client_id
         logger.info("TRADE POST %s | wallet=%s | body=%s", path,
@@ -225,6 +253,7 @@ class GmgnClient:
             raise RuntimeError(
                 "GMGN_PRIVATE_KEY não configurada — endpoints de trade desabilitados"
             )
+        _wait_global_ban()
         params = self._params(extra_params)
         sig    = self._sign(path, params, "")  # GET: body="" (não None — evita "None" literal no f-string)
         resp   = self.session.get(
