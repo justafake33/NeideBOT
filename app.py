@@ -355,12 +355,10 @@ def export_bounce_ticks():
         def col(name: str) -> str:
             return f"t.{name}" if name in tick_cols else f"NULL AS {name}"
 
-        if "tick_ts" in tick_cols:
-            tick_ts_expr = "t.tick_ts"
-        elif "ts" in tick_cols:
-            tick_ts_expr = "t.ts"
-        else:
-            tick_ts_expr = "NULL::timestamptz"
+        # Compatibilidade de schema: alguns ambientes usam `tick_ts`, outros `ts`.
+        tick_ts_expr = "t.tick_ts" if "tick_ts" in tick_cols else (
+            "t.ts" if "ts" in tick_cols else "NULL::timestamptz"
+        )
 
         cur.execute(f"""
             SELECT
