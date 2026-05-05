@@ -226,15 +226,19 @@ class TradeExecutor:
             status   = str(qd.get("status") or "").lower()
             logger.info("query_order #%d %s → status='%s' data=%s", trade_id, symbol, status, qd)
 
-            if status in ("failed", "cancelled", "rejected", "expired"):
-                logger.warning("Swap #%d %s cancelado pela chain (status=%s)", trade_id, symbol, status)
-                _fail(trade_id, f"swap cancelado: {status}")
+            # confirmation.state: "processed"|"confirmed" = OK, "failed"|"expired" = cancelado
+            confirmation = qd.get("confirmation") or {}
+            conf_state   = str(confirmation.get("state") or "").lower()
+            if conf_state in ("failed", "expired"):
+                logger.warning("Swap #%d %s cancelado (confirmation.state=%s)", trade_id, symbol, conf_state)
+                _fail(trade_id, f"swap cancelado: {conf_state}")
                 return
 
-            out_raw = _safe_float(qd.get("out_amount"))
+            # filled_output_amount = tokens recebidos | filled_input_amount = SOL gasto
+            out_raw = _safe_float(qd.get("filled_output_amount"))
             if out_raw and out_raw > 0:
                 tokens_received = out_raw
-            in_raw = _safe_float(qd.get("in_amount"))
+            in_raw = _safe_float(qd.get("filled_input_amount"))
             if in_raw:
                 fill_sol = in_raw / 1e9 if in_raw > 1000 else in_raw
                 slippage_pct = (fill_sol - amount_sol) / amount_sol if amount_sol else None
@@ -283,19 +287,21 @@ class TradeExecutor:
                 tp_pct=TRADE_TP_PCT,
                 sl_pct=TRADE_SL_PCT,
             )
-            strat_data  = strat_res.get("data") or strat_res
-            strategy_id = strat_data.get("strategy_id") or strat_data.get("id")
+            tp_id = strat_res.get("tp", {}).get("order_id")
+            sl_id = strat_res.get("sl", {}).get("order_id")
+            # strategy_id guarda ambos como "tp:{id}|sl:{id}"
+            strategy_id = f"tp:{tp_id}|sl:{sl_id}"
             db.update_trade(trade_id, {
                 "strategy_id": strategy_id,
                 "status":      "open",
+                "error_msg":   None,
             })
             logger.info(
-                "Estratégia #%d %s — strategy_id=%s TP=+%.0f%% SL=-%.0f%%",
-                trade_id, symbol, strategy_id, TRADE_TP_PCT * 100, TRADE_SL_PCT * 100,
+                "Estratégia #%d %s — TP=%s SL=%s (TP=+%.0f%% SL=-%.0f%%)",
+                trade_id, symbol, tp_id, sl_id, TRADE_TP_PCT * 100, TRADE_SL_PCT * 100,
             )
         except Exception as e:
             logger.error("create_strategy #%d %s: %s", trade_id, symbol, e)
-            # Trade está aberto, estratégia falhou — salva erro mas não marca como error total
             db.update_trade(trade_id, {
                 "status":    "open",
                 "error_msg": f"create_strategy: {e}",
@@ -333,11 +339,12 @@ class TradeExecutor:
             try:
                 result = self.gmgn.query_order(order_id)
                 data   = result.get("data") or result
-                status = str(data.get("status") or "").lower()
-                if status in ("filled", "completed", "success", "done"):
+                confirmation = data.get("confirmation") or {}
+                status = str(confirmation.get("state") or data.get("state") or "").lower()
+                if status in ("processed", "confirmed"):
                     return result
-                if status in ("failed", "cancelled", "rejected", "expired"):
-                    logger.error("query_order extended %s status=%s", order_id, status)
+                if status in ("failed", "expired"):
+                    logger.error("query_order extended %s state=%s", order_id, status)
                     return None
             except Exception as e:
                 logger.debug("query_order extended %s: %s", order_id, e)
@@ -354,14 +361,15 @@ class TradeExecutor:
             try:
                 result = self.gmgn.query_order(order_id)
                 data   = result.get("data") or result
-                status = str(data.get("status") or "").lower()
+                confirmation = data.get("confirmation") or {}
+                status = str(confirmation.get("state") or data.get("state") or "").lower()
                 if status != last_status:
-                    logger.info("query_order %s → status='%s' data=%s", order_id[:16], status, data)
+                    logger.info("query_order %s → state='%s' data=%s", order_id[:16], status, data)
                     last_status = status
-                if status in ("filled", "completed", "success", "done"):
+                if status in ("processed", "confirmed"):
                     return result
-                if status in ("failed", "cancelled", "rejected", "expired"):
-                    raise RuntimeError(f"Ordem {order_id} status={status}")
+                if status in ("failed", "expired"):
+                    raise RuntimeError(f"Ordem {order_id} state={status}")
             except RuntimeError:
                 raise
             except Exception as e:
