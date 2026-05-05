@@ -5314,6 +5314,14 @@ def debug_sign_test():
 @app.route("/debug/trade-analysis")
 def debug_trade_analysis():
     """Analisa tokens comprados: o que aconteceu após o bounce signal."""
+    import traceback
+    try:
+        return _debug_trade_analysis_inner()
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
+def _debug_trade_analysis_inner():
     mints = request.args.getlist("mint")
     if not mints:
         # Default: últimos 20 trades no banco
