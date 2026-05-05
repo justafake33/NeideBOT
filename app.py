@@ -5330,7 +5330,7 @@ def debug_trade_analysis():
             mg = cur.fetchone()
 
             cur.execute("""
-                SELECT ts_signal, mc_at_signal, bounce_pct, elapsed_min
+                SELECT ts_signal, mc_at_signal, bounce_pct, elapsed_sec
                 FROM bounce_signals WHERE mint = %s
             """, (mint,))
             bs = cur.fetchone()
@@ -5365,6 +5365,7 @@ def debug_trade_analysis():
 
             rows.append({
                 "mint": mint, "name": name, "mg": mg, "bs": bs, "tr": tr,
+                "entry_mc": entry_mc,
                 "peak_mc": peak_mc, "low_mc": low_mc,
                 "pct_up": pct_up, "pct_dn": pct_dn,
                 "hit_tp": hit_tp, "hit_sl": hit_sl,
@@ -5391,7 +5392,7 @@ def debug_trade_analysis():
 
         html_rows += f"""<tr style="{bg}">
   <td>{r['name']}</td>
-  <td>{fmt(r['bs']['elapsed_min'] if r['bs'] else None)}min</td>
+  <td>{fmt(r['bs']['elapsed_sec'] / 60 if r['bs'] and r['bs']['elapsed_sec'] else None)}min</td>
   <td>{fmt(r['bs']['bounce_pct'] if r['bs'] else None, pct=True)}</td>
   <td>{fmt(r['entry_mc'] if r['bs'] else None, usd=True) if r['bs'] else '—'}</td>
   <td>{fmt(r['peak_mc'], usd=True)}</td>
