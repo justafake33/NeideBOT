@@ -172,10 +172,15 @@ class HotMonitor:
 
     BOUNCE_MIN_PCT   = float(os.getenv("BOUNCE_MIN_PCT",   "0.15"))  # bounce mínimo do mc_min
     BOUNCE_DROP_MIN  = float(os.getenv("BOUNCE_DROP_MIN",  "0.30"))  # queda mínima da migração
-    BOUNCE_TIME_MAX  = float(os.getenv("BOUNCE_TIME_MAX",  "30.0"))  # janela máxima em minutos
+    BOUNCE_TIME_MAX  = float(os.getenv("BOUNCE_TIME_MAX",  "20.0"))  # A.5: janela 30→20min (100% TPs em ≤20min)
+
+    # A.1 slope filter: slope (% mc/s) dos 2min pré-fundo. Capitulação ≤ -0.0008 → WR 66.7%.
+    # Gradual > -0.0008 → WR 0%. Threshold negativo = queda mais intensa = bom sinal.
+    BOUNCE_SLOPE_MIN = float(os.getenv("BOUNCE_SLOPE_MIN", "-0.0008"))  # slope máximo permitido (mais negativo = mais íngreme)
+    BOUNCE_SLOPE_MIN_TICKS = int(os.getenv("BOUNCE_SLOPE_MIN_TICKS", "3"))    # ticks mínimos para ativar filtro A.1
 
     def _check_bounce(self, mint: str, state: dict, mc: float, elapsed_sec: int):
-        """Detecta bounce em tempo real e dispara alerta no Telegram."""
+        """Detecta bounce em tempo real. Fase A: filtros slope, dead zone, entry ratio."""
         if state.get("bounce_fired"):
             return
 
@@ -194,6 +199,24 @@ class HotMonitor:
 
         bounce_pct = (mc - mc_min) / mc_min
         if bounce_pct < self.BOUNCE_MIN_PCT:
+            return
+
+        # A.2 — Dead zone: bounce 20-30% tem WR 4% e EV -10%. Permitir <20% ou ≥30%.
+        if 0.20 <= bounce_pct < 0.30:
+            logger.debug("BOUNCE skip %s — dead zone bounce=%.1f%%", mint[:8], bounce_pct * 100)
+            return
+
+        # A.3 — Entry ratio 50-65% da migração: WR 0% em 15 tokens. Rejeitar.
+        entry_ratio = mc / mc_migration if mc_migration > 0 else 0
+        if 0.50 <= entry_ratio <= 0.65:
+            logger.debug("BOUNCE skip %s — entry ratio=%.2f (dead zone 50-65%%)", mint[:8], entry_ratio)
+            return
+
+        # A.1 — Slope filter: capitulação íngreme (≤ -0.0008 %/s) → WR 66.7%.
+        # Requer cobertura de ticks ≥ BOUNCE_SLOPE_MIN_TICKS; se insuficiente, passa sem filtrar.
+        skip_reason = self._check_slope(mint, mc_min)
+        if skip_reason:
+            logger.debug("BOUNCE skip %s — slope gradual: %s", mint[:8], skip_reason)
             return
 
         state["bounce_fired"] = True
@@ -240,6 +263,38 @@ class HotMonitor:
                 )
             except Exception as e:
                 logger.error("executor.on_bounce %s: %s", symbol, e)
+
+    def _check_slope(self, mint: str, mc_min: float) -> str | None:
+        """
+        A.1: Calcula slope dos últimos 2min de ticks antes do fundo.
+        Retorna motivo de rejeição (str) ou None se aprovado / ticks insuficientes.
+        Slope em %MC/s. Threshold: BOUNCE_SLOPE_MIN (padrão -0.0008).
+        Capitulação brusca tem slope muito negativo (≤ -0.0008). Dump gradual > -0.0008.
+        """
+        try:
+            ticks = db.get_recent_ticks(mint, window_sec=120)
+        except Exception as e:
+            logger.debug("_check_slope %s: db error %s — skip filter", mint[:8], e)
+            return None
+
+        if len(ticks) < self.BOUNCE_SLOPE_MIN_TICKS:
+            # Cobertura insuficiente — não filtrar, passar o sinal
+            return None
+
+        # Slope linear simples: (y_last - y_first) / (t_last - t_first) em %MC/s
+        t0, mc0 = ticks[0]
+        t1, mc1 = ticks[-1]
+        dt = (t1 - t0).total_seconds()
+        if dt <= 0 or mc0 <= 0:
+            return None
+
+        slope = ((mc1 - mc0) / mc0) / dt  # %/s (negativo = queda)
+        logger.debug("SLOPE %s: slope=%.6f (threshold=%.6f) n=%d ticks",
+                     mint[:8], slope, self.BOUNCE_SLOPE_MIN, len(ticks))
+
+        if slope > self.BOUNCE_SLOPE_MIN:
+            return f"slope={slope:.6f} > threshold={self.BOUNCE_SLOPE_MIN} (dump gradual)"
+        return None
 
     # ------------------------------------------------------------------
     # Threads

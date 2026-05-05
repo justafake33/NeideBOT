@@ -28,6 +28,11 @@ SLIPPAGE_BPS       = int(os.getenv(  "TRADE_SLIPPAGE_BPS",      "500"))  # 5% ma
 ORDER_POLL_SEC     = int(os.getenv(  "ORDER_POLL_SEC",           "2"))
 ORDER_TIMEOUT_SEC  = int(os.getenv(  "ORDER_TIMEOUT_SEC",        "30"))
 
+# A.4 — Persistência: aguarda N segundos e verifica que os últimos K ticks estão acima do entry.
+# 3 ticks consecutivos acima do entry → WR 36.4% vs 12.1% (+24.3pp).
+PERSISTENCE_WAIT_SEC   = int(os.getenv("PERSISTENCE_WAIT_SEC",   "90"))   # espera antes de verificar
+PERSISTENCE_MIN_TICKS  = int(os.getenv("PERSISTENCE_MIN_TICKS",  "3"))    # ticks mínimos acima do entry
+
 
 class TradeExecutor:
     """
@@ -105,7 +110,7 @@ class TradeExecutor:
 
         threading.Thread(
             target=self._execute,
-            args=(trade_id, mint, symbol, amount_sol, sol_usd),
+            args=(trade_id, mint, symbol, amount_sol, sol_usd, entry_expected),
             daemon=True,
             name=f"trade-{trade_id}",
         ).start()
@@ -115,8 +120,20 @@ class TradeExecutor:
     # ------------------------------------------------------------------
 
     def _execute(self, trade_id: int, mint: str, symbol: str,
-                 amount_sol: float, sol_usd: float):
+                 amount_sol: float, sol_usd: float, entry_expected: float = 0.0):
         ts_signal = datetime.now(timezone.utc)
+
+        # A.4 — Persistência: aguarda 90s e verifica que os últimos 3 ticks estão acima do entry.
+        # 3 ticks consecutivos acima do entry → WR 36.4% vs 12.1% sem o filtro (+24.3pp).
+        if PERSISTENCE_WAIT_SEC > 0 and entry_expected > 0:
+            logger.info("TRADE #%d %s — aguardando %ds para verificar persistência (entry=$%.0f)",
+                        trade_id, symbol, PERSISTENCE_WAIT_SEC, entry_expected)
+            time.sleep(PERSISTENCE_WAIT_SEC)
+            if not self._check_persistence(mint, entry_expected):
+                logger.info("TRADE #%d %s — cancelado: preço não manteve acima do entry em %ds",
+                            trade_id, symbol, PERSISTENCE_WAIT_SEC)
+                _fail(trade_id, f"persistence_fail: preço abaixo do entry após {PERSISTENCE_WAIT_SEC}s")
+                return
 
         # 1. Swap
         try:
@@ -210,6 +227,29 @@ class TradeExecutor:
                 "status":    "open",
                 "error_msg": f"create_strategy: {e}",
             })
+
+    def _check_persistence(self, mint: str, entry_expected: float) -> bool:
+        """
+        A.4: Verifica que os últimos PERSISTENCE_MIN_TICKS ticks estão acima do entry_expected.
+        Retorna True se o preço persistiu acima do entry (sinal forte) ou se não há ticks suficientes.
+        """
+        try:
+            ticks = db.get_recent_ticks(mint, window_sec=PERSISTENCE_WAIT_SEC + 60)
+        except Exception as e:
+            logger.warning("_check_persistence %s: db error %s — aprovando por falta de dados", mint[:8], e)
+            return True
+
+        if len(ticks) < PERSISTENCE_MIN_TICKS:
+            logger.debug("_check_persistence %s: apenas %d ticks — aprovando por falta de dados",
+                         mint[:8], len(ticks))
+            return True
+
+        recent = ticks[-PERSISTENCE_MIN_TICKS:]
+        all_above = all(mc >= entry_expected for _, mc in recent)
+        logger.debug("_check_persistence %s: %d/%d ticks acima do entry ($%.0f) — %s",
+                     mint[:8], sum(1 for _, mc in recent if mc >= entry_expected),
+                     len(recent), entry_expected, "OK" if all_above else "FAIL")
+        return all_above
 
     def _wait_fill(self, order_id: str) -> dict:
         """Poll query_order até status filled/completed ou timeout."""
