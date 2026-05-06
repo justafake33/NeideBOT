@@ -53,59 +53,8 @@ class TradeExecutor:
                 "TradeExecutor ativo — TP=%.0f%% SL=%.0f%% amount=$%.2f max=%d trades",
                 TRADE_TP_PCT * 100, TRADE_SL_PCT * 100, CALIBRATION_AMOUNT, CALIBRATION_MAX,
             )
-            threading.Thread(target=self._recover_pending, daemon=True, name="trade-recover").start()
         else:
             logger.info("TradeExecutor em modo DRY-RUN (TRADING_ENABLED=false)")
-
-    def _recover_pending(self):
-        """
-        Na inicialização, recupera trades com order_id mas sem strategy_id.
-        Casos: fill_pending, error por timeout, open sem estratégia.
-        Re-tenta criar TP/SL automaticamente.
-        """
-        time.sleep(5)  # aguarda DB e GMGN estarem prontos
-        try:
-            pending = db.get_trades_without_strategy()
-        except Exception as e:
-            logger.error("_recover_pending: db error %s", e)
-            return
-        if not pending:
-            return
-        logger.info("_recover_pending: %d trades sem estratégia — tentando recuperar", len(pending))
-        for trade in pending:
-            trade_id   = trade["id"]
-            order_id   = trade.get("order_id")
-            mint       = trade["mint"]
-            symbol     = trade.get("symbol", mint[:8])
-            amount_sol = trade.get("amount_sol", 0)
-            sol_usd    = trade.get("entry_price_usd") / amount_sol if trade.get("entry_price_usd") and amount_sol else 0
-            if not order_id:
-                continue
-            try:
-                result = self.gmgn.query_order(order_id)
-                data   = result.get("data") or result
-                status = str(data.get("status") or "").lower()
-                logger.info("_recover_pending #%d %s → status='%s'", trade_id, symbol, status)
-                if status not in ("filled", "completed", "success", "done"):
-                    continue
-                tokens_received = _safe_float(data.get("out_amount"))
-                entry_price_sol = _safe_float(trade.get("entry_price_sol"))
-                if not tokens_received or not entry_price_sol:
-                    logger.warning("_recover_pending #%d: tokens ou entry_price ausentes", trade_id)
-                    continue
-                strat_res   = self.gmgn.create_strategy(
-                    token_mint=mint,
-                    tokens_amount=tokens_received,
-                    entry_price_sol=entry_price_sol,
-                    tp_pct=TRADE_TP_PCT,
-                    sl_pct=TRADE_SL_PCT,
-                )
-                strat_data  = strat_res.get("data") or strat_res
-                strategy_id = strat_data.get("strategy_id") or strat_data.get("id")
-                db.update_trade(trade_id, {"strategy_id": strategy_id, "status": "open", "error_msg": None})
-                logger.info("_recover_pending #%d %s — estratégia criada: %s", trade_id, symbol, strategy_id)
-            except Exception as e:
-                logger.error("_recover_pending #%d %s: %s", trade_id, symbol, e)
 
     # ------------------------------------------------------------------
     # Entry point — chamado pelo HotMonitor._check_bounce()
