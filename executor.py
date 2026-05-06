@@ -182,31 +182,35 @@ class TradeExecutor:
                 _fail(trade_id, f"persistence_fail após {PERSISTENCE_WAIT_SEC}s")
                 return
 
-        # 1. Swap
+        # 1. Swap com TP/SL embutidos via condition_orders
+        # GMGN calcula os preços de saída sobre o fill real (price_scale = multiplicador)
+        # Não precisamos do preço do fill — sem erros de "check price less than open price"
         try:
             ts_sent  = datetime.now(timezone.utc)
             swap_res = self.gmgn.swap(
                 token_mint=mint,
                 amount_sol=amount_sol,
                 slippage_bps=SLIPPAGE_BPS,
+                tp_pct=TRADE_TP_PCT,
+                sl_pct=TRADE_SL_PCT,
             )
             data     = swap_res.get("data") or swap_res
             order_id = data.get("order_id") or data.get("id")
-            db.update_trade(trade_id, {"ts_order_sent": ts_sent, "order_id": order_id, "status": "open"})
-            logger.info("Swap #%d %s — order_id=%s", trade_id, symbol, order_id)
+            db.update_trade(trade_id, {
+                "ts_order_sent": ts_sent,
+                "order_id":      order_id,
+                "strategy_id":   f"embedded:TP+{TRADE_TP_PCT*100:.0f}%|SL-{TRADE_SL_PCT*100:.0f}%",
+                "status":        "open",
+            })
+            logger.info("Swap+TP/SL #%d %s — order_id=%s (TP+%.0f%% SL-%.0f%% embutidos)",
+                        trade_id, symbol, order_id, TRADE_TP_PCT * 100, TRADE_SL_PCT * 100)
         except Exception as e:
             logger.error("Swap #%d %s falhou: %s", trade_id, symbol, e)
             _fail(trade_id, str(e))
             return
 
-        # 2. Poll fill — Solana confirma em ~5s, tentamos por FILL_TIMEOUT_SEC
-        FILL_TIMEOUT_SEC = int(os.getenv("FILL_TIMEOUT_SEC", "20"))
-        tokens_received  = None
-        entry_price_sol  = None
-        fill_sol         = amount_sol
-        fee_sol          = None
-        slippage_pct     = None
-
+        # 2. Poll fill em background — só para registrar dados reais no DB
+        FILL_TIMEOUT_SEC = int(os.getenv("FILL_TIMEOUT_SEC", "30"))
         deadline = time.time() + FILL_TIMEOUT_SEC
         while time.time() < deadline:
             try:
@@ -214,74 +218,30 @@ class TradeExecutor:
                 qd    = qr.get("data") or qr
                 conf  = qd.get("confirmation") or {}
                 state = str(conf.get("state") or "").lower()
-
                 if state in ("failed", "expired"):
-                    _fail(trade_id, f"swap on-chain: {state}")
+                    db.update_trade(trade_id, {"error_msg": f"swap on-chain: {state}"})
                     return
-
                 out_raw = _safe_float(qd.get("filled_output_amount"))
                 if out_raw and out_raw > 0:
-                    tokens_received = out_raw
-                    in_raw  = _safe_float(qd.get("filled_input_amount"))
-                    if in_raw:
-                        fill_sol = in_raw / 1e9 if in_raw > 1000 else in_raw
-                        slippage_pct = (fill_sol - amount_sol) / amount_sol
-                    fee_raw = _safe_float(qd.get("fee"))
-                    if fee_raw:
-                        fee_sol = fee_raw / 1e9 if fee_raw > 1000 else fee_raw
-                    entry_price_sol = fill_sol / tokens_received
-                    logger.info("Fill #%d %s — %.0f tokens @ %.10f SOL (slippage=%s)",
-                                trade_id, symbol, tokens_received, entry_price_sol,
-                                f"{slippage_pct*100:.2f}%" if slippage_pct else "n/a")
-                    break
+                    in_raw   = _safe_float(qd.get("filled_input_amount"))
+                    fill_sol = (in_raw / 1e9 if in_raw and in_raw > 1000 else in_raw) or amount_sol
+                    fee_raw  = _safe_float(qd.get("fee"))
+                    fee_sol  = (fee_raw / 1e9 if fee_raw and fee_raw > 1000 else fee_raw)
+                    db.update_trade(trade_id, {
+                        "ts_order_confirmed": datetime.now(timezone.utc),
+                        "tokens_received":    out_raw,
+                        "entry_price_sol":    fill_sol / out_raw,
+                        "entry_price_usd":    fill_sol * sol_usd,
+                        "fee_sol":            fee_sol,
+                        "latency_sec":        (datetime.now(timezone.utc) - ts_signal).total_seconds(),
+                        "slippage_pct":       (fill_sol - amount_sol) / amount_sol,
+                    })
+                    logger.info("Fill #%d %s — %.0f tokens @ %.10f SOL",
+                                trade_id, symbol, out_raw, fill_sol / out_raw)
+                    return
             except Exception as e:
                 logger.debug("poll fill #%d: %s", trade_id, e)
-            time.sleep(1)  # Solana é rápido — 1s é suficiente
-
-        ts_confirmed = datetime.now(timezone.utc)
-        latency_sec  = (ts_confirmed - ts_signal).total_seconds()
-
-        if not tokens_received or not entry_price_sol:
-            logger.error("Fill #%d %s — sem dados após %ds, TP/SL impossíveis com preço correto",
-                         trade_id, symbol, FILL_TIMEOUT_SEC)
-            db.update_trade(trade_id, {
-                "ts_order_confirmed": ts_confirmed,
-                "latency_sec":        latency_sec,
-                "status":             "open",
-                "error_msg":          f"fill timeout {FILL_TIMEOUT_SEC}s — strategy pendente",
-            })
-            return
-
-        db.update_trade(trade_id, {
-            "ts_order_confirmed": ts_confirmed,
-            "tokens_received":    tokens_received,
-            "entry_price_sol":    entry_price_sol,
-            "entry_price_usd":    fill_sol * sol_usd,
-            "fee_sol":            fee_sol,
-            "latency_sec":        latency_sec,
-            "slippage_pct":       slippage_pct,
-            "status":             "strategy_pending",
-        })
-
-        # 3. Cria TP/SL com preço REAL do fill
-        try:
-            strat_res = self.gmgn.create_strategy(
-                token_mint=mint,
-                tokens_amount=tokens_received,
-                entry_price_sol=entry_price_sol,
-                tp_pct=TRADE_TP_PCT,
-                sl_pct=TRADE_SL_PCT,
-            )
-            tp_id = strat_res.get("tp", {}).get("order_id")
-            sl_id = strat_res.get("sl", {}).get("order_id")
-            strategy_id = f"tp:{tp_id}|sl:{sl_id}"
-            db.update_trade(trade_id, {"strategy_id": strategy_id, "status": "open", "error_msg": None})
-            logger.info("Estratégia #%d %s — TP=%s SL=%s (TP=+%.0f%% SL=-%.0f%%) @ %.10f SOL",
-                        trade_id, symbol, tp_id, sl_id,
-                        TRADE_TP_PCT * 100, TRADE_SL_PCT * 100, entry_price_sol)
-        except Exception as e:
-            logger.error("create_strategy #%d %s: %s", trade_id, symbol, e)
-            db.update_trade(trade_id, {"status": "open", "error_msg": f"create_strategy: {e}"})
+            time.sleep(1)
 
     def _check_persistence(self, mint: str, entry_expected: float, ts_signal) -> bool:
         """
