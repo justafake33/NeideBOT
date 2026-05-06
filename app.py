@@ -5508,7 +5508,7 @@ Delta: <b style="color:{color}">{delta:+.1f}pp</b> {"✅ H9 CONFIRMADA" if delta
 <td>{r['token_nome'] or r['mint'][:8]}</td>
 <td>{r['n_sinais']}</td>
 <td>${float(r['min_trigger_mc']):,.0f}</td>
-<td>${float(r['mc_migration']):,.0f}" if r['mc_migration'] else '<td>—'}</td>
+<td>{'$' + f"{float(r['mc_migration']):,.0f}" if r['mc_migration'] else '—'}</td>
 <td>{'✅' if r['recovery'] else '❌' if r['recovery'] is not None else '—'}</td>
 </tr>""" for r in top_tokens)
 
