@@ -270,15 +270,15 @@ class GmgnClient:
 
     def swap(self, token_mint: str, amount_sol: float,
              slippage_bps: int = 500,
+             tp_pct: float | None = None,
+             sl_pct: float | None = None,
              chain: str = "sol") -> dict:
         """
-        POST /v1/trade/swap — compra token com SOL (input_token=SOL, output_token=mint).
-        amount_sol:   quantidade em SOL (ex: 0.005 ≈ $1 a $200/SOL).
-        slippage_bps: slippage máximo em basis points (500 = 5%).
-
-        Campos corretos conforme OpenApiClient.ts SwapParams:
-          from_address, input_token (SOL), output_token (mint), input_amount (lamports).
-        Priority fee e tip NÃO enviados — GMGN gerencia internamente.
+        POST /v1/trade/swap — compra token com SOL.
+        condition_orders embutidos: TP e SL calculados pelo GMGN sobre o fill real.
+          price_scale = multiplicador do fill price (1.75 = +75%, 0.85 = -15%)
+          sell_ratio  = "1" = 100% da posição
+          order_type  = "profit_stop" | "loss_stop"
         """
         lamports = int(round(amount_sol * 1_000_000_000))
         body = {
@@ -289,6 +289,23 @@ class GmgnClient:
             "input_amount": str(lamports),
             "slippage":     slippage_bps,
         }
+        condition_orders = []
+        if tp_pct is not None:
+            condition_orders.append({
+                "order_type":  "profit_stop",
+                "side":        "sell",
+                "price_scale": str(1 + tp_pct),
+                "sell_ratio":  "1",
+            })
+        if sl_pct is not None:
+            condition_orders.append({
+                "order_type":  "loss_stop",
+                "side":        "sell",
+                "price_scale": str(1 - sl_pct),
+                "sell_ratio":  "1",
+            })
+        if condition_orders:
+            body["condition_orders"] = condition_orders
         return self._post_trade("/v1/trade/swap", body)
 
     def create_strategy(self, token_mint: str, tokens_amount: float,
