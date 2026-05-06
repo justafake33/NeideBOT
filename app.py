@@ -5429,5 +5429,120 @@ def _debug_trade_analysis_inner():
 </body></html>"""
 
 
+@app.route("/analise/h9")
+def analise_h9():
+    """H9 — Validação: tokens com signal type 12 perto do fundo têm recovery maior?"""
+    with db._cursor() as cur:
+        # Resumo geral
+        cur.execute("""
+            SELECT COUNT(*)              AS total_sinais,
+                   COUNT(DISTINCT mint)  AS tokens_unicos,
+                   MIN(ts_recorded)      AS primeiro,
+                   MAX(ts_recorded)      AS ultimo
+            FROM token_signals
+        """)
+        summ = dict(cur.fetchone())
+
+        # Sinais por dia
+        cur.execute("""
+            SELECT DATE(ts_recorded) AS dia, COUNT(*) AS n
+            FROM token_signals
+            GROUP BY 1 ORDER BY 1 DESC LIMIT 14
+        """)
+        por_dia = cur.fetchall()
+
+        # H9: tokens com sinal próximo ao fundo (trigger_mc < mc_migration * 1.20)
+        # vs tokens sem sinal — quem tem mais recovery?
+        cur.execute("""
+            SELECT
+                has_signal,
+                COUNT(*)                                    AS n,
+                ROUND(AVG(recovery::int) * 100, 1)          AS recovery_rate,
+                COUNT(*) FILTER (WHERE recovery = true)     AS n_recovery
+            FROM (
+                SELECT m.mint, m.recovery,
+                       EXISTS (
+                           SELECT 1 FROM token_signals ts
+                           WHERE ts.mint = m.mint
+                             AND ts.trigger_mc < m.mc_migration * 1.20
+                       ) AS has_signal
+                FROM migrations m
+                WHERE m.recovery IS NOT NULL
+                  AND m.mc_migration > 0
+            ) sub
+            GROUP BY has_signal
+        """)
+        h9_rows = cur.fetchall()
+
+        # Top tokens por quantidade de sinais
+        cur.execute("""
+            SELECT ts.mint, m.token_nome, COUNT(*) AS n_sinais,
+                   MIN(ts.trigger_mc) AS min_trigger_mc,
+                   m.mc_migration, m.recovery
+            FROM token_signals ts
+            LEFT JOIN migrations m ON m.mint = ts.mint
+            GROUP BY ts.mint, m.token_nome, m.mc_migration, m.recovery
+            ORDER BY n_sinais DESC LIMIT 20
+        """)
+        top_tokens = cur.fetchall()
+
+    def _dt(v): return v.strftime("%Y-%m-%d %H:%M") if v else "—"
+
+    # H9 summary
+    h9_html = ""
+    with_sig = next((r for r in h9_rows if r["has_signal"]), None)
+    without_sig = next((r for r in h9_rows if not r["has_signal"]), None)
+    if with_sig and without_sig:
+        delta = float(with_sig["recovery_rate"] or 0) - float(without_sig["recovery_rate"] or 0)
+        color = "#4f4" if delta >= 10 else "#fa0" if delta >= 5 else "#f44"
+        h9_html = f"""
+<div style="background:#1a2a1a;padding:16px;border-radius:6px;margin:16px 0">
+<b>H9 — Com sinal type 12 (trigger &lt; mc_mig×1.20):</b><br>
+✅ Com sinal: <b>{with_sig['recovery_rate']}%</b> recovery rate (n={with_sig['n']})<br>
+❌ Sem sinal: <b>{without_sig['recovery_rate']}%</b> recovery rate (n={without_sig['n']})<br>
+Delta: <b style="color:{color}">{delta:+.1f}pp</b> {"✅ H9 CONFIRMADA" if delta >= 20 else "⏳ acumulando dados (meta: ≥20pp)"}
+</div>"""
+
+    dias_html = "".join(f"<tr><td>{r['dia']}</td><td>{r['n']}</td></tr>" for r in por_dia)
+    top_html  = "".join(f"""<tr>
+<td>{r['token_nome'] or r['mint'][:8]}</td>
+<td>{r['n_sinais']}</td>
+<td>${float(r['min_trigger_mc']):,.0f}</td>
+<td>${float(r['mc_migration']):,.0f}" if r['mc_migration'] else '<td>—'}</td>
+<td>{'✅' if r['recovery'] else '❌' if r['recovery'] is not None else '—'}</td>
+</tr>""" for r in top_tokens)
+
+    return f"""<!DOCTYPE html><html><body style="background:#111;color:#eee;font-family:monospace;padding:20px">
+<h2>Análise H9 — Smart Money Type 12</h2>
+<div style="display:flex;gap:20px;flex-wrap:wrap;margin:16px 0">
+  <div style="background:#222;padding:16px;border-radius:6px">
+    <div style="color:#888;font-size:12px">Total sinais</div>
+    <div style="font-size:28px;font-weight:bold">{summ['total_sinais']}</div>
+  </div>
+  <div style="background:#222;padding:16px;border-radius:6px">
+    <div style="color:#888;font-size:12px">Tokens únicos</div>
+    <div style="font-size:28px;font-weight:bold">{summ['tokens_unicos']}</div>
+  </div>
+  <div style="background:#222;padding:16px;border-radius:6px">
+    <div style="color:#888;font-size:12px">Primeiro sinal</div>
+    <div style="font-size:16px">{_dt(summ['primeiro'])}</div>
+  </div>
+  <div style="background:#222;padding:16px;border-radius:6px">
+    <div style="color:#888;font-size:12px">Último sinal</div>
+    <div style="font-size:16px">{_dt(summ['ultimo'])}</div>
+  </div>
+</div>
+{h9_html}
+<h3>Sinais por dia</h3>
+<table border=1 cellpadding=6 style="border-collapse:collapse;font-size:13px">
+<tr style="background:#222"><th>Dia</th><th>Sinais</th></tr>{dias_html}</table>
+<h3>Top 20 tokens com mais sinais</h3>
+<table border=1 cellpadding=6 style="border-collapse:collapse;font-size:13px">
+<tr style="background:#222"><th>Token</th><th>Sinais</th><th>Min trigger MC</th><th>MC migração</th><th>Recovery</th></tr>
+{top_html}</table>
+<p style="color:#888;font-size:12px">Meta H9: delta ≥ 20pp. Confirmada = smart money comprando perto do fundo prediz recovery.</p>
+</body></html>"""
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
