@@ -294,15 +294,15 @@ class GmgnClient:
             condition_orders.append({
                 "order_type":  "profit_stop",
                 "side":        "sell",
-                "price_scale": str(1 + tp_pct),
-                "sell_ratio":  "1",
+                "price_scale": str(round(tp_pct * 100, 2)),  # 75 = +75%
+                "sell_ratio":  "100",                         # 100% da posição
             })
         if sl_pct is not None:
             condition_orders.append({
                 "order_type":  "loss_stop",
                 "side":        "sell",
-                "price_scale": str(1 - sl_pct),
-                "sell_ratio":  "1",
+                "price_scale": str(round(sl_pct * 100, 2)),  # 15 = -15%
+                "sell_ratio":  "100",
             })
         if condition_orders:
             body["condition_orders"] = condition_orders
