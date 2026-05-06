@@ -306,6 +306,8 @@ class GmgnClient:
             })
         if condition_orders:
             body["condition_orders"] = condition_orders
+            body["priority_fee"] = os.getenv("STRATEGY_PRIORITY_FEE", "0.0001")
+            body["tip_fee"]      = os.getenv("STRATEGY_TIP_FEE",      "0.0001")
         return self._post_trade("/v1/trade/swap", body)
 
     def create_strategy(self, token_mint: str, tokens_amount: float,
