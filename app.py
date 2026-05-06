@@ -5451,33 +5451,50 @@ def analise_h9():
         """)
         por_dia = cur.fetchall()
 
-        # H9: tokens com sinal próximo ao fundo (trigger_mc < mc_migration * 1.20)
-        # vs tokens sem sinal — quem tem mais recovery?
+        # H9 — breakdown por threshold de proximidade ao fundo
+        # trigger_ratio = trigger_mc / mc_migration: quanto menor, mais perto (ou abaixo) da migração
         cur.execute("""
+            WITH token_min_ratio AS (
+                SELECT m.mint, m.recovery,
+                       MIN(ts.trigger_mc / NULLIF(m.mc_migration, 0)) AS min_ratio
+                FROM migrations m
+                JOIN token_signals ts ON ts.mint = m.mint
+                WHERE m.recovery IS NOT NULL AND m.mc_migration > 0
+                GROUP BY m.mint, m.recovery
+            )
             SELECT
-                has_signal,
+                CASE
+                    WHEN min_ratio < 0.50 THEN '< 50% migração (deep bottom)'
+                    WHEN min_ratio < 0.80 THEN '50-80% migração'
+                    WHEN min_ratio < 1.00 THEN '80-100% migração'
+                    WHEN min_ratio < 1.20 THEN '100-120% migração'
+                    ELSE '> 120% migração (acima)'
+                END AS faixa,
+                MIN(min_ratio)                              AS ratio_min,
                 COUNT(*)                                    AS n,
                 ROUND(AVG(recovery::int) * 100, 1)          AS recovery_rate,
                 COUNT(*) FILTER (WHERE recovery = true)     AS n_recovery
-            FROM (
-                SELECT m.mint, m.recovery,
-                       EXISTS (
-                           SELECT 1 FROM token_signals ts
-                           WHERE ts.mint = m.mint
-                             AND ts.trigger_mc < m.mc_migration * 1.20
-                       ) AS has_signal
-                FROM migrations m
-                WHERE m.recovery IS NOT NULL
-                  AND m.mc_migration > 0
-            ) sub
-            GROUP BY has_signal
+            FROM token_min_ratio
+            GROUP BY 1, 2 ORDER BY 2
         """)
-        h9_rows = cur.fetchall()
+        h9_threshold = cur.fetchall()
+
+        # H9 baseline: tokens sem nenhum sinal
+        cur.execute("""
+            SELECT COUNT(*) AS n,
+                   ROUND(AVG(recovery::int) * 100, 1) AS recovery_rate
+            FROM migrations m
+            WHERE m.recovery IS NOT NULL
+              AND m.mc_migration > 0
+              AND NOT EXISTS (SELECT 1 FROM token_signals ts WHERE ts.mint = m.mint)
+        """)
+        h9_baseline = dict(cur.fetchone())
 
         # Top tokens por quantidade de sinais
         cur.execute("""
             SELECT ts.mint, m.token_nome, COUNT(*) AS n_sinais,
                    MIN(ts.trigger_mc) AS min_trigger_mc,
+                   MIN(ts.trigger_mc / NULLIF(m.mc_migration,0)) AS min_ratio,
                    m.mc_migration, m.recovery
             FROM token_signals ts
             LEFT JOIN migrations m ON m.mint = ts.mint
@@ -5488,19 +5505,34 @@ def analise_h9():
 
     def _dt(v): return v.strftime("%Y-%m-%d %H:%M") if v else "—"
 
-    # H9 summary
-    h9_html = ""
-    with_sig = next((r for r in h9_rows if r["has_signal"]), None)
-    without_sig = next((r for r in h9_rows if not r["has_signal"]), None)
-    if with_sig and without_sig:
-        delta = float(with_sig["recovery_rate"] or 0) - float(without_sig["recovery_rate"] or 0)
-        color = "#4f4" if delta >= 10 else "#fa0" if delta >= 5 else "#f44"
-        h9_html = f"""
+    # H9 threshold breakdown table
+    base_rr  = float(h9_baseline["recovery_rate"] or 0)
+    base_n   = h9_baseline["n"]
+    thresh_rows = ""
+    for r in h9_threshold:
+        rr    = float(r["recovery_rate"] or 0)
+        delta = rr - base_rr
+        col   = "#4f4" if delta >= 10 else "#fa0" if delta >= 0 else "#f44"
+        thresh_rows += (
+            f"<tr><td>{r['faixa']}</td><td>{r['n']}</td>"
+            f"<td>{rr}%</td>"
+            f"<td style='color:{col}'>{delta:+.1f}pp</td>"
+            f"<td>{r['n_recovery']}</td></tr>"
+        )
+    thresh_rows += (
+        f"<tr style='background:#1a1a2a'><td><b>Sem sinal (baseline)</b></td>"
+        f"<td>{base_n}</td><td>{base_rr}%</td><td>—</td><td>—</td></tr>"
+    )
+
+    h9_html = f"""
 <div style="background:#1a2a1a;padding:16px;border-radius:6px;margin:16px 0">
-<b>H9 — Com sinal type 12 (trigger &lt; mc_mig×1.20):</b><br>
-✅ Com sinal: <b>{with_sig['recovery_rate']}%</b> recovery rate (n={with_sig['n']})<br>
-❌ Sem sinal: <b>{without_sig['recovery_rate']}%</b> recovery rate (n={without_sig['n']})<br>
-Delta: <b style="color:{color}">{delta:+.1f}pp</b> {"✅ H9 CONFIRMADA" if delta >= 20 else "⏳ acumulando dados (meta: ≥20pp)"}
+<b>H9 — Recovery rate por proximidade do sinal ao fundo</b><br>
+<small style="color:#888">trigger_ratio = trigger_mc / mc_migration. Quanto menor, mais perto (ou abaixo) da migração.</small><br><br>
+<table border=1 cellpadding=6 style="border-collapse:collapse;font-size:13px">
+<tr style="background:#222"><th>Faixa</th><th>n tokens</th><th>Recovery rate</th><th>Delta vs baseline</th><th>n recovery</th></tr>
+{thresh_rows}
+</table>
+<br><small style="color:#888">Meta H9: delta ≥ 20pp. Faixa com sinal abaixo de 80% da migração = smart money comprando no dump.</small>
 </div>"""
 
     dias_html = "".join(f"<tr><td>{r['dia']}</td><td>{r['n']}</td></tr>" for r in por_dia)
@@ -5509,6 +5541,7 @@ Delta: <b style="color:{color}">{delta:+.1f}pp</b> {"✅ H9 CONFIRMADA" if delta
 <td>{r['n_sinais']}</td>
 <td>${float(r['min_trigger_mc']):,.0f}</td>
 <td>{'$' + f"{float(r['mc_migration']):,.0f}" if r['mc_migration'] else '—'}</td>
+<td>{'%.2f×' % float(r['min_ratio']) if r['min_ratio'] else '—'}</td>
 <td>{'✅' if r['recovery'] else '❌' if r['recovery'] is not None else '—'}</td>
 </tr>""" for r in top_tokens)
 
@@ -5538,9 +5571,9 @@ Delta: <b style="color:{color}">{delta:+.1f}pp</b> {"✅ H9 CONFIRMADA" if delta
 <tr style="background:#222"><th>Dia</th><th>Sinais</th></tr>{dias_html}</table>
 <h3>Top 20 tokens com mais sinais</h3>
 <table border=1 cellpadding=6 style="border-collapse:collapse;font-size:13px">
-<tr style="background:#222"><th>Token</th><th>Sinais</th><th>Min trigger MC</th><th>MC migração</th><th>Recovery</th></tr>
+<tr style="background:#222"><th>Token</th><th>Sinais</th><th>Min trigger MC</th><th>MC migração</th><th>Min ratio</th><th>Recovery</th></tr>
 {top_html}</table>
-<p style="color:#888;font-size:12px">Meta H9: delta ≥ 20pp. Confirmada = smart money comprando perto do fundo prediz recovery.</p>
+<p style="color:#888;font-size:12px">Min ratio = trigger_mc mais baixo / mc_migration. &lt;1.0 = sinal abaixo da migração (fundo real). &gt;1.0 = sinal acima da migração (momentum).</p>
 </body></html>"""
 
 
