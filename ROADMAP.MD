@@ -16,7 +16,7 @@
 | **B** | **Cobertura de Ticks** | ✅ **ATIVO** — impacto esperado nos próximos bounces |
 | 6-lite | Execução $1 calibração | 🟡 **20/50 trades** — WR 25% (5 TP, 15 SL) |
 | C | Flow Continuation Score | ⏳ Depende de cobertura de ticks (Fase B maturando) |
-| D | Smart Netflow Live (H9) | ⏳ +3.8pp (n=98) — acumulando |
+| D | Smart Netflow Live (H9) | ⏳ +11.8pp faixa <50% mig. (n=14) — reverse causality identificada em >120% |
 | E | Score composto modular | ⏳ Após C+D validados individualmente |
 
 ---
@@ -121,7 +121,20 @@ Dobra frequência de coleta kline. Impacto < 15% do rate limit mesmo com 10 toke
 - `trigger_mc < mc_min * 1.20` → smart wallet comprou perto do fundo → bullish
 - Múltiplos triggers na janela → acumulação real
 
-**Status:** token_signals coletados a cada 5s. H9 pendente de volume de dados.
+**Status:** 119 sinais acumulados (97 tokens únicos, 4 dias).
+
+**Resultado parcial (2026-05-06):**
+| Faixa trigger_mc/mc_migration | n | Recovery rate | Delta | Interpretação |
+|-------------------------------|---|---------------|-------|---------------|
+| < 50% migração | 14 | 35.7% | **+11.8pp** | ✅ Sinal genuíno — smart money no dump |
+| 50-80% migração | 23 | 30.4% | +6.5pp | ⏳ Fraco — aguardar mais dados |
+| 80-100% migração | 18 | 22.2% | -1.7pp | ❌ Negativo — zona de armadilha |
+| > 120% migração | 25 | 56.0% | +32.1pp | ⚠️ **Reverse causality** — token já fez bounce quando sinal chega |
+| Baseline (sem sinal) | 1190 | 23.9% | — | — |
+
+**⚠️ Reverse causality em `>120%`:** token que atingiu 120% do mc_migration já fez o bounce → recovery=TRUE é esperado. Não é predição, é consequência. GME (4.83×), SueaAuan (2.01×): smart money comprou no pico, não no fundo.
+
+**H9 reformulada:** threshold correto é `trigger_mc < mc_migration × 0.80`. Exclui momentum buyers pós-recovery. Aguardar n≥30 na faixa `<50%` antes de implementar como filtro.
 
 ---
 

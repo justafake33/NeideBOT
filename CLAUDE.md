@@ -589,7 +589,7 @@ PERSISTENCE_MIN_TICKS=3      # A.4: ticks pós-sinal acima do entry para confirm
 58. **Global rate limit gate `_global_ban_until`** em `gmgn_client.py`: variável module-level compartilhada por todas as threads. Qualquer 429 em qualquer endpoint chama `_set_global_ban(reset_at)` → todas as threads bloqueiam em `_wait_global_ban()` até o ban expirar. Sem isso, threads concorrentes do HotMonitor continuam chamando API durante o ban do scanner, estendendo o ban de 73s para 127s+.
 59. **`_recover_pending()` no startup do executor**: chamado quando `TRADING_ENABLED=true` na inicialização. Busca trades com `order_id IS NOT NULL AND strategy_id IS NULL` (swap executado mas TP/SL não criado). Para cada um, chama `create_strategy()` automaticamente. Garante que trades que perderam o TP/SL por crash/timeout não ficam expostos sem proteção.
 60. **WR live confirmado 25% em primeiros 20 trades** (2026-05-06): 5 TP hits, 15 SL hits = 25% WR. EV bruto = 5×75% − 15×15% = +3.75% por trade. Próximo a estimativa de 29%. 6 dos 15 SLs tiveram 0% de upside pós-entrada (dead-cat bounce que A.4 deveria bloquear). Confirmar com mais dados se A.4 está filtrando corretamente.
-61. **H9 dados iniciais** (2026-05-06, n=98 sinais, 83 tokens únicos, 3 dias): delta geral = +3.8pp (28.3% vs 24.5%). Fraco — threshold de 1.20 muito largo, captura momentum buyers acima da migração. Breakdown por faixa de `trigger_mc/mc_migration` é mais revelador: sinais em `< 80% de mc_migration` (smart money comprando no dump real) devem ter delta maior. Dashboard em `/analise/h9`.
+61. **H9 dados iniciais** (2026-05-06, n=119 sinais, 97 tokens únicos, 4 dias): Breakdown por faixa de `trigger_mc/mc_migration` revela reverse causality crítica. Faixa `>120% migração` tem delta +32.1pp (56% recovery, n=25) MAS é consequência, não predição — token que atingiu 120% do MC de migração JÁ fez o bounce, logo recovery=TRUE é esperado. Faixas genuinamente preditivas (sinal chega durante o dump): `<50% migração` (+11.8pp, n=14) e `50-80%` (+6.5pp, n=23). Faixa `80-100%` é negativa (-1.7pp). H9 reformulada: threshold correto é `trigger_mc < mc_migration × 0.80` — exclui momentum buyers e reverse causality. Aguardar n≥30 na faixa `<50%` para validação. Dashboard em `/analise/h9`.
 62. **`/debug/trade-analysis`**: endpoint para análise post-mortem de trades. Mostra para cada trade: elapsed_sec, bounce_pct, entry_mc, peak_mc, low_mc e se atingiu TP (+75%) ou SL (-15%). Usa token_ticks após ts_signal. Sem ticks = sem dados pós-entrada.
 63. **⚠️ PENDENTE — TP/SL verificar funcionamento**: confirmar após próximo trade que create_strategy está criando ordens na GMGN e que `strategy_id` é salvo corretamente no banco. Se `strategy_id` for NULL após trade com `order_id` preenchido, chamar `/debug/sign-test` e verificar logs da thread `trade-{id}`.
 
@@ -613,7 +613,7 @@ PERSISTENCE_MIN_TICKS=3      # A.4: ticks pós-sinal acima do entry para confirm
 | Fase 6 | Latência detecção → ordem | ≤15s | ⏳ |
 | Fase 6 | Divergência real vs backtest | ≤30% após 50 trades | ⏳ |
 | Fase 6 | Max drawdown | ≤40% do capital alocado | ⏳ |
-| H9 | Validação smart money signal | delta_pp ≥ 20pp | 🟡 +3.8pp (n=98 sinais, 3 dias) — acumulando |
+| H9 | Validação smart money signal | delta_pp ≥ 20pp | 🟡 +11.8pp na faixa <50% (n=14) — reverse causality em >120%. Threshold correto: <80% migração |
 
 ---
 
