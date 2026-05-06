@@ -5475,7 +5475,7 @@ def analise_h9():
                 ROUND(AVG(recovery::int) * 100, 1)          AS recovery_rate,
                 COUNT(*) FILTER (WHERE recovery = true)     AS n_recovery
             FROM token_min_ratio
-            GROUP BY 1, 2 ORDER BY 2
+            GROUP BY 1 ORDER BY MIN(min_ratio)
         """)
         h9_threshold = cur.fetchall()
 

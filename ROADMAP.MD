@@ -1,7 +1,7 @@
 # NeideBOT — ROADMAP
 
 > **Regra:** Não avance para o próximo passo sem validar o anterior com dados reais.
-> **Data:** 2026-05-05 (atualizado — Fase 6-lite desbloqueada)
+> **Data:** 2026-05-06 (atualizado — 20 trades executados, bugs críticos de execução corrigidos)
 
 ---
 
@@ -11,22 +11,28 @@
 |------|------|--------|
 | 0 | Blindagem (Sentry, logs) | ✅ Completo |
 | 1 | Intelligence Layer (campos Fase 1) | ✅ Completo |
-| 2 | Flow Engine (token_signals type 12) | ✅ Ativo — acumulando |
+| 2 | Flow Engine (token_signals type 12) | ✅ Ativo — 98 sinais acumulados |
 | **A** | **Bounce Detector v2** | ✅ **ATIVO** — aguardando 30+ bounces filtrados |
 | **B** | **Cobertura de Ticks** | ✅ **ATIVO** — impacto esperado nos próximos bounces |
-| 6-lite | Execução $1 calibração | 🟡 **ATIVO** — aguardando primeiro trade |
+| 6-lite | Execução $1 calibração | 🟡 **20/50 trades** — WR 25% (5 TP, 15 SL) |
 | C | Flow Continuation Score | ⏳ Depende de cobertura de ticks (Fase B maturando) |
-| D | Smart Netflow Live (H9) | ⏳ Depende de token_signals acumulados |
+| D | Smart Netflow Live (H9) | ⏳ +3.8pp (n=98) — acumulando |
 | E | Score composto modular | ⏳ Após C+D validados individualmente |
 
 ---
 
-## ✅ BLOQUEIO RESOLVIDO — Signature GMGN
+## ✅ BLOQUEIO RESOLVIDO — Signature GMGN (2026-05-05/06)
 
-**Causa raiz:** `_load_ed25519_key` tentava Base64 antes de Base58. String Base58 de 88 chars (Phantom export) é decodificável por Base64, gerando seed errado → wallet errada → assinatura inválida.
-**Fix:** Base58 movido antes do Base64 + validação de comprimento (32 ou 64 bytes).
+**Causa raiz 1:** `_load_ed25519_key` tentava Base64 antes de Base58. String Base58 de 88 chars (Phantom export) é decodificável por Base64, gerando seed errado → wallet errada → assinatura inválida.
+**Fix 1:** Base58 movido antes do Base64 + validação de comprimento (32 ou 64 bytes).
+
+**Causa raiz 2:** `GMGN_PRIVATE_KEY` era a private key da wallet Solana (Base58). GMGN exige chave PEM Ed25519 separada emitida pela própria GMGN — disponível no painel da conta.
+**Fix 2:** Usuário obteve a PEM key correta do painel GMGN.
+
 **IP:** Railway IP cadastrado na whitelist GMGN.
 **Keypair:** `DJVwyki5hTqMSLVaSyS9MXo5pGVbx4qEowV3BDtqvEgy` ✅ CORRESPONDE.
+
+> ⚠️ **IP muda a cada redeploy Railway.** Usuário atualiza manualmente após cada deploy. Solução permanente: Railway Static Outbound IP (~$3/mês).
 
 > ⚠️ **IP muda a cada redeploy Railway.** Solução permanente: Railway Static Outbound IP (~$3/mês). Necessário antes de escalar.
 
@@ -187,17 +193,45 @@ Solução: Railway Static Outbound IP (~$3/mês) — necessário antes de escala
 
 ---
 
-## KPIs atualizados (2026-05-05)
+## ✅ BUGS CRÍTICOS CORRIGIDOS — Execução (2026-05-06)
+
+### create_strategy — reescrita completa
+**Problema:** 4 bugs impediam a criação de TP/SL. `order_type` errado, `sub_order_type` ausente, `condition_orders` inválido, `priority_fee`/`tip_fee` ausentes.
+**Fix:** duas chamadas separadas (`take_profit` + `stop_loss`), baseadas no repositório oficial GMGN. `strategy_id = "tp:{tp_id}|sl:{sl_id}"`.
+
+### _wait_fill — campos errados
+**Problema:** bot checava `data.get("status")` e `out_amount`/`in_amount` que não existem.
+**Fix:** status em `confirmation.state` ("processed"/"confirmed"). Amounts: `filled_output_amount`/`filled_input_amount`.
+
+### Rate limit global
+**Problema:** threads concorrentes do HotMonitor chamavam API durante ban do scanner → ban de 73s virava 127s+.
+**Fix:** `_global_ban_until` module-level em `gmgn_client.py` — todas as threads bloqueiam no mesmo gate.
+
+### _recover_pending no startup
+**Fix:** ao iniciar com `TRADING_ENABLED=true`, busca trades com `order_id` mas sem `strategy_id` e cria TP/SL automaticamente.
+
+---
+
+## ⚠️ PENDENTE — Validar TP/SL no próximo trade
+
+Verificar que `strategy_id` é salvo como `"tp:XXX|sl:YYY"` no banco após próximo bounce.
+Se NULL: checar logs da thread `trade-{id}` e `/debug/sign-test`.
+
+---
+
+## KPIs atualizados (2026-05-06)
 
 | Métrica | Meta | Status |
 |---------|------|--------|
-| Tokens com recovery definido | ≥1000 | ✅ 1134 |
-| Bounce signals coletados | ≥50 | ✅ 83 |
+| Tokens com recovery definido | ≥1000 | ✅ 1175+ |
+| Bounce signals coletados | ≥50 | ✅ 83+ |
 | WR base do bounce detector | — | 🟡 13.3% (histórico sem filtros) |
+| WR live pós-filtros (Fase A ativa) | ≥25% | 🟡 25% (5/20 trades, n pequeno) |
 | WR estimado pós-filtros A.2+A.3 | ≥25% | ⏳ ~29% estimado — confirmar com 30+ bounces |
 | Slope filter cobertura | ≥50% | 🟡 20.5% — Fase B deve elevar |
-| Swaps executando sem erro | 50 trades | 🟡 ATIVO — aguardando primeiro trade |
-| EV real > 0 após friction | positivo | ⏳ depende swaps funcionando |
-| H9 validada | delta_pp ≥ 20pp | ⏳ acumulando passivamente |
+| Swaps executando sem erro | 50 trades | 🟡 20/50 executados |
+| TP/SL criados automaticamente | todos os trades | ⚠️ validar no próximo trade |
+| EV real > 0 após friction | positivo | ⏳ acumulando |
+| H9 validada | delta_pp ≥ 20pp | 🟡 +3.8pp (n=98) — acumulando |
 | H18 (velocity) | — | ❌ REFUTADA — não implementar |
 | Fase A ativa + 30 bounces filtrados | — | ⏳ aguardando dados |

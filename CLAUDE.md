@@ -583,6 +583,15 @@ PERSISTENCE_MIN_TICKS=3      # A.4: ticks pós-sinal acima do entry para confirm
 52. **Base58 deve ser verificado antes de Base64 em `_load_ed25519_key`**: o alfabeto Base58 é um subconjunto do Base64 — strings Base58 de 88 chars (Phantom export, 64 bytes) são decodificáveis por Base64, gerando ~66 bytes e seed errado. Fix: Base58 primeiro, com validação `len(decoded) in (32, 64)`. Base64 só aceita comprimentos exatos de 32 ou 64 bytes. Causa raiz do AUTH_SIGNATURE_INVALID original.
 53. **TP/SL fixo é piso, não teto**: `TRADE_TP_PCT=0.75` e `TRADE_SL_PCT=0.15` são os parâmetros da calibração inicial (50 × $1). A Fase F (Exit Engine Maleável) substitui isso por saídas parciais em camadas (30% em +30%, 30% em +60%, 40% trailing) + risk engine em tempo real. Não construir saída dinâmica antes de medir friction real nos 50 trades de calibração.
 54. **IP Railway muda a cada redeploy**: após cada redeploy, o IP de saída muda e a whitelist GMGN quebra → AUTH_SIGNATURE_INVALID retorna. Solução permanente: Railway Static Outbound IP (~$3/mês). Necessário antes de escalar para evitar interrupções de trading.
+55. **GMGN_PRIVATE_KEY é chave de assinatura GMGN, NÃO a chave da wallet Solana**: a GMGN emite uma Ed25519 PEM key separada por conta, usada exclusivamente para assinar requests de trade. Usar a private key da wallet Solana (Base58 do Phantom) como GMGN_PRIVATE_KEY gera address errado e AUTH_SIGNATURE_INVALID. A PEM key fica no painel da conta GMGN e NÃO deriva o mesmo endereço que GMGN_WALLET_ADDRESS — isso é esperado, não é erro.
+56. **create_strategy requer DUAS chamadas separadas**: uma para `take_profit` e outra para `stop_loss`. Campos obrigatórios: `order_type="limit_order"`, `sub_order_type="take_profit"/"stop_loss"`, `check_price=str(price_in_sol)`, `amount_in=str(int(tokens))`, `auto_slippage=True`, `priority_fee` e `tip_fee` (padrão "0.0001" SOL cada). Sem priority_fee/tip_fee a ordem não é aceita na rede Solana. Resultado retornado: `{"tp": {"order_id": ...}, "sl": {"order_id": ...}}`. Salvo como `strategy_id = "tp:{tp_id}|sl:{sl_id}"`.
+57. **query_order: status em `confirmation.state`, não `data.status`**: o fill é detectado quando `confirmation.state` é `"processed"` ou `"confirmed"`. O campo `data.get("status")` retorna `"filled"` apenas em alguns casos mas não é confiável como trigger principal. Amounts corretos: `filled_output_amount` (tokens recebidos) e `filled_input_amount` (SOL enviado) — NÃO `out_amount`/`in_amount`.
+58. **Global rate limit gate `_global_ban_until`** em `gmgn_client.py`: variável module-level compartilhada por todas as threads. Qualquer 429 em qualquer endpoint chama `_set_global_ban(reset_at)` → todas as threads bloqueiam em `_wait_global_ban()` até o ban expirar. Sem isso, threads concorrentes do HotMonitor continuam chamando API durante o ban do scanner, estendendo o ban de 73s para 127s+.
+59. **`_recover_pending()` no startup do executor**: chamado quando `TRADING_ENABLED=true` na inicialização. Busca trades com `order_id IS NOT NULL AND strategy_id IS NULL` (swap executado mas TP/SL não criado). Para cada um, chama `create_strategy()` automaticamente. Garante que trades que perderam o TP/SL por crash/timeout não ficam expostos sem proteção.
+60. **WR live confirmado 25% em primeiros 20 trades** (2026-05-06): 5 TP hits, 15 SL hits = 25% WR. EV bruto = 5×75% − 15×15% = +3.75% por trade. Próximo a estimativa de 29%. 6 dos 15 SLs tiveram 0% de upside pós-entrada (dead-cat bounce que A.4 deveria bloquear). Confirmar com mais dados se A.4 está filtrando corretamente.
+61. **H9 dados iniciais** (2026-05-06, n=98 sinais, 83 tokens únicos, 3 dias): delta geral = +3.8pp (28.3% vs 24.5%). Fraco — threshold de 1.20 muito largo, captura momentum buyers acima da migração. Breakdown por faixa de `trigger_mc/mc_migration` é mais revelador: sinais em `< 80% de mc_migration` (smart money comprando no dump real) devem ter delta maior. Dashboard em `/analise/h9`.
+62. **`/debug/trade-analysis`**: endpoint para análise post-mortem de trades. Mostra para cada trade: elapsed_sec, bounce_pct, entry_mc, peak_mc, low_mc e se atingiu TP (+75%) ou SL (-15%). Usa token_ticks após ts_signal. Sem ticks = sem dados pós-entrada.
+63. **⚠️ PENDENTE — TP/SL verificar funcionamento**: confirmar após próximo trade que create_strategy está criando ordens na GMGN e que `strategy_id` é salvo corretamente no banco. Se `strategy_id` for NULL após trade com `order_id` preenchido, chamar `/debug/sign-test` e verificar logs da thread `trade-{id}`.
 
 ---
 
@@ -597,14 +606,14 @@ PERSISTENCE_MIN_TICKS=3      # A.4: ticks pós-sinal acima do entry para confirm
 | Backtester | Cobertura de ticks | n_trades ≥ 200 | ⏳ kline OHLC acumulando |
 | Fase A | WR pós-filtros ≥ 25% | WR ≥ 25% com 30+ bounces filtrados | ⏳ aguardando dados |
 | Fase B | Cobertura slope ≥ 50% | 50% dos bounces com slope calculável | ⏳ impacto esperado |
-| Fase 6-lite | Friction total medida | 50 trades de $1 | 🟡 ATIVO — aguardando primeiro trade |
-| Fase 6-lite | EV_real > 0 após friction | EV_real > 0 | ⏳ depende de friction |
-| Fase 6 | Win rate live | ≥20% (break-even = 11% com payoff 8.7x) | ⏳ |
+| Fase 6-lite | Friction total medida | 50 trades de $1 | 🟡 20/50 — WR 25% (5 TP, 15 SL) |
+| Fase 6-lite | EV_real > 0 após friction | EV_real > 0 | ⏳ acumulando |
+| Fase 6 | Win rate live | ≥20% (break-even = 11% com payoff 8.7x) | 🟡 25% (n=20) |
 | Fase 6 | Payoff ratio live | ≥3× | ⏳ |
 | Fase 6 | Latência detecção → ordem | ≤15s | ⏳ |
 | Fase 6 | Divergência real vs backtest | ≤30% após 50 trades | ⏳ |
 | Fase 6 | Max drawdown | ≤40% do capital alocado | ⏳ |
-| H9 | Validação smart money signal | delta_pp ≥ 20pp | ⏳ acumulando passivamente |
+| H9 | Validação smart money signal | delta_pp ≥ 20pp | 🟡 +3.8pp (n=98 sinais, 3 dias) — acumulando |
 
 ---
 
