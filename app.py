@@ -5577,5 +5577,78 @@ def analise_h9():
 </body></html>"""
 
 
+@app.route("/debug/test-swap")
+def debug_test_swap():
+    """
+    Executa um swap real de teste com TP/SL embutidos.
+    GET /debug/test-swap?mint=<mint>&amount=<usd>
+    Padrão: amount=$1. Requer TRADING_ENABLED=true.
+    """
+    from gmgn_client import get_sol_usd
+    import traceback
+
+    mint   = request.args.get("mint", "").strip()
+    amount = float(request.args.get("amount", "1.0"))
+
+    lines = []
+
+    if not mint:
+        return "<pre>❌ Parâmetro mint obrigatório.\nEx: /debug/test-swap?mint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v</pre>", 400
+
+    trading_enabled = os.getenv("TRADING_ENABLED", "false").lower() == "true"
+    lines.append(f"TRADING_ENABLED : {'✅ true' if trading_enabled else '❌ false (swap não será executado)'}")
+    lines.append(f"Mint            : {mint}")
+    lines.append(f"Amount          : ${amount:.2f}")
+
+    sol_usd = get_sol_usd()
+    if not sol_usd or sol_usd <= 0:
+        return "<pre>❌ Sem preço SOL/USD — tente novamente.</pre>", 500
+
+    amount_sol = amount / sol_usd
+    tp_pct     = float(os.getenv("TRADE_TP_PCT",       "0.75"))
+    sl_pct     = float(os.getenv("TRADE_SL_PCT",       "0.15"))
+    slippage   = int(os.getenv("TRADE_SLIPPAGE_BPS",   "500"))
+
+    lines.append(f"SOL/USD         : ${sol_usd:,.2f}")
+    lines.append(f"Amount SOL      : {amount_sol:.6f} SOL")
+    lines.append(f"TP              : +{tp_pct*100:.0f}%  →  price_scale = '{round(tp_pct*100,2)}'")
+    lines.append(f"SL              : -{sl_pct*100:.0f}%  →  price_scale = '{round(sl_pct*100,2)}'")
+    lines.append(f"sell_ratio      : '100' (100% da posição)")
+    lines.append(f"Slippage        : {slippage} bps ({slippage/100:.1f}%)")
+    lines.append("")
+
+    if not trading_enabled:
+        lines.append("⚠️  TRADING_ENABLED=false — swap simulado apenas. Ative para executar real.")
+        lines.append("")
+        lines.append("Body que seria enviado:")
+        lines.append(f"  input_amount    : {int(round(amount_sol * 1_000_000_000))} lamports")
+        lines.append(f"  condition_orders: profit_stop price_scale={round(tp_pct*100,2)} sell_ratio=100")
+        lines.append(f"                    loss_stop  price_scale={round(sl_pct*100,2)} sell_ratio=100")
+        return "<pre>" + "\n".join(lines) + "</pre>"
+
+    try:
+        lines.append("Enviando swap...")
+        res      = gmgn.swap(
+            token_mint=mint,
+            amount_sol=amount_sol,
+            slippage_bps=slippage,
+            tp_pct=tp_pct,
+            sl_pct=sl_pct,
+        )
+        data     = res.get("data") or res
+        order_id = data.get("order_id") or data.get("id")
+        lines.append(f"✅ Swap enviado!")
+        lines.append(f"order_id        : {order_id}")
+        lines.append(f"Resposta raw    : {res}")
+        lines.append("")
+        lines.append("TP e SL estão ativos na GMGN automaticamente.")
+        lines.append(f"Verificar em: /debug/sign-test ou query_order/{order_id}")
+    except Exception:
+        lines.append("❌ Swap falhou:")
+        lines.append(traceback.format_exc())
+
+    return "<pre>" + "\n".join(lines) + "</pre>"
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
