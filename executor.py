@@ -35,7 +35,8 @@ ORDER_TIMEOUT_SEC  = int(os.getenv(  "ORDER_TIMEOUT_SEC",        "60"))
 PERSISTENCE_WAIT_SEC   = int(os.getenv("PERSISTENCE_WAIT_SEC",   "90"))   # espera antes de verificar
 PERSISTENCE_MIN_TICKS  = int(os.getenv("PERSISTENCE_MIN_TICKS",  "3"))    # ticks mínimos acima do entry
 
-PUMP_FUN_SUPPLY = 1_000_000_000  # supply padrão Pump.fun — usado para calcular preço/token antes do fill
+PUMP_FUN_SUPPLY    = 1_000_000_000  # supply padrão Pump.fun
+SPL_TOKEN_DECIMALS = int(os.getenv("SPL_TOKEN_DECIMALS", "6"))  # casas decimais do token SPL (Pump.fun = 6)
 
 
 class TradeExecutor:
@@ -136,9 +137,10 @@ class TradeExecutor:
             return
 
         amount_sol      = CALIBRATION_AMOUNT / sol_usd
-        entry_mc_usd    = mc_bottom * 1.15                          # MC esperado na entrada
-        entry_price_sol = (entry_mc_usd / PUMP_FUN_SUPPLY) / sol_usd  # preço por token em SOL
-        estimated_tokens = int(amount_sol / entry_price_sol)          # tokens estimados a receber
+        entry_mc_usd    = mc_bottom * 1.15                                   # MC esperado na entrada
+        entry_price_sol = (entry_mc_usd / PUMP_FUN_SUPPLY) / sol_usd         # preço por token em SOL
+        token_scale     = 10 ** SPL_TOKEN_DECIMALS                           # 10^6 para Pump.fun
+        estimated_tokens = int(amount_sol / entry_price_sol) * token_scale   # raw SPL units
 
         try:
             trade_id = db.insert_trade({
@@ -159,9 +161,9 @@ class TradeExecutor:
             return
 
         logger.info(
-            "TRADE #%d %s — $%.2f (%.5f SOL @ $%.0f/SOL) entry_price=%.8f SOL/token ~%d tokens",
+            "TRADE #%d %s — $%.2f (%.5f SOL @ $%.0f/SOL) entry_price=%.10f SOL/token ~%d tokens (raw=%d)",
             trade_id, symbol, CALIBRATION_AMOUNT, amount_sol, sol_usd,
-            entry_price_sol, estimated_tokens,
+            entry_price_sol, estimated_tokens // token_scale, estimated_tokens,
         )
 
         threading.Thread(

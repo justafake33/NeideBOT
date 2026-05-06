@@ -298,43 +298,43 @@ class GmgnClient:
         """
         Cria TP e SL como duas ordens separadas em /v1/trade/strategy/create.
 
-        Formato correto conforme OpenApiClient.ts StrategyCreateParams:
-          order_type = "limit_order"
-          sub_order_type = "take_profit" | "stop_loss"
-          check_price = preço trigger em SOL/token
-          priority_fee + tip_fee obrigatórios no SOL (retorna 400 sem eles)
+        check_price: preço trigger em SOL/token — formatado sem notação científica.
+        amount_in: quantidade de tokens em unidades RAW SPL (×10^6 para 6 casas decimais).
         """
-        tp_price  = entry_price_sol * (1 + tp_pct)
-        sl_price  = entry_price_sol * (1 - sl_pct)
-        amt_str   = str(int(tokens_amount))
-        prio_fee  = os.getenv("STRATEGY_PRIORITY_FEE", "0.0001")
-        tip_fee   = os.getenv("STRATEGY_TIP_FEE",      "0.0001")
+        tp_price = entry_price_sol * (1 + tp_pct)
+        sl_price = entry_price_sol * (1 - sl_pct)
+        # Formata sem notação científica — GMGN rejeita "1.342e-07"
+        tp_price_str = f"{tp_price:.12f}"
+        sl_price_str = f"{sl_price:.12f}"
+        amt_str  = str(int(tokens_amount))
+        prio_fee = os.getenv("STRATEGY_PRIORITY_FEE", "0.0001")
+        tip_fee  = os.getenv("STRATEGY_TIP_FEE",      "0.0001")
 
         tp_body = {
-            "chain":         chain,
-            "from_address":  GMGN_WALLET_ADDRESS,
-            "base_token":    token_mint,
-            "quote_token":   SOL_NATIVE_MINT,
-            "order_type":    "limit_order",
+            "chain":          chain,
+            "from_address":   GMGN_WALLET_ADDRESS,
+            "base_token":     token_mint,
+            "quote_token":    SOL_NATIVE_MINT,
+            "order_type":     "limit_order",
             "sub_order_type": "take_profit",
-            "check_price":   str(tp_price),
-            "amount_in":     amt_str,
-            "auto_slippage": True,
-            "priority_fee":  prio_fee,
-            "tip_fee":       tip_fee,
+            "check_price":    tp_price_str,
+            "amount_in":      amt_str,
+            "auto_slippage":  True,
+            "priority_fee":   prio_fee,
+            "tip_fee":        tip_fee,
         }
         sl_body = {
-            "chain":         chain,
-            "from_address":  GMGN_WALLET_ADDRESS,
-            "base_token":    token_mint,
-            "quote_token":   SOL_NATIVE_MINT,
-            "order_type":    "limit_order",
+            "chain":          chain,
+            "from_address":   GMGN_WALLET_ADDRESS,
+            "base_token":     token_mint,
+            "quote_token":    SOL_NATIVE_MINT,
+            "order_type":     "limit_order",
             "sub_order_type": "stop_loss",
-            "check_price":   str(sl_price),
-            "amount_in":     amt_str,
-            "auto_slippage": True,
-            "priority_fee":  prio_fee,
-            "tip_fee":       tip_fee,
+            "check_price":    sl_price_str,
+            "amount_in":      amt_str,
+            "auto_slippage":  True,
+            "priority_fee":   prio_fee,
+            "tip_fee":        tip_fee,
         }
 
         tp_res = self._post_trade("/v1/trade/strategy/create", tp_body)
