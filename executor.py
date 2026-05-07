@@ -3,10 +3,12 @@ executor.py — Fase 6-lite: execução de trades $1 para calibração de fricti
 
 Fluxo:
   bounce_signal dispara → on_bounce() → thread _execute() →
-  swap() → create_strategy() IMEDIATO → poll fill data (background)
+  swap() com condition_orders embutidos (TP+SL atomicamente) →
+  poll fill data (background 30s) → TradeMonitor detecta exit via token_ticks
 
-TP/SL criados imediatamente após o swap, sem esperar confirmação on-chain.
-Os tokens estimados são calculados no momento do bounce a partir do MC e supply padrão.
+TP/SL criados atomicamente no mesmo body do swap via condition_orders.
+TradeMonitor roda em background a cada 30s verificando ticks pós-entrada
+para detectar quando TP ou SL foi atingido e atualizar o status no DB.
 Ativado apenas com TRADING_ENABLED=true no Railway.
 Limite: CALIBRATION_MAX_TRADES trades (padrão 50).
 """
@@ -261,6 +263,116 @@ class TradeExecutor:
                 logger.info("query_order %s erro: %s", order_id[:16], e)
             time.sleep(ORDER_POLL_SEC)
         raise TimeoutError(f"Ordem {order_id} não confirmada em {ORDER_TIMEOUT_SEC}s — último status='{last_status}'")
+
+
+# ------------------------------------------------------------------
+# TradeMonitor — detecta TP/SL via token_ticks do DB
+# ------------------------------------------------------------------
+
+MONITOR_POLL_SEC = int(os.getenv("TRADE_MONITOR_POLL_SEC", "30"))
+MONITOR_MAX_AGE_H = int(os.getenv("TRADE_MONITOR_MAX_AGE_H", "4"))  # descarta trades muito antigos
+
+
+class TradeMonitor:
+    """
+    Roda em background e detecta quando TP ou SL foi atingido para trades 'open'.
+    Usa token_ticks (mc_high/mc_low em USD) coletados pelo HotMonitor/scanner.
+    Compara contra entry_expected (mc_bottom * 1.15) com os thresholds tp_pct/sl_pct.
+    """
+
+    def __init__(self):
+        self._stop = threading.Event()
+
+    def start(self):
+        if not TRADING_ENABLED:
+            return
+        threading.Thread(target=self._loop, daemon=True, name="trade-monitor").start()
+        logger.info("TradeMonitor iniciado (poll=%ds max_age=%dh)", MONITOR_POLL_SEC, MONITOR_MAX_AGE_H)
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                self._check_all()
+            except Exception as e:
+                logger.error("TradeMonitor._check_all: %s", e)
+            time.sleep(MONITOR_POLL_SEC)
+
+    def _check_all(self):
+        trades = db.get_open_trades()
+        if not trades:
+            return
+        sol_usd = get_sol_usd() or 0
+        now = datetime.now(timezone.utc)
+        for trade in trades:
+            try:
+                self._check_trade(trade, sol_usd, now)
+            except Exception as e:
+                logger.debug("TradeMonitor trade #%s: %s", trade.get("id"), e)
+
+    def _check_trade(self, trade: dict, sol_usd: float, now: datetime):
+        trade_id    = trade["id"]
+        mint        = trade["mint"]
+        symbol      = trade.get("symbol", mint[:8])
+        entry_mc    = trade.get("entry_expected")
+        tp_pct      = trade.get("tp_pct")  or TRADE_TP_PCT
+        sl_pct      = trade.get("sl_pct")  or TRADE_SL_PCT
+        created_at  = trade.get("created_at")
+        ref_ts      = trade.get("ts_order_sent") or trade.get("ts_signal") or created_at
+
+        if not entry_mc or entry_mc <= 0:
+            return
+
+        # Ignora trades muito antigos (sem ticks no DB)
+        if created_at:
+            age_h = (now - created_at).total_seconds() / 3600
+            if age_h > MONITOR_MAX_AGE_H:
+                logger.info("TradeMonitor #%d %s — fechando por idade (%.1fh > %dh)",
+                            trade_id, symbol, age_h, MONITOR_MAX_AGE_H)
+                db.update_trade(trade_id, {
+                    "status":        "expired",
+                    "exit_type":     "expired",
+                    "exit_ts":       now,
+                    "pnl_pct_real":  None,
+                })
+                return
+
+        tp_mc = entry_mc * (1 + tp_pct)
+        sl_mc = entry_mc * (1 - sl_pct)
+
+        ticks = db.get_ticks_after(mint, min_ts=ref_ts)
+        if not ticks:
+            return
+
+        for tick in ticks:
+            high = float(tick["mc_high"] or 0)
+            low  = float(tick["mc_low"]  or 0)
+            tick_ts = tick["tick_ts"]
+
+            if high >= tp_mc:
+                exit_usd = tp_mc * sol_usd / entry_mc * (trade.get("amount_usd") or 1.0) if entry_mc else None
+                db.update_trade(trade_id, {
+                    "status":       "tp",
+                    "exit_type":    "tp",
+                    "exit_ts":      tick_ts,
+                    "exit_price_usd": exit_usd,
+                    "pnl_pct_real": tp_pct,
+                })
+                logger.info("TradeMonitor #%d %s — TP atingido (mc_high=$%.0f >= tp_mc=$%.0f)",
+                            trade_id, symbol, high, tp_mc)
+                return
+
+            if low > 0 and low <= sl_mc:
+                exit_usd = sl_mc * sol_usd / entry_mc * (trade.get("amount_usd") or 1.0) if entry_mc else None
+                db.update_trade(trade_id, {
+                    "status":       "sl",
+                    "exit_type":    "sl",
+                    "exit_ts":      tick_ts,
+                    "exit_price_usd": exit_usd,
+                    "pnl_pct_real": -sl_pct,
+                })
+                logger.info("TradeMonitor #%d %s — SL atingido (mc_low=$%.0f <= sl_mc=$%.0f)",
+                            trade_id, symbol, low, sl_mc)
+                return
 
 
 # ------------------------------------------------------------------

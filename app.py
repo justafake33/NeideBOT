@@ -12,7 +12,7 @@ from monitoring import init_sentry
 from gmgn_client import GmgnClient
 from scheduler import HeapScheduler
 from scanner import Scanner, HotMonitor
-from executor import TradeExecutor
+from executor import TradeExecutor, TradeMonitor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -5187,12 +5187,14 @@ def _start_services():
     db.init_db()
     gmgn      = GmgnClient()
     executor  = TradeExecutor(gmgn)
+    monitor   = TradeMonitor()
     scheduler = HeapScheduler()
     hot       = HotMonitor(gmgn, scheduler, executor=executor)
     scanner   = Scanner(gmgn, hot)
     scheduler.start()
     hot.start()
     scanner.start()
+    monitor.start()
     logger.info("Todos os serviços iniciados")
 
 
