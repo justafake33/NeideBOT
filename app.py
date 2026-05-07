@@ -5887,14 +5887,15 @@ def _h13_reanalysis_inner():
     WINDOW_SEC  = int(request.args.get("window_sec", 120))
     MIN_TICKS   = 3
 
-    # Buscar todos os bounces
+    # Buscar todos os bounces + recovery da tabela migrations (outcome real, n=153)
+    # NÃO usar trades (n=20 live trades) — seleção enviesada + amostra pequena
     with db._cursor() as cur:
         cur.execute("""
             SELECT b.mint, b.symbol, b.ts_signal, b.mc_min, b.mc_migration,
                    b.drop_from_mig, b.bounce_pct,
-                   t2.status, t2.pnl_pct_real, t2.entry_expected
+                   m.recovery, m.time_to_bottom, m.pct_drop
             FROM bounce_signals b
-            LEFT JOIN trades t2 ON t2.mint = b.mint
+            LEFT JOIN migrations m ON m.mint = b.mint
             ORDER BY b.ts_signal
         """)
         bounces = [dict(r) for r in cur.fetchall()]
@@ -5902,7 +5903,8 @@ def _h13_reanalysis_inner():
     if not bounces:
         return "<pre>Sem bounces.</pre>"
 
-    # Para cada bounce, estimar ts_min e calcular slope
+    # Para cada bounce, estimar ts_min = tick com menor MC antes de ts_signal
+    # Depois calcular slope nos WINDOW_SEC antes desse ponto (igual ao A.1 no código)
     def get_slope(mint, ts_signal):
         try:
             with db._cursor() as cur:
@@ -5930,93 +5932,97 @@ def _h13_reanalysis_inner():
     rows = []
     for b in bounces:
         slope = get_slope(b["mint"], b["ts_signal"])
-        status = b.get("status")
-        is_tp = (status == "tp")
-        is_sl = (status == "sl")
-        rows.append({**b, "slope": slope, "is_tp": is_tp, "is_sl": is_sl,
-                     "has_trade": status is not None})
+        rows.append({**b, "slope": slope})
 
-    # Filtrar apenas bounces com slope calculado e com trade executado
     with_slope = [r for r in rows if r["slope"] is not None]
-    with_trade = [r for r in rows if r["has_trade"] and r["slope"] is not None]
+    # Apenas bounces com recovery definido (não None) para análise de WR
+    with_outcome = [r for r in with_slope if r["recovery"] is not None]
 
-    # Análise por faixas de slope
-    # Faixas: gradual(>-0.0008), leve(-0.0008 a -0.002), médio(-0.002 a -0.004), íngreme(<-0.004)
+    # Faixas de slope para análise
     thresholds = [
-        ("Gradual (> -0.0008)",    lambda s: s > -0.0008),
+        ("Gradual (> -0.0008)",     lambda s: s > -0.0008),
         ("Leve (-0.0008 a -0.002)", lambda s: -0.002 < s <= -0.0008),
         ("Médio (-0.002 a -0.004)", lambda s: -0.004 < s <= -0.002),
-        ("Íngreme (< -0.004)",     lambda s: s <= -0.004),
+        ("Íngreme (< -0.004)",      lambda s: s <= -0.004),
+        # Thresholds mais agressivos para testar
+        ("Ultra-íngreme (< -0.006)",lambda s: s <= -0.006),
     ]
 
-    # Análise de WR por faixa (apenas trades executados)
+    # WR = recovery rate por faixa (outcome = migrations.recovery)
     faixa_rows = ""
     for label, fn in thresholds:
-        subset = [r for r in with_trade if fn(r["slope"])]
+        subset = [r for r in with_outcome if fn(r["slope"])]
         n = len(subset)
-        n_tp = sum(1 for r in subset if r["is_tp"])
-        n_sl = sum(1 for r in subset if r["is_sl"])
-        wr = n_tp / n if n > 0 else None
+        n_rec = sum(1 for r in subset if r["recovery"])
+        wr = n_rec / n if n > 0 else None
+        # Baseline recovery rate (todos com outcome)
+        base = sum(1 for r in with_outcome if r["recovery"]) / len(with_outcome) if with_outcome else 0
+        delta = (wr - base) if wr is not None else None
         wr_str = f"{wr*100:.1f}%" if wr is not None else "—"
-        ev = (wr * 0.75 - (1-wr) * 0.15) if wr is not None else None
-        ev_str = f"{ev*100:+.1f}%" if ev is not None else "—"
-        c = "#4f4" if (ev and ev > 0) else ("#fa0" if n > 0 else "#666")
-        faixa_rows += (f"<tr><td>{label}</td><td>{n}</td><td>{n_tp}</td><td>{n_sl}</td>"
+        delta_str = f"{delta*100:+.1f}pp" if delta is not None else "—"
+        c = "#4f4" if (delta and delta > 0.05) else ("#f44" if (delta and delta < -0.05) else ("#fa0" if n > 0 else "#666"))
+        faixa_rows += (f"<tr><td>{label}</td><td>{n}</td><td>{n_rec}</td>"
                        f"<td style='color:{c}'><b>{wr_str}</b></td>"
-                       f"<td style='color:{c}'>{ev_str}</td></tr>")
+                       f"<td style='color:{c}'>{delta_str}</td></tr>")
 
-    # Distribuição de slope (todos os bounces com slope, independente de ter trade)
+    # Distribuição de slope
     ranges = [(-999, -0.006), (-0.006, -0.004), (-0.004, -0.002), (-0.002, -0.0008), (-0.0008, 0)]
     dist_rows = ""
     for lo, hi in ranges:
-        subset = [r for r in with_slope if lo <= r["slope"] < hi]
+        subset_all = [r for r in with_slope if lo <= r["slope"] < hi]
+        subset_out = [r for r in with_outcome if lo <= r["slope"] < hi]
+        n_rec = sum(1 for r in subset_out if r["recovery"])
+        wr = n_rec / len(subset_out) if subset_out else None
+        wr_s = f"{wr*100:.1f}%" if wr is not None else "—"
         label = f"{lo:.4f} a {hi:.4f}"
-        dist_rows += f"<tr><td>{label}</td><td>{len(subset)}</td><td>{len(subset)/len(with_slope)*100:.1f}%</td></tr>"
+        dist_rows += (f"<tr><td>{label}</td>"
+                      f"<td>{len(subset_all)}</td>"
+                      f"<td>{len(subset_all)/len(with_slope)*100:.1f}%</td>"
+                      f"<td>{len(subset_out)}</td>"
+                      f"<td>{wr_s}</td></tr>")
 
-    # Estatísticas gerais de slope
+    # Estatísticas gerais
     slopes = [r["slope"] for r in with_slope]
     avg_slope = sum(slopes) / len(slopes) if slopes else 0
-    min_slope = min(slopes) if slopes else 0
-    max_slope = max(slopes) if slopes else 0
 
-    tp_slopes = [r["slope"] for r in with_trade if r["is_tp"]]
-    sl_slopes = [r["slope"] for r in with_trade if r["is_sl"]]
-    avg_tp = sum(tp_slopes)/len(tp_slopes) if tp_slopes else None
-    avg_sl = sum(sl_slopes)/len(sl_slopes) if sl_slopes else None
+    rec_slopes  = [r["slope"] for r in with_outcome if r["recovery"]]
+    nrec_slopes = [r["slope"] for r in with_outcome if not r["recovery"]]
+    avg_rec  = sum(rec_slopes)/len(rec_slopes) if rec_slopes else None
+    avg_nrec = sum(nrec_slopes)/len(nrec_slopes) if nrec_slopes else None
+    base_rate = sum(1 for r in with_outcome if r["recovery"]) / len(with_outcome) if with_outcome else 0
 
     return f"""<html><head><title>H13 Re-análise</title></head>
 <body style="font-family:monospace;background:#111;color:#eee;padding:20px">
-<h2>H13 Re-análise — Slope pré-fundo vs WR (metodologia correta)</h2>
-<p style="color:#aaa">Janela: {WINDOW_SEC}s antes do ts_min estimado (tick com menor MC) | TP=75% SL=15%</p>
-<p style="color:#fa0">Original H13: n=17, WR 66.7% — seleção enviesada (20.5% cobertura).
-Agora com ts_min correto e ~89% cobertura: threshold -0.0008 passa 92% dos bounces.</p>
+<h2>H13 Re-análise — Slope pré-fundo vs Recovery Rate (metodologia correta)</h2>
+<p style="color:#aaa">Janela: {WINDOW_SEC}s antes do ts_min estimado | Outcome: migrations.recovery (mc_1h &gt; mc_bottom × 1.3)</p>
+<p style="color:#fa0">Original H13: n=17, WR 66.7% — seleção enviesada (20.5% cobertura, médido vs trades).
+Agora: bounce_signals → migrations.recovery (n={len(with_outcome)} com outcome definido).</p>
 
-<h3>Estatísticas de slope (todos bounces com dados: n={len(with_slope)})</h3>
+<h3>Médias de slope por outcome (n_outcome={len(with_outcome)}, baseline recovery={base_rate*100:.1f}%)</h3>
 <table border=1 cellpadding=6 style="border-collapse:collapse;font-size:13px">
-<tr><td>Média geral</td><td>{avg_slope:.6f}</td></tr>
-<tr><td>Mín</td><td>{min_slope:.6f}</td></tr>
-<tr><td>Máx</td><td>{max_slope:.6f}</td></tr>
-<tr><td>Média slope — trades TP (n={len(tp_slopes)})</td><td style="color:#4f4">{f'{avg_tp:.6f}' if avg_tp else '—'}</td></tr>
-<tr><td>Média slope — trades SL (n={len(sl_slopes)})</td><td style="color:#f44">{f'{avg_sl:.6f}' if avg_sl else '—'}</td></tr>
+<tr><td>Média slope — Recovery TRUE (n={len(rec_slopes)})</td><td style="color:#4f4">{f'{avg_rec:.6f}' if avg_rec else '—'}</td></tr>
+<tr><td>Média slope — Recovery FALSE (n={len(nrec_slopes)})</td><td style="color:#f44">{f'{avg_nrec:.6f}' if avg_nrec else '—'}</td></tr>
+<tr><td>Média slope geral (n={len(with_slope)})</td><td>{avg_slope:.6f}</td></tr>
 </table>
+<p style="color:#aaa;font-size:12px">Se médias forem similares → slope não discrimina recovery.</p>
 
-<h3>WR por faixa de slope (apenas trades executados: n={len(with_trade)})</h3>
-<p style="color:#aaa;font-size:12px">Bounces que viraram trades reais. WR = hit TP antes de SL.</p>
+<h3>Recovery rate por faixa de slope</h3>
+<p style="color:#aaa;font-size:12px">Baseline recovery = {base_rate*100:.1f}%. Delta = diferença vs baseline.</p>
 <table border=1 cellpadding=6 style="border-collapse:collapse;font-size:13px">
-<tr style="background:#222"><th>Faixa slope</th><th>Trades</th><th>TP</th><th>SL</th><th>WR</th><th>EV (TP75/SL15)</th></tr>
+<tr style="background:#222"><th>Faixa slope</th><th>N bounces</th><th>Recovery</th><th>Rate</th><th>Delta vs baseline</th></tr>
 {faixa_rows}
 </table>
 
-<h3>Distribuição de slope — todos bounces (n={len(with_slope)})</h3>
+<h3>Distribuição de slope + recovery rate por faixa</h3>
 <table border=1 cellpadding=6 style="border-collapse:collapse;font-size:13px">
-<tr style="background:#222"><th>Faixa</th><th>N bounces</th><th>%</th></tr>
+<tr style="background:#222"><th>Faixa slope</th><th>N (todos)</th><th>% do total</th><th>N com outcome</th><th>Recovery rate</th></tr>
 {dist_rows}
 </table>
 
 <p style="color:#888;font-size:12px;margin-top:12px">
-  H13 original (CLAUDE.md): slope ≤-0.0008 → WR 66.7% (n=17, cobertura 20.5%). Era seleção enviesada.<br>
-  Com ts_min correto: 92% dos bounces passam threshold -0.0008. Slope não discrimina no threshold atual.<br>
-  Pergunta: existe threshold mais agressivo que discrimine?
+  H13 original: slope ≤-0.0008 → WR 66.7% (n=17). Comparava vs trades — seleção enviesada.<br>
+  Esta análise compara vs migrations.recovery — outcome real para todos os bounces com slope calculado.<br>
+  Baseline recovery: {base_rate*100:.1f}% (recovery rate dos bounces com slope + outcome definido).
 </p>
 </body></html>"""
 
