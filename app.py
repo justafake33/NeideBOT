@@ -12,7 +12,7 @@ from monitoring import init_sentry
 from gmgn_client import GmgnClient
 from scheduler import HeapScheduler
 from scanner import Scanner, HotMonitor
-from executor import TradeExecutor
+from executor import TradeExecutor, TradeMonitor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -5187,12 +5187,14 @@ def _start_services():
     db.init_db()
     gmgn      = GmgnClient()
     executor  = TradeExecutor(gmgn)
+    monitor   = TradeMonitor()
     scheduler = HeapScheduler()
     hot       = HotMonitor(gmgn, scheduler, executor=executor)
     scanner   = Scanner(gmgn, hot)
     scheduler.start()
     hot.start()
     scanner.start()
+    monitor.start()
     logger.info("Todos os serviços iniciados")
 
 
@@ -5648,6 +5650,292 @@ def debug_test_swap():
         lines.append(traceback.format_exc())
 
     return "<pre>" + "\n".join(lines) + "</pre>"
+
+
+@app.route("/debug/backfill-pnl")
+def debug_backfill_pnl():
+    """
+    Recalcula pnl_pct_real para trades tp/sl sem P&L registrado.
+    Usa amount_usd, fee_sol e tp_pct/sl_pct do próprio trade.
+    GET /debug/backfill-pnl?dry=1 para simular sem salvar.
+    """
+    dry = request.args.get("dry", "0") not in ("0", "false", "")
+    lines = [f"{'[DRY RUN] ' if dry else ''}Backfill P&L de trades tp/sl sem pnl_pct_real", ""]
+    updated = 0
+    try:
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT id, symbol, status, tp_pct, sl_pct, amount_usd, amount_sol, fee_sol, pnl_pct_real
+                FROM trades
+                WHERE status IN ('tp', 'sl')
+                  AND pnl_pct_real IS NULL
+                ORDER BY created_at DESC
+            """)
+            rows = [dict(r) for r in cur.fetchall()]
+
+        for r in rows:
+            tp_pct    = r["tp_pct"]  or 0.75
+            sl_pct    = r["sl_pct"]  or 0.15
+            amount_sol = r["amount_sol"] or 0.0
+            fee_sol   = r["fee_sol"] or 0.0
+            fee_frac  = fee_sol / amount_sol if amount_sol > 0 else 0.0
+            pnl_target = tp_pct if r["status"] == "tp" else -sl_pct
+            pnl_real   = pnl_target - fee_frac
+            exit_usd   = (r["amount_usd"] or 1.0) * (1 + pnl_target)
+
+            lines.append(f"Trade #{r['id']} {r['symbol']} [{r['status'].upper()}]"
+                         f" pnl_bruto={pnl_target*100:.1f}%"
+                         f" fee={fee_frac*100:.3f}%"
+                         f" pnl_real={pnl_real*100:.1f}%"
+                         f" exit_usd=${exit_usd:.4f}")
+            if not dry:
+                db.update_trade(r["id"], {
+                    "pnl_pct_real":   pnl_real,
+                    "exit_price_usd": exit_usd,
+                })
+                updated += 1
+
+        lines.append("")
+        lines.append(f"{'Simulado' if dry else 'Atualizado'}: {len(rows)} trades | saved={updated}")
+    except Exception:
+        import traceback
+        lines.append(traceback.format_exc())
+
+    return "<pre>" + "\n".join(lines) + "</pre>"
+
+
+@app.route("/analise/persistence-sim")
+def analise_persistence_sim():
+    """
+    Simula 0-tick vs 1-tick vs 3-tick de persistência com friction real.
+    Parâmetros URL (todos opcionais):
+      trade_usd=10      tamanho do trade em USD
+      tp=0.75           take profit %
+      sl=0.15           stop loss %
+      tip_sol=0.001     tip fee por ordem (compra + venda)
+      prio_sol=0.001    priority fee por ordem (compra + venda)
+      gmgn_pct=0.01     fee GMGN sobre valor (compra + venda)
+      slip=0.025        slippage médio na compra (estimativa)
+      sol_usd=150       preço SOL/USD (padrão: cotação atual)
+    """
+    import traceback
+    try:
+        return _persistence_sim_inner()
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
+def _persistence_sim_inner():
+    from gmgn_client import get_sol_usd as _get_sol_usd
+
+    # — Parâmetros —
+    TRADE_USD  = float(request.args.get("trade_usd", 10.0))
+    TP_PCT     = float(request.args.get("tp",        0.75))
+    SL_PCT     = float(request.args.get("sl",        0.15))
+    TIP_SOL    = float(request.args.get("tip_sol",   0.001))
+    PRIO_SOL   = float(request.args.get("prio_sol",  0.001))
+    GMGN_PCT   = float(request.args.get("gmgn_pct",  0.01))
+    SLIP_PCT   = float(request.args.get("slip",       0.025))
+    sol_usd    = float(request.args.get("sol_usd",    0)) or _get_sol_usd() or 150.0
+
+    # Friction por trade (buy + sell)
+    fixed_sol_per_trade = (TIP_SOL + PRIO_SOL) * 2          # 0.004 SOL
+    fixed_usd_per_trade = fixed_sol_per_trade * sol_usd      # ~$0.60
+    gmgn_buy_usd        = TRADE_USD * GMGN_PCT               # 1% da compra
+    slippage_usd        = TRADE_USD * SLIP_PCT               # entry slip
+    total_buy_cost      = fixed_usd_per_trade / 2 + gmgn_buy_usd + slippage_usd
+
+    # Resultado líquido para TP e SL (as fees de saída incidem sobre o valor de saída)
+    tp_exit_gross  = TRADE_USD * (1 + TP_PCT)
+    sl_exit_gross  = TRADE_USD * (1 - SL_PCT)
+    tp_sell_cost   = fixed_usd_per_trade / 2 + tp_exit_gross * GMGN_PCT
+    sl_sell_cost   = fixed_usd_per_trade / 2 + sl_exit_gross * GMGN_PCT
+
+    tp_net_pnl     = tp_exit_gross - tp_sell_cost - TRADE_USD - total_buy_cost
+    sl_net_pnl     = sl_exit_gross - sl_sell_cost - TRADE_USD - total_buy_cost
+    tp_net_pct     = tp_net_pnl / TRADE_USD
+    sl_net_pct     = sl_net_pnl / TRADE_USD
+
+    # — Busca bounce signals com ticks —
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT b.mint, b.symbol, b.ts_signal, b.mc_min, b.mc_at_signal, b.mc_migration,
+                   b.bounce_pct, b.drop_from_mig
+            FROM bounce_signals b
+            WHERE b.mc_min IS NOT NULL AND b.ts_signal IS NOT NULL
+            ORDER BY b.ts_signal ASC
+        """)
+        bounces = [dict(r) for r in cur.fetchall()]
+
+    # — Cenários —
+    scenarios = {
+        "imediato":  {"min_ticks": 0, "results": []},
+        "1_tick":    {"min_ticks": 1, "results": []},
+        "3_ticks":   {"min_ticks": 3, "results": []},
+    }
+
+    no_ticks_count = 0
+
+    for b in bounces:
+        mint          = b["mint"]
+        ts_signal     = b["ts_signal"]
+        mc_min        = b["mc_min"]
+        entry_expected = mc_min * 1.15 if mc_min else None
+        if not entry_expected:
+            continue
+
+        ticks = db.get_ticks_after(mint, min_ts=ts_signal)
+        if not ticks:
+            no_ticks_count += 1
+            continue
+
+        for sc_name, sc in scenarios.items():
+            min_ticks = sc["min_ticks"]
+
+            # Encontrar tick de entrada
+            if min_ticks == 0:
+                # Entrada imediata: preço = mc_at_signal (o preço no momento do sinal)
+                entry_mc = float(b["mc_at_signal"] or entry_expected)
+                entry_tick_idx = 0
+            else:
+                # Esperar N ticks consecutivos acima do entry_expected
+                consecutive = 0
+                entry_mc = None
+                entry_tick_idx = None
+                for i, t in enumerate(ticks):
+                    mc_val = float(t["mc"] or 0)
+                    if mc_val >= entry_expected:
+                        consecutive += 1
+                        if consecutive >= min_ticks:
+                            entry_mc    = mc_val
+                            entry_tick_idx = i
+                            break
+                    else:
+                        consecutive = 0
+
+            if entry_mc is None or entry_mc <= 0:
+                continue
+
+            # Overshoot: quanto pagamos acima do entry_expected (price drift durante wait)
+            overshoot_pct = (entry_mc / entry_expected - 1)
+
+            # TP e SL calculados sobre o preço REAL de entrada (condition_orders)
+            tp_mc = entry_mc * (1 + TP_PCT)
+            sl_mc = entry_mc * (1 - SL_PCT)
+
+            # Walk forward para encontrar exit
+            post_ticks = ticks[entry_tick_idx:] if entry_tick_idx is not None else ticks
+            exit_type = "timeout"
+            for t in post_ticks:
+                high = float(t["mc_high"] or t["mc"] or 0)
+                low  = float(t["mc_low"]  or t["mc"] or 0)
+                if high >= tp_mc:
+                    exit_type = "tp"
+                    break
+                if low > 0 and low <= sl_mc:
+                    exit_type = "sl"
+                    break
+
+            sc["results"].append({
+                "mint":         mint,
+                "symbol":       b.get("symbol", "?"),
+                "exit":         exit_type,
+                "overshoot":    overshoot_pct,
+                "entry_mc":     entry_mc,
+                "entry_expected": entry_expected,
+            })
+
+    # — Computar métricas por cenário —
+    def calc_metrics(results):
+        if not results:
+            return {}
+        n       = len(results)
+        n_tp    = sum(1 for r in results if r["exit"] == "tp")
+        n_sl    = sum(1 for r in results if r["exit"] == "sl")
+        n_to    = sum(1 for r in results if r["exit"] == "timeout")
+        wr      = n_tp / n if n else 0
+        ev_pct  = wr * tp_net_pct + (1 - wr) * sl_net_pct
+        total_pnl = n_tp * tp_net_pnl + (n_sl + n_to) * sl_net_pnl
+        avg_overshoot = sum(r["overshoot"] for r in results) / n if n else 0
+        return dict(n=n, n_tp=n_tp, n_sl=n_sl, n_to=n_to, wr=wr,
+                    ev_pct=ev_pct, total_pnl=total_pnl, avg_overshoot=avg_overshoot)
+
+    metrics = {k: calc_metrics(sc["results"]) for k, sc in scenarios.items()}
+    total_bounces = len(bounces)
+
+    # — HTML —
+    CSS = "font-family:monospace;background:#111;color:#eee;padding:20px"
+
+    def pct(v):
+        if v is None: return "—"
+        color = "#4f4" if v >= 0 else "#f44"
+        return f'<span style="color:{color}">{v*100:+.1f}%</span>'
+
+    def usd(v):
+        if v is None: return "—"
+        color = "#4f4" if v >= 0 else "#f44"
+        return f'<span style="color:{color}">${v:+.2f}</span>'
+
+    rows = ""
+    for sc_name, m in metrics.items():
+        label = {"imediato": "0 ticks (imediato)", "1_tick": "1 tick", "3_ticks": "3 ticks (atual A.4)"}.get(sc_name, sc_name)
+        if not m:
+            rows += f"<tr><td>{label}</td><td colspan=8>sem dados</td></tr>"
+            continue
+        rows += (f"<tr>"
+                 f"<td><b>{label}</b></td>"
+                 f"<td>{m['n']}</td>"
+                 f"<td>{m['n_tp']} ({m['wr']*100:.1f}%)</td>"
+                 f"<td>{m['n_sl']}</td>"
+                 f"<td>{m['n_to']}</td>"
+                 f"<td>{pct(m['ev_pct'])}</td>"
+                 f"<td>{usd(m['total_pnl'])}</td>"
+                 f"<td>{pct(m['avg_overshoot'])}</td>"
+                 f"</tr>")
+
+    h = f"""<html><head><title>Persistence Sim</title></head>
+<body style="{CSS}">
+<h2>Simulação: 0 vs 1 vs 3 ticks de persistência</h2>
+<p style="color:#aaa">
+  Trade: <b>${TRADE_USD:.0f}</b> |
+  TP: <b>+{TP_PCT*100:.0f}%</b> |
+  SL: <b>-{SL_PCT*100:.0f}%</b> |
+  Tip: <b>{TIP_SOL} SOL/ordem</b> |
+  Priority: <b>{PRIO_SOL} SOL/ordem</b> |
+  GMGN fee: <b>{GMGN_PCT*100:.0f}%</b> |
+  Slippage médio: <b>{SLIP_PCT*100:.1f}%</b> |
+  SOL: <b>${sol_usd:.0f}</b>
+</p>
+
+<h3>Friction por trade</h3>
+<table border=1 cellpadding=6 style="border-collapse:collapse;font-size:13px">
+<tr style="background:#222"><th>Item</th><th>Compra</th><th>Venda (TP)</th><th>Venda (SL)</th></tr>
+<tr><td>Tip + Priority</td><td>${fixed_usd_per_trade/2:.3f}</td><td>${fixed_usd_per_trade/2:.3f}</td><td>${fixed_usd_per_trade/2:.3f}</td></tr>
+<tr><td>GMGN fee (1%)</td><td>${gmgn_buy_usd:.3f}</td><td>${tp_exit_gross*GMGN_PCT:.3f}</td><td>${sl_exit_gross*GMGN_PCT:.3f}</td></tr>
+<tr><td>Slippage entry</td><td>${slippage_usd:.3f}</td><td>—</td><td>—</td></tr>
+<tr style="background:#222"><td><b>Total</b></td><td><b>${total_buy_cost:.3f}</b></td><td><b>${tp_sell_cost:.3f}</b></td><td><b>${sl_sell_cost:.3f}</b></td></tr>
+<tr style="background:#333"><td><b>P&L líquido</b></td><td></td><td>{pct(tp_net_pct)} (${tp_net_pnl:+.2f})</td><td>{pct(sl_net_pct)} (${sl_net_pnl:+.2f})</td></tr>
+</table>
+
+<h3>Resultado por cenário</h3>
+<p style="color:#888">Total de bounce signals: {total_bounces} | Sem ticks: {no_ticks_count} | Com ticks: {total_bounces - no_ticks_count}</p>
+<table border=1 cellpadding=6 style="border-collapse:collapse;font-size:13px">
+<tr style="background:#222">
+  <th>Cenário</th><th>Trades</th><th>TP (WR)</th><th>SL</th><th>Timeout</th>
+  <th>EV/trade</th><th>P&L total</th><th>Overshoot médio</th>
+</tr>
+{rows}
+</table>
+
+<p style="color:#888;font-size:12px;margin-top:20px">
+  <b>Overshoot</b>: quanto o preço de entrada subiu acima do entry_expected (mc_bottom×1.15) durante o wait.<br>
+  <b>EV/trade</b>: WR × P&L_líquido_TP + (1-WR) × P&L_líquido_SL<br>
+  <b>Timeout</b>: janela de ticks acabou sem TP ou SL — contado como SL no EV (pior caso).<br>
+  <b>0 ticks</b>: entrada imediata ao sinal (preço = mc_at_signal).<br>
+  <b>Slippage de {SLIP_PCT*100:.1f}%</b>: estimativa — use ?slip=0.02 para ajustar.
+</p>
+</body></html>"""
+    return h
 
 
 if __name__ == "__main__":

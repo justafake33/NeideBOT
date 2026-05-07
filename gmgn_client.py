@@ -276,8 +276,8 @@ class GmgnClient:
         """
         POST /v1/trade/swap — compra token com SOL.
         condition_orders embutidos: TP e SL calculados pelo GMGN sobre o fill real.
-          price_scale = multiplicador do fill price (1.75 = +75%, 0.85 = -15%)
-          sell_ratio  = "1" = 100% da posição
+          price_scale = percentual (0-100): "75" = +75%, "15" = -15%
+          sell_ratio  = percentual (0-100): "100" = 100% da posição
           order_type  = "profit_stop" | "loss_stop"
         """
         lamports = int(round(amount_sol * 1_000_000_000))

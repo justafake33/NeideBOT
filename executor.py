@@ -3,10 +3,12 @@ executor.py — Fase 6-lite: execução de trades $1 para calibração de fricti
 
 Fluxo:
   bounce_signal dispara → on_bounce() → thread _execute() →
-  swap() → create_strategy() IMEDIATO → poll fill data (background)
+  swap() com condition_orders embutidos (TP+SL atomicamente) →
+  poll fill data (background 30s) → TradeMonitor detecta exit via token_ticks
 
-TP/SL criados imediatamente após o swap, sem esperar confirmação on-chain.
-Os tokens estimados são calculados no momento do bounce a partir do MC e supply padrão.
+TP/SL criados atomicamente no mesmo body do swap via condition_orders.
+TradeMonitor roda em background a cada 30s verificando ticks pós-entrada
+para detectar quando TP ou SL foi atingido e atualizar o status no DB.
 Ativado apenas com TRADING_ENABLED=true no Railway.
 Limite: CALIBRATION_MAX_TRADES trades (padrão 50).
 """
@@ -158,8 +160,9 @@ class TradeExecutor:
             _fail(trade_id, str(e))
             return
 
-        # 2. Poll fill em background — só para registrar dados reais no DB
-        FILL_TIMEOUT_SEC = int(os.getenv("FILL_TIMEOUT_SEC", "30"))
+        # 2. Poll fill em background — registra dados reais (slippage, fee, tokens, latência)
+        # Timeout de 120s: Solana pode demorar até 60s em congestionamento
+        FILL_TIMEOUT_SEC = int(os.getenv("FILL_TIMEOUT_SEC", "120"))
         deadline = time.time() + FILL_TIMEOUT_SEC
         while time.time() < deadline:
             try:
@@ -168,29 +171,34 @@ class TradeExecutor:
                 conf  = qd.get("confirmation") or {}
                 state = str(conf.get("state") or "").lower()
                 if state in ("failed", "expired"):
-                    db.update_trade(trade_id, {"error_msg": f"swap on-chain: {state}"})
+                    db.update_trade(trade_id, {"status": "error", "error_msg": f"swap on-chain: {state}"})
                     return
                 out_raw = _safe_float(qd.get("filled_output_amount"))
                 if out_raw and out_raw > 0:
                     in_raw   = _safe_float(qd.get("filled_input_amount"))
+                    # in_raw pode estar em lamports (>1000) ou SOL
                     fill_sol = (in_raw / 1e9 if in_raw and in_raw > 1000 else in_raw) or amount_sol
                     fee_raw  = _safe_float(qd.get("fee"))
-                    fee_sol  = (fee_raw / 1e9 if fee_raw and fee_raw > 1000 else fee_raw)
+                    fee_sol  = (fee_raw / 1e9 if fee_raw and fee_raw > 1000 else fee_raw) or 0.0
+                    # slippage: diferença entre SOL real gasto e SOL intencionado
+                    slippage = (fill_sol - amount_sol) / amount_sol if amount_sol else 0.0
                     db.update_trade(trade_id, {
                         "ts_order_confirmed": datetime.now(timezone.utc),
                         "tokens_received":    out_raw,
                         "entry_price_sol":    fill_sol / out_raw,
-                        "entry_price_usd":    fill_sol * sol_usd,
+                        "entry_price_usd":    fill_sol * sol_usd,  # USD gasto real
                         "fee_sol":            fee_sol,
                         "latency_sec":        (datetime.now(timezone.utc) - ts_signal).total_seconds(),
-                        "slippage_pct":       (fill_sol - amount_sol) / amount_sol,
+                        "slippage_pct":       slippage,
                     })
-                    logger.info("Fill #%d %s — %.0f tokens @ %.10f SOL",
-                                trade_id, symbol, out_raw, fill_sol / out_raw)
+                    logger.info("Fill #%d %s — %.0f tokens @ %.10f SOL | slip=%.2f%% fee=%.6f SOL lat=%.1fs",
+                                trade_id, symbol, out_raw, fill_sol / out_raw,
+                                slippage * 100, fee_sol,
+                                (datetime.now(timezone.utc) - ts_signal).total_seconds())
                     return
             except Exception as e:
                 logger.debug("poll fill #%d: %s", trade_id, e)
-            time.sleep(1)
+            time.sleep(2)
 
     def _check_persistence(self, mint: str, entry_expected: float, ts_signal) -> bool:
         """
@@ -261,6 +269,126 @@ class TradeExecutor:
                 logger.info("query_order %s erro: %s", order_id[:16], e)
             time.sleep(ORDER_POLL_SEC)
         raise TimeoutError(f"Ordem {order_id} não confirmada em {ORDER_TIMEOUT_SEC}s — último status='{last_status}'")
+
+
+# ------------------------------------------------------------------
+# TradeMonitor — detecta TP/SL via token_ticks do DB
+# ------------------------------------------------------------------
+
+MONITOR_POLL_SEC = int(os.getenv("TRADE_MONITOR_POLL_SEC", "30"))
+MONITOR_MAX_AGE_H = int(os.getenv("TRADE_MONITOR_MAX_AGE_H", "4"))  # descarta trades muito antigos
+
+
+class TradeMonitor:
+    """
+    Roda em background e detecta quando TP ou SL foi atingido para trades 'open'.
+    Usa token_ticks (mc_high/mc_low em USD) coletados pelo HotMonitor/scanner.
+    Compara contra entry_expected (mc_bottom * 1.15) com os thresholds tp_pct/sl_pct.
+    """
+
+    def __init__(self):
+        self._stop = threading.Event()
+
+    def start(self):
+        if not TRADING_ENABLED:
+            return
+        threading.Thread(target=self._loop, daemon=True, name="trade-monitor").start()
+        logger.info("TradeMonitor iniciado (poll=%ds max_age=%dh)", MONITOR_POLL_SEC, MONITOR_MAX_AGE_H)
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                self._check_all()
+            except Exception as e:
+                logger.error("TradeMonitor._check_all: %s", e)
+            time.sleep(MONITOR_POLL_SEC)
+
+    def _check_all(self):
+        trades = db.get_open_trades()
+        if not trades:
+            return
+        sol_usd = get_sol_usd() or 0
+        now = datetime.now(timezone.utc)
+        for trade in trades:
+            try:
+                self._check_trade(trade, sol_usd, now)
+            except Exception as e:
+                logger.debug("TradeMonitor trade #%s: %s", trade.get("id"), e)
+
+    def _check_trade(self, trade: dict, sol_usd: float, now: datetime):
+        trade_id   = trade["id"]
+        mint       = trade["mint"]
+        symbol     = trade.get("symbol", mint[:8])
+        entry_mc   = trade.get("entry_expected")
+        tp_pct     = trade.get("tp_pct") or TRADE_TP_PCT
+        sl_pct     = trade.get("sl_pct") or TRADE_SL_PCT
+        created_at = trade.get("created_at")
+        ref_ts     = trade.get("ts_order_sent") or trade.get("ts_signal") or created_at
+
+        if not entry_mc or entry_mc <= 0:
+            return
+
+        # Trades muito antigos sem ticks → marca expired
+        if created_at:
+            age_h = (now - created_at).total_seconds() / 3600
+            if age_h > MONITOR_MAX_AGE_H:
+                logger.info("TradeMonitor #%d %s — expired (%.1fh)", trade_id, symbol, age_h)
+                db.update_trade(trade_id, {"status": "expired", "exit_type": "expired", "exit_ts": now})
+                return
+
+        tp_mc = entry_mc * (1 + tp_pct)
+        sl_mc = entry_mc * (1 - sl_pct)
+
+        ticks = db.get_ticks_after(mint, min_ts=ref_ts)
+        if not ticks:
+            return
+
+        for tick in ticks:
+            high    = float(tick["mc_high"] or 0)
+            low     = float(tick["mc_low"]  or 0)
+            tick_ts = tick["tick_ts"]
+
+            if high >= tp_mc:
+                self._record_exit(trade, "tp",  tp_pct,  tick_ts, sol_usd)
+                return
+            if low > 0 and low <= sl_mc:
+                self._record_exit(trade, "sl", -sl_pct, tick_ts, sol_usd)
+                return
+
+    def _record_exit(self, trade: dict, exit_type: str, pnl_target: float,
+                     exit_ts, sol_usd: float):
+        """
+        Registra saída no DB com P&L real calculado a partir dos dados de fill.
+
+        P&L bruto = pnl_target (tp_pct ou -sl_pct) — condition_orders disparam
+        exatamente nessa porcentagem sobre o preço de fill.
+        P&L líquido = P&L bruto − fee_fraction (fee_sol / fill_sol).
+        """
+        trade_id   = trade["id"]
+        symbol     = trade.get("symbol", trade["mint"][:8])
+        amount_usd = trade.get("amount_usd") or 1.0
+
+        # P&L líquido: deduz fee sobre o capital investido
+        fee_sol  = trade.get("fee_sol") or 0.0
+        fill_sol = trade.get("amount_sol") or 0.0
+        fee_frac = (fee_sol / fill_sol) if fill_sol > 0 else 0.0
+        pnl_real = pnl_target - fee_frac
+
+        # Valor de saída em USD
+        exit_usd = amount_usd * (1 + pnl_target)
+
+        db.update_trade(trade_id, {
+            "status":         exit_type,
+            "exit_type":      exit_type,
+            "exit_ts":        exit_ts,
+            "exit_price_usd": exit_usd,
+            "pnl_pct_real":   pnl_real,
+        })
+        logger.info(
+            "TradeMonitor #%d %s — %s | pnl=%.1f%% (bruto=%.1f%% fee=%.3f%%)",
+            trade_id, symbol, exit_type.upper(),
+            pnl_real * 100, pnl_target * 100, fee_frac * 100,
+        )
 
 
 # ------------------------------------------------------------------

@@ -789,6 +789,35 @@ def get_trades(limit: int = 200) -> list:
         return [dict(row) for row in cur.fetchall()]
 
 
+def get_open_trades() -> list:
+    """Retorna trades com status='open' e entry_price_sol preenchido."""
+    with _cursor() as cur:
+        cur.execute("""
+            SELECT * FROM trades
+            WHERE status = 'open'
+              AND entry_expected IS NOT NULL
+            ORDER BY created_at ASC
+        """)
+        return [dict(row) for row in cur.fetchall()]
+
+
+def get_ticks_after(mint: str, min_ts) -> list:
+    """Retorna ticks (mc, mc_high, mc_low, tick_ts) para um mint após min_ts."""
+    with _cursor() as cur:
+        cur.execute("""
+            SELECT tick_ts,
+                   mc,
+                   COALESCE(mc_high, mc) AS mc_high,
+                   COALESCE(mc_low,  mc) AS mc_low
+            FROM token_ticks
+            WHERE mint    = %(mint)s
+              AND tick_ts >= %(min_ts)s
+              AND mc IS NOT NULL
+            ORDER BY tick_ts ASC
+        """, {"mint": mint, "min_ts": min_ts})
+        return [dict(row) for row in cur.fetchall()]
+
+
 def get_trades_without_strategy() -> list:
     """Trades com order_id mas sem strategy_id — candidatos a recuperação de TP/SL."""
     with _cursor() as cur:
