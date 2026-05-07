@@ -5719,58 +5719,67 @@ def analise_slope_coverage():
 
 
 def _slope_coverage_inner():
-    FASE_B_DATE = "2026-05-04"  # Fase B deployada nessa data (B.1-B.4)
-    MIN_TICKS   = int(request.args.get("min_ticks", 3))
-    WINDOW_SEC  = int(request.args.get("window_sec", 120))
+    FASE_B_DATE     = "2026-05-04"
+    MIN_TICKS       = int(request.args.get("min_ticks", 3))
+    WINDOW_SEC      = int(request.args.get("window_sec", 120))
+    SLOPE_THRESHOLD = -0.0008
 
-    # Para cada bounce, contar ticks nos 2min ANTES do ts_signal
-    # (ts_signal ≈ ts_min — o bounce dispara logo após o fundo)
+    # Passo 1: buscar todos os bounces com mc_min
     with db._cursor() as cur:
         cur.execute(f"""
-            SELECT
-                b.id,
-                b.mint,
-                b.symbol,
-                b.ts_signal,
-                b.ts_signal >= '{FASE_B_DATE}'::date AS pos_fase_b,
-                COUNT(t.tick_ts)                      AS n_ticks,
-                COUNT(t.tick_ts) >= {MIN_TICKS}       AS tem_slope,
-                MIN(t.mc)                             AS mc_min_tick,
-                MAX(t.mc)                             AS mc_max_tick
-            FROM bounce_signals b
-            LEFT JOIN token_ticks t
-                ON  t.mint    = b.mint
-                AND t.tick_ts <  b.ts_signal
-                AND t.tick_ts >= b.ts_signal - INTERVAL '{WINDOW_SEC} seconds'
-                AND t.mc IS NOT NULL
-            GROUP BY b.id, b.mint, b.symbol, b.ts_signal
-            ORDER BY b.ts_signal DESC
+            SELECT id, mint, symbol, ts_signal, mc_min,
+                   ts_signal >= '{FASE_B_DATE}'::date AS pos_fase_b
+            FROM bounce_signals
+            ORDER BY ts_signal DESC
         """)
-        rows = [dict(r) for r in cur.fetchall()]
+        bounces = [dict(r) for r in cur.fetchall()]
 
-    if not rows:
+    if not bounces:
         return "<pre>Sem bounce signals no banco.</pre>"
 
-    # Calcular slope quando há ticks suficientes
-    def calc_slope(mint, ts_signal):
+    # Passo 2: para cada bounce, estimar ts_min = tick com menor mc antes de ts_signal
+    # A.1 no código usa ts_min (fundo real), não ts_signal (detecção pós-bounce)
+    # Usar ts_signal diretamente inclui a recuperação → slope positivo → análise errada
+    def get_ts_min_estimated(mint, ts_signal, mc_min_ref):
         try:
-            ticks = db.get_recent_ticks(mint, window_sec=WINDOW_SEC, max_ts=ts_signal)
+            with db._cursor() as cur:
+                cur.execute("""
+                    SELECT tick_ts FROM token_ticks
+                    WHERE mint = %(mint)s AND tick_ts < %(ts)s AND mc IS NOT NULL
+                    ORDER BY mc ASC LIMIT 1
+                """, {"mint": mint, "ts": ts_signal})
+                row = cur.fetchone()
+                return row["tick_ts"] if row else None
+        except Exception:
+            return None
+
+    # Passo 3: calcular slope nos WINDOW_SEC antes do ts_min_estimated
+    def calc_slope_from_ts_min(mint, ts_min):
+        try:
+            ticks = db.get_recent_ticks(mint, window_sec=WINDOW_SEC, max_ts=ts_min)
             if len(ticks) < MIN_TICKS:
-                return None
+                return None, len(ticks)
             t0, mc0 = ticks[0]
             t1, mc1 = ticks[-1]
             dt = (t1 - t0).total_seconds()
             if dt <= 0 or mc0 <= 0:
-                return None
-            return ((mc1 - mc0) / mc0) / dt
+                return None, len(ticks)
+            return ((mc1 - mc0) / mc0) / dt, len(ticks)
         except Exception:
-            return None
+            return None, 0
 
-    SLOPE_THRESHOLD = -0.0008
+    rows = []
+    for b in bounces:
+        ts_min_est = get_ts_min_estimated(b["mint"], b["ts_signal"], b.get("mc_min"))
+        if ts_min_est is None:
+            slope, n_ticks = None, 0
+        else:
+            slope, n_ticks = calc_slope_from_ts_min(b["mint"], ts_min_est)
 
-    for r in rows:
-        r["slope"] = calc_slope(r["mint"], r["ts_signal"]) if r["tem_slope"] else None
-        r["slope_pass"] = (r["slope"] is not None and r["slope"] <= SLOPE_THRESHOLD)
+        tem_slope = n_ticks >= MIN_TICKS
+        slope_pass = (slope is not None and slope <= SLOPE_THRESHOLD)
+        rows.append({**b, "ts_min_est": ts_min_est, "n_ticks": n_ticks,
+                     "tem_slope": tem_slope, "slope": slope, "slope_pass": slope_pass})
 
     # Resumo por período
     def summary(subset):
@@ -5801,7 +5810,6 @@ def _slope_coverage_inner():
         label = "✅ íngreme" if v <= SLOPE_THRESHOLD else "❌ gradual"
         return f'<span style="color:{c}">{v:.6f} {label}</span>'
 
-    # Tabela de resumo
     sum_rows = ""
     for label, s in [("Antes Fase B", s_pre), ("Após Fase B", s_pos), ("Total", s_all)]:
         if not s:
@@ -5813,13 +5821,14 @@ def _slope_coverage_inner():
                      f"<td>{s['n_pass']} ({pct(s['pass_rate'])} dos cobertos)</td>"
                      f"<td>{s['n_fail']}</td></tr>")
 
-    # Tabela de bounces recentes (pos Fase B)
     detail_rows = ""
-    for r in pos_b[:40]:
-        ts = r["ts_signal"].strftime("%m-%d %H:%M") if r["ts_signal"] else "?"
+    for r in pos_b[:50]:
+        ts_sig = r["ts_signal"].strftime("%m-%d %H:%M") if r["ts_signal"] else "?"
+        ts_min_s = r["ts_min_est"].strftime("%H:%M:%S") if r["ts_min_est"] else "—"
         detail_rows += (f"<tr>"
-                        f"<td>{ts}</td>"
+                        f"<td>{ts_sig}</td>"
                         f"<td>{r['symbol'] or r['mint'][:8]}</td>"
+                        f"<td>{ts_min_s}</td>"
                         f"<td>{r['n_ticks']}</td>"
                         f"<td>{'✅' if r['tem_slope'] else '❌'}</td>"
                         f"<td>{slope_fmt(r['slope'])}</td>"
@@ -5828,8 +5837,10 @@ def _slope_coverage_inner():
     return f"""<html><head><title>Slope Coverage</title></head>
 <body style="font-family:monospace;background:#111;color:#eee;padding:20px">
 <h2>Coverage do slope filter (A.1) — antes vs após Fase B</h2>
-<p style="color:#aaa">Janela: {WINDOW_SEC}s antes do fundo | Min ticks: {MIN_TICKS} | Threshold slope: {SLOPE_THRESHOLD}</p>
+<p style="color:#aaa">Janela: {WINDOW_SEC}s antes do <b>fundo estimado</b> (tick com menor MC) | Min ticks: {MIN_TICKS} | Threshold: {SLOPE_THRESHOLD}</p>
 <p style="color:#fa0"><b>Meta Fase B: ≥ 50% de coverage</b></p>
+<p style="color:#aaa;font-size:12px">Fix: slope calculado em relação ao ts_min (fundo real, tick de menor MC),
+não ao ts_signal (detecção pós-bounce). ts_signal inclui a recuperação → slope positivo falso.</p>
 
 <h3>Resumo por período</h3>
 <table border=1 cellpadding=6 style="border-collapse:collapse;font-size:13px">
@@ -5843,14 +5854,14 @@ def _slope_coverage_inner():
 <h3>Bounces pós-Fase B (mais recentes primeiro)</h3>
 <table border=1 cellpadding=6 style="border-collapse:collapse;font-size:13px">
 <tr style="background:#222">
-  <th>Data/hora</th><th>Token</th><th>Ticks (2min antes fundo)</th>
-  <th>Slope calc?</th><th>Slope valor</th>
+  <th>Data/hora</th><th>Token</th><th>ts_min estimado</th>
+  <th>Ticks pré-fundo</th><th>Slope calc?</th><th>Slope valor</th>
 </tr>
 {detail_rows}
 </table>
 
 <p style="color:#888;font-size:12px;margin-top:12px">
-  Coverage = bounce tem ≥{MIN_TICKS} ticks nos {WINDOW_SEC}s antes do ts_signal.<br>
+  Coverage = bounce tem ≥{MIN_TICKS} ticks nos {WINDOW_SEC}s antes do ts_min_estimado.<br>
   Slope íngreme (≤{SLOPE_THRESHOLD}) → WR 66.7% (n=17). Gradual → WR 0%.<br>
   Fase B deployada em {FASE_B_DATE}: fix ts_min, kline 5min, backfill retroativo, hot-precise 30s.
 </p>
