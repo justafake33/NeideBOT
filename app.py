@@ -5868,6 +5868,159 @@ não ao ts_signal (detecção pós-bounce). ts_signal inclui a recuperação →
 </body></html>"""
 
 
+@app.route("/analise/h13-reanalysis")
+def analise_h13_reanalysis():
+    """
+    Re-análise H13 com metodologia correta (ts_min real via tick menor MC).
+    Original H13: n=17, WR 66.7% — cobertura 20.5%, seleção enviesada.
+    Agora com ~89% de cobertura: slope ≤-0.0008 passa 92% dos bounces → não discrimina.
+    Objetivo: encontrar threshold de slope que discrimine WR, se existir.
+    """
+    import traceback
+    try:
+        return _h13_reanalysis_inner()
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
+def _h13_reanalysis_inner():
+    WINDOW_SEC  = int(request.args.get("window_sec", 120))
+    MIN_TICKS   = 3
+
+    # Buscar todos os bounces
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT b.mint, b.symbol, b.ts_signal, b.mc_min, b.mc_migration,
+                   b.drop_from_mig, b.bounce_pct,
+                   t2.status, t2.pnl_pct_real, t2.entry_expected
+            FROM bounce_signals b
+            LEFT JOIN trades t2 ON t2.mint = b.mint
+            ORDER BY b.ts_signal
+        """)
+        bounces = [dict(r) for r in cur.fetchall()]
+
+    if not bounces:
+        return "<pre>Sem bounces.</pre>"
+
+    # Para cada bounce, estimar ts_min e calcular slope
+    def get_slope(mint, ts_signal):
+        try:
+            with db._cursor() as cur:
+                cur.execute("""
+                    SELECT tick_ts FROM token_ticks
+                    WHERE mint = %(mint)s AND tick_ts < %(ts)s AND mc IS NOT NULL
+                    ORDER BY mc ASC LIMIT 1
+                """, {"mint": mint, "ts": ts_signal})
+                row = cur.fetchone()
+                if not row:
+                    return None
+                ts_min = row["tick_ts"]
+            ticks = db.get_recent_ticks(mint, window_sec=WINDOW_SEC, max_ts=ts_min)
+            if len(ticks) < MIN_TICKS:
+                return None
+            t0, mc0 = ticks[0]
+            t1, mc1 = ticks[-1]
+            dt = (t1 - t0).total_seconds()
+            if dt <= 0 or mc0 <= 0:
+                return None
+            return ((mc1 - mc0) / mc0) / dt
+        except Exception:
+            return None
+
+    rows = []
+    for b in bounces:
+        slope = get_slope(b["mint"], b["ts_signal"])
+        status = b.get("status")
+        is_tp = (status == "tp")
+        is_sl = (status == "sl")
+        rows.append({**b, "slope": slope, "is_tp": is_tp, "is_sl": is_sl,
+                     "has_trade": status is not None})
+
+    # Filtrar apenas bounces com slope calculado e com trade executado
+    with_slope = [r for r in rows if r["slope"] is not None]
+    with_trade = [r for r in rows if r["has_trade"] and r["slope"] is not None]
+
+    # Análise por faixas de slope
+    # Faixas: gradual(>-0.0008), leve(-0.0008 a -0.002), médio(-0.002 a -0.004), íngreme(<-0.004)
+    thresholds = [
+        ("Gradual (> -0.0008)",    lambda s: s > -0.0008),
+        ("Leve (-0.0008 a -0.002)", lambda s: -0.002 < s <= -0.0008),
+        ("Médio (-0.002 a -0.004)", lambda s: -0.004 < s <= -0.002),
+        ("Íngreme (< -0.004)",     lambda s: s <= -0.004),
+    ]
+
+    # Análise de WR por faixa (apenas trades executados)
+    faixa_rows = ""
+    for label, fn in thresholds:
+        subset = [r for r in with_trade if fn(r["slope"])]
+        n = len(subset)
+        n_tp = sum(1 for r in subset if r["is_tp"])
+        n_sl = sum(1 for r in subset if r["is_sl"])
+        wr = n_tp / n if n > 0 else None
+        wr_str = f"{wr*100:.1f}%" if wr is not None else "—"
+        ev = (wr * 0.75 - (1-wr) * 0.15) if wr is not None else None
+        ev_str = f"{ev*100:+.1f}%" if ev is not None else "—"
+        c = "#4f4" if (ev and ev > 0) else ("#fa0" if n > 0 else "#666")
+        faixa_rows += (f"<tr><td>{label}</td><td>{n}</td><td>{n_tp}</td><td>{n_sl}</td>"
+                       f"<td style='color:{c}'><b>{wr_str}</b></td>"
+                       f"<td style='color:{c}'>{ev_str}</td></tr>")
+
+    # Distribuição de slope (todos os bounces com slope, independente de ter trade)
+    ranges = [(-999, -0.006), (-0.006, -0.004), (-0.004, -0.002), (-0.002, -0.0008), (-0.0008, 0)]
+    dist_rows = ""
+    for lo, hi in ranges:
+        subset = [r for r in with_slope if lo <= r["slope"] < hi]
+        label = f"{lo:.4f} a {hi:.4f}"
+        dist_rows += f"<tr><td>{label}</td><td>{len(subset)}</td><td>{len(subset)/len(with_slope)*100:.1f}%</td></tr>"
+
+    # Estatísticas gerais de slope
+    slopes = [r["slope"] for r in with_slope]
+    avg_slope = sum(slopes) / len(slopes) if slopes else 0
+    min_slope = min(slopes) if slopes else 0
+    max_slope = max(slopes) if slopes else 0
+
+    tp_slopes = [r["slope"] for r in with_trade if r["is_tp"]]
+    sl_slopes = [r["slope"] for r in with_trade if r["is_sl"]]
+    avg_tp = sum(tp_slopes)/len(tp_slopes) if tp_slopes else None
+    avg_sl = sum(sl_slopes)/len(sl_slopes) if sl_slopes else None
+
+    return f"""<html><head><title>H13 Re-análise</title></head>
+<body style="font-family:monospace;background:#111;color:#eee;padding:20px">
+<h2>H13 Re-análise — Slope pré-fundo vs WR (metodologia correta)</h2>
+<p style="color:#aaa">Janela: {WINDOW_SEC}s antes do ts_min estimado (tick com menor MC) | TP=75% SL=15%</p>
+<p style="color:#fa0">Original H13: n=17, WR 66.7% — seleção enviesada (20.5% cobertura).
+Agora com ts_min correto e ~89% cobertura: threshold -0.0008 passa 92% dos bounces.</p>
+
+<h3>Estatísticas de slope (todos bounces com dados: n={len(with_slope)})</h3>
+<table border=1 cellpadding=6 style="border-collapse:collapse;font-size:13px">
+<tr><td>Média geral</td><td>{avg_slope:.6f}</td></tr>
+<tr><td>Mín</td><td>{min_slope:.6f}</td></tr>
+<tr><td>Máx</td><td>{max_slope:.6f}</td></tr>
+<tr><td>Média slope — trades TP (n={len(tp_slopes)})</td><td style="color:#4f4">{f'{avg_tp:.6f}' if avg_tp else '—'}</td></tr>
+<tr><td>Média slope — trades SL (n={len(sl_slopes)})</td><td style="color:#f44">{f'{avg_sl:.6f}' if avg_sl else '—'}</td></tr>
+</table>
+
+<h3>WR por faixa de slope (apenas trades executados: n={len(with_trade)})</h3>
+<p style="color:#aaa;font-size:12px">Bounces que viraram trades reais. WR = hit TP antes de SL.</p>
+<table border=1 cellpadding=6 style="border-collapse:collapse;font-size:13px">
+<tr style="background:#222"><th>Faixa slope</th><th>Trades</th><th>TP</th><th>SL</th><th>WR</th><th>EV (TP75/SL15)</th></tr>
+{faixa_rows}
+</table>
+
+<h3>Distribuição de slope — todos bounces (n={len(with_slope)})</h3>
+<table border=1 cellpadding=6 style="border-collapse:collapse;font-size:13px">
+<tr style="background:#222"><th>Faixa</th><th>N bounces</th><th>%</th></tr>
+{dist_rows}
+</table>
+
+<p style="color:#888;font-size:12px;margin-top:12px">
+  H13 original (CLAUDE.md): slope ≤-0.0008 → WR 66.7% (n=17, cobertura 20.5%). Era seleção enviesada.<br>
+  Com ts_min correto: 92% dos bounces passam threshold -0.0008. Slope não discrimina no threshold atual.<br>
+  Pergunta: existe threshold mais agressivo que discrimine?
+</p>
+</body></html>"""
+
+
 @app.route("/analise/dump-entry")
 def analise_dump_entry():
     """
