@@ -5652,5 +5652,57 @@ def debug_test_swap():
     return "<pre>" + "\n".join(lines) + "</pre>"
 
 
+@app.route("/debug/backfill-pnl")
+def debug_backfill_pnl():
+    """
+    Recalcula pnl_pct_real para trades tp/sl sem P&L registrado.
+    Usa amount_usd, fee_sol e tp_pct/sl_pct do próprio trade.
+    GET /debug/backfill-pnl?dry=1 para simular sem salvar.
+    """
+    dry = request.args.get("dry", "0") not in ("0", "false", "")
+    lines = [f"{'[DRY RUN] ' if dry else ''}Backfill P&L de trades tp/sl sem pnl_pct_real", ""]
+    updated = 0
+    try:
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT id, symbol, status, tp_pct, sl_pct, amount_usd, amount_sol, fee_sol, pnl_pct_real
+                FROM trades
+                WHERE status IN ('tp', 'sl')
+                  AND pnl_pct_real IS NULL
+                ORDER BY created_at DESC
+            """)
+            rows = [dict(r) for r in cur.fetchall()]
+
+        for r in rows:
+            tp_pct    = r["tp_pct"]  or 0.75
+            sl_pct    = r["sl_pct"]  or 0.15
+            amount_sol = r["amount_sol"] or 0.0
+            fee_sol   = r["fee_sol"] or 0.0
+            fee_frac  = fee_sol / amount_sol if amount_sol > 0 else 0.0
+            pnl_target = tp_pct if r["status"] == "tp" else -sl_pct
+            pnl_real   = pnl_target - fee_frac
+            exit_usd   = (r["amount_usd"] or 1.0) * (1 + pnl_target)
+
+            lines.append(f"Trade #{r['id']} {r['symbol']} [{r['status'].upper()}]"
+                         f" pnl_bruto={pnl_target*100:.1f}%"
+                         f" fee={fee_frac*100:.3f}%"
+                         f" pnl_real={pnl_real*100:.1f}%"
+                         f" exit_usd=${exit_usd:.4f}")
+            if not dry:
+                db.update_trade(r["id"], {
+                    "pnl_pct_real":   pnl_real,
+                    "exit_price_usd": exit_usd,
+                })
+                updated += 1
+
+        lines.append("")
+        lines.append(f"{'Simulado' if dry else 'Atualizado'}: {len(rows)} trades | saved={updated}")
+    except Exception:
+        import traceback
+        lines.append(traceback.format_exc())
+
+    return "<pre>" + "\n".join(lines) + "</pre>"
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)

@@ -160,8 +160,9 @@ class TradeExecutor:
             _fail(trade_id, str(e))
             return
 
-        # 2. Poll fill em background — só para registrar dados reais no DB
-        FILL_TIMEOUT_SEC = int(os.getenv("FILL_TIMEOUT_SEC", "30"))
+        # 2. Poll fill em background — registra dados reais (slippage, fee, tokens, latência)
+        # Timeout de 120s: Solana pode demorar até 60s em congestionamento
+        FILL_TIMEOUT_SEC = int(os.getenv("FILL_TIMEOUT_SEC", "120"))
         deadline = time.time() + FILL_TIMEOUT_SEC
         while time.time() < deadline:
             try:
@@ -170,29 +171,34 @@ class TradeExecutor:
                 conf  = qd.get("confirmation") or {}
                 state = str(conf.get("state") or "").lower()
                 if state in ("failed", "expired"):
-                    db.update_trade(trade_id, {"error_msg": f"swap on-chain: {state}"})
+                    db.update_trade(trade_id, {"status": "error", "error_msg": f"swap on-chain: {state}"})
                     return
                 out_raw = _safe_float(qd.get("filled_output_amount"))
                 if out_raw and out_raw > 0:
                     in_raw   = _safe_float(qd.get("filled_input_amount"))
+                    # in_raw pode estar em lamports (>1000) ou SOL
                     fill_sol = (in_raw / 1e9 if in_raw and in_raw > 1000 else in_raw) or amount_sol
                     fee_raw  = _safe_float(qd.get("fee"))
-                    fee_sol  = (fee_raw / 1e9 if fee_raw and fee_raw > 1000 else fee_raw)
+                    fee_sol  = (fee_raw / 1e9 if fee_raw and fee_raw > 1000 else fee_raw) or 0.0
+                    # slippage: diferença entre SOL real gasto e SOL intencionado
+                    slippage = (fill_sol - amount_sol) / amount_sol if amount_sol else 0.0
                     db.update_trade(trade_id, {
                         "ts_order_confirmed": datetime.now(timezone.utc),
                         "tokens_received":    out_raw,
                         "entry_price_sol":    fill_sol / out_raw,
-                        "entry_price_usd":    fill_sol * sol_usd,
+                        "entry_price_usd":    fill_sol * sol_usd,  # USD gasto real
                         "fee_sol":            fee_sol,
                         "latency_sec":        (datetime.now(timezone.utc) - ts_signal).total_seconds(),
-                        "slippage_pct":       (fill_sol - amount_sol) / amount_sol,
+                        "slippage_pct":       slippage,
                     })
-                    logger.info("Fill #%d %s — %.0f tokens @ %.10f SOL",
-                                trade_id, symbol, out_raw, fill_sol / out_raw)
+                    logger.info("Fill #%d %s — %.0f tokens @ %.10f SOL | slip=%.2f%% fee=%.6f SOL lat=%.1fs",
+                                trade_id, symbol, out_raw, fill_sol / out_raw,
+                                slippage * 100, fee_sol,
+                                (datetime.now(timezone.utc) - ts_signal).total_seconds())
                     return
             except Exception as e:
                 logger.debug("poll fill #%d: %s", trade_id, e)
-            time.sleep(1)
+            time.sleep(2)
 
     def _check_persistence(self, mint: str, entry_expected: float, ts_signal) -> bool:
         """
@@ -310,30 +316,24 @@ class TradeMonitor:
                 logger.debug("TradeMonitor trade #%s: %s", trade.get("id"), e)
 
     def _check_trade(self, trade: dict, sol_usd: float, now: datetime):
-        trade_id    = trade["id"]
-        mint        = trade["mint"]
-        symbol      = trade.get("symbol", mint[:8])
-        entry_mc    = trade.get("entry_expected")
-        tp_pct      = trade.get("tp_pct")  or TRADE_TP_PCT
-        sl_pct      = trade.get("sl_pct")  or TRADE_SL_PCT
-        created_at  = trade.get("created_at")
-        ref_ts      = trade.get("ts_order_sent") or trade.get("ts_signal") or created_at
+        trade_id   = trade["id"]
+        mint       = trade["mint"]
+        symbol     = trade.get("symbol", mint[:8])
+        entry_mc   = trade.get("entry_expected")
+        tp_pct     = trade.get("tp_pct") or TRADE_TP_PCT
+        sl_pct     = trade.get("sl_pct") or TRADE_SL_PCT
+        created_at = trade.get("created_at")
+        ref_ts     = trade.get("ts_order_sent") or trade.get("ts_signal") or created_at
 
         if not entry_mc or entry_mc <= 0:
             return
 
-        # Ignora trades muito antigos (sem ticks no DB)
+        # Trades muito antigos sem ticks → marca expired
         if created_at:
             age_h = (now - created_at).total_seconds() / 3600
             if age_h > MONITOR_MAX_AGE_H:
-                logger.info("TradeMonitor #%d %s — fechando por idade (%.1fh > %dh)",
-                            trade_id, symbol, age_h, MONITOR_MAX_AGE_H)
-                db.update_trade(trade_id, {
-                    "status":        "expired",
-                    "exit_type":     "expired",
-                    "exit_ts":       now,
-                    "pnl_pct_real":  None,
-                })
+                logger.info("TradeMonitor #%d %s — expired (%.1fh)", trade_id, symbol, age_h)
+                db.update_trade(trade_id, {"status": "expired", "exit_type": "expired", "exit_ts": now})
                 return
 
         tp_mc = entry_mc * (1 + tp_pct)
@@ -344,35 +344,51 @@ class TradeMonitor:
             return
 
         for tick in ticks:
-            high = float(tick["mc_high"] or 0)
-            low  = float(tick["mc_low"]  or 0)
+            high    = float(tick["mc_high"] or 0)
+            low     = float(tick["mc_low"]  or 0)
             tick_ts = tick["tick_ts"]
 
             if high >= tp_mc:
-                exit_usd = tp_mc * sol_usd / entry_mc * (trade.get("amount_usd") or 1.0) if entry_mc else None
-                db.update_trade(trade_id, {
-                    "status":       "tp",
-                    "exit_type":    "tp",
-                    "exit_ts":      tick_ts,
-                    "exit_price_usd": exit_usd,
-                    "pnl_pct_real": tp_pct,
-                })
-                logger.info("TradeMonitor #%d %s — TP atingido (mc_high=$%.0f >= tp_mc=$%.0f)",
-                            trade_id, symbol, high, tp_mc)
+                self._record_exit(trade, "tp",  tp_pct,  tick_ts, sol_usd)
+                return
+            if low > 0 and low <= sl_mc:
+                self._record_exit(trade, "sl", -sl_pct, tick_ts, sol_usd)
                 return
 
-            if low > 0 and low <= sl_mc:
-                exit_usd = sl_mc * sol_usd / entry_mc * (trade.get("amount_usd") or 1.0) if entry_mc else None
-                db.update_trade(trade_id, {
-                    "status":       "sl",
-                    "exit_type":    "sl",
-                    "exit_ts":      tick_ts,
-                    "exit_price_usd": exit_usd,
-                    "pnl_pct_real": -sl_pct,
-                })
-                logger.info("TradeMonitor #%d %s — SL atingido (mc_low=$%.0f <= sl_mc=$%.0f)",
-                            trade_id, symbol, low, sl_mc)
-                return
+    def _record_exit(self, trade: dict, exit_type: str, pnl_target: float,
+                     exit_ts, sol_usd: float):
+        """
+        Registra saída no DB com P&L real calculado a partir dos dados de fill.
+
+        P&L bruto = pnl_target (tp_pct ou -sl_pct) — condition_orders disparam
+        exatamente nessa porcentagem sobre o preço de fill.
+        P&L líquido = P&L bruto − fee_fraction (fee_sol / fill_sol).
+        """
+        trade_id   = trade["id"]
+        symbol     = trade.get("symbol", trade["mint"][:8])
+        amount_usd = trade.get("amount_usd") or 1.0
+
+        # P&L líquido: deduz fee sobre o capital investido
+        fee_sol  = trade.get("fee_sol") or 0.0
+        fill_sol = trade.get("amount_sol") or 0.0
+        fee_frac = (fee_sol / fill_sol) if fill_sol > 0 else 0.0
+        pnl_real = pnl_target - fee_frac
+
+        # Valor de saída em USD
+        exit_usd = amount_usd * (1 + pnl_target)
+
+        db.update_trade(trade_id, {
+            "status":         exit_type,
+            "exit_type":      exit_type,
+            "exit_ts":        exit_ts,
+            "exit_price_usd": exit_usd,
+            "pnl_pct_real":   pnl_real,
+        })
+        logger.info(
+            "TradeMonitor #%d %s — %s | pnl=%.1f%% (bruto=%.1f%% fee=%.3f%%)",
+            trade_id, symbol, exit_type.upper(),
+            pnl_real * 100, pnl_target * 100, fee_frac * 100,
+        )
 
 
 # ------------------------------------------------------------------
