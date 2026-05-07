@@ -208,11 +208,11 @@ FASE 2 — coleta ativa (IMPLEMENTADO 2026-05-03)
 BOUNCE DETECTOR + FASE 6 — execução real (ATIVO 2026-05-04)
     ├─ _check_bounce() chamado em cada push_mc
     ├─ Condições base: drop ≥ 30% + bounce ≥ 15% do fundo + elapsed ≤ 20min (A.5)
-    ├─ Fase A — filtros adicionais (ordem de aplicação):
+    ├─ Fase A — filtros ativos (ordem de aplicação):
     │       ├─ A.2: rejeita bounce_pct 20-30% (dead zone, WR 3.1%)
     │       ├─ A.3: rejeita entry_ratio 50-65% da migração (WR 0%)
-    │       ├─ B.3: primeira detecção elegível → backfill retroativo kline + aguarda 5s
-    │       └─ A.1: slope pré-fundo ≤ -0.0008 %/s (WR 66.7% vs 0.0%). Fallback se < 3 ticks.
+    │       └─ B.3: primeira detecção elegível → backfill retroativo kline em background (sem bloquear)
+    │       ~~A.1 REMOVIDO: slope pré-fundo — H13 refutada com n=153 (recovery rate flat em todas faixas)~~
     ├─ One-shot por token (bounce_fired = True após primeiro disparo)
     ├─ Persiste em bounce_signals (UNIQUE mint) + alerta Telegram
     ├─ Chama TradeExecutor.on_bounce() → thread _execute()
@@ -228,7 +228,7 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO 2026-05-04)
 - Recovery rate baseline: **23.5%** (não 52% — corrigido após marcar tokens mortos como FALSE)
 - **83 bounce signals** disparados em produção — analisados em `/analise/deep-bounce` (12 seções)
 - **Bounce detector WR atual: 13.3%** (EV -3% bruto) — filtros Fase A devem elevar para ~29% (estimado)
-- **Fase A ATIVA**: slope filter, dead zone, entry ratio, persistência, time-stop 20min
+- **Fase A ATIVA**: dead zone (A.2), entry ratio (A.3), persistência (A.4), time-stop (A.5). A.1 slope removido — H13 refutada.
 - **Fase B ATIVA**: ts_min bug fix, kline 5min window, backfill retroativo, hot-precise 30s
 - **Fase 2 ativa**: sinais type 12 coletados em `token_signals` a cada 5s
 - **Fase 6 BLOQUEADA**: `AUTH_SIGNATURE_INVALID` — problema de configuração GMGN (wallet/IP), não de código
@@ -307,7 +307,7 @@ Registradas ANTES de ver os dados. Não alterar retroativamente.
 | H10 | time_to_bottom < 25min → recovery rate ≥20pp maior que time_to_bottom ≥ 25min | ✅ **+21.8pp** confirmado (61.2% vs 39.3%, n=425) |
 | H11 | Deceleração de preço (d²p/dt²→0) precede o fundo em recovery tokens | ❌ **REFUTADA** — direção invertida. Recovery tokens ACELERAM no fundo (capitulação brusca), não desaceleram |
 | H12 | dump_depth + time_elapsed definem zona probabilística de entrada (P(recovery) > 50%) | ⚠️ **PARCIAL** — time domina sobre depth. 3 zonas acionáveis (N≥15, rate≥60%) mas todas já cobertas por H10. Insight novo: zona 5-10min tem recovery 51% (dead zone). |
-| H13 | Slope íngreme pré-fundo (≤ -0.0008 %/s) → WR de bounce ≥40pp maior que slope gradual | ✅ **+66.7pp** confirmado (66.7% vs 0.0%, n=17 com dados, cobertura 20.5%). Slope avg TP=-0.0035, SL=-0.0003. |
+| H13 | Slope íngreme pré-fundo (≤ -0.0008 %/s) → WR de bounce ≥40pp maior que slope gradual | ❌ **REFUTADA** com n=153 (metodologia correta). Avg slope recovery TRUE=-0.003829 vs FALSE=-0.003696 (diff=0.000133, essencialmente zero). Recovery rate flat em todas as faixas (25-44%, ruído). H13 original n=17 era seleção enviesada (20.5% cobertura, ts_signal errado). A.1 removido do pipeline. |
 | H14 | bounce_pct entre 20-30% é dead zone — WR inferior a 15-20% e 30%+ | ✅ **confirmado** (3.1% WR vs 18.5% e 21.1%, n=32). Dead-cat zone reforçada com n maior. |
 | H15 | Entry entre 50-65% do mc_migration tem WR=0% | ✅ **confirmado** (0/21 = 0% WR, n=21 — amostra maior). Zona morta absoluta. |
 | H16 | 3 ticks consecutivos acima do entry pós-sinal → WR ≥20pp maior | ✅ **+18.0pp** confirmado (28.6% vs 10.6%, n=14/66). Efeito menor que n=71 (+24.3pp) mas consistente. |
@@ -335,7 +335,7 @@ WR base: **13.3%** (EV -3%, TP75/SL15). WR estimado pós-filtros A.2+A.3: **~29%
 
 | Feature | Resultado | Status | Nota |
 |---------|-----------|--------|------|
-| slope pré-fundo ≤ -0.0008 | **66.7% vs 0.0% WR** (+66.7pp) | ✅ A.1 implementado | n=17, cobertura 20.5%. Slope avg TP=-0.0035, SL=-0.0003 |
+| slope pré-fundo ≤ -0.0008 | Recovery rate flat: 34-44% em todas faixas | ❌ A.1 REMOVIDO | n=153, ts_min correto. Original n=17 era seleção enviesada. Slope é característica universal dos bounces, não discrimina. |
 | bounce_pct 15-20% | 18.5% WR (n=27) | ✅ faixa válida | — |
 | bounce_pct 20-30% | 3.1% WR (n=32) | ✅ A.2 bloqueia | Dead zone — 39% de todos os bounces |
 | bounce_pct 30-50% | 21.1% WR (n=19) | ✅ faixa válida | — |
@@ -350,7 +350,7 @@ WR base: **13.3%** (EV -3%, TP75/SL15). WR estimado pós-filtros A.2+A.3: **~29%
 | W-bottom (double-dip) | 98% prevalência — não discrimina | ❌ não é filtro | Ubíquo em TPs e SLs. A.4 trata implicitamente |
 | tempo para TP hit | mediana 6.1min, 100% ≤20min | ✅ time-stop = 20min | 82% em ≤10min. Zero TPs entre 20-40min |
 
-> **Por que 70 SLs em <2min:** bounce dispara sinal, preço sobe 15-20%, imediatamente despenca. Não é bounce — é micro-recuperação dentro de downtrend que não terminou. O slope filter (A.1) resolve isso: capitulação real gera spike abrupto de venda antes do fundo. W-bottom nesses casos: o "W" cruza abaixo do SL floor antes de recuperar.
+> **Por que 70 SLs em <2min:** bounce dispara sinal, preço sobe 15-20%, imediatamente despenca. Não é bounce — é micro-recuperação dentro de downtrend que não terminou. W-bottom nesses casos: o "W" cruza abaixo do SL floor antes de recuperar. A.4 (persistência 90s + 3 ticks) é o único filtro ativo para isso.
 
 > **WR pós-filtros estimado:** remover A.2 (32 trades, WR 3.1%) + A.3 (21 trades, WR 0%, ~8 overlap com A.2) → ~38 trades restantes com 11 TPs = **~29% WR estimado**. Confirmar após 30+ bounces com Fase A ativa.
 
@@ -489,8 +489,6 @@ MIGRATION_SOL_UNITS=410      # SOL teórico da bonding curve → mc_migration_bc
 BOUNCE_MIN_PCT=0.15          # bounce mínimo do fundo para disparar sinal (15%)
 BOUNCE_DROP_MIN=0.30         # drop mínimo da migração para considerar (30%)
 BOUNCE_TIME_MAX=20.0         # A.5: janela máxima em minutos (era 30min — 100% TPs em ≤20min)
-BOUNCE_SLOPE_MIN=-0.0008     # A.1: slope pré-fundo máximo (mais negativo = mais íngreme = bom)
-BOUNCE_SLOPE_MIN_TICKS=3     # A.1: ticks mínimos para ativar o slope filter
 
 # Fase 6 — Execução de trades (configuráveis sem redeploy)
 TRADING_ENABLED=false        # true para ativar trades reais
@@ -576,7 +574,7 @@ PERSISTENCE_MIN_TICKS=3      # A.4: ticks pós-sinal acima do entry para confirm
 45. **rug_ratio vs bundler_trader_amount_rate são campos diferentes**: `token["rug_ratio"]` é o score de risco interno da GMGN (escala 0-1, tende a ser baixo). `token["bundler_trader_amount_rate"]` é a % real de bundlers (o campo relevante para filtrar). O filtro `FILTER_BUNDLER_MAX` checa `bundler_trader_amount_rate`; `FILTER_RUG_MAX` checa `rug_ratio`. Ambos devem estar no filtro.
 46. **bot_degen_rate é um forte sinal de lixo**: tokens com >50% de bot_degen_rate tendem a ser rugs ou distribuição pura. Filtrado por `FILTER_BOT_MAX` (padrão 50%).
 47. **ts_min rastreado no state do HotMonitor**: `state["ts_min"]` é atualizado em `push_mc()` (trenches) e em `_precise_bottom_tick()` (kline) sempre que um novo mc_min é detectado. Usado pelo slope filter (A.1) para queryar ticks pré-fundo. Bug original: kline path não atualizava ts_min → slope filter sempre retornava 0 ticks (janela errada). Corrigido em Fase B.
-48. **slope_backfill_triggered**: flag no state do HotMonitor. Na primeira detecção de bounce elegível (A.2/A.3 passam), dispara `_backfill_slope_ticks()` em thread própria e retorna sem disparar o sinal. No segundo poll (5s depois), slope filter roda com dados completos do kline retroativo.
+48. **slope_backfill_triggered**: flag no state do HotMonitor. Na primeira detecção de bounce elegível (A.2/A.3 passam), dispara `_backfill_slope_ticks()` em thread própria para cobertura de ticks históricos. Não bloqueia o sinal (A.1 removido — H13 refutada com n=153).
 49. **Bounce velocity NÃO discrimina**: testado com n=83. Todas as tercis de velocidade (lento/médio/rápido) têm WR 40% flat. TTB<25min+Slow tem WR MAIOR que TTB<25min+Fast (43% vs 29%). Não implementar filtro de velocity.
 50. **W-bottom é ubíquo (98%)**: 82/83 bounces têm double-dip. NÃO é filtro. A.4 (persistência 90s) trata implicitamente: se o W-bottom recupera antes de 90s, os ticks pós-sinal voltam acima do entry → persistência passa.
 51. **WR estimado pós-filtros A.2+A.3**: remover 32 trades (dead zone 20-30%) + 21 trades (entry 50-65%, ~8 overlap) → ~38 trades restantes com 11 TPs = **~29% WR estimado**. Confirmar com 30+ bounces após Fase A ativa.
