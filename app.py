@@ -5704,6 +5704,196 @@ def debug_backfill_pnl():
     return "<pre>" + "\n".join(lines) + "</pre>"
 
 
+@app.route("/analise/dump-entry")
+def analise_dump_entry():
+    """
+    Exploração: se comprássemos durante o dump (limit buy em X% do mc_migration),
+    qual seria o WR e EV em cada nível?
+
+    Deixa os dados dizerem onde está o edge — sem presumir nada.
+    Parâmetros: tp=0.75  sl=0.15  trade_usd=10  tip_sol=0.001  prio_sol=0.001
+                gmgn_pct=0.01  slip=0.025  sol_usd=auto
+    """
+    import traceback
+    try:
+        return _dump_entry_inner()
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
+def _dump_entry_inner():
+    from gmgn_client import get_sol_usd as _get_sol_usd
+
+    TP_PCT    = float(request.args.get("tp",        0.75))
+    SL_PCT    = float(request.args.get("sl",        0.15))
+    TRADE_USD = float(request.args.get("trade_usd", 10.0))
+    TIP_SOL   = float(request.args.get("tip_sol",   0.001))
+    PRIO_SOL  = float(request.args.get("prio_sol",  0.001))
+    GMGN_PCT  = float(request.args.get("gmgn_pct",  0.01))
+    SLIP_PCT  = float(request.args.get("slip",       0.025))
+    sol_usd   = float(request.args.get("sol_usd",   0)) or _get_sol_usd() or 150.0
+
+    # Friction (igual à persistence-sim)
+    fixed_usd   = (TIP_SOL + PRIO_SOL) * 2 * sol_usd
+    buy_cost    = fixed_usd / 2 + TRADE_USD * GMGN_PCT + TRADE_USD * SLIP_PCT
+    tp_sell_cost = fixed_usd / 2 + TRADE_USD * (1 + TP_PCT) * GMGN_PCT
+    sl_sell_cost = fixed_usd / 2 + TRADE_USD * (1 - SL_PCT) * GMGN_PCT
+    tp_net_pnl  = TRADE_USD * TP_PCT - buy_cost - tp_sell_cost
+    sl_net_pnl  = -TRADE_USD * SL_PCT - buy_cost - sl_sell_cost
+    tp_net_pct  = tp_net_pnl / TRADE_USD
+    sl_net_pct  = sl_net_pnl / TRADE_USD
+    breakeven_wr = (-sl_net_pct) / (tp_net_pct - sl_net_pct)
+
+    # Dados brutos
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT mc_migration, mc_bottom, mc_peak, recovery,
+                   time_to_bottom, mc_1h
+            FROM migrations
+            WHERE mc_migration > 0
+              AND mc_bottom    > 0
+              AND mc_peak      > 0
+              AND mc_bottom    < mc_migration
+        """)
+        tokens = [dict(r) for r in cur.fetchall()]
+
+    n_total = len(tokens)
+
+    # Níveis de entrada a explorar: 10% a 90% do mc_migration
+    levels = [round(x * 0.05, 2) for x in range(2, 20)]  # 0.10 a 0.95 step 0.05
+
+    rows_data = []
+    for T in levels:
+        eligible = [
+            t for t in tokens
+            if t["mc_bottom"] <= t["mc_migration"] * T
+        ]
+        n = len(eligible)
+        if n == 0:
+            rows_data.append({"T": T, "n": 0})
+            continue
+
+        # Para cada token elegível: entry = mc_migration * T
+        # TP price = entry * (1 + TP_PCT)
+        # SL price = entry * (1 - SL_PCT)
+        # Após a compra, o token pode:
+        #   - continuar caindo até mc_bottom < SL price → SL hit
+        #   - subir até mc_peak > TP price             → TP potencial
+        # Se ambos cruzam → não sabemos a ordem sem ticks (mostrado separado)
+
+        n_tp_only  = 0  # só TP cruzado (clean win)
+        n_sl_only  = 0  # só SL cruzado (clean loss)
+        n_both     = 0  # ambos cruzados (ambíguo — sem ticks para saber a ordem)
+        n_neither  = 0  # nenhum cruzado (saiu por tempo)
+
+        for t in eligible:
+            entry  = t["mc_migration"] * T
+            tp_lvl = entry * (1 + TP_PCT)
+            sl_lvl = entry * (1 - SL_PCT)
+            hit_tp = t["mc_peak"]   >= tp_lvl
+            hit_sl = t["mc_bottom"] <  sl_lvl
+
+            if   hit_tp and not hit_sl: n_tp_only += 1
+            elif hit_sl and not hit_tp: n_sl_only += 1
+            elif hit_tp and hit_sl:     n_both    += 1
+            else:                       n_neither += 1
+
+        # WR conservador: n_both → todos SL (pior caso)
+        wr_bear  = n_tp_only / n
+        # WR otimista: n_both → todos TP
+        wr_bull  = (n_tp_only + n_both) / n
+        # WR central: n_both → 50/50
+        wr_mid   = (n_tp_only + n_both * 0.5) / n
+
+        ev_bear = wr_bear * tp_net_pct + (1 - wr_bear) * sl_net_pct
+        ev_mid  = wr_mid  * tp_net_pct + (1 - wr_mid)  * sl_net_pct
+        ev_bull = wr_bull * tp_net_pct + (1 - wr_bull) * sl_net_pct
+
+        rows_data.append({
+            "T": T, "n": n, "pct_of_total": n / n_total,
+            "n_tp_only": n_tp_only, "n_sl_only": n_sl_only,
+            "n_both": n_both, "n_neither": n_neither,
+            "wr_bear": wr_bear, "wr_mid": wr_mid, "wr_bull": wr_bull,
+            "ev_bear": ev_bear, "ev_mid": ev_mid, "ev_bull": ev_bull,
+        })
+
+    # HTML
+    def pct(v, dec=1):
+        if v is None: return "—"
+        c = "#4f4" if v >= 0 else "#f44"
+        return f'<span style="color:{c}">{v*100:+.{dec}f}%</span>'
+
+    def wr_cell(v):
+        be = breakeven_wr
+        c = "#4f4" if v >= be else "#f66"
+        return f'<span style="color:{c}">{v*100:.1f}%</span>'
+
+    header = ("<tr style='background:#222'>"
+              "<th>Nível entrada<br>(% mc_mig)</th>"
+              "<th>Tokens<br>elegíveis</th>"
+              "<th>% do total<br>que chega</th>"
+              "<th>✅ TP limpo</th>"
+              "<th>❌ SL limpo</th>"
+              "<th>⚠️ Ambos<br>(ordem ?)</th>"
+              "<th>⏱ Nenhum</th>"
+              "<th>WR mín<br>(bear)</th>"
+              "<th>WR central<br>(50/50)</th>"
+              "<th>WR máx<br>(bull)</th>"
+              "<th>EV central<br>/trade</th>"
+              "</tr>")
+
+    body = ""
+    for r in rows_data:
+        if r["n"] == 0:
+            body += f"<tr><td>{r['T']*100:.0f}%</td><td colspan=10 style='color:#666'>nenhum token chegou aqui</td></tr>"
+            continue
+        ev_color = "#4f4" if r["ev_mid"] >= 0 else "#f44"
+        bg = "background:#1a2a1a" if r["ev_mid"] >= 0 else ""
+        body += (f"<tr style='{bg}'>"
+                 f"<td><b>{r['T']*100:.0f}%</b></td>"
+                 f"<td>{r['n']}</td>"
+                 f"<td>{r['pct_of_total']*100:.1f}%</td>"
+                 f"<td>{r['n_tp_only']} ({r['n_tp_only']/r['n']*100:.0f}%)</td>"
+                 f"<td>{r['n_sl_only']} ({r['n_sl_only']/r['n']*100:.0f}%)</td>"
+                 f"<td>{r['n_both']} ({r['n_both']/r['n']*100:.0f}%)</td>"
+                 f"<td>{r['n_neither']} ({r['n_neither']/r['n']*100:.0f}%)</td>"
+                 f"<td>{wr_cell(r['wr_bear'])}</td>"
+                 f"<td>{wr_cell(r['wr_mid'])}</td>"
+                 f"<td>{wr_cell(r['wr_bull'])}</td>"
+                 f"<td><span style='color:{ev_color}'>{r['ev_mid']*100:+.1f}%</span></td>"
+                 f"</tr>")
+
+    return f"""<html><head><title>Dump Entry Analysis</title></head>
+<body style="font-family:monospace;background:#111;color:#eee;padding:20px">
+<h2>Exploração: comprar durante o dump — onde está o edge?</h2>
+<p style="color:#aaa">
+  {n_total} tokens com mc_bottom &lt; mc_migration |
+  TP: <b>+{TP_PCT*100:.0f}%</b> | SL: <b>-{SL_PCT*100:.0f}%</b> |
+  Trade: <b>${TRADE_USD:.0f}</b> | SOL: <b>${sol_usd:.0f}</b>
+</p>
+<p style="color:#fa0">
+  Break-even WR: <b>{breakeven_wr*100:.1f}%</b> |
+  P&L líquido TP: <b>{tp_net_pct*100:+.1f}%</b> |
+  P&L líquido SL: <b>{sl_net_pct*100:+.1f}%</b>
+</p>
+
+<table border=1 cellpadding=6 style="border-collapse:collapse;font-size:13px">
+{header}{body}
+</table>
+
+<p style="color:#888;font-size:12px;margin-top:16px">
+<b>Nível entrada</b>: limit buy quando mc cai para X% do mc_migration (ex: 30% = dump de -70%).<br>
+<b>Tokens elegíveis</b>: aqueles onde mc_bottom ≤ nível de entrada (a ordem teria sido preenchida).<br>
+<b>TP limpo</b>: mc_peak ≥ TP price e mc_bottom ≥ SL price — TP definitivamente antes do SL.<br>
+<b>SL limpo</b>: mc_peak &lt; TP price e mc_bottom &lt; SL price — SL definitivamente.<br>
+<b>Ambos</b>: mc_peak ≥ TP e mc_bottom &lt; SL — ambos os níveis foram tocados, ordem desconhecida sem ticks.<br>
+<b>WR mín/central/máx</b>: bear=todos 'ambos' como SL | central=50/50 | bull=todos 'ambos' como TP.<br>
+<b>EV central</b>: WR_central × P&L_TP_líquido + (1-WR) × P&L_SL_líquido.<br>
+Linhas <span style="color:#4f4">verdes</span>: EV central positivo. Linhas sem cor: EV negativo.
+</p>
+</body></html>"""
+
+
 @app.route("/analise/persistence-sim")
 def analise_persistence_sim():
     """
