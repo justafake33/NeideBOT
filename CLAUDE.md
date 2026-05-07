@@ -216,9 +216,7 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO 2026-05-04)
     ├─ One-shot por token (bounce_fired = True após primeiro disparo)
     ├─ Persiste em bounce_signals (UNIQUE mint) + alerta Telegram
     ├─ Chama TradeExecutor.on_bounce() → thread _execute()
-    └─ _execute(): A.4 (aguarda 90s + 3 ticks pós-sinal acima entry) →
-                   A.6 (cancela se preço atual > entry_expected × 1.20) →
-                   swap() com condition_orders (TP+SL atômico)
+    └─ _execute(): A.4 (aguarda 90s + 3 ticks pós-sinal acima entry) → swap() → _wait_fill() → create_strategy()
 ```
 
 ---
@@ -505,7 +503,6 @@ ORDER_POLL_SEC=2             # intervalo de poll do fill (segundos)
 ORDER_TIMEOUT_SEC=30         # timeout do fill (segundos)
 PERSISTENCE_WAIT_SEC=90      # A.4: segundos de espera antes de verificar persistência
 PERSISTENCE_MIN_TICKS=3      # A.4: ticks pós-sinal acima do entry para confirmar
-ENTRY_MAX_OVERSHOOT=0.20     # A.6: cancela se preço atual > entry_expected × 1.20 (compra 20% acima do planejado)
 ```
 
 ---

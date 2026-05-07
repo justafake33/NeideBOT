@@ -37,11 +37,8 @@ ORDER_TIMEOUT_SEC  = int(os.getenv(  "ORDER_TIMEOUT_SEC",        "60"))
 PERSISTENCE_WAIT_SEC   = int(os.getenv("PERSISTENCE_WAIT_SEC",   "90"))   # espera antes de verificar
 PERSISTENCE_MIN_TICKS  = int(os.getenv("PERSISTENCE_MIN_TICKS",  "3"))    # ticks mínimos acima do entry
 
-# A.6 — Teto de entry: cancela trade se preço já subiu mais de X% acima do entry_expected.
-# Evita comprar no topo quando o bounce já aconteceu durante o wait de 90s.
-# Dado observado: SNDK +47%, FIN +28% acima do entry → SL imediato.
-# Threshold 20%: entry_expected × 1.20 = mc_bottom × 1.38 máximo.
-ENTRY_MAX_OVERSHOOT    = float(os.getenv("ENTRY_MAX_OVERSHOOT",  "0.20"))  # 20% acima do entry_expected
+PUMP_FUN_SUPPLY    = 1_000_000_000  # supply padrão Pump.fun
+SPL_TOKEN_DECIMALS = int(os.getenv("SPL_TOKEN_DECIMALS", "6"))  # casas decimais do token SPL (Pump.fun = 6)
 
 
 class TradeExecutor:
@@ -136,23 +133,6 @@ class TradeExecutor:
                 _fail(trade_id, f"persistence_fail após {PERSISTENCE_WAIT_SEC}s")
                 return
 
-        # A.6 — Teto de entry: cancela se preço atual subiu mais de ENTRY_MAX_OVERSHOOT acima do entry_expected.
-        # Evita comprar no topo quando o bounce já disparou durante o wait de 90s.
-        if entry_expected > 0 and ENTRY_MAX_OVERSHOOT > 0:
-            current_mc = self._get_current_mc(mint, ts_signal)
-            if current_mc and current_mc > 0:
-                overshoot = (current_mc / entry_expected) - 1
-                if overshoot > ENTRY_MAX_OVERSHOOT:
-                    logger.info(
-                        "TRADE #%d %s — cancelado A.6: preço atual $%.0f já %.1f%% acima do entry $%.0f (max=%.0f%%)",
-                        trade_id, symbol, current_mc, overshoot * 100,
-                        entry_expected, ENTRY_MAX_OVERSHOOT * 100,
-                    )
-                    _fail(trade_id, f"entry_overshoot {overshoot*100:.1f}% > max {ENTRY_MAX_OVERSHOOT*100:.0f}%")
-                    return
-                logger.debug("A.6 OK #%d %s — overshoot=%.1f%% (max=%.0f%%)",
-                             trade_id, symbol, overshoot * 100, ENTRY_MAX_OVERSHOOT * 100)
-
         # 1. Swap com TP/SL embutidos via condition_orders
         # GMGN calcula os preços de saída sobre o fill real (price_scale = multiplicador)
         # Não precisamos do preço do fill — sem erros de "check price less than open price"
@@ -219,16 +199,6 @@ class TradeExecutor:
             except Exception as e:
                 logger.debug("poll fill #%d: %s", trade_id, e)
             time.sleep(2)
-
-    def _get_current_mc(self, mint: str, ts_signal) -> float | None:
-        """Retorna o MC mais recente do mint a partir dos ticks pós-sinal."""
-        try:
-            ticks = db.get_recent_ticks(mint, min_ts=ts_signal)
-            if ticks:
-                return float(ticks[-1][1])  # (tick_ts, mc)
-        except Exception as e:
-            logger.debug("_get_current_mc %s: %s", mint[:8], e)
-        return None
 
     def _check_persistence(self, mint: str, entry_expected: float, ts_signal) -> bool:
         """
