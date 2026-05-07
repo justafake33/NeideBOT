@@ -223,16 +223,18 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO 2026-05-04)
 
 ## 🔍 ESTADO ATUAL — Coleta de Dados
 
-### Situação (2026-05-05)
-- **1175+ tokens** coletados no banco, **1134** com `recovery` definido (baseline correto após fix dead tokens)
+### Situação (2026-05-07)
+- **1175+ tokens** coletados no banco, **1134** com `recovery` definido
 - Recovery rate baseline: **23.5%** (não 52% — corrigido após marcar tokens mortos como FALSE)
-- **83 bounce signals** disparados em produção — analisados em `/analise/deep-bounce` (12 seções)
-- **Bounce detector WR atual: 13.3%** (EV -3% bruto) — filtros Fase A devem elevar para ~29% (estimado)
-- **Fase A ATIVA**: dead zone (A.2), entry ratio (A.3), persistência (A.4), time-stop (A.5). A.1 slope removido — H13 refutada.
-- **Fase B ATIVA**: ts_min bug fix, kline 5min window, backfill retroativo, hot-precise 30s
+- **172+ bounce signals** disparados em produção
+- **Bounce detector WR live: 25%** (5 TP, 15 SL, n=20 trades) — break-even ~26%
+- **Fase A ATIVA**: dead zone (A.2), entry ratio (A.3), persistência (A.4), time-stop (A.5). **A.1 slope REMOVIDO** — H13 refutada com n=153 (slope flat: avg TRUE=-0.003829 vs FALSE=-0.003696)
+- **Fase B ATIVA**: ts_min bug fix, kline 5min window, backfill retroativo, hot-precise 30s. Cobertura slope: 89%.
 - **Fase 2 ativa**: sinais type 12 coletados em `token_signals` a cada 5s
-- **Fase 6 BLOQUEADA**: `AUTH_SIGNATURE_INVALID` — problema de configuração GMGN (wallet/IP), não de código
-- **Cobertura de ticks slope**: 20.5% (17/83) — Fase B deve elevar para ≥50% nos próximos bounces
+- **Fase 6 ATIVA**: TRADING_ENABLED=true, $1/trade, 20/50 trades de calibração executados
+- **TP/SL via condition_orders** no body do swap (validado 2026-05-06) — `price_scale` em escala percentual (0-100)
+- **TradeMonitor ativo**: detecta TP/SL via token_ticks a cada 30s, atualiza status e pnl_pct_real
+- **H9 reformulada**: threshold correto = trigger_mc < mc_migration × 0.80. Dados iniciais: +11.8pp na faixa <50% (n=14). Aguardando n≥30.
 
 ### Campos coletados por migração
 
