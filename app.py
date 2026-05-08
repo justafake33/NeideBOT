@@ -5736,6 +5736,40 @@ def analise_h9():
 </body></html>"""
 
 
+@app.route("/debug/query-order")
+def debug_query_order():
+    """
+    Mostra o response raw do query_order para um order_id real.
+    GET /debug/query-order?order_id=<id>
+    Ou sem parâmetro → pega o order_id do trade mais recente com status=open/tp/sl.
+    """
+    import json, traceback
+    try:
+        order_id = request.args.get("order_id")
+        if not order_id:
+            with db._cursor() as cur:
+                cur.execute("""
+                    SELECT order_id, id, symbol, status FROM trades
+                    WHERE order_id IS NOT NULL
+                    ORDER BY id DESC LIMIT 1
+                """)
+                row = cur.fetchone()
+            if not row:
+                return "<pre>Sem trades com order_id no banco.</pre>"
+            order_id = row["order_id"]
+            trade_info = f"Trade #{row['id']} {row['symbol']} (status={row['status']})"
+        else:
+            trade_info = f"order_id={order_id}"
+
+        raw = gmgn.query_order(order_id)
+        return (f"<html><body style='background:#111;color:#eee;font-family:monospace;padding:20px'>"
+                f"<h3>query_order — {trade_info}</h3>"
+                f"<pre>{json.dumps(raw, indent=2, default=str)}</pre>"
+                f"</body></html>")
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
 @app.route("/debug/test-swap")
 def debug_test_swap():
     """
