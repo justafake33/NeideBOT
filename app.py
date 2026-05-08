@@ -9,7 +9,7 @@ from flask import Flask, render_template_string, redirect, Response, request
 
 import db
 from monitoring import init_sentry
-from gmgn_client import GmgnClient
+from gmgn_client import GmgnClient, get_sol_usd as _get_sol_usd
 from scheduler import HeapScheduler
 from scanner import Scanner, HotMonitor
 from executor import TradeExecutor, TradeMonitor
@@ -5324,7 +5324,7 @@ def analise_calibration():
 
 
 def _calibration_inner():
-    SOL_USD = gmgn.get_sol_usd() or 150.0
+    SOL_USD = _get_sol_usd() or 150.0
     TP_PCT  = float(os.getenv("TRADE_TP_PCT", "0.75"))
     SL_PCT  = float(os.getenv("TRADE_SL_PCT", "0.15"))
 
