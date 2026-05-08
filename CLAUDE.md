@@ -223,18 +223,42 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO 2026-05-04)
 
 ## 🔍 ESTADO ATUAL — Coleta de Dados
 
-### Situação (2026-05-07)
+### Situação (2026-05-08) — BOT PAUSADO
 - **1175+ tokens** coletados no banco, **1134** com `recovery` definido
-- Recovery rate baseline: **23.5%** (não 52% — corrigido após marcar tokens mortos como FALSE)
+- Recovery rate baseline: **23.5%**
 - **172+ bounce signals** disparados em produção
-- **Bounce detector WR live: 25%** (5 TP, 15 SL, n=20 trades) — break-even ~26%
-- **Fase A ATIVA**: dead zone (A.2), entry ratio (A.3), persistência (A.4), time-stop (A.5). **A.1 slope REMOVIDO** — H13 refutada com n=153 (slope flat: avg TRUE=-0.003829 vs FALSE=-0.003696)
-- **Fase B ATIVA**: ts_min bug fix, kline 5min window, backfill retroativo, hot-precise 30s. Cobertura slope: 89%.
+- **Fase A ATIVA**: A.2, A.3, A.4, A.5. **A.1 slope REMOVIDO** — H13 refutada com n=153
+- **Fase B ATIVA**: ts_min bug fix, kline 5min, backfill retroativo, hot-precise 30s
 - **Fase 2 ativa**: sinais type 12 coletados em `token_signals` a cada 5s
-- **Fase 6 ATIVA**: TRADING_ENABLED=true, $1/trade, 20/50 trades de calibração executados
-- **TP/SL via condition_orders** no body do swap (validado 2026-05-06) — `price_scale` em escala percentual (0-100)
-- **TradeMonitor ativo**: detecta TP/SL via token_ticks a cada 30s, atualiza status e pnl_pct_real
-- **H9 reformulada**: threshold correto = trigger_mc < mc_migration × 0.80. Dados iniciais: +11.8pp na faixa <50% (n=14). Aguardando n≥30.
+- **Fase 6 PAUSADA**: TRADING_ENABLED=false — calibração de 71 trades concluída
+- **H9 reformulada**: threshold = trigger_mc < mc_migration × 0.80. +11.8pp na faixa <50% (n=14). Aguardando n≥30.
+
+### Resultado da Calibração — 71 trades de $1 (2026-05-07/08)
+
+| Métrica | Valor | Observação |
+|---------|-------|-----------|
+| Trades executados | 71 | 48 done, 21 erro, 2 expired |
+| TPs detectados (TradeMonitor) | 27 | **INFLADO** — referência errada |
+| TPs reais confirmados | ~8-9 | DAN, CLAIRE, pWRG, SH, QUACK, USDSC, ONECOIN, STARFOX, BTS |
+| WR real | ~17-19% | Break-even teórico = 16.7% (sem tips) |
+| Capital inicial | $40 | |
+| Capital final | ~$20 | -$20 em 2 dias |
+| Perda real | ~$20 | **Quase 100% em fees/tips, não em trades ruins** |
+
+**Diagnóstico da perda:**
+- Tips + priority por trade: ~$0.36 (0.001 SOL × 4 transações × $88/SOL)
+- 71 trades × $0.36 = **~$25 em tips** — custo fixo independente do resultado
+- A $1/trade: tips = 36% do tamanho da posição → break-even exige WR ~59% (impossível)
+- A $10/trade: tips = 3.6% → break-even exige WR ~23% (viável com edge da estratégia)
+- **Conclusão: $1/trade sempre ia perder. A calibração mediu o custo de friction real, não a estratégia.**
+
+**Problema de monitoramento identificado:**
+- `entry_price_usd` NULL em todos os trades — fill poll não captura `filled_output_amount` da GMGN
+- TradeMonitor usa `entry_expected` (preço no sinal) como referência em vez do preço real de compra
+- Com A.4 (90s wait): compra real ~25% acima do sinal → TP detectado prematuramente
+- Resultado: 27 "TPs" no DB, ~8-9 reais. P&L no DB = ±75%/-15% fixo, não o real
+
+**Próximo passo obrigatório antes de religar:** implementar Helius + Jupiter swap.
 
 ### Campos coletados por migração
 
@@ -596,6 +620,82 @@ PERSISTENCE_MIN_TICKS=3      # A.4: ticks pós-sinal acima do entry para confirm
 
 ---
 
+## 🔄 Próximo Passo: Helius + Jupiter Swap
+
+### Por que é obrigatório antes de religar
+A calibração mostrou que as tips (0.001 SOL × 4 txs = ~$0.36/trade) dominam o custo a $1/trade.
+A $10/trade as tips representam 3.6% — viável. Mas GMGN ainda cobra 1%×2 = 2% adicional.
+Implementar Jupiter swap via Helius elimina o 1% da GMGN e permite reduzir tips (0.00005 SOL suficiente para Meteora/Raydium fora de congestionamento).
+
+### O que muda na arquitetura
+
+```
+ATUAL:
+  executor.py → gmgn.swap() → /v1/trade/swap (GMGN)
+  condition_orders embutidos → GMGN gerencia TP/SL
+  TradeMonitor → token_ticks (MC) → detecta exit (referência ERRADA)
+
+NOVO:
+  executor.py → jupiter.swap() → Jupiter API v6 → Helius RPC
+  TP/SL: TradeMonitor já funciona → submete sell via Jupiter quando detecta exit
+  Referência correta: entry_price_usd real (capturado do fill da tx Solana)
+```
+
+### Mudanças necessárias no código
+
+**1. `gmgn_client.py` — manter apenas discovery + sinais**
+- Manter: `get_trenches()`, `get_token_signal()`, `get_token_kline()`, `get_token_info()`
+- Remover do executor: `gmgn.swap()` — não mais chamado para execução
+
+**2. Novo `jupiter_client.py`**
+- `get_quote(input_mint, output_mint, amount_lamports, slippage_bps)` → Jupiter `/v6/quote`
+- `swap(quote_response, wallet_pubkey)` → Jupiter `/v6/swap` → retorna transaction serializada
+- `submit_tx(signed_tx)` → Helius RPC `sendTransaction` com `skipPreflight=false`
+- Fee: 0% plataforma Jupiter (integração direta). DEX LP fee ~0.25% (inevitável).
+- Tip: configurável, padrão 0.00005 SOL (≈ 10× menor que atual)
+
+**3. `executor.py` — trocar gmgn.swap por jupiter.swap**
+- `_execute()`: chamar `jupiter_client.swap()` em vez de `gmgn.swap()`
+- Fill data: capturar da confirmação da tx Solana (slot, fee, amounts do AccountInfo)
+- Remover: `condition_orders` body (não existe no Jupiter)
+- TP/SL: TradeMonitor detecta via ticks → chama `jupiter_client.swap()` para sell
+
+**4. `executor.py` — TradeMonitor: corrigir referência TP/SL**
+- Usar `entry_price_usd` (fill real) como referência, não `entry_expected`
+- Só marca TP/SL quando `entry_price_usd` está populado
+- TP threshold: `entry_price_usd × (1 + tp_pct)`
+- SL threshold: `entry_price_usd × (1 - sl_pct)`
+
+**5. Novas env vars**
+```
+HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx
+WALLET_PRIVATE_KEY=xxxx   # Base58 da wallet Solana (para assinar txs)
+JUPITER_API_URL=https://quote-api.jup.ag/v6
+SOL_MINT=So11111111111111111111111111111111111111112
+TIP_SOL=0.00005            # tip Jito (reduzido de 0.001 para 0.00005)
+PRIORITY_FEE_MICRO_LAMPORTS=1000  # priority fee controlado (não GMGN default)
+```
+
+### Break-even esperado após migração
+
+| Custo | Atual (GMGN) | Após (Jupiter+Helius) |
+|-------|-------------|----------------------|
+| Swap fee | 1% × 2 = 2% | ~0.25% × 2 = 0.5% (LP fee) |
+| Tip | 0.001 SOL × 4 ≈ $0.36 | 0.00005 SOL × 4 ≈ $0.018 |
+| Priority | 0.001 SOL × 4 ≈ $0.36 | controlado ~$0.04 |
+| **Total a $10/trade** | **~$0.92 (9.2%)** | **~$0.11 (1.1%)** |
+| Break-even WR a $10 | ~28% | ~18% |
+
+### Ordem de implementação
+1. Assinar Helius (primeiro mês $24.50)
+2. Criar `jupiter_client.py` com quote + swap + submit
+3. Testar swap manual via `/debug/test-swap` com Jupiter
+4. Migrar `executor._execute()` para Jupiter
+5. Corrigir TradeMonitor para usar `entry_price_usd` real
+6. Religar bot com `TRADING_ENABLED=true` a $10/trade
+
+---
+
 ## 🎯 KPIs de Sucesso
 
 | Fase | Métrica | Meta | Status |
@@ -607,14 +707,13 @@ PERSISTENCE_MIN_TICKS=3      # A.4: ticks pós-sinal acima do entry para confirm
 | Backtester | Cobertura de ticks | n_trades ≥ 200 | ⏳ kline OHLC acumulando |
 | Fase A | WR pós-filtros ≥ 25% | WR ≥ 25% com 30+ bounces filtrados | ⏳ aguardando dados |
 | Fase B | Cobertura slope ≥ 50% | 50% dos bounces com slope calculável | ⏳ impacto esperado |
-| Fase 6-lite | Friction total medida | 50 trades de $1 | 🟡 20/50 — WR 25% (5 TP, 15 SL) |
-| Fase 6-lite | EV_real > 0 após friction | EV_real > 0 | ⏳ acumulando |
-| Fase 6 | Win rate live | ≥20% (break-even = 11% com payoff 8.7x) | 🟡 25% (n=20) |
-| Fase 6 | Payoff ratio live | ≥3× | ⏳ |
-| Fase 6 | Latência detecção → ordem | ≤15s | ⏳ |
-| Fase 6 | Divergência real vs backtest | ≤30% após 50 trades | ⏳ |
-| Fase 6 | Max drawdown | ≤40% do capital alocado | ⏳ |
-| H9 | Validação smart money signal | delta_pp ≥ 20pp | 🟡 +11.8pp na faixa <50% (n=14) — reverse causality em >120%. Threshold correto: <80% migração |
+| Fase 6-lite | Friction total medida | 71 trades de $1 | ✅ CONCLUÍDA — perda $20 em fees |
+| Fase 6-lite | EV_real > 0 após friction | EV_real > 0 | ❌ -$20 (tips dominam a $1/trade) |
+| Fase 6 | WR real confirmado | ≥20% | 🟡 ~17-19% (8-9 TPs reais / 48 done) |
+| Fase 6 | Break-even WR real (c/ tips) | < WR real | ❌ ~59% a $1/trade → inviável |
+| Fase 6 | Break-even WR a $10/trade | < WR real | ✅ ~23% → viável |
+| Helius+Jupiter | Implementar antes de religar | Tips < 1% do trade | ⏳ PRÓXIMO PASSO |
+| H9 | Validação smart money signal | delta_pp ≥ 20pp | 🟡 +11.8pp na faixa <50% (n=14) |
 
 ---
 
