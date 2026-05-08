@@ -1,16 +1,15 @@
 # NeideBOT — Roadmap
 
-> Última atualização: 2026-05-04 (sessão 3)
+> Última atualização: 2026-05-07 (sessão 5)
 
 ---
 
-## Status atual: **Fase 2.7 — Backtester OHLC + Kline Ticks**
+## Status atual: **Fase 6-lite — Calibração Live ($1/trade)**
 
-- **1015+ tokens** coletados, **425** com `recovery` definido
-- Backtester tick-level operacional: TP=75%, SL=15% → EV=+11.5% | TP=100%, SL=15% → EV=+14.7%
-- Kline ticks com OHLC (mc_open/mc_high/mc_low) implementados — cobertura expandindo
-- Bounce detector ativo em produção: `bounce_signals` populando, alertas Telegram ao vivo
-- Sinais type 12 coletados em `token_signals` (H9 acumulando passivamente)
+- **1175+ tokens** coletados, **1134** com `recovery` definido
+- **20/50 trades** de calibração executados — WR 25% (5 TP, 15 SL), break-even ~26%
+- **172+ bounce signals** em produção, A.1 slope removido (H13 refutada com n=153)
+- Bot ativo: TRADING_ENABLED=true, $1/trade, acumulando dados
 
 ---
 
@@ -24,193 +23,165 @@
 | H4 | sniper_wallets ≥30% → recovery <30% | ❌ REFUTADA | levemente positivo |
 | H5 | top10 ≥0.80 → var_24h <-80% em ≥60% | ⚠️ DESCARTADA | 24h fora do escopo |
 | H6 | Entradas entre -25% e -45% têm melhor R:R | ⚠️ DESCARTADA | 4h/24h fora do escopo |
-| H7 | liq_migration <$5k → slippage inaceitável para >$50 | ⏳ PENDENTE | será medido em $1 trades |
+| H7 | liq_migration <$5k → slippage inaceitável para >$50 | ⏳ PENDENTE | medindo em $1 trades |
 | H8 | is_wash_trading=TRUE → recovery ≥20pp menor | ❌ REFUTADA | -0.1pp |
-| H9 | ≥1 signal type 12 com trigger_mc < mc_migration → recovery ≥20pp maior | ⏳ PENDENTE | acumulando passivamente |
+| H9 | ≥1 signal type 12 com trigger_mc < 80% mc_migration → recovery ≥20pp maior | ⏳ PENDENTE | +11.8pp na faixa <50% (n=14). Threshold correto: <80% migração. Aguardando n≥30. |
 | H10 | time_to_bottom < 25min → recovery ≥20pp maior | ✅ CONFIRMADA | **+21.8pp** (61.2% vs 39.3%, n=425) |
 | H11 | Deceleração de preço antes do fundo discrimina recovery | ❌ REFUTADA | invertido — recovery tokens ACELERAM (capitulação brusca) |
 | H12 | dump_depth + time_elapsed → P(recovery) > 50% | ⚠️ PARCIAL | time domina. 3 zonas acionáveis mas cobertas por H10 |
+| H13 | Slope íngreme pré-fundo (≤-0.0008 %/s) → WR ≥40pp maior | ❌ REFUTADA | n=153, ts_min correto. Avg TRUE=-0.003829 vs FALSE=-0.003696 (diff=0.000133). Rate flat em todas faixas. A.1 removido. |
+| H14 | bounce_pct 20-30% é dead zone — WR inferior | ✅ CONFIRMADA | WR 3.1% (n=32). A.2 ativo. |
+| H15 | Entry 50-65% do mc_migration → WR=0% | ✅ CONFIRMADA | 0/21 = 0% WR (n=21). A.3 ativo. |
+| H16 | 3 ticks consecutivos acima do entry pós-sinal → WR ≥20pp maior | ✅ CONFIRMADA | +18pp (28.6% vs 10.6%, n=14/66). A.4 ativo. |
+| H17 | 100% dos TPs ocorrem em ≤20min após o sinal | ✅ CONFIRMADA | 11/11 TPs ≤20min. Mediana 6.1min. A.5 time-stop=20min. |
+| H18 | Bounce velocity discrimina WR | ❌ REFUTADA | WR flat em todos os tercis. TTB<25min+Slow=43% > Fast=29%. |
+| H19 | Aguardar 1-2min após sinal melhora EV | ✅ CONFIRMADA | +6.6pp WR. Coberto pelo A.4 (90s). |
+| H20 | W-bottom (double-dip) é sinal de confirmação | ❌ NÃO É FILTRO | 98% prevalência — ubíquo em TPs e SLs. A.4 trata implicitamente. |
 
-### Backtester tick-level — resultados consolidados
+---
+
+## Backtester tick-level — resultados consolidados
 
 **Setup:** entry = mc_bottom × 1.15, drop ≥ 30%, time_to_bottom < 30min
-**n=68** com ticks (expandindo via kline OHLC), **492** sem ticks (acumulando)
+**n=68** com ticks, **492** sem ticks (acumulando via kline OHLC)
 
 | TP | SL | Win Rate | EV | Payoff | n_tp | n_sl |
 |----|----|----------|----|--------|------|------|
-| 15% | 15% | 39.7% | -2.5% | 1.1x | 27 | 38 |
 | 30% | 15% | 33.8% | +1.1% | 2.2x | 23 | 40 |
 | 40% | 15% | 32.4% | +3.7% | 2.9x | 22 | 41 |
-| 50% | 15% | 27.9% | +4.5% | 3.8x | 19 | 43 |
 | **75%** | **15%** | **27.9%** | **+11.5%** | **5.7x** | 19 | 43 |
-| **100%** | **15%** | **23.5%** | **+14.7%** | **8.7x** | 16 | 44 |
+| 100% | 15% | 23.5% | +14.7% | 8.7x | 16 | 44 |
 
-**SL=15% domina em todos os TP.** SL=10% aciona a 3.5% acima do fundo (ruído). SL=15% exige retorno abaixo do próprio fundo para disparar.
+**SL=15% domina.** SL=10% aciona a 3.5% acima do fundo (ruído de mercado).
+**Sinal estável em 3 runs.** Payoff assimétrico compensa win rate baixo — break-even = 11%.
 
-**Sinal estável em 3 runs consecutivos.** Direção confirmada: payoff assimétrico compensa win rate baixo.
+> ⚠️ **Bias de cobertura:** 492/560 tokens sem ticks. Recovery_rate similar ao baseline — não são piores.
+> ⚠️ **O que o backtest NÃO captura:** slippage, MEV, fees, latência. EV_real = EV_backtest − friction_total.
 
-> ⚠️ **Bias de cobertura:** 492/560 tokens sem ticks. Os sem ticks têm recovery_rate similar (57.7%) ao baseline (52%) — não são piores, apenas sem cobertura histórica de ticks. Kline OHLC resolvendo progressivamente.
+---
 
-> ⚠️ **O que o backtest NÃO captura:** taxas de swap, priority fee, slippage, MEV/sandwich, latência de execução. EV_real = EV_backtest - friction_total. Friction só mensurável em live trading.
+## Live Trading — Calibração (2026-05-07)
+
+| Métrica | Valor |
+|---------|-------|
+| Trades executados | 20/50 |
+| TP hits | 5 |
+| SL hits | 15 |
+| WR live | 25% |
+| Break-even WR | ~26% (com tip+priority+GMGN 1%+slippage) |
+| Problema identificado | A.4 (90s wait) → entrada 25% acima do esperado |
+
+**Principais aprendizados de execução:**
+- TP/SL via `condition_orders` no body do swap — `price_scale` em escala 0-100 (não decimal)
+- Priority fee NÃO enviado explicitamente — GMGN gerencia internamente
+- TradeMonitor detecta exits via token_ticks (mc_high/mc_low) a cada 30s
+- `filled_output_amount` = tokens recebidos; `filled_input_amount` (lamports) = SOL pago
 
 ---
 
 ## Fases — Histórico e Status
 
 ### Fase 0 — Infraestrutura ✅
-- Flask + PostgreSQL (Railway), GMGN client, HeapScheduler, Telegram, Sentry
+Flask + PostgreSQL (Railway), GMGN client, HeapScheduler, Telegram, Sentry
 
 ### Fase 1 — Watchlist + Migração ✅
-- Scanner poll 5s, HotMonitor 60min, tabelas migrations + token_ticks
-- Campos Fase 1 (qualidade) coletados do trenches
+Scanner poll 5s, HotMonitor 60min, tabelas migrations + token_ticks, campos Fase 1 do trenches
 
 ### Fase 2 — Coleta de Sinais Ativos ✅ (2026-05-03)
-- `_poll_signals()` a cada 5s: token_signals com type 12 (SmartDegenBuy)
-- `bounce_signals`: detector de bounce em tempo real, alertas Telegram
-- Volume fix: `backfill_tick_volumes()` via kline 1m
+`_poll_signals()` a cada 5s, token_signals type 12, bounce_signals, volume via kline
 
 ### Fase 2.5 — Análise Estrutural ✅ (2026-05-03)
-- H10 validada formalmente (+21.8pp, n=425)
-- H11 refutada: recovery = capitulação brusca, não deceleração
-- H12 parcial: time domina sobre dump depth
+H10 validada (+21.8pp, n=425), H11 refutada, H12 parcial
 
-### Fase 2.7 — Backtester OHLC + Kline Ticks ✅ (2026-05-04)
-- Backtester tick-level com OHLC: mc_open/mc_high/mc_low por vela
-- Kline ticks inseridos a cada 60s no `_precise_bottom_tick()` — cobertura independente do feed trenches
-- Desempate intra-vela: mc_open vs midpoint SL/TP quando ambos cruzados
-- Sinal confirmado: TP=75-100%, SL=15%, EV positivo estável
-- **Conclusão:** dados suficientes para iniciar execução live com capital mínimo
+### Fase 2.7 — Backtester OHLC ✅ (2026-05-04)
+Backtester tick-level com OHLC, EV positivo confirmado (TP=75%, SL=15%), dados suficientes para execução live
+
+### Fase A/B — Filtros e Coverage ✅ (2026-05-04/05)
+- A.2 dead zone, A.3 entry ratio, A.4 persistência, A.5 time-stop 20min
+- B.3 backfill retroativo, ts_min fix, hot-precise 30s, cobertura slope 89%
+- **A.1 slope REMOVIDO** (2026-05-07) — H13 refutada com n=153
+
+### Fase 6-lite — Calibração Live 🟡 ATIVA (2026-05-04)
+- TP/SL via condition_orders validado (2026-05-06)
+- TradeMonitor para exit tracking implementado
+- 20/50 trades executados — WR 25%, break-even ~26%
+- Meta: 50 trades para medir EV_real com confiança
 
 ---
 
 ## Próximas Fases
 
-### Fase 6-lite — Calibração Live com $1/trade ⏳ (AGORA)
+### [AGORA] Completar 50 trades de calibração
 
-**Por que pular Fase 4 e 5 do roadmap original:**
-- Fase 4 (regras de entrada) já está definida pelo backtester — não precisa de H9 para começar
-- Fase 5 (walk-forward) tinha critério errado: **win rate ≥50% é inválido para estratégias assimétricas.** Com payoff 8.7x, o break-even é win rate de 11%. Exigir 50% rejeitaria uma estratégia matematicamente lucrativa.
-- **$1 trades são o walk-forward real** — medem friction que nenhum backtest consegue capturar
-
-**Objetivo:** medir friction total real, não gerar lucro.
-
-**Regras de entrada (fixas para calibração):**
-```
-Entry trigger : bounce_signals dispara (drop ≥ 30%, bounce ≥ 15%, elapsed ≤ 30min)
-Size          : $1 por trade (50 trades de calibração)
-TP            : +75%
-SL            : −15%
-Execução      : POST /v1/trade/swap → POST /v1/trade/strategy/create
-```
-
-**O que medir em cada trade:**
-- Entry esperado (mc_bottom × 1.15) vs fill real → slippage
-- Fees totais (priority + swap fee)
-- Latência: ts_bounce_signal → ts_order_confirmed
-- P&L real vs P&L esperado pelo backtest
-
-**Dependências técnicas:**
-1. `GMGN_PRIVATE_KEY` configurado no Railway (Ed25519 PEM)
-2. Header `X-Signature` no GmgnClient (assina subpath+params+body+timestamp)
-3. `POST /v1/trade/swap` com slippage config
-4. `POST /v1/trade/strategy/create` para TP/SL automático
-5. `GET /v1/trade/query_order` para monitorar status
-6. Tabela `trades` no banco para log completo de cada trade
-
-### Fase 6 — Scale Up ⏳ (após 50 trades de calibração)
-
-**Gate único:** `EV_real > 0` após friction, calculado sobre os 50 trades de calibração.
+**Gate único:** n=50 trades com P&L registrado.
+Com n=50: σ_WR = ±6.1% — suficiente para distinguir lucrativo de EV negativo.
 
 ```
-friction_total = EV_backtest - EV_real_$1trades
-EV_real_escala = EV_backtest - friction_total
-
-Se EV_real_escala > 0:
-  → $20/trade (50 trades)
-  → validar: EV_real_$20 ≈ EV_real_$1 (friction não escala?)
-  → $50/trade (go-live)
-
-Se EV_real_escala ≤ 0:
-  → diagnosticar: slippage? MEV? latência? liq_migration baixa?
-  → aplicar filtro específico e re-testar
+Parâmetros ativos:
+  Entry : bounce (drop ≥30%, bounce ≥15%, elapsed ≤20min)
+  Size  : $1/trade
+  TP    : +75%
+  SL    : -15%
+  Filtros A: A.2 (dead zone), A.3 (entry ratio), A.4 (persistência 90s), A.5 (time-stop 20min)
 ```
 
-**KPIs corretos para estratégia assimétrica:**
-| Métrica | Meta | Racional |
-|---------|------|---------|
-| Win rate | ≥20% | Break-even com 8.7x payoff = 11% — meta conservadora |
-| Payoff ratio | ≥3× | Confirmado no backtest (5.7-8.7x) |
-| EV por trade | > friction_total | Único critério que importa |
-| Latência | ≤15s | Detecção → ordem confirmada |
-| Divergência real vs backtest | ≤30% após 50 trades | Calibração aceita |
-| Max drawdown | ≤40% do capital alocado | Stop total |
-
-### Fase 6b — H9 como filtro adicional ⏳ (paralelo passivo)
-
-**Gate:** ~100 tokens com sinais em `token_signals`
-
-- H9 CONFIRMADA (+20pp) → adicionar `trigger_mc < mc_migration` como filtro de entrada
-- H9 REFUTADA → manter sistema sem filtro de smart money
-- Não bloqueia o início dos $1 trades — roda em paralelo
-
----
-
-## Decision Gates
+### [50 trades] Decisão baseada em EV_real
 
 ```
-[AGORA] Fase 6-lite — $1 trades (calibração de friction)
-    │   Implementar: X-Signature, swap, strategy/create, tabela trades
-    │   50 trades com bounce_signals → medir EV_real
-    │
-    ▼
-[50 trades] EV_real > 0 após friction?
+EV_real > 0 após friction?
     │
     ├── SIM → $20/trade → $50/trade (go-live)
-    │           │
-    │           │  (paralelo) H9 acumulando
-    │           │
-    │           ├── H9 CONFIRMADA → adicionar filtro smart money
-    │           └── H9 REFUTADA   → sistema sem filtro (já lucrativo)
+    │         (paralelo) H9 validada? → adicionar filtro smart money
     │
     └── NÃO → diagnosticar friction:
-                ├── Slippage > esperado? → filtrar liq_migration > $15k
-                ├── MEV/sandwich?        → Jito / private RPC
-                ├── Latência > 15s?      → otimizar pipeline bounce→swap
-                └── Priority fee alto?   → ajustar priority_fee config
+                ├── Entrada muito acima do esperado? → reduzir PERSISTENCE_WAIT_SEC ou A.4 ticks
+                ├── Slippage > esperado?             → filtrar liq_migration > $15k
+                ├── MEV/sandwich?                    → Jito / private RPC
+                └── Latência > 15s?                 → otimizar pipeline bounce→swap
 ```
+
+### [Paralelo] H9 — Smart Money Signal
+
+- Threshold correto: `trigger_mc < mc_migration × 0.80` (exclui reverse causality)
+- Dados iniciais: +11.8pp na faixa <50% migração (n=14) — aguardando n≥30
+- Não bloqueia calibração — coleta passiva já ativa
 
 ---
 
-## Arquitetura de Dados — Estado Atual
+## KPIs
 
-| Tabela | Linhas | Completude |
-|--------|--------|-----------|
-| `migrations` | 1015+ | recovery definido em 425 (42%) |
-| `token_ticks` | crescendo | OHLC via kline: cobertura expandindo de 12% para ~70-80% |
-| `token_signals` | crescendo | ~100 tokens meta para H9 |
-| `bounce_signals` | crescendo | populando em produção |
-| `trades` | 0 | a criar na Fase 6-lite |
+| Fase | Métrica | Meta | Status |
+|------|---------|------|--------|
+| Coleta | Migrações com recovery | ≥200 | ✅ 1134 |
+| Análise | H10 validada | ≥20pp | ✅ +21.8pp |
+| Backtester | EV positivo | EV > 0 (TP≥30%) | ✅ confirmado (n=68) |
+| Fase 6-lite | Trades executados | 50 | 🟡 20/50 |
+| Fase 6-lite | WR live | ≥20% | 🟡 25% (n=20) |
+| Fase 6-lite | EV_real > 0 | EV > friction | ⏳ acumulando |
+| Fase 6 | Payoff ratio live | ≥3× | ⏳ |
+| Fase 6 | Latência | ≤15s | ⏳ |
+| H9 | Validação smart money | ≥20pp delta | 🟡 +11.8pp (n=14) |
 
 ---
 
 ## Lições Aprendidas
 
-1. **Snapshots não discriminam recovery**: smart_count, renowned_count, holders, rug_ratio, wash_trading — todos testados, nenhum discrimina.
+1. **Snapshots não discriminam recovery**: smart_count, renowned, holders, rug_ratio, wash_trading, slope pré-fundo — todos testados, nenhum discrimina com n suficiente.
 
-2. **O único preditor validado é tempo**: `time_to_bottom < 30min` (+22pp). Dumps rápidos = capitulação. Dumps lentos = distribuição.
+2. **O único preditor validado é tempo**: `time_to_bottom < 25min` (+21.8pp, n=425). Dumps rápidos = capitulação. Dumps lentos = distribuição.
 
-3. **Volume estava faltando**: fix aplicado via kline. Dados futuros preenchidos.
+3. **Slope é característica universal**: 92% dos bounces têm slope íngreme. Condição necessária, não suficiente. H13 refutada com metodologia correta (ts_min real).
 
-4. **Compra ativa ≠ posição acumulada**: delta_smart é invertido. Sinal correto = signal type 12.
+4. **Win rate baixo ≠ estratégia ruim**: payoff 8.7x → break-even = 11%. WR 23% gera EV=+14.7%. Exigir ≥50% WR rejeita estratégia matematicamente lucrativa.
 
-5. **Metodologia > Features**: dataset limpo e hipóteses formais antes de qualquer execução.
+5. **Friction só é medida em live trading**: slippage, MEV, fees, latência não existem no backtest. 50 × $1 trades = o único walk-forward real.
 
-6. **Invertido ≠ inútil**: H11 revelou capitulação brusca (slope_c −0.171 vs −0.107).
+6. **A.4 é o maior inimigo da execução**: espera 90s → entrada 25% acima do esperado → WR live ≈ break-even. Investigar após 50 trades.
 
-7. **Win rate baixo ≠ estratégia ruim**: com payoff 8.7x, win rate de 23% gera EV=+14.7%. Exigir ≥50% win rate é o critério errado para estratégias assimétricas.
+7. **ts_signal ≠ ts_min**: bounce é detectado depois do fundo (precisa ver preço subir ≥15%). Qualquer análise de pré-fundo deve usar ts_min (tick de menor MC), não ts_signal.
 
-8. **Walk-forward backtest ≠ validação real**: $1 trades capturam friction (slippage, MEV, fees, latência) que nenhum backtest consegue modelar. São mais valiosos que mais análise.
+8. **condition_orders usa escala 0-100**: `price_scale="75"` = +75%, não 1.75. Bug histórico causou TP e SL disparando imediatamente (1.75% threshold).
 
-9. **Ticks precisam de OHLC**: só o close perde cruzamentos intra-candle de SL/TP. mc_high/mc_low detectam eventos reais que o close mascara.
+9. **Compra ativa ≠ posição acumulada**: delta_smart (trenches) é snapshot de posições. Sinal de compra ativa = signal type 12 (token_signals).
 
-10. **Caminho importa mais que endpoint**: mode=full (migrations apenas) mostrou avg_loss=+29% porque ignora o path. Token pode subir a mc_1h mas ter acionado SL no meio. Tick-level é o único modelo válido.
+10. **Ticks precisam de OHLC**: close perde cruzamentos intra-candle. mc_high/mc_low detectam TP/SL reais.

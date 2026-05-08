@@ -5313,6 +5313,163 @@ def debug_sign_test():
     return "<pre>" + "\n".join(lines) + "</pre>"
 
 
+@app.route("/analise/calibration")
+def analise_calibration():
+    """Sumário completo dos 50 trades de calibração: WR, EV real, friction, overshoot, latência."""
+    import traceback
+    try:
+        return _calibration_inner()
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
+def _calibration_inner():
+    SOL_USD = gmgn.get_sol_usd() or 150.0
+    TP_PCT  = float(os.getenv("TRADE_TP_PCT", "0.75"))
+    SL_PCT  = float(os.getenv("TRADE_SL_PCT", "0.15"))
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT id, mint, symbol, status, pnl_pct_real, pnl_pct_expected,
+                   amount_usd, entry_expected, entry_price_usd,
+                   slippage_pct, fee_sol, latency_sec,
+                   ts_signal, ts_order_sent, ts_order_confirmed,
+                   tp_pct, sl_pct, exit_type, exit_ts,
+                   mc_bottom, mc_migration, tokens_received
+            FROM trades
+            ORDER BY id ASC
+        """)
+        trades = [dict(r) for r in cur.fetchall()]
+
+    if not trades:
+        return "<pre>Sem trades no banco.</pre>"
+
+    # Separar por status
+    done   = [t for t in trades if t["status"] in ("tp", "sl")]
+    open_  = [t for t in trades if t["status"] == "open"]
+    errors = [t for t in trades if t["status"] in ("error", "timeout", "pending")]
+    tp_    = [t for t in done if t["status"] == "tp"]
+    sl_    = [t for t in done if t["status"] == "sl"]
+
+    n_total = len(trades)
+    n_done  = len(done)
+    n_tp    = len(tp_)
+    n_sl    = len(sl_)
+    wr      = n_tp / n_done if n_done > 0 else 0
+
+    # EV real (pnl_pct_real já inclui fees)
+    pnls = [t["pnl_pct_real"] for t in done if t["pnl_pct_real"] is not None]
+    ev_real = sum(pnls) / len(pnls) if pnls else None
+
+    # EV esperado pelo backtest (sem friction)
+    ev_backtest = wr * TP_PCT - (1 - wr) * SL_PCT if n_done > 0 else None
+
+    # Friction = diferença entre EV teórico e EV real
+    friction_per_trade = (ev_backtest - ev_real) if (ev_backtest is not None and ev_real is not None) else None
+
+    # Break-even WR com friction real
+    # EV = wr × TP - (1-wr) × SL - friction = 0
+    # wr × (TP + SL) = SL + friction
+    be_wr = (SL_PCT + (friction_per_trade or 0)) / (TP_PCT + SL_PCT) if friction_per_trade is not None else SL_PCT / (TP_PCT + SL_PCT)
+
+    # Entry overshoot: quanto pagamos acima do esperado
+    overshoots = []
+    for t in done:
+        if t["entry_price_usd"] and t["entry_expected"] and t["entry_expected"] > 0:
+            overshoot = (t["entry_price_usd"] - t["entry_expected"]) / t["entry_expected"]
+            overshoots.append(overshoot)
+    avg_overshoot = sum(overshoots) / len(overshoots) if overshoots else None
+
+    # Friction em USD por trade
+    fees_usd = []
+    for t in done:
+        if t["fee_sol"] and t["amount_usd"]:
+            fee_usd = t["fee_sol"] * SOL_USD
+            fees_usd.append(fee_usd)
+    avg_fee_usd = sum(fees_usd) / len(fees_usd) if fees_usd else None
+
+    # Latência
+    lats = [t["latency_sec"] for t in done if t["latency_sec"] is not None]
+    avg_lat = sum(lats) / len(lats) if lats else None
+
+    # Slippage
+    slips = [t["slippage_pct"] for t in done if t["slippage_pct"] is not None]
+    avg_slip = sum(slips) / len(slips) if slips else None
+
+    # P&L total em USD ($1/trade)
+    total_amount = sum(t["amount_usd"] or 0 for t in done)
+    total_pnl_usd = sum((t["pnl_pct_real"] or 0) * (t["amount_usd"] or 0) for t in done if t["pnl_pct_real"])
+
+    def c(v, good=True):
+        if v is None: return "#888"
+        return "#4f4" if (v > 0) == good else "#f44"
+
+    def pct(v):
+        return f"{v*100:+.2f}%" if v is not None else "—"
+
+    def usd(v):
+        return f"${v:.4f}" if v is not None else "—"
+
+    # Tabela por trade
+    trade_rows = ""
+    for t in trades:
+        s = t["status"] or "—"
+        bg = {"tp": "#1a3a1a", "sl": "#3a1a1a", "error": "#2a2a00", "timeout": "#2a2a00"}.get(s, "")
+        pnl = t["pnl_pct_real"]
+        pnl_s = pct(pnl) if pnl else "—"
+        pnl_c = c(pnl) if pnl else "#888"
+        over = None
+        if t["entry_price_usd"] and t["entry_expected"] and t["entry_expected"] > 0:
+            over = (t["entry_price_usd"] - t["entry_expected"]) / t["entry_expected"]
+        trade_rows += (f"<tr style='background:{bg}'>"
+                       f"<td>#{t['id']}</td>"
+                       f"<td>{t['symbol'] or t['mint'][:8]}</td>"
+                       f"<td>{s.upper()}</td>"
+                       f"<td style='color:{pnl_c}'>{pnl_s}</td>"
+                       f"<td>{pct(over) if over is not None else '—'}</td>"
+                       f"<td>{(str(round(t['latency_sec'],1))+'s') if t['latency_sec'] else '—'}</td>"
+                       f"<td>{pct(t['slippage_pct']) if t['slippage_pct'] else '—'}</td>"
+                       f"</tr>")
+
+    return f"""<html><head><title>Calibração — 50 trades</title></head>
+<body style="font-family:monospace;background:#111;color:#eee;padding:20px">
+<h2>Calibração — {n_total} trades de $1</h2>
+
+<h3>Resultado geral</h3>
+<table border=1 cellpadding=8 style="border-collapse:collapse;font-size:14px">
+<tr><td>Trades executados</td><td><b>{n_total}</b> (done={n_done}, open={len(open_)}, erro={len(errors)})</td></tr>
+<tr><td>TP hits / SL hits</td><td><b style="color:#4f4">{n_tp} TP</b> / <b style="color:#f44">{n_sl} SL</b></td></tr>
+<tr><td>Win Rate live</td><td style="color:{c(wr-0.20)}"><b>{wr*100:.1f}%</b></td></tr>
+<tr><td>Break-even WR (com friction real)</td><td><b>{be_wr*100:.1f}%</b></td></tr>
+<tr><td>EV real (avg pnl_pct_real)</td><td style="color:{c(ev_real)}"><b>{pct(ev_real)}</b> por trade</td></tr>
+<tr><td>EV teórico (sem friction)</td><td style="color:{c(ev_backtest)}"><b>{pct(ev_backtest)}</b> por trade</td></tr>
+<tr><td>Friction medida</td><td style="color:#f44"><b>{pct(friction_per_trade)}</b> por trade</td></tr>
+<tr><td>P&L total (USD)</td><td style="color:{c(total_pnl_usd)}"><b>{usd(total_pnl_usd)}</b> sobre {usd(total_amount)} investido</td></tr>
+</table>
+
+<h3>Execução & friction</h3>
+<table border=1 cellpadding=8 style="border-collapse:collapse;font-size:14px">
+<tr><td>Entry overshoot médio</td><td style="color:#f44"><b>{pct(avg_overshoot)}</b> acima do esperado</td></tr>
+<tr><td>Slippage médio</td><td><b>{pct(avg_slip)}</b></td></tr>
+<tr><td>Fee médio (SOL→USD)</td><td><b>{usd(avg_fee_usd)}</b> por trade</td></tr>
+<tr><td>Latência média (detecção→fill)</td><td><b>{f'{avg_lat:.1f}s' if avg_lat else '—'}</b></td></tr>
+</table>
+
+<h3>Todos os trades</h3>
+<table border=1 cellpadding=6 style="border-collapse:collapse;font-size:12px">
+<tr style="background:#222"><th>#</th><th>Token</th><th>Status</th>
+<th>P&L real</th><th>Entry overshoot</th><th>Latência</th><th>Slippage</th></tr>
+{trade_rows}
+</table>
+
+<p style="color:#888;font-size:11px;margin-top:12px">
+  WR break-even = (SL% + friction%) / (TP% + SL%). SOL/USD usado: ${SOL_USD:.0f}.<br>
+  entry_overshoot = (fill_price - expected_entry) / expected_entry. Positivo = comprou mais caro.<br>
+  Friction = EV_teórico − EV_real (inclui GMGN fee, tip, priority, slippage).
+</p>
+</body></html>"""
+
+
 @app.route("/debug/trade-analysis")
 def debug_trade_analysis():
     """Analisa tokens comprados: o que aconteceu após o bounce signal."""
