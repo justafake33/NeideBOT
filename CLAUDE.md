@@ -252,6 +252,28 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO 2026-05-04)
 - A $10/trade: tips = 3.6% → break-even exige WR ~23% (viável com edge da estratégia)
 - **Conclusão: $1/trade sempre ia perder. A calibração mediu o custo de friction real, não a estratégia.**
 
+**Análise de ticks pós-calibração (2026-05-08, n=45 trades com dados):**
+
+| Grupo | n | MC bottom médio | MC bottom min | MC bottom max |
+|-------|---|-----------------|---------------|---------------|
+| TP (DB) | 24 | $16,688 | $7,614 | $24,505 |
+| SL (DB) | 21 | $17,265 | $8,565 | $25,210 |
+
+MC bottom médio de TPs e SLs é praticamente igual → o nível de MC no fundo **não discrimina resultado**. O problema é execução, não seleção de tokens.
+
+De 24 "TPs" no DB: apenas **7 confirmados reais** via tick trajectory (DAN, Claire, pWRG/AND-M, SH, QUACK, USDSC, ONECOIN). Taxa de falso positivo TradeMonitor: **~70%**.
+
+**Mecanismo exato de destruição de WR pelo A.4:**
+1. Sinal dispara em MC = X → entry_expected = X × 1.15
+2. A.4 aguarda 90s → entrada real em ~X × 1.44 (25% acima)
+3. Condition_order TP = entrada_real × 1.75 = **X × 2.52** (precisa +119% do fundo)
+4. Condition_order SL = entrada_real × 0.85 = **X × 1.22** (basta cair para +6% do fundo)
+5. TradeMonitor marca TP quando MC chega em X × 2.01 — threshold errado e baixo
+6. O preço atinge X × 2.01 → TradeMonitor detecta "TP", mas condition_order não disparou
+7. Preço recua → SL real bate em X × 1.22 → posição fecha com -15%
+
+Resultado: **30 TPs teóricos** (ref. entry_expected) → **8 TPs reais** (ref. entrada com overshoot).
+
 **Problema de monitoramento identificado:**
 - `entry_price_usd` NULL em todos os trades — fill poll não captura `filled_output_amount` da GMGN
 - TradeMonitor usa `entry_expected` (preço no sinal) como referência em vez do preço real de compra
@@ -617,6 +639,8 @@ PERSISTENCE_MIN_TICKS=3      # A.4: ticks pós-sinal acima do entry para confirm
 62. **`/debug/trade-analysis`**: endpoint para análise post-mortem de trades. Mostra para cada trade: elapsed_sec, bounce_pct, entry_mc, peak_mc, low_mc e se atingiu TP (+75%) ou SL (-15%). Usa token_ticks após ts_signal. Sem ticks = sem dados pós-entrada.
 63. **TP/SL via `condition_orders` — ✅ VALIDADO** (2026-05-06): TP e SL são embutidos no body do swap em uma única chamada à API. `price_scale` e `sell_ratio` estão em escala percentual (0-100), não decimal nem multiplicador. Valores corretos: `price_scale="75"` (TP +75%), `price_scale="15"` (SL -15%), `sell_ratio="100"` (100% da posição). Bug anterior: `"1.75"`/`"0.85"` eram lidos como 1.75%/0.85% (thresholds minúsculos que disparavam imediatamente), e `"1"` vendia apenas 1% por disparo — os 98% restantes ficavam expostos sem proteção real. `priority_fee` e `tip_fee` são obrigatórios quando `condition_orders` está presente.
 64. **`/debug/test-swap`**: endpoint para teste manual de swap real. `GET /debug/test-swap?mint=<mint>&amount=<usd>` (padrão $1). Com `TRADING_ENABLED=false` exibe simulação do body sem executar. Com `TRADING_ENABLED=true` executa o swap e retorna o `order_id`. Mostra `price_scale` e `sell_ratio` exatos que serão enviados — útil para validar parâmetros antes de religar o bot.
+
+65. **A.4 destrói WR por overshoot de entrada, não só delay**: com 90s de espera, a entrada real é ~25% acima do entry_expected (sinal). Isso eleva o TP real para entry_expected × 2.52 (precisa +119% do fundo) e coloca o SL em entry_expected × 1.22 (apenas +6% do fundo). TradeMonitor usa entry_expected como referência → marca TP quando MC chega em × 2.01 (abaixo do TP real) → condition_order nunca dispara → preço recua → SL bate. Análise de 45 trades com ticks: 24 "TPs" no DB → 7 TPs reais confirmados. Taxa de falso positivo TradeMonitor: ~70%. MC bottom médio de TPs ($16,688) ≈ SLs ($17,265) → o fundo em si não discrimina, o problema é puramente execução.
 
 ---
 
