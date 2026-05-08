@@ -5313,6 +5313,221 @@ def debug_sign_test():
     return "<pre>" + "\n".join(lines) + "</pre>"
 
 
+@app.route("/analise/trade-ticks")
+def analise_trade_ticks():
+    """
+    Trajetória de ticks pós-sinal para cada trade executado.
+    Mostra MC ao longo do tempo com referências entry_expected e entry_price_usd (se disponível).
+    GET /analise/trade-ticks?trade_id=<id>  → trade específico
+    GET /analise/trade-ticks                → lista todos os trades com resumo
+    """
+    import traceback
+    try:
+        return _trade_ticks_inner()
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
+def _trade_ticks_inner():
+    trade_id = request.args.get("trade_id", type=int)
+    WINDOW_MIN = int(request.args.get("window", 30))  # minutos após sinal
+
+    with db._cursor() as cur:
+        if trade_id:
+            cur.execute("""
+                SELECT t.id, t.mint, t.symbol, t.status, t.entry_expected,
+                       t.entry_price_usd, t.tp_pct, t.sl_pct, t.amount_usd,
+                       b.ts_signal, b.mc_min, b.bounce_pct, b.drop_from_mig, b.mc_migration
+                FROM trades t
+                LEFT JOIN bounce_signals b ON b.mint = t.mint
+                WHERE t.id = %s
+            """, (trade_id,))
+        else:
+            cur.execute("""
+                SELECT t.id, t.mint, t.symbol, t.status, t.entry_expected,
+                       t.entry_price_usd, t.tp_pct, t.sl_pct, t.amount_usd,
+                       b.ts_signal, b.mc_min, b.bounce_pct, b.drop_from_mig, b.mc_migration
+                FROM trades t
+                LEFT JOIN bounce_signals b ON b.mint = t.mint
+                WHERE t.status IN ('tp','sl','open')
+                ORDER BY t.id DESC
+            """)
+        trades = [dict(r) for r in cur.fetchall()]
+
+    if not trades:
+        return "<pre>Sem trades.</pre>"
+
+    # Detalhe de um trade específico
+    if trade_id and trades:
+        tr = trades[0]
+        ts_sig = tr["ts_signal"]
+        if not ts_sig:
+            return "<pre>Sem ts_signal para este trade.</pre>"
+
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT tick_ts,
+                       COALESCE(mc_high, mc) AS mc_high,
+                       COALESCE(mc_low, mc)  AS mc_low,
+                       mc,
+                       source
+                FROM token_ticks
+                WHERE mint = %s
+                  AND tick_ts >= %s
+                  AND tick_ts <= %s + INTERVAL '%s minutes'
+                  AND mc IS NOT NULL
+                ORDER BY tick_ts ASC
+            """, (tr["mint"], ts_sig, ts_sig, WINDOW_MIN))
+            ticks = [dict(r) for r in cur.fetchall()]
+
+        entry_exp  = tr["entry_expected"] or 0
+        entry_real = tr["entry_price_usd"] or 0
+        tp_pct     = tr["tp_pct"] or 0.75
+        sl_pct     = tr["sl_pct"] or 0.15
+
+        tp_exp  = entry_exp  * (1 + tp_pct) if entry_exp  else None
+        sl_exp  = entry_exp  * (1 - sl_pct) if entry_exp  else None
+        tp_real = entry_real * (1 + tp_pct) if entry_real else None
+        sl_real = entry_real * (1 - sl_pct) if entry_real else None
+
+        # Verificar hits com referência correta (real se disponível, esperado como fallback)
+        ref_entry = entry_real or entry_exp
+        ref_tp    = tp_real or tp_exp
+        ref_sl    = sl_real or sl_exp
+
+        first_tp_hit = next((t for t in ticks if ref_tp and t["mc_high"] >= ref_tp), None)
+        first_sl_hit = next((t for t in ticks if ref_sl and t["mc_low"]  <= ref_sl), None)
+
+        def elapsed(tick_ts):
+            if not ts_sig: return "?"
+            return f"{(tick_ts - ts_sig).total_seconds() / 60:.1f}min"
+
+        tick_rows = ""
+        for tk in ticks:
+            mins = (tk["tick_ts"] - ts_sig).total_seconds() / 60
+            mc   = tk["mc"]
+            pct_from_exp  = (mc - entry_exp)  / entry_exp  * 100 if entry_exp  else None
+            pct_from_real = (mc - entry_real) / entry_real * 100 if entry_real else None
+
+            flags = ""
+            if ref_tp and tk["mc_high"] >= ref_tp:  flags += " <b style='color:#4f4'>▲TP HIT</b>"
+            if ref_sl and tk["mc_low"]  <= ref_sl:  flags += " <b style='color:#f44'>▼SL HIT</b>"
+
+            bg = ""
+            if ref_tp and tk["mc_high"] >= ref_tp: bg = "background:#1a3a1a"
+            if ref_sl and tk["mc_low"]  <= ref_sl: bg = "background:#3a1a1a"
+
+            tick_rows += (f"<tr style='{bg}'>"
+                          f"<td>{mins:.1f}min</td>"
+                          f"<td>${mc:,.0f}</td>"
+                          f"<td>${tk['mc_high']:,.0f}</td>"
+                          f"<td>${tk['mc_low']:,.0f}</td>"
+                          f"<td>{'—' if pct_from_exp is None else f'{pct_from_exp:+.1f}%'}</td>"
+                          f"<td>{'—' if pct_from_real is None else f'{pct_from_real:+.1f}%'}</td>"
+                          f"<td style='color:#888;font-size:11px'>{tk['source']}</td>"
+                          f"<td>{flags}</td>"
+                          f"</tr>")
+
+        real_note = f"${entry_real:,.0f}" if entry_real else "<span style='color:#f44'>NULL — fill não capturado</span>"
+        ref_note  = "entry_price_usd (real)" if entry_real else "entry_expected (fallback)"
+
+        return f"""<html><head><title>Ticks #{tr['id']} {tr['symbol']}</title></head>
+<body style="font-family:monospace;background:#111;color:#eee;padding:20px">
+<h2>Trade #{tr['id']} — {tr['symbol']} ({tr['status'].upper()})</h2>
+<p><a href="/analise/trade-ticks" style="color:#4af">← todos os trades</a></p>
+
+<table border=1 cellpadding=6 style="border-collapse:collapse;font-size:13px;margin-bottom:16px">
+<tr><td>Status DB</td><td><b>{tr['status']}</b></td></tr>
+<tr><td>MC bottom (fundo)</td><td>${tr['mc_min']:,.0f}</td></tr>
+<tr><td>entry_expected (sinal)</td><td>${entry_exp:,.0f}</td></tr>
+<tr><td>entry_price_usd (fill real)</td><td>{real_note}</td></tr>
+<tr><td>TP ref ({ref_note})</td><td style='color:#4f4'>${ref_tp:,.0f} (+{tp_pct*100:.0f}%)</td></tr>
+<tr><td>SL ref ({ref_note})</td><td style='color:#f44'>${ref_sl:,.0f} (-{sl_pct*100:.0f}%)</td></tr>
+<tr><td>Primeiro TP hit</td><td style='color:#4f4'>{elapsed(first_tp_hit['tick_ts']) if first_tp_hit else '—'}</td></tr>
+<tr><td>Primeiro SL hit</td><td style='color:#f44'>{elapsed(first_sl_hit['tick_ts']) if first_sl_hit else '—'}</td></tr>
+<tr><td>Ticks carregados</td><td>{len(ticks)} (janela {WINDOW_MIN}min)</td></tr>
+</table>
+
+<h3>Trajetória de ticks</h3>
+<table border=1 cellpadding=5 style="border-collapse:collapse;font-size:12px">
+<tr style="background:#222">
+  <th>Tempo</th><th>MC close</th><th>MC high</th><th>MC low</th>
+  <th>% vs entry_exp</th><th>% vs entry_real</th><th>Source</th><th>Evento</th>
+</tr>
+{tick_rows if tick_rows else '<tr><td colspan=8 style="color:#888">Sem ticks nesta janela.</td></tr>'}
+</table>
+</body></html>"""
+
+    # Lista de todos os trades com resumo de ticks
+    list_rows = ""
+    for tr in trades:
+        ts_sig     = tr["ts_signal"]
+        entry_exp  = tr["entry_expected"] or 0
+        entry_real = tr["entry_price_usd"] or 0
+        tp_pct     = tr["tp_pct"] or 0.75
+        sl_pct     = tr["sl_pct"] or 0.15
+
+        n_ticks = 0
+        peak_mc = low_mc = None
+        if ts_sig:
+            with db._cursor() as cur:
+                cur.execute("""
+                    SELECT COUNT(*) AS n,
+                           MAX(COALESCE(mc_high, mc)) AS peak,
+                           MIN(COALESCE(mc_low,  mc)) AS low
+                    FROM token_ticks
+                    WHERE mint = %s
+                      AND tick_ts >= %s
+                      AND tick_ts <= %s + INTERVAL '%s minutes'
+                      AND mc IS NOT NULL
+                """, (tr["mint"], ts_sig, ts_sig, WINDOW_MIN))
+                row = cur.fetchone()
+                n_ticks = row["n"] or 0
+                peak_mc = row["peak"]
+                low_mc  = row["low"]
+
+        ref = entry_real or entry_exp
+        tp_hit = peak_mc and ref and peak_mc >= ref * (1 + tp_pct)
+        sl_hit = low_mc  and ref and low_mc  <= ref * (1 - sl_pct)
+
+        pct_peak = (peak_mc - ref) / ref * 100 if (peak_mc and ref) else None
+        pct_low  = (low_mc  - ref) / ref * 100 if (low_mc  and ref) else None
+
+        real_flag = "✅" if entry_real else "<span style='color:#fa0'>—</span>"
+        status_c  = {"tp": "#4f4", "sl": "#f44", "open": "#4af"}.get(tr["status"], "#888")
+        outcome = "✅ TP" if tp_hit else ("❌ SL" if sl_hit else "⏳")
+
+        list_rows += (f"<tr>"
+                      f"<td><a href='/analise/trade-ticks?trade_id={tr['id']}' style='color:#4af'>#{tr['id']} {tr['symbol']}</a></td>"
+                      f"<td style='color:{status_c}'>{tr['status'].upper()}</td>"
+                      f"<td>{real_flag}</td>"
+                      f"<td>{n_ticks}</td>"
+                      f"<td style='color:#4f4'>{'—' if pct_peak is None else f'{pct_peak:+.1f}%'}</td>"
+                      f"<td style='color:#f44'>{'—' if pct_low  is None else f'{pct_low:+.1f}%'}</td>"
+                      f"<td>{outcome}</td>"
+                      f"</tr>")
+
+    return f"""<html><head><title>Trade Ticks</title></head>
+<body style="font-family:monospace;background:#111;color:#eee;padding:20px">
+<h2>Trajetória de ticks — {len(trades)} trades</h2>
+<p style="color:#aaa;font-size:12px">
+  Referência: entry_price_usd (real) se disponível, entry_expected (sinal) como fallback.<br>
+  Janela: {WINDOW_MIN}min após ts_signal. Clique num trade para ver os ticks completos.
+</p>
+<table border=1 cellpadding=6 style="border-collapse:collapse;font-size:13px">
+<tr style="background:#222">
+  <th>Trade</th><th>Status DB</th><th>Fill real?</th>
+  <th>N ticks</th><th>Peak %</th><th>Low %</th><th>Deveria?</th>
+</tr>
+{list_rows}
+</table>
+<p style="color:#888;font-size:11px;margin-top:8px">
+  "Deveria?" = se MC bateu TP ou SL usando referência correta (real ou esperado).<br>
+  "Fill real?" = entry_price_usd populado no DB. NULL = fill poll não capturou.
+</p>
+</body></html>"""
+
+
 @app.route("/analise/calibration")
 def analise_calibration():
     """Sumário completo dos 50 trades de calibração: WR, EV real, friction, overshoot, latência."""
