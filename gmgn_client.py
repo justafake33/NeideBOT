@@ -270,15 +270,22 @@ class GmgnClient:
 
     def swap(self, token_mint: str, amount_sol: float,
              slippage_bps: int = 500,
-             tp_pct: float | None = None,
+             trailing_activation_pct: float | None = None,
+             trailing_drawdown_pct: float | None = None,
              sl_pct: float | None = None,
              chain: str = "sol") -> dict:
         """
         POST /v1/trade/swap — compra token com SOL.
-        condition_orders embutidos: TP e SL calculados pelo GMGN sobre o fill real.
-          price_scale = percentual (0-100): "75" = +75%, "15" = -15%
-          sell_ratio  = percentual (0-100): "100" = 100% da posição
-          order_type  = "profit_stop" | "loss_stop"
+        condition_orders embutidos: trailing TP + SL fixo calculados pelo GMGN sobre o fill real.
+
+          profit_stop_trace (trailing):
+            price_scale   = activation gain % (0-100): "100" = ativa quando dobra
+            drawdown_rate = recuo máximo do pico % (0-100): "30" = vende se cair 30% do pico
+
+          loss_stop (SL fixo):
+            price_scale = "15" → vende se cair 15% do preço de entrada
+
+          Todos os valores em escala percentual (0-100), NÃO decimal.
         """
         lamports = int(round(amount_sol * 1_000_000_000))
         body = {
@@ -290,12 +297,13 @@ class GmgnClient:
             "slippage":     slippage_bps,
         }
         condition_orders = []
-        if tp_pct is not None:
+        if trailing_activation_pct is not None and trailing_drawdown_pct is not None:
             condition_orders.append({
-                "order_type":  "profit_stop",
-                "side":        "sell",
-                "price_scale": str(round(tp_pct * 100, 2)),  # 75 = +75%
-                "sell_ratio":  "100",                         # 100% da posição
+                "order_type":    "profit_stop_trace",
+                "side":          "sell",
+                "price_scale":   str(round(trailing_activation_pct, 2)),  # ex: "100" = +100%
+                "drawdown_rate": str(round(trailing_drawdown_pct,   2)),  # ex: "30"  = 30% do pico
+                "sell_ratio":    "100",
             })
         if sl_pct is not None:
             condition_orders.append({
