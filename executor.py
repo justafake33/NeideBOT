@@ -11,6 +11,10 @@ TradeMonitor roda em background a cada 30s verificando ticks pós-entrada
 para detectar quando TP ou SL foi atingido e atualizar o status no DB.
 Ativado apenas com TRADING_ENABLED=true no Railway.
 Limite: CALIBRATION_MAX_TRADES trades (padrão 50).
+
+A.4 (persistência 90s) DESATIVADO: entrada imediata ao sinal.
+Motivo: A.4 atrasava a entrada em ~90s, capturando o preço 53% acima do fundo
+— quase no TP — eliminando o R:R da estratégia.
 """
 import logging
 import os
@@ -34,8 +38,8 @@ ORDER_TIMEOUT_SEC  = int(os.getenv(  "ORDER_TIMEOUT_SEC",        "60"))
 
 # A.4 — Persistência: aguarda N segundos e verifica que os últimos K ticks estão acima do entry.
 # 3 ticks consecutivos acima do entry → WR 36.4% vs 12.1% (+24.3pp).
-PERSISTENCE_WAIT_SEC   = int(os.getenv("PERSISTENCE_WAIT_SEC",   "90"))   # espera antes de verificar
-PERSISTENCE_MIN_TICKS  = int(os.getenv("PERSISTENCE_MIN_TICKS",  "3"))    # ticks mínimos acima do entry
+PERSISTENCE_WAIT_SEC   = 0   # A.4 desativado — entrada imediata ao sinal
+PERSISTENCE_MIN_TICKS  = 0
 
 PUMP_FUN_SUPPLY    = 1_000_000_000  # supply padrão Pump.fun
 SPL_TOKEN_DECIMALS = int(os.getenv("SPL_TOKEN_DECIMALS", "6"))  # casas decimais do token SPL (Pump.fun = 6)
@@ -121,18 +125,6 @@ class TradeExecutor:
     def _execute(self, trade_id: int, mint: str, symbol: str,
                  amount_sol: float, sol_usd: float, entry_expected: float):
         ts_signal = datetime.now(timezone.utc)
-
-        # A.4 — Persistência
-        if PERSISTENCE_WAIT_SEC > 0 and entry_expected > 0:
-            logger.info("TRADE #%d %s — aguardando %ds persistência (entry_ref=$%.0f)",
-                        trade_id, symbol, PERSISTENCE_WAIT_SEC, entry_expected)
-            time.sleep(PERSISTENCE_WAIT_SEC)
-            if not self._check_persistence(mint, entry_expected, ts_signal):
-                logger.info("TRADE #%d %s — cancelado: preço não manteve acima do entry em %ds",
-                            trade_id, symbol, PERSISTENCE_WAIT_SEC)
-                _fail(trade_id, f"persistence_fail após {PERSISTENCE_WAIT_SEC}s")
-                return
-
         # 1. Swap com TP/SL embutidos via condition_orders
         # GMGN calcula os preços de saída sobre o fill real (price_scale = multiplicador)
         # Não precisamos do preço do fill — sem erros de "check price less than open price"
