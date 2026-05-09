@@ -221,44 +221,42 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO 2026-05-04)
 
 ---
 
-## 🔍 ESTADO ATUAL — Coleta de Dados
+## 🔍 ESTADO ATUAL
 
-### Situação (2026-05-08) — BOT PAUSADO
+### Situação (2026-05-09) — PRONTO PARA RELIGAR
 - **1175+ tokens** coletados no banco, **1134** com `recovery` definido
 - Recovery rate baseline: **23.5%**
-- **172+ bounce signals** disparados em produção
-- **Fase A ATIVA**: A.2, A.3, A.4, A.5. **A.1 slope REMOVIDO** — H13 refutada com n=153
-- **Fase B ATIVA**: ts_min bug fix, kline 5min, backfill retroativo, hot-precise 30s
-- **Fase 2 ativa**: sinais type 12 coletados em `token_signals` a cada 5s
-- **Fase 6 PAUSADA**: TRADING_ENABLED=false — calibração de 71 trades concluída
-- **H9 reformulada**: threshold = trigger_mc < mc_migration × 0.80. +11.8pp na faixa <50% (n=14). Aguardando n≥30.
+- **251 bounce signals** analisados: 119 válidos (47.4%) / 132 inválidos (52.6%)
+- **Fase A**: A.2 ✅, A.3 ✅, A.5 ✅. A.1 slope REMOVIDO (H13 refutada). **A.4 DESATIVADO** (90s wait → entrada 53% acima do fundo, matava R:R). **A.6 NOVO** (bottom freshness ≤5min).
+- **Fase B ATIVA**: ts_min bug fix, kline backfill, hot-precise 30s
+- **Fase 2 ativa**: token_signals type 12 a cada 5s
+- **Fase 6 calibração CONCLUÍDA**: 50 trades $1 — WR real ~17-19% (8-9 TPs reais), perda $20 dominada por friction
+- **Trailing TP IMPLEMENTADO**: `profit_stop_trace` ativação=75%, drawdown=30%. SL fixo -15%.
+- **H9 pendente**: threshold = trigger_mc < mc_migration × 0.80. Aguardando n≥30 na faixa <50%.
 
-### Resultado da Calibração — 71 trades de $1 (2026-05-07/08)
+### Resultado da Calibração — 50 trades de $1 (2026-05-07/08)
 
 | Métrica | Valor | Observação |
 |---------|-------|-----------|
-| Trades executados | 71 | 48 done, 21 erro, 2 expired |
-| TPs detectados (TradeMonitor) | 27 | **INFLADO** — referência errada |
+| Trades executados | 50 | 48 done, 2 expired |
 | TPs reais confirmados | ~8-9 | DAN, CLAIRE, pWRG, SH, QUACK, USDSC, ONECOIN, STARFOX, BTS |
 | WR real | ~17-19% | Break-even teórico = 16.7% (sem tips) |
 | Capital inicial | $40 | |
-| Capital final | ~$20 | -$20 em 2 dias |
 | Perda real | ~$20 | **Quase 100% em fees/tips, não em trades ruins** |
 
 **Diagnóstico da perda:**
-- Tips + priority por trade: ~$0.36 (0.001 SOL × 4 transações × $88/SOL)
-- 71 trades × $0.36 = **~$25 em tips** — custo fixo independente do resultado
-- A $1/trade: tips = 36% do tamanho da posição → break-even exige WR ~59% (impossível)
-- A $10/trade: tips = 3.6% → break-even exige WR ~23% (viável com edge da estratégia)
-- **Conclusão: $1/trade sempre ia perder. A calibração mediu o custo de friction real, não a estratégia.**
+- Tips por trade: ~$0.36 (0.001 SOL × 4 transações × $88/SOL)
+- A $1/trade: tips = 36% do tamanho → break-even exige WR ~59% (impossível)
+- A $10/trade: tips = 3.6% → break-even exige WR ~23% (viável com o edge da estratégia)
+- **Conclusão: $1/trade sempre ia perder. Calibração mediu o custo de friction real, não a estratégia.**
 
-**Problema de monitoramento identificado:**
-- `entry_price_usd` NULL em todos os trades — fill poll não captura `filled_output_amount` da GMGN
-- TradeMonitor usa `entry_expected` (preço no sinal) como referência em vez do preço real de compra
-- Com A.4 (90s wait): compra real ~25% acima do sinal → TP detectado prematuramente
-- Resultado: 27 "TPs" no DB, ~8-9 reais. P&L no DB = ±75%/-15% fixo, não o real
+**Análise de sinais inválidos (2026-05-09):**
+- 52% dos sinais disparavam depois do pico — hipótese de latência REFUTADA (P50 atraso = 6.7min)
+- Padrão real: tokens que picam em <3min pós-migração (velocity 7.5× mais rápido que válidos), dumpeiam 10-20min, sinal dispara em mini-rally tardio com fundo estagnado
+- Helius resolve apenas 3.8% dos inválidos — não é latência, é estrutural
+- **A.6 (bottom freshness)** resolve 92% dos inválidos: sinal só dispara se ts_min ≤ 5min atrás
 
-**Próximo passo obrigatório antes de religar:** implementar Helius + Jupiter swap.
+**Próximo passo para religar:** escalar para $10/trade (break-even ~23%, viável).
 
 ### Campos coletados por migração
 
@@ -514,19 +512,20 @@ MIGRATION_SOL_UNITS=410      # SOL teórico da bonding curve → mc_migration_bc
 # Bounce detector (configuráveis sem redeploy)
 BOUNCE_MIN_PCT=0.15          # bounce mínimo do fundo para disparar sinal (15%)
 BOUNCE_DROP_MIN=0.30         # drop mínimo da migração para considerar (30%)
-BOUNCE_TIME_MAX=20.0         # A.5: janela máxima em minutos (era 30min — 100% TPs em ≤20min)
+BOUNCE_TIME_MAX=20.0         # A.5: janela máxima em minutos (100% TPs em ≤20min)
+BOTTOM_FRESHNESS_SEC=300     # A.6: máx 5min desde o último mc_min (bloqueia sinais tardios)
 
 # Fase 6 — Execução de trades (configuráveis sem redeploy)
 TRADING_ENABLED=false        # true para ativar trades reais
-CALIBRATION_AMOUNT_USD=1.0   # tamanho de cada trade em USD
-CALIBRATION_MAX_TRADES=50    # limite total de trades de calibração
-TRADE_TP_PCT=0.75            # take profit (75%)
-TRADE_SL_PCT=0.15            # stop loss (15%)
+CALIBRATION_AMOUNT_USD=10.0  # tamanho de cada trade em USD (era $1 na calibração)
+CALIBRATION_MAX_TRADES=50    # limite total de trades por sessão
+TRADE_SL_PCT=0.15            # stop loss fixo (15%)
+TRAILING_ACTIVATION_PCT=75   # trailing: gain% mínimo para ativar (75% = início conservador)
+TRAILING_DRAWDOWN_PCT=30     # trailing: recuo máximo do pico antes de vender (30%)
 TRADE_SLIPPAGE_BPS=500       # slippage máximo em basis points (5%)
 ORDER_POLL_SEC=2             # intervalo de poll do fill (segundos)
-ORDER_TIMEOUT_SEC=30         # timeout do fill (segundos)
-PERSISTENCE_WAIT_SEC=90      # A.4: segundos de espera antes de verificar persistência
-PERSISTENCE_MIN_TICKS=3      # A.4: ticks pós-sinal acima do entry para confirmar
+ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
+# PERSISTENCE_WAIT_SEC e PERSISTENCE_MIN_TICKS REMOVIDOS — A.4 desativado (hardcoded = 0)
 ```
 
 ---
@@ -546,6 +545,10 @@ PERSISTENCE_MIN_TICKS=3      # A.4: ticks pós-sinal acima do entry para confirm
 | `/analise/backtest` | **Backtester tick-level** — grid TP×SL com OHLC. `?mode=ticks` (padrão) ou `?mode=full`. |
 | `/export/csv` | Export completo do banco |
 | `/health` | Health check |
+| `/analise/trailing` | **Trailing TP** — distribuição de gains válidos, intra-rally drawdown, simulação 7 configs vs TP fixo |
+| `/analise/invalidos` | **Sinais tardios** — diagnóstico dos 52% de bounces inválidos, impacto Helius, filtro A.6 |
+| `/analise/a6-trades` | **Retroativo A.6** — dos 50 trades reais, quantos A.6 teria bloqueado e se eram bons/ruins |
+| `/analise/h9` | H9 — token_signals type 12 vs recovery rate por faixa de trigger_mc/mc_migration |
 | `/debug/signal` | Diagnóstico histórico — testa formatos do token_signal (legacy) |
 | `/debug/signal-live` | **Fase 2** — chama get_token_signal(), mostra matches com HotMonitor e últimos sinais salvos |
 
@@ -617,15 +620,35 @@ PERSISTENCE_MIN_TICKS=3      # A.4: ticks pós-sinal acima do entry para confirm
 62. **`/debug/trade-analysis`**: endpoint para análise post-mortem de trades. Mostra para cada trade: elapsed_sec, bounce_pct, entry_mc, peak_mc, low_mc e se atingiu TP (+75%) ou SL (-15%). Usa token_ticks após ts_signal. Sem ticks = sem dados pós-entrada.
 63. **TP/SL via `condition_orders` — ✅ VALIDADO** (2026-05-06): TP e SL são embutidos no body do swap em uma única chamada à API. `price_scale` e `sell_ratio` estão em escala percentual (0-100), não decimal nem multiplicador. Valores corretos: `price_scale="75"` (TP +75%), `price_scale="15"` (SL -15%), `sell_ratio="100"` (100% da posição). Bug anterior: `"1.75"`/`"0.85"` eram lidos como 1.75%/0.85% (thresholds minúsculos que disparavam imediatamente), e `"1"` vendia apenas 1% por disparo — os 98% restantes ficavam expostos sem proteção real. `priority_fee` e `tip_fee` são obrigatórios quando `condition_orders` está presente.
 64. **`/debug/test-swap`**: endpoint para teste manual de swap real. `GET /debug/test-swap?mint=<mint>&amount=<usd>` (padrão $1). Com `TRADING_ENABLED=false` exibe simulação do body sem executar. Com `TRADING_ENABLED=true` executa o swap e retorna o `order_id`. Mostra `price_scale` e `sell_ratio` exatos que serão enviados — útil para validar parâmetros antes de religar o bot.
+65. **A.4 DESATIVADO** (2026-05-09): `PERSISTENCE_WAIT_SEC = 0` e `PERSISTENCE_MIN_TICKS = 0` hardcoded no executor.py (não lê env var para evitar reativação acidental). Motivo: A.4 esperava 90s após sinal → entrada ~53% acima do fundo (quase no TP). Eliminava o R:R da estratégia.
+66. **A.6 — Bottom Freshness** (2026-05-09): sinal só dispara se `(now - state["ts_min"]).seconds <= BOTTOM_FRESHNESS_SEC` (padrão 300s). `ts_min` já rastreado em push_mc + _precise_bottom_tick. Bloqueia sinais de fundo "velho": tokens que picaram em <3min pós-migração e geram mini-rally tardio com fundo estagnado há 10-20min. 92% dos inválidos históricos seriam bloqueados.
+67. **Trailing TP via `profit_stop_trace`** (2026-05-09): substitui `profit_stop` (TP fixo) no body do swap. Campos: `price_scale` = activation % (ex: "75" = ativa quando +75%), `drawdown_rate` = recuo máximo do pico (ex: "30" = vende se cair 30% do pico), `sell_ratio = "100"`. Simulação n=119: trailing 30% ativ.100% → avg 159.2% vs 71.3% TP fixo. Ativação conservadora em 75% para fase inicial (pouco caixa). SL fixo -15% mantido via `loss_stop`.
+68. **Sinais inválidos são padrão estrutural, não latência** (2026-05-09): 52% dos bounces disparavam depois do pico. Hipótese de latência (Helius resolve) REFUTADA — P50 atraso = 6.7min, apenas 3.8% dentro da janela de 30s do GMGN. Padrão real: tokens com spike relâmpago em <3min (velocity 7.5× maior que válidos), dump de 10-20min, sinal em mini-rally tardio. Helius continua no roadmap mas como **redução de custo** (Jupiter swap), não como melhoria de sinal.
+69. **TradeMonitor "trailing_active"**: com trailing TP, o TradeMonitor soft-detector marca o trade como "trailing_active" quando price atinge a activation level (tp_pct armazenado = TRAILING_ACTIVATION_PCT/100). Não é saída real — GMGN condition_orders gerencia o trailing. É apenas visibilidade de que o trailing está ativo.
+70. **Inválidos A.6 não afetam os 50 trades reais**: retroativo mostrou que A.6 só teria bloqueado 1/50 trades (QUACK, que era TP). Os 50 trades executados eram todos "frescos" — o tick de menor MC estava a 0.1-4.5min do sinal. Os inválidos da análise geral são de períodos anteriores sem A.5 ativo.
 
 ---
 
-## 🔄 Próximo Passo: Helius + Jupiter Swap
+## 🔄 Próximo Passo: Religar com $10/trade
 
-### Por que é obrigatório antes de religar
-A calibração mostrou que as tips (0.001 SOL × 4 txs = ~$0.36/trade) dominam o custo a $1/trade.
-A $10/trade as tips representam 3.6% — viável. Mas GMGN ainda cobra 1%×2 = 2% adicional.
-Implementar Jupiter swap via Helius elimina o 1% da GMGN e permite reduzir tips (0.00005 SOL suficiente para Meteora/Raydium fora de congestionamento).
+### Estado atual do pipeline (2026-05-09)
+Calibração de $1/trade concluída. Diagnóstico: friction dominou a $1/trade (tips = 36% do tamanho). A $10/trade as tips representam 3.6% — viável com WR ~17-19% e trailing TP.
+
+**Melhorias implementadas desde a calibração:**
+- A.4 desativado → entrada imediata ao sinal (não mais 53% acima do fundo)
+- A.6 adicionado → bloqueia sinais com fundo estagnado (92% dos inválidos históricos)
+- Trailing TP → avg 159% vs 71% TP fixo (simulação n=119)
+
+**Gate para religar:** TRADING_ENABLED=true, CALIBRATION_AMOUNT_USD=10, TRAILING_ACTIVATION_PCT=75
+
+---
+
+## 📋 Roadmap: Helius + Jupiter Swap (médio prazo)
+
+### Por que faz sentido (não é urgente)
+A $10/trade a friction é aceitável com GMGN (~9.2% total). Helius/Jupiter reduz para ~1.1%.
+Implementar DEPOIS de confirmar WR com trailing TP em $10/trade.
+GMGN ainda cobra 1%×2 = 2% adicional. Jupiter elimina esse custo.
 
 ### O que muda na arquitetura
 
