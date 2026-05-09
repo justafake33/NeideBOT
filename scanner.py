@@ -172,12 +172,13 @@ class HotMonitor:
     # Bounce detector
     # ------------------------------------------------------------------
 
-    BOUNCE_MIN_PCT   = float(os.getenv("BOUNCE_MIN_PCT",   "0.15"))  # bounce mínimo do mc_min
-    BOUNCE_DROP_MIN  = float(os.getenv("BOUNCE_DROP_MIN",  "0.30"))  # queda mínima da migração
-    BOUNCE_TIME_MAX  = float(os.getenv("BOUNCE_TIME_MAX",  "20.0"))  # A.5: janela 30→20min (100% TPs em ≤20min)
+    BOUNCE_MIN_PCT       = float(os.getenv("BOUNCE_MIN_PCT",         "0.15"))  # bounce mínimo do mc_min
+    BOUNCE_DROP_MIN      = float(os.getenv("BOUNCE_DROP_MIN",        "0.30"))  # queda mínima da migração
+    BOUNCE_TIME_MAX      = float(os.getenv("BOUNCE_TIME_MAX",        "20.0"))  # A.5: janela 30→20min (100% TPs em ≤20min)
+    BOTTOM_FRESHNESS_SEC = int(os.getenv(  "BOTTOM_FRESHNESS_SEC",  "300"))   # A.6: máx 5min desde o último mc_min
 
     def _check_bounce(self, mint: str, state: dict, mc: float, elapsed_sec: int):
-        """Detecta bounce em tempo real. Fase A: filtros dead zone (A.2) e entry ratio (A.3)."""
+        """Detecta bounce em tempo real. Fase A: filtros A.2, A.3, A.6."""
         if state.get("bounce_fired"):
             return
 
@@ -197,6 +198,20 @@ class HotMonitor:
         bounce_pct = (mc - mc_min) / mc_min
         if bounce_pct < self.BOUNCE_MIN_PCT:
             return
+
+        # A.6 — Bottom freshness: sinal deve vir logo após o fundo ser confirmado.
+        # Padrão inválido: token pica em <3min, dump por 10-20min, sinal dispara em mini-rally tardio.
+        # Dados: 92% dos inválidos têm gap (ts_min → sinal) > 2min. P50 gap = 6.7min.
+        # Válidos: fundo recente → sinal em 1-3min. Invalidos: fundo em 2-5min → sinal 13-17min depois.
+        ts_min = state.get("ts_min")
+        if ts_min is not None:
+            secs_since_bottom = (datetime.now(timezone.utc) - ts_min).total_seconds()
+            if secs_since_bottom > self.BOTTOM_FRESHNESS_SEC:
+                logger.debug(
+                    "BOUNCE skip %s — A.6 bottom stale %.0fs ago (max=%ds)",
+                    mint[:8], secs_since_bottom, self.BOTTOM_FRESHNESS_SEC,
+                )
+                return
 
         # A.2 — Dead zone: bounce 20-30% tem WR 4% e EV -10%. Permitir <20% ou ≥30%.
         if 0.20 <= bounce_pct < 0.30:
