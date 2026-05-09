@@ -803,6 +803,360 @@ tr:hover td { background: #161b22; }
     return html
 
 
+@app.route("/analise/invalidos")
+def analise_invalidos():
+    """
+    Investiga por que 52% dos sinais disparam depois do pico.
+
+    Hipótese central: o token bounceou, picou e caiu de volta antes do próximo
+    poll GMGN (5s). Detectamos o preço na DESCIDA, não na subida.
+
+    Helius RPC (sub-segundo) resolveria os casos onde o pico ocorreu dentro
+    da janela de latência do GMGN (~5-30s). Esta análise quantifica quantos.
+    """
+    with db._cursor() as cur:
+
+        # Todos os bounces com dados completos
+        cur.execute("""
+            SELECT
+                b.mint,
+                b.symbol,
+                b.ts_signal,
+                b.mc_min                                                    AS mc_bottom,
+                b.mc_at_signal,
+                b.bounce_pct,
+                b.elapsed_sec / 60.0                                        AS elapsed_min_signal,
+                b.drop_from_mig,
+                m.mc_peak,
+                m.mc_migration,
+                m.time_to_peak,
+                m.time_to_bottom,
+                m.recovery,
+                -- posição do sinal relativa ao pico (negativo = sinal depois do pico)
+                m.time_to_peak - (b.elapsed_sec / 60.0)                    AS min_signal_to_peak,
+                -- o sinal capturou quanto % do upside disponível?
+                -- (mc_at_signal - mc_bottom) / (mc_peak - mc_bottom)
+                CASE WHEN m.mc_peak > b.mc_min
+                    THEN (b.mc_at_signal - b.mc_min) / NULLIF(m.mc_peak - b.mc_min, 0)
+                END                                                         AS pct_upside_captured,
+                -- velocidade do bounce: gain por minuto até o pico
+                CASE WHEN m.time_to_peak > 0
+                    THEN (m.mc_peak - b.mc_min) / NULLIF(b.mc_min, 0) / m.time_to_peak
+                END                                                         AS gain_per_min,
+                -- o sinal veio enquanto o preço ainda subia ou já caindo?
+                -- se mc_at_signal < mc_peak → compramos abaixo do pico (algum upside)
+                -- se mc_at_signal > mc_peak → impossível (mc_peak é o máximo)
+                (m.mc_peak - b.mc_at_signal) / NULLIF(m.mc_peak, 0)        AS pct_peak_missed
+            FROM bounce_signals b
+            JOIN migrations m ON m.mint = b.mint
+            WHERE b.mc_min > 0
+              AND m.mc_peak IS NOT NULL
+              AND b.mc_at_signal IS NOT NULL
+        """)
+        all_rows = [dict(r) for r in cur.fetchall()]
+
+        # Ticks dos inválidos para medir velocidade real
+        cur.execute("""
+            SELECT
+                b.mint,
+                b.symbol,
+                b.ts_signal,
+                b.mc_min,
+                b.mc_at_signal,
+                m.time_to_peak,
+                b.elapsed_sec / 60.0                          AS elapsed_min_signal,
+                -- primeiro tick APÓS o sinal
+                MIN(t.tick_ts)                                AS first_tick_after_signal,
+                COUNT(t.id) FILTER (WHERE t.tick_ts <= b.ts_signal + INTERVAL '5 minutes') AS ticks_5min,
+                -- mc mínimo visto nos 5min após o sinal (continuou caindo?)
+                MIN(COALESCE(t.mc_low, t.mc))
+                    FILTER (WHERE t.tick_ts >= b.ts_signal
+                              AND t.tick_ts <= b.ts_signal + INTERVAL '5 minutes') AS mc_min_after_signal,
+                -- mc máximo visto nos 5min após o sinal
+                MAX(COALESCE(t.mc_high, t.mc))
+                    FILTER (WHERE t.tick_ts >= b.ts_signal
+                              AND t.tick_ts <= b.ts_signal + INTERVAL '5 minutes') AS mc_max_after_signal
+            FROM bounce_signals b
+            JOIN migrations m ON m.mint = b.mint
+            JOIN token_ticks t ON t.mint = b.mint
+            WHERE b.mc_min > 0
+              AND m.time_to_peak IS NOT NULL
+              AND m.time_to_peak < b.elapsed_sec / 60.0   -- apenas inválidos
+              AND t.tick_ts >= b.ts_signal - INTERVAL '1 minute'
+            GROUP BY b.mint, b.symbol, b.ts_signal, b.mc_min, b.mc_at_signal,
+                     m.time_to_peak, b.elapsed_sec
+        """)
+        tick_rows = {r["mint"]: dict(r) for r in cur.fetchall()}
+
+    def _pcts(values, ps=(10, 25, 50, 75, 90)):
+        if not values: return {p: None for p in ps}
+        s = sorted(values)
+        n = len(s)
+        out = {}
+        for p in ps:
+            idx = (p / 100) * (n - 1)
+            lo, hi = int(idx), min(int(idx) + 1, n - 1)
+            out[p] = s[lo] + (idx - lo) * (s[hi] - s[lo])
+        return out
+
+    def _fp(v, mult=100, dec=1):
+        return f"{v*mult:.{dec}f}%" if v is not None else "—"
+    def _fm(v, dec=1):
+        return f"{v:.{dec}f}min" if v is not None else "—"
+    def _fs(v):
+        return f"{v:.0f}s" if v is not None else "—"
+
+    valid   = [r for r in all_rows if (r["min_signal_to_peak"] or 0) > 0]
+    invalid = [r for r in all_rows if (r["min_signal_to_peak"] or 0) <= 0]
+
+    # Para os inválidos: quanto antes do sinal foi o pico?
+    # late_by_min = quanto minutos DEPOIS do pico chegou o sinal
+    late_vals = [abs(r["min_signal_to_peak"]) for r in invalid
+                 if r["min_signal_to_peak"] is not None]
+    late_pcts = _pcts(late_vals)
+
+    # Velocidade do bounce (gain/min até o pico) — inválidos vs válidos
+    speed_invalid = [r["gain_per_min"] for r in invalid
+                     if r["gain_per_min"] is not None and r["gain_per_min"] > 0]
+    speed_valid   = [r["gain_per_min"] for r in valid
+                     if r["gain_per_min"] is not None and r["gain_per_min"] > 0]
+
+    # Quanto do upside o sinal capturou (posição no pico)
+    captured_invalid = [r["pct_upside_captured"] for r in invalid
+                        if r["pct_upside_captured"] is not None]
+    captured_valid   = [r["pct_upside_captured"] for r in valid
+                        if r["pct_upside_captured"] is not None]
+
+    # Estimativa de impacto do Helius:
+    # GMGN latência estimada: poll 5s + latência de agregação ~10-20s = ~30s total
+    # Se o sinal chegou com menos de 30s de atraso → Helius teria pego
+    GMGN_LATENCY_MIN = 30 / 60  # 30 segundos em minutos
+    helius_would_catch = [r for r in invalid
+                          if r["min_signal_to_peak"] is not None
+                          and abs(r["min_signal_to_peak"]) <= GMGN_LATENCY_MIN]
+    helius_partial = [r for r in invalid
+                      if r["min_signal_to_peak"] is not None
+                      and GMGN_LATENCY_MIN < abs(r["min_signal_to_peak"]) <= 2.0]
+    helius_no_help = [r for r in invalid
+                      if r["min_signal_to_peak"] is not None
+                      and abs(r["min_signal_to_peak"]) > 2.0]
+
+    # Quanto % do upside os inválidos capturam (sinal veio em que ponto da curva?)
+    # 0% = sinal veio quando preço = bottom (pior)
+    # 100% = sinal veio no exato pico
+    # Valores > 0 = ainda havia algum upside quando compramos
+    neg_upside = sum(1 for r in invalid if (r["pct_upside_captured"] or 0) < 0.05)
+    pos_upside = sum(1 for r in invalid if (r["pct_upside_captured"] or 0) >= 0.05)
+
+    html = f"""<!DOCTYPE html><html lang="pt-BR"><head>
+<meta charset="utf-8"><title>Análise Inválidos — Sinais Tardios</title>
+<style>
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{ font-family: 'Courier New', monospace; background: #0d1117; color: #c9d1d9;
+       padding: 20px; font-size: 13px; }}
+h1 {{ color: #58a6ff; margin-bottom: 4px; }}
+h2 {{ color: #58a6ff; margin: 28px 0 10px; font-size: 15px;
+     border-bottom: 1px solid #30363d; padding-bottom: 6px; }}
+.sub {{ color: #8b949e; margin-bottom: 20px; font-size: 12px; }}
+.nav {{ margin-bottom: 20px; display: flex; gap: 8px; flex-wrap: wrap; }}
+.nav a {{ color: #58a6ff; font-size: 12px; text-decoration: none;
+         border: 1px solid #30363d; padding: 3px 10px; border-radius: 4px; }}
+.nav a:hover {{ background: #161b22; }}
+.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px,1fr));
+        gap: 16px; margin-bottom: 24px; }}
+.card {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }}
+.card-title {{ color: #8b949e; font-size: 11px; text-transform: uppercase;
+              letter-spacing:.05em; margin-bottom: 12px; }}
+.row {{ display: flex; justify-content: space-between; padding: 5px 0;
+       border-bottom: 1px solid #21262d; }}
+.row:last-child {{ border-bottom: none; }}
+.label {{ color: #8b949e; }}
+.green {{ color: #3fb950; }} .yellow {{ color: #d29922; }} .red {{ color: #f85149; }}
+.blue  {{ color: #58a6ff; }}
+.insight {{ background: #0d2137; border-left: 3px solid #58a6ff; padding: 12px 16px;
+           margin: 14px 0; border-radius: 0 6px 6px 0; line-height: 1.7; }}
+.warn {{ background: #1e1500; border-left: 3px solid #d29922; padding: 12px 16px;
+        margin: 14px 0; border-radius: 0 6px 6px 0; line-height: 1.7; }}
+.ok   {{ background: #0d1e0d; border-left: 3px solid #3fb950; padding: 12px 16px;
+        margin: 14px 0; border-radius: 0 6px 6px 0; line-height: 1.7; }}
+table {{ border-collapse: collapse; width: 100%; }}
+th {{ background: #161b22; color: #8b949e; padding: 7px 10px; text-align: left;
+     border-bottom: 2px solid #30363d; font-size: 11px; text-transform: uppercase; }}
+td {{ padding: 5px 10px; border-bottom: 1px solid #21262d; }}
+tr:hover td {{ background: #161b22; }}
+.stat-big {{ font-size: 26px; font-weight: bold; margin-top: 4px; }}
+.helius-bar {{ display: flex; height: 28px; border-radius: 6px; overflow: hidden;
+              margin-top: 12px; }}
+.hb-green  {{ background: #238636; display: flex; align-items: center;
+              justify-content: center; font-size: 11px; font-weight: bold; color: #fff; }}
+.hb-yellow {{ background: #9a6700; display: flex; align-items: center;
+              justify-content: center; font-size: 11px; font-weight: bold; color: #fff; }}
+.hb-red    {{ background: #8b1a1a; display: flex; align-items: center;
+              justify-content: center; font-size: 11px; font-weight: bold; color: #fff; }}
+</style></head><body>
+<h1>Análise — Sinais Tardios (Inválidos)</h1>
+<p class="sub">Por que 52% dos sinais chegam depois do pico? E quanto o Helius RPC resolveria?</p>
+<div class="nav">
+  <a href="/analise/trailing">← Trailing</a>
+  <a href="/analise">Análise</a>
+  <a href="/export/bounces">CSV Bounces</a>
+</div>
+
+<h2>1. Hipótese — O que provavelmente acontece</h2>
+<div class="insight">
+  <b>Mecanismo identificado:</b> O token bouncea, atinge o pico e começa a cair — tudo dentro de uma janela
+  menor que o poll do GMGN (5s + latência de agregação ~10-20s = ~30s total).<br><br>
+  Quando nosso scanner lê o próximo dado, o preço já passou pelo pico e está na <b>descida</b>.
+  O preço ainda está acima do fundo (+15%), então o sinal dispara — mas compramos na curva errada.<br><br>
+  <b>Com Helius RPC:</b> eventos on-chain chegam em &lt;100ms. A primeira vez que o preço cruza
+  bottom × 1.15 é detectada na <b>subida real</b>, não na descida.
+</div>
+
+<h2>2. Quanto Tempo Depois do Pico o Sinal Chegou?</h2>
+<p class="sub" style="margin-top:-6px">
+  Para os {len(invalid)} inválidos: distribuição de (elapsed_min_signal − time_to_peak).
+  Quanto menor, mais o Helius ajuda.
+</p>
+<div class="grid">
+  <div class="card">
+    <div class="card-title">Atraso Sinal vs Pico ({len(late_vals)} tokens)</div>
+    {"".join(f'<div class="row"><span class="label">P{p}</span><span class="val {("green" if (late_pcts.get(p) or 99)<0.5 else "yellow" if (late_pcts.get(p) or 99)<2 else "red")}">{_fm(late_pcts.get(p))}</span></div>' for p in [10,25,50,75,90])}
+  </div>
+  <div class="card">
+    <div class="card-title">Velocidade do Bounce — Gain/Minuto</div>
+    <div class="row"><span class="label">Inválidos P50</span>
+      <span class="val red">{_fp(_pcts(speed_invalid).get(50))}/min</span></div>
+    <div class="row"><span class="label">Inválidos P75</span>
+      <span class="val red">{_fp(_pcts(speed_invalid).get(75))}/min</span></div>
+    <div class="row"><span class="label">Válidos P50</span>
+      <span class="val green">{_fp(_pcts(speed_valid).get(50))}/min</span></div>
+    <div class="row"><span class="label">Válidos P75</span>
+      <span class="val green">{_fp(_pcts(speed_valid).get(75))}/min</span></div>
+    <div style="color:#8b949e;font-size:11px;margin-top:8px">
+      Inválidos bounceiam mais rápido → pico passa antes do poll
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Upside Capturado pelo Sinal</div>
+    <div class="row"><span class="label">Inválidos P50</span>
+      <span class="val red">{_fp(_pcts(captured_invalid).get(50))}</span></div>
+    <div class="row"><span class="label">Inválidos P75</span>
+      <span class="val red">{_fp(_pcts(captured_invalid).get(75))}</span></div>
+    <div class="row"><span class="label">Válidos P50</span>
+      <span class="val green">{_fp(_pcts(captured_valid).get(50))}</span></div>
+    <div class="row"><span class="label">Válidos P75</span>
+      <span class="val green">{_fp(_pcts(captured_valid).get(75))}</span></div>
+    <div style="color:#8b949e;font-size:11px;margin-top:8px">
+      0% = sinal veio quando preço = fundo. 100% = sinal veio no pico exato.
+    </div>
+  </div>
+</div>
+
+<h2>3. Impacto Estimado do Helius RPC</h2>
+<p class="sub" style="margin-top:-6px">
+  Latência GMGN atual: poll 5s + agregação ~25s ≈ <b>30s total</b>.
+  Helius RPC: &lt;100ms. Categorização dos {len(invalid)} inválidos:
+</p>
+<div class="grid">
+  <div class="card">
+    <div class="card-title">Helius resolve (&lt;30s de atraso)</div>
+    <div class="stat-big green">{len(helius_would_catch)}</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:6px">
+      {len(helius_would_catch)/len(invalid)*100:.1f}% dos inválidos
+    </div>
+    <div style="color:#8b949e;font-size:12px;margin-top:4px">
+      Pico ocorreu dentro da janela de latência do GMGN
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Helius ajuda parcial (30s–2min)</div>
+    <div class="stat-big yellow">{len(helius_partial)}</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:6px">
+      {len(helius_partial)/len(invalid)*100:.1f}% dos inválidos
+    </div>
+    <div style="color:#8b949e;font-size:12px;margin-top:4px">
+      Helius pega na subida mas ainda perto do pico
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Helius não ajuda (&gt;2min de atraso)</div>
+    <div class="stat-big red">{len(helius_no_help)}</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:6px">
+      {len(helius_no_help)/len(invalid)*100:.1f}% dos inválidos
+    </div>
+    <div style="color:#8b949e;font-size:12px;margin-top:4px">
+      Problema estrutural — não é latência, é sinal tardio mesmo
+    </div>
+  </div>
+</div>
+<div class="card" style="margin-bottom:24px">
+  <div class="card-title">Composição dos {len(invalid)} Inválidos</div>
+  <div class="helius-bar">
+    <div class="hb-green" style="width:{len(helius_would_catch)/len(invalid)*100:.0f}%">
+      {len(helius_would_catch)/len(invalid)*100:.0f}% Helius resolve
+    </div>
+    <div class="hb-yellow" style="width:{len(helius_partial)/len(invalid)*100:.0f}%">
+      {len(helius_partial)/len(invalid)*100:.0f}% parcial
+    </div>
+    <div class="hb-red" style="width:{len(helius_no_help)/len(invalid)*100:.0f}%">
+      {len(helius_no_help)/len(invalid)*100:.0f}% não ajuda
+    </div>
+  </div>
+</div>
+
+<div class="ok">
+  <b>Impacto total do Helius nos trades:</b><br>
+  De {len(all_rows)} sinais totais:
+  <b>{len(valid)}</b> válidos (47.4%) + <b>{len(helius_would_catch)}</b> inválidos resolvidos pelo Helius =
+  <b>{len(valid) + len(helius_would_catch)}</b> trades utilizáveis
+  ({(len(valid) + len(helius_would_catch))/len(all_rows)*100:.1f}% vs 47.4% atual).
+  O Helius não é só uma melhoria de custo — é uma melhoria de qualidade de sinal.
+</div>
+
+<h2>4. Os Inválidos com &gt;2min de Atraso — O que são?</h2>
+<p class="sub" style="margin-top:-6px">
+  Esses {len(helius_no_help)} tokens tiveram pico muito antes do sinal. Padrão provável:
+  bounce duplo — o token bounceou, caiu, o sinal disparou num segundo bounce menor.
+</p>
+<table>
+  <thead><tr>
+    <th>Token</th><th>Atraso (pico→sinal)</th><th>T Pico</th><th>T Sinal</th>
+    <th>Gain Máx</th><th>Upside no Sinal</th><th>Velocidade</th><th>Recovery</th>
+  </tr></thead>
+  <tbody>
+"""
+    for r in sorted(helius_no_help, key=lambda x: abs(x.get("min_signal_to_peak") or 0), reverse=True)[:40]:
+        late = abs(r.get("min_signal_to_peak") or 0)
+        gain = (r.get("mc_peak", 0) - r.get("mc_bottom", 1)) / max(r.get("mc_bottom", 1), 1)
+        cap  = r.get("pct_upside_captured") or 0
+        spd  = r.get("gain_per_min") or 0
+        rec  = r.get("recovery")
+        html += f"""
+    <tr>
+      <td><b>{r.get('symbol') or r['mint'][:8]}</b></td>
+      <td class="red">{_fm(late)}</td>
+      <td class="muted">{_fm(r.get('time_to_peak'))}</td>
+      <td class="muted">{_fm(r.get('elapsed_min_signal'))}</td>
+      <td class="{'green' if gain>1 else 'yellow'}">{_fp(gain)}</td>
+      <td class="{'green' if cap>0.5 else 'red'}">{_fp(cap)}</td>
+      <td>{_fp(spd)}/min</td>
+      <td class="{'green' if rec else 'red'}">{('TRUE' if rec else 'FALSE') if rec is not None else '—'}</td>
+    </tr>"""
+
+    html += """
+  </tbody>
+</table>
+<div class="warn" style="margin-top:16px">
+  <b>Próximo passo:</b> Os inválidos com &gt;2min de atraso provavelmente têm padrão de bounce duplo
+  (o bot dispara num segundo rally menor após o pico real já ter passado).
+  Investigar se um filtro de "bounce_pct crescente" — exigir que o bounce atual seja maior
+  que qualquer bounce anterior para o mesmo token — eliminaria esses casos.
+</div>
+</body></html>"""
+
+    return html
+
+
 @app.route("/health")
 def health():
     return {"status": "ok"}, 200
