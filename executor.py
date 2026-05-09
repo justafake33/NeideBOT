@@ -30,11 +30,17 @@ logger = logging.getLogger(__name__)
 TRADING_ENABLED    = os.getenv("TRADING_ENABLED",         "false").lower() == "true"
 CALIBRATION_AMOUNT = float(os.getenv("CALIBRATION_AMOUNT_USD",  "1.0"))
 CALIBRATION_MAX    = int(os.getenv(  "CALIBRATION_MAX_TRADES",  "50"))
-TRADE_TP_PCT       = float(os.getenv("TRADE_TP_PCT",            "0.75"))
 TRADE_SL_PCT       = float(os.getenv("TRADE_SL_PCT",            "0.15"))
 SLIPPAGE_BPS       = int(os.getenv(  "TRADE_SLIPPAGE_BPS",      "500"))  # 5% max slippage
 ORDER_POLL_SEC     = int(os.getenv(  "ORDER_POLL_SEC",           "2"))
 ORDER_TIMEOUT_SEC  = int(os.getenv(  "ORDER_TIMEOUT_SEC",        "60"))
+
+# Trailing TP — substitui TP fixo (TRADE_TP_PCT removido)
+# TRAILING_ACTIVATION_PCT: gain mínimo para ativar o trailing (padrão 100% = dobra)
+# TRAILING_DRAWDOWN_PCT:   recuo máximo do pico antes de vender (padrão 30%)
+# Simulação (n=119 válidos): trailing 30% ativ. 100% → avg 159.2% vs TP fixo 71.3%
+TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "100"))  # %
+TRAILING_DRAWDOWN_PCT   = float(os.getenv("TRAILING_DRAWDOWN_PCT",   "30"))   # %
 
 # A.4 — Persistência: aguarda N segundos e verifica que os últimos K ticks estão acima do entry.
 # 3 ticks consecutivos acima do entry → WR 36.4% vs 12.1% (+24.3pp).
@@ -56,8 +62,9 @@ class TradeExecutor:
         self._lock = threading.Lock()
         if TRADING_ENABLED:
             logger.info(
-                "TradeExecutor ativo — TP=%.0f%% SL=%.0f%% amount=$%.2f max=%d trades",
-                TRADE_TP_PCT * 100, TRADE_SL_PCT * 100, CALIBRATION_AMOUNT, CALIBRATION_MAX,
+                "TradeExecutor ativo — trailing(ativ=%.0f%% dd=%.0f%%) SL=%.0f%% amount=$%.2f max=%d",
+                TRAILING_ACTIVATION_PCT, TRAILING_DRAWDOWN_PCT, TRADE_SL_PCT * 100,
+                CALIBRATION_AMOUNT, CALIBRATION_MAX,
             )
         else:
             logger.info("TradeExecutor em modo DRY-RUN (TRADING_ENABLED=false)")
@@ -100,7 +107,7 @@ class TradeExecutor:
                 "entry_expected": entry_target,
                 "amount_sol":     amount_sol,
                 "amount_usd":     CALIBRATION_AMOUNT,
-                "tp_pct":         TRADE_TP_PCT,
+                "tp_pct":         TRAILING_ACTIVATION_PCT / 100,  # activation level — sem TP fixo
                 "sl_pct":         TRADE_SL_PCT,
                 "status":         "pending",
             })
@@ -134,7 +141,8 @@ class TradeExecutor:
                 token_mint=mint,
                 amount_sol=amount_sol,
                 slippage_bps=SLIPPAGE_BPS,
-                tp_pct=TRADE_TP_PCT,
+                trailing_activation_pct=TRAILING_ACTIVATION_PCT,
+                trailing_drawdown_pct=TRAILING_DRAWDOWN_PCT,
                 sl_pct=TRADE_SL_PCT,
             )
             data     = swap_res.get("data") or swap_res
@@ -142,11 +150,14 @@ class TradeExecutor:
             db.update_trade(trade_id, {
                 "ts_order_sent": ts_sent,
                 "order_id":      order_id,
-                "strategy_id":   f"embedded:TP+{TRADE_TP_PCT*100:.0f}%|SL-{TRADE_SL_PCT*100:.0f}%",
+                "strategy_id":   f"trailing:ativ{TRAILING_ACTIVATION_PCT:.0f}%|dd{TRAILING_DRAWDOWN_PCT:.0f}%|SL-{TRADE_SL_PCT*100:.0f}%",
                 "status":        "open",
             })
-            logger.info("Swap+TP/SL #%d %s — order_id=%s (TP+%.0f%% SL-%.0f%% embutidos)",
-                        trade_id, symbol, order_id, TRADE_TP_PCT * 100, TRADE_SL_PCT * 100)
+            logger.info(
+                "Swap+trailing #%d %s — order_id=%s (ativ=%.0f%% dd=%.0f%% SL-%.0f%%)",
+                trade_id, symbol, order_id,
+                TRAILING_ACTIVATION_PCT, TRAILING_DRAWDOWN_PCT, TRADE_SL_PCT * 100,
+            )
         except Exception as e:
             logger.error("Swap #%d %s falhou: %s", trade_id, symbol, e)
             _fail(trade_id, str(e))
@@ -312,7 +323,7 @@ class TradeMonitor:
         mint       = trade["mint"]
         symbol     = trade.get("symbol", mint[:8])
         entry_mc   = trade.get("entry_expected")
-        tp_pct     = trade.get("tp_pct") or TRADE_TP_PCT
+        tp_pct     = trade.get("tp_pct") or (TRAILING_ACTIVATION_PCT / 100)
         sl_pct     = trade.get("sl_pct") or TRADE_SL_PCT
         created_at = trade.get("created_at")
         ref_ts     = trade.get("ts_order_sent") or trade.get("ts_signal") or created_at
@@ -341,7 +352,8 @@ class TradeMonitor:
             tick_ts = tick["tick_ts"]
 
             if high >= tp_mc:
-                self._record_exit(trade, "tp",  tp_pct,  tick_ts, sol_usd)
+                # trailing: activation level atingida — GMGN trailing continua rodando
+                self._record_exit(trade, "trailing_active", tp_pct, tick_ts, sol_usd)
                 return
             if low > 0 and low <= sl_mc:
                 self._record_exit(trade, "sl", -sl_pct, tick_ts, sol_usd)
