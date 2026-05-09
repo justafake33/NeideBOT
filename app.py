@@ -1170,6 +1170,288 @@ tr:hover td {{ background: #161b22; }}
     return html
 
 
+@app.route("/analise/a6-trades")
+def analise_a6_trades():
+    """
+    Retroactive: dos 48 trades reais de $1, quantos A.6 teria bloqueado?
+    E esses bloqueados eram vencedores ou perdedores?
+
+    Proxy para ts_min: migrations.time_to_bottom (fundo medido na graduação).
+    Gap = elapsed_sec/60 - time_to_bottom. Se gap > 5min → A.6 bloqueia.
+    """
+    import traceback
+    try:
+        return _analise_a6_trades_inner()
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
+def _analise_a6_trades_inner():
+    FRESHNESS_MIN = 5.0  # 300s / 60
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                t.id,
+                t.mint,
+                t.symbol,
+                t.ts_signal,
+                t.status,
+                t.pnl_pct,
+                t.entry_expected,
+                t.entry_price_usd,
+                b.elapsed_sec,
+                b.elapsed_sec / 60.0                       AS elapsed_min,
+                b.mc_min                                    AS mc_bottom_signal,
+                b.mc_at_signal,
+                b.bounce_pct,
+                b.drop_from_mig,
+                m.time_to_bottom,
+                m.mc_peak,
+                m.mc_migration,
+                m.mc_bottom                                 AS mc_bottom_final,
+                m.recovery,
+                -- Gap estimado: quando o sinal disparou vs quando o fundo foi estabelecido
+                -- Proxy: time_to_bottom vem da graduação (60min), não do momento do sinal
+                (b.elapsed_sec / 60.0) - m.time_to_bottom  AS gap_min,
+                -- Para tokens com ticks: encontrar o tick de menor mc antes do sinal
+                (SELECT tick_ts
+                 FROM token_ticks tt
+                 WHERE tt.mint = t.mint
+                   AND tt.tick_ts < t.ts_signal
+                   AND tt.tick_ts > t.ts_signal - INTERVAL '60 minutes'
+                 ORDER BY COALESCE(tt.mc_low, tt.mc) ASC
+                 LIMIT 1)                                   AS ts_bottom_tick,
+                (SELECT EXTRACT(EPOCH FROM (t.ts_signal -
+                    (SELECT tick_ts
+                     FROM token_ticks tt2
+                     WHERE tt2.mint = t.mint
+                       AND tt2.tick_ts < t.ts_signal
+                       AND tt2.tick_ts > t.ts_signal - INTERVAL '60 minutes'
+                     ORDER BY COALESCE(tt2.mc_low, tt2.mc) ASC
+                     LIMIT 1)))
+                )                                           AS gap_sec_ticks
+            FROM trades t
+            JOIN bounce_signals b ON b.mint = t.mint
+            JOIN migrations m ON m.mint = t.mint
+            WHERE t.status NOT IN ('pending', 'error')
+              AND m.time_to_bottom IS NOT NULL
+            ORDER BY t.ts_signal ASC
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
+
+    if not rows:
+        return "<h2>Sem trades com dados suficientes.</h2>", 200
+
+    # Determinar se A.6 bloquearia cada trade
+    # Preferir gap_sec_ticks (dado real de ticks) se disponível, fallback para gap_min proxy
+    for r in rows:
+        tick_gap = r.get("gap_sec_ticks")
+        if tick_gap is not None and tick_gap > 0:
+            r["gap_sec_used"] = tick_gap
+            r["gap_source"] = "ticks"
+        else:
+            proxy = r.get("gap_min") or 0
+            r["gap_sec_used"] = proxy * 60
+            r["gap_source"] = "proxy"
+        r["a6_blocked"] = r["gap_sec_used"] > (FRESHNESS_MIN * 60)
+
+    # Classificar outcome real de cada trade
+    # pnl_pct no DB tem bug de referência (A.4 causou entry_expected 25% abaixo do real)
+    # Usamos status + mc_peak vs mc_bottom para estimar se o trade tinha potencial real
+    def classify_outcome(r):
+        status = r.get("status") or ""
+        if "tp" in status:
+            return "tp_hit"
+        if "sl" in status or status == "done":
+            # Verificar pelo mc_peak: se mc_peak > entry × 1.75, havia TP disponível
+            entry = r.get("mc_at_signal") or r.get("entry_expected") or 0
+            peak  = r.get("mc_peak") or 0
+            if entry > 0 and peak > entry * 1.75:
+                return "had_tp_potential"
+            return "sl_loss"
+        if "expired" in status:
+            return "expired"
+        return status
+
+    for r in rows:
+        r["outcome"] = classify_outcome(r)
+
+    blocked = [r for r in rows if r["a6_blocked"]]
+    passes  = [r for r in rows if not r["a6_blocked"]]
+
+    blocked_tp   = [r for r in blocked if r["outcome"] in ("tp_hit", "had_tp_potential")]
+    blocked_loss = [r for r in blocked if r["outcome"] not in ("tp_hit", "had_tp_potential")]
+    passes_tp    = [r for r in passes  if r["outcome"] in ("tp_hit", "had_tp_potential")]
+    passes_loss  = [r for r in passes  if r["outcome"] not in ("tp_hit", "had_tp_potential")]
+
+    n = len(rows)
+
+    def _fp(v, mult=100, dec=1):
+        return f"{v*mult:.{dec}f}%" if v is not None else "—"
+    def _fm(v, dec=1):
+        return f"{v:.{dec}f}min" if v is not None else "—"
+    def _pct(a, b):
+        return f"{a/b*100:.0f}%" if b else "—"
+
+    html = f"""<!DOCTYPE html><html lang="pt-BR"><head>
+<meta charset="utf-8"><title>A.6 — Impacto nos 48 Trades Reais</title>
+<style>
+* {{ box-sizing:border-box; margin:0; padding:0; }}
+body {{ font-family:'Courier New',monospace; background:#0d1117; color:#c9d1d9;
+       padding:20px; font-size:13px; }}
+h1 {{ color:#58a6ff; margin-bottom:4px; }}
+h2 {{ color:#58a6ff; margin:28px 0 10px; font-size:15px;
+     border-bottom:1px solid #30363d; padding-bottom:6px; }}
+.sub {{ color:#8b949e; margin-bottom:20px; font-size:12px; }}
+.nav {{ margin-bottom:20px; display:flex; gap:8px; flex-wrap:wrap; }}
+.nav a {{ color:#58a6ff; font-size:12px; text-decoration:none;
+         border:1px solid #30363d; padding:3px 10px; border-radius:4px; }}
+.grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
+        gap:16px; margin-bottom:24px; }}
+.card {{ background:#161b22; border:1px solid #30363d; border-radius:8px; padding:16px; }}
+.card-title {{ color:#8b949e; font-size:11px; text-transform:uppercase;
+              letter-spacing:.05em; margin-bottom:10px; }}
+.stat-big {{ font-size:28px; font-weight:bold; margin-top:4px; }}
+.row {{ display:flex; justify-content:space-between; padding:5px 0;
+       border-bottom:1px solid #21262d; }}
+.row:last-child {{ border-bottom:none; }}
+.green {{ color:#3fb950; }} .yellow {{ color:#d29922; }}
+.red {{ color:#f85149; }} .blue {{ color:#58a6ff; }} .muted {{ color:#8b949e; }}
+.ok   {{ background:#0d1e0d; border-left:3px solid #3fb950; padding:12px 16px;
+        margin:14px 0; border-radius:0 6px 6px 0; line-height:1.7; }}
+.warn {{ background:#1e1500; border-left:3px solid #d29922; padding:12px 16px;
+        margin:14px 0; border-radius:0 6px 6px 0; line-height:1.7; }}
+.insight {{ background:#0d2137; border-left:3px solid #58a6ff; padding:12px 16px;
+           margin:14px 0; border-radius:0 6px 6px 0; line-height:1.7; }}
+table {{ border-collapse:collapse; width:100%; }}
+th {{ background:#161b22; color:#8b949e; padding:7px 10px; text-align:left;
+     border-bottom:2px solid #30363d; font-size:11px; text-transform:uppercase; }}
+td {{ padding:5px 10px; border-bottom:1px solid #21262d; font-size:12px; }}
+tr:hover td {{ background:#161b22; }}
+.badge {{ display:inline-block; padding:2px 8px; border-radius:10px; font-size:10px; font-weight:bold; }}
+.badge-red {{ background:#3d0000; color:#f85149; }}
+.badge-green {{ background:#0d2e0d; color:#3fb950; }}
+.badge-yellow {{ background:#2e2000; color:#d29922; }}
+</style></head><body>
+<h1>A.6 — Retroativo: impacto nos {n} trades reais</h1>
+<p class="sub">Pergunta: dos trades que fizemos, quantos A.6 teria bloqueado? E esses eram vencedores ou perdedores?</p>
+<div class="nav">
+  <a href="/analise/invalidos">← Inválidos</a>
+  <a href="/analise/trailing">Trailing</a>
+  <a href="/trades">Trades</a>
+</div>
+
+<div class="insight">
+  <b>Metodologia:</b> Gap = tempo entre o fundo (última atualização de mc_min) e o sinal.
+  Fonte primária: ticks reais (tick com menor mc antes do sinal). Fallback: proxy via migrations.time_to_bottom.<br>
+  A.6 bloqueia se gap &gt; {FRESHNESS_MIN:.0f}min. Outcome: tp_hit = status tp, had_tp_potential = mc_peak &gt; entry × 1.75x.
+</div>
+
+<h2>Resumo</h2>
+<div class="grid">
+  <div class="card">
+    <div class="card-title">Total de trades analisados</div>
+    <div class="stat-big blue">{n}</div>
+  </div>
+  <div class="card">
+    <div class="card-title">A.6 bloquearia</div>
+    <div class="stat-big red">{len(blocked)}</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:4px">{_pct(len(blocked),n)} dos trades</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Passariam pelo A.6</div>
+    <div class="stat-big green">{len(passes)}</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:4px">{_pct(len(passes),n)} dos trades</div>
+  </div>
+</div>
+
+<h2>Trades Bloqueados pelo A.6 ({len(blocked)}) — eram bons ou ruins?</h2>
+<div class="grid">
+  <div class="card">
+    <div class="card-title">Com TP / Potencial</div>
+    <div class="stat-big {'red' if len(blocked_tp)/max(len(blocked),1) > 0.3 else 'green'}">{len(blocked_tp)}</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:4px">{_pct(len(blocked_tp),len(blocked))} dos bloqueados</div>
+    <div style="color:#f85149;font-size:12px">trades "bons" que perderíamos</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Perdas (SL / sem potencial)</div>
+    <div class="stat-big green">{len(blocked_loss)}</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:4px">{_pct(len(blocked_loss),len(blocked))} dos bloqueados</div>
+    <div style="color:#3fb950;font-size:12px">losses evitadas ✓</div>
+  </div>
+  <div class="card">
+    <div class="card-title">WR do grupo bloqueado</div>
+    <div class="stat-big {'green' if len(blocked_tp)/max(len(blocked),1) > 0.25 else 'red'}">{_pct(len(blocked_tp),len(blocked))}</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:4px">WR dos que A.6 teria bloqueado</div>
+  </div>
+</div>
+
+<h2>Trades que Passariam ({len(passes)}) — qualidade</h2>
+<div class="grid">
+  <div class="card">
+    <div class="card-title">Com TP / Potencial</div>
+    <div class="stat-big green">{len(passes_tp)}</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:4px">{_pct(len(passes_tp),len(passes))} dos que passam</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Perdas</div>
+    <div class="stat-big red">{len(passes_loss)}</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:4px">{_pct(len(passes_loss),len(passes))} dos que passam</div>
+  </div>
+  <div class="card">
+    <div class="card-title">WR do grupo válido</div>
+    <div class="stat-big {'green' if len(passes_tp)/max(len(passes),1) > 0.25 else 'yellow'}">{_pct(len(passes_tp),len(passes))}</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:4px">WR dos que passariam pelo A.6</div>
+  </div>
+</div>
+
+<h2>Detalhe — todos os {n} trades</h2>
+<table>
+  <thead><tr>
+    <th>Token</th><th>Gap (fundo→sinal)</th><th>Fonte gap</th>
+    <th>T Fundo</th><th>T Sinal</th><th>A.6</th>
+    <th>Outcome</th><th>Bounce%</th><th>Drop%</th>
+  </tr></thead>
+  <tbody>
+"""
+    for r in rows:
+        gap_min = r["gap_sec_used"] / 60
+        src = "tick" if r["gap_source"] == "ticks" else "proxy"
+        outcome = r["outcome"]
+        blocked_flag = r["a6_blocked"]
+        outcome_color = "green" if outcome in ("tp_hit","had_tp_potential") else "red" if "sl" in outcome or "loss" in outcome else "yellow"
+        a6_color = "red" if blocked_flag else "green"
+        a6_label = "BLOQUEIA" if blocked_flag else "PASSA"
+        html += f"""
+    <tr>
+      <td><b>{r.get('symbol') or r['mint'][:8]}</b></td>
+      <td class="{'red' if blocked_flag else 'green'}">{gap_min:.1f}min</td>
+      <td class="muted">{src}</td>
+      <td class="muted">{_fm(r.get('time_to_bottom'))}</td>
+      <td class="muted">{_fm(r.get('elapsed_min'))}</td>
+      <td><span class="badge badge-{'red' if blocked_flag else 'green'}">{a6_label}</span></td>
+      <td class="{outcome_color}">{outcome}</td>
+      <td>{_fp(r.get('bounce_pct'))}</td>
+      <td>{_fp(r.get('drop_from_mig'))}</td>
+    </tr>"""
+
+    html += f"""
+  </tbody>
+</table>
+
+<div class="{'ok' if len(blocked_tp)/max(len(blocked),1) < 0.25 else 'warn'}" style="margin-top:20px">
+  <b>Veredicto A.6 nos trades reais:</b><br>
+  Bloquearia {len(blocked)} de {n} trades ({_pct(len(blocked),n)}).
+  Desses, {len(blocked_tp)} tinham potencial de TP ({_pct(len(blocked_tp),len(blocked))}) e
+  {len(blocked_loss)} eram perdas ({_pct(len(blocked_loss),len(blocked))}).<br><br>
+  {"✓ A.6 é eficaz — bloqueou principalmente perdas." if len(blocked_loss) > len(blocked_tp) else "⚠ Cuidado — A.6 bloquearia muitos trades bons. Considerar aumentar BOTTOM_FRESHNESS_SEC."}
+</div>
+</body></html>"""
+
+    return html
+
+
 @app.route("/health")
 def health():
     return {"status": "ok"}, 200
