@@ -391,132 +391,16 @@ def export_bounce_ticks():
 @app.route("/analise/trailing")
 def analise_trailing():
     """
-    Análise data-driven para calibrar trailing profit.
-    Responde 3 perguntas com dados reais do banco:
-      1. Distribuição do ganho máximo a partir do fundo (bounce tokens)
-      2. % de tokens que atingem cada threshold de ganho
-      3. Volatilidade intra-rally: max drawdown de ticks intermediários antes do pico
+    Análise data-driven para calibrar trailing profit — metodologia big player.
+
+    3 perguntas respondidas com dados reais:
+      1. Universo utilizável: quantos bounces tinham pico DEPOIS do sinal?
+         (Apenas esses são candidatos reais ao trailing)
+      2. Intra-rally volatility CORRETA: drawdown durante a subida real
+         (ticks de ts_signal até ts_peak estimado, apenas bounces válidos)
+      3. Simulação head-to-head: trailing vs TP fixo 75%
+         usando os picos reais de cada token — sem chutar parâmetros
     """
-    with db._cursor() as cur:
-
-        # ── 1. Distribuição de ganho máximo a partir do fundo ──────────────────
-        # gain_from_bottom = (mc_peak - mc_bottom) / mc_bottom
-        # Usamos bounce_signals para focar exatamente nos tokens que disparariam trade
-        cur.execute("""
-            SELECT
-                b.mint,
-                b.symbol,
-                b.mc_min                                           AS mc_bottom,
-                b.mc_migration,
-                b.bounce_pct,
-                b.drop_from_mig,
-                b.elapsed_sec / 60.0                               AS elapsed_min,
-                m.mc_peak,
-                m.time_to_peak,
-                m.time_to_bottom,
-                m.recovery,
-                -- ganho real máximo a partir do fundo (nossa referência de entrada)
-                (m.mc_peak - b.mc_min) / NULLIF(b.mc_min, 0)      AS gain_from_bottom,
-                -- ganho máximo a partir do entry real (mc_bottom * 1.15)
-                (m.mc_peak - b.mc_min * 1.15) / NULLIF(b.mc_min * 1.15, 0) AS gain_from_entry,
-                -- quanto tempo do bounce até o pico
-                m.time_to_peak - (b.elapsed_sec / 60.0)            AS min_bounce_to_peak
-            FROM bounce_signals b
-            JOIN migrations m ON m.mint = b.mint
-            WHERE b.mc_min > 0
-              AND m.mc_peak IS NOT NULL
-              AND m.mc_peak > b.mc_min
-            ORDER BY gain_from_bottom DESC
-        """)
-        bounce_rows = [dict(r) for r in cur.fetchall()]
-
-        # ── 2. Volatilidade intra-rally via token_ticks ────────────────────────
-        # Para cada bounce, pega os ticks APÓS o sinal e calcula:
-        # - max_gain_seen: máximo ganho visto nos ticks (vs mc_bottom)
-        # - max_intermediate_dd: maior pullback de um high intermediário antes do pico real
-        cur.execute("""
-            WITH bounce_ticks AS (
-                SELECT
-                    b.mint,
-                    b.mc_min             AS mc_bottom,
-                    t.tick_ts,
-                    t.elapsed_sec,
-                    COALESCE(t.mc_high, t.mc)  AS mc_high,
-                    COALESCE(t.mc_low,  t.mc)  AS mc_low,
-                    t.mc
-                FROM bounce_signals b
-                JOIN token_ticks t ON t.mint = b.mint
-                WHERE t.tick_ts >= b.ts_signal
-                  AND t.elapsed_sec <= 3660
-                  AND b.mc_min > 0
-            ),
-            per_token AS (
-                SELECT
-                    mint,
-                    mc_bottom,
-                    MAX(mc_high)                               AS observed_peak_mc,
-                    (MAX(mc_high) - mc_bottom) / mc_bottom     AS max_gain_ticks,
-                    -- running max para medir drawdown intermediário
-                    COUNT(*)                                   AS tick_count
-                FROM bounce_ticks
-                GROUP BY mint, mc_bottom
-                HAVING COUNT(*) >= 5
-            )
-            SELECT
-                p.mint,
-                p.mc_bottom,
-                p.observed_peak_mc,
-                p.max_gain_ticks,
-                p.tick_count
-            FROM per_token p
-            ORDER BY p.max_gain_ticks DESC
-        """)
-        tick_rows = [dict(r) for r in cur.fetchall()]
-
-        # Drawdown intermediário: para cada token, calcula a maior queda
-        # de um high intermediário (running max) até o próximo low
-        cur.execute("""
-            WITH numbered AS (
-                SELECT
-                    b.mint,
-                    b.mc_min     AS mc_bottom,
-                    t.tick_ts,
-                    COALESCE(t.mc_high, t.mc) AS mc_high,
-                    COALESCE(t.mc_low,  t.mc) AS mc_low,
-                    MAX(COALESCE(t.mc_high, t.mc)) OVER (
-                        PARTITION BY b.mint
-                        ORDER BY t.tick_ts
-                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                    ) AS running_max
-                FROM bounce_signals b
-                JOIN token_ticks t ON t.mint = b.mint
-                WHERE t.tick_ts >= b.ts_signal
-                  AND t.elapsed_sec <= 3660
-                  AND b.mc_min > 0
-            ),
-            drawdowns AS (
-                SELECT
-                    mint,
-                    mc_bottom,
-                    -- drawdown percentual de cada ponto em relação ao running max
-                    (running_max - mc_low) / NULLIF(running_max, 0) AS dd_pct
-                FROM numbered
-                WHERE running_max > 0 AND mc_low > 0
-            )
-            SELECT
-                mint,
-                MAX(dd_pct)  AS max_intermediate_dd,
-                AVG(dd_pct)  AS avg_dd,
-                COUNT(*)     AS n_points
-            FROM drawdowns
-            GROUP BY mint
-            HAVING COUNT(*) >= 5
-            ORDER BY max_intermediate_dd DESC
-        """)
-        dd_rows = [dict(r) for r in cur.fetchall()]
-
-    # ── Estatísticas ─────────────────────────────────────────────────────────
-
     def _pcts(values, ps=(25, 50, 75, 90, 95)):
         if not values: return {p: None for p in ps}
         s = sorted(values)
@@ -528,186 +412,394 @@ def analise_trailing():
             out[p] = s[lo] + (idx - lo) * (s[hi] - s[lo])
         return out
 
-    def _mean(vals):
-        return sum(vals) / len(vals) if vals else None
+    def _fp(v, mult=100, dec=1):
+        return f"{v*mult:.{dec}f}%" if v is not None else "—"
+    def _fm(v, dec=1):
+        return f"{v:.{dec}f}min" if v is not None else "—"
+    def _fc(v, dec=1):
+        return f"{v:.{dec}f}" if v is not None else "—"
 
-    # Ganhos a partir do entry (mc_bottom * 1.15)
-    gains_entry = [r["gain_from_entry"] for r in bounce_rows if r["gain_from_entry"] is not None]
-    gains_bottom = [r["gain_from_bottom"] for r in bounce_rows if r["gain_from_bottom"] is not None]
-    time_to_peak = [r["min_bounce_to_peak"] for r in bounce_rows
-                    if r["min_bounce_to_peak"] is not None and r["min_bounce_to_peak"] >= 0]
+    with db._cursor() as cur:
 
-    pct_entry  = _pcts(gains_entry)
-    pct_bottom = _pcts(gains_bottom)
-    n_total    = len(bounce_rows)
+        # ── SEÇÃO 1: classificar todos os bounces em válidos vs inválidos ──────
+        # Válido = pico chegou DEPOIS do sinal. Inválido = já tínhamos passado do pico.
+        cur.execute("""
+            SELECT
+                b.mint,
+                b.symbol,
+                b.ts_signal,
+                b.mc_min                                                AS mc_bottom,
+                b.mc_at_signal                                          AS mc_entry_ref,
+                b.elapsed_sec / 60.0                                    AS elapsed_min,
+                b.drop_from_mig,
+                b.bounce_pct,
+                m.mc_peak,
+                m.time_to_peak,
+                m.recovery,
+                m.time_to_bottom,
+                -- ganho máximo a partir do entry (mc_bottom * 1.15)
+                (m.mc_peak - b.mc_min * 1.15) / NULLIF(b.mc_min * 1.15, 0) AS gain_from_entry,
+                -- minutos entre o sinal e o pico (negativo = pico foi antes do sinal)
+                m.time_to_peak - (b.elapsed_sec / 60.0)                AS min_signal_to_peak
+            FROM bounce_signals b
+            JOIN migrations m ON m.mint = b.mint
+            WHERE b.mc_min > 0
+              AND m.mc_peak IS NOT NULL
+        """)
+        all_rows = [dict(r) for r in cur.fetchall()]
 
-    # Thresholds: % de tokens que atingem cada ganho a partir do entry
+        # ── SEÇÃO 2: intra-rally drawdown CORRETO ─────────────────────────────
+        # Apenas bounces válidos (pico depois do sinal).
+        # Ticks somente do intervalo [ts_signal, ts_peak_estimado].
+        # Mede a maior queda de qualquer running_max DURANTE a subida real.
+        cur.execute("""
+            WITH valid_bounces AS (
+                SELECT
+                    b.mint,
+                    b.ts_signal,
+                    b.mc_min * 1.15                                     AS mc_entry,
+                    -- estima ts do pico como ts_signal + (time_to_peak - elapsed_min) minutos
+                    b.ts_signal + ((m.time_to_peak - b.elapsed_sec/60.0) * 60)::int
+                        * INTERVAL '1 second'                           AS ts_peak_est
+                FROM bounce_signals b
+                JOIN migrations m ON m.mint = b.mint
+                WHERE b.mc_min > 0
+                  AND m.time_to_peak IS NOT NULL
+                  AND m.time_to_peak > b.elapsed_sec / 60.0   -- pico depois do sinal
+            ),
+            rally_ticks AS (
+                SELECT
+                    vb.mint,
+                    vb.mc_entry,
+                    t.tick_ts,
+                    COALESCE(t.mc_high, t.mc)  AS mc_high,
+                    COALESCE(t.mc_low,  t.mc)  AS mc_low,
+                    MAX(COALESCE(t.mc_high, t.mc)) OVER (
+                        PARTITION BY vb.mint
+                        ORDER BY t.tick_ts
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    )                          AS running_max
+                FROM valid_bounces vb
+                JOIN token_ticks t ON t.mint = vb.mint
+                WHERE t.tick_ts >= vb.ts_signal      -- após o sinal
+                  AND t.tick_ts <= vb.ts_peak_est    -- antes do pico
+            ),
+            drawdowns AS (
+                SELECT
+                    mint,
+                    mc_entry,
+                    (running_max - mc_low) / NULLIF(running_max, 0) AS dd_pct
+                FROM rally_ticks
+                WHERE running_max > mc_entry   -- só conta drawdown após entrar em lucro
+                  AND mc_low > 0
+            )
+            SELECT
+                mint,
+                MAX(dd_pct)  AS max_intra_rally_dd,
+                AVG(dd_pct)  AS avg_dd,
+                COUNT(*)     AS n_points
+            FROM drawdowns
+            GROUP BY mint
+            HAVING COUNT(*) >= 3
+            ORDER BY max_intra_rally_dd
+        """)
+        dd_rows = [dict(r) for r in cur.fetchall()]
+
+    # ── Classificação ────────────────────────────────────────────────────────
+    valid   = [r for r in all_rows if r["min_signal_to_peak"] is not None and r["min_signal_to_peak"] > 0]
+    invalid = [r for r in all_rows if r["min_signal_to_peak"] is not None and r["min_signal_to_peak"] <= 0]
+    no_peak = [r for r in all_rows if r["min_signal_to_peak"] is None]
+    n_total = len(all_rows)
+
+    gains_valid = [r["gain_from_entry"] for r in valid if r["gain_from_entry"] is not None]
+    gains_invalid = [r["gain_from_entry"] for r in invalid if r["gain_from_entry"] is not None]
+    ttp_valid = [r["min_signal_to_peak"] for r in valid if r["min_signal_to_peak"] is not None]
+
+    pct_valid   = _pcts(gains_valid)
+    pct_invalid = _pcts(gains_invalid)
+
+    # Thresholds só nos válidos (onde a estratégia poderia ter funcionado)
     thresholds = [0.30, 0.50, 0.75, 1.00, 1.50, 2.00, 3.00, 5.00]
-    thresh_counts = {}
+    thresh = {}
     for t in thresholds:
-        n_reach = sum(1 for g in gains_entry if g is not None and g >= t)
-        thresh_counts[t] = {"n": n_reach, "pct": n_reach / len(gains_entry) * 100 if gains_entry else 0}
+        n = sum(1 for g in gains_valid if g is not None and g >= t)
+        thresh[t] = {"n": n, "pct": n / len(gains_valid) * 100 if gains_valid else 0}
 
-    # Volatilidade intra-rally
-    dd_vals = [float(r["max_intermediate_dd"]) for r in dd_rows if r["max_intermediate_dd"] is not None]
+    # Intra-rally drawdown (corrigido)
+    dd_vals = [float(r["max_intra_rally_dd"]) for r in dd_rows if r["max_intra_rally_dd"] is not None]
     dd_pcts = _pcts(dd_vals) if dd_vals else {}
-    gains_ticks = [float(r["max_gain_ticks"]) for r in tick_rows if r["max_gain_ticks"] is not None]
-    gains_ticks_pcts = _pcts(gains_ticks) if gains_ticks else {}
 
-    def _fp(v, mult=100, decimals=1):
-        return f"{v*mult:.{decimals}f}%" if v is not None else "—"
-    def _fm(v, decimals=1):
-        return f"{v:.{decimals}f}min" if v is not None else "—"
+    # ── SEÇÃO 3: Simulação head-to-head ──────────────────────────────────────
+    # Para cada bounce válido com pico conhecido, simula diferentes estratégias
+    # usando o pico real como referência (melhor caso para trailing).
+    # Sem ticks: assume que o trailing dispara exatamente no pico × (1 - drawdown_rate).
+    FIXED_TP  = 0.75
+    FIXED_SL  = 0.15
+    configs = [
+        # (label, price_scale, drawdown_rate)
+        ("TP fixo 75%",             None,  None ),
+        ("Trailing 30% (ativ. 50%)", 0.50,  0.30),
+        ("Trailing 30% (ativ. 75%)", 0.75,  0.30),
+        ("Trailing 40% (ativ. 75%)", 0.75,  0.40),
+        ("Trailing 50% (ativ. 75%)", 0.75,  0.50),
+        ("Trailing 30% (ativ. 100%)",1.00,  0.30),
+        ("Trailing 40% (ativ. 100%)",1.00,  0.40),
+    ]
 
-    html = """<!DOCTYPE html><html lang="pt-BR"><head>
-<meta charset="utf-8">
-<title>Trailing — Análise</title>
+    sim_results = {}
+    for label, ps, dr in configs:
+        gains = []
+        for r in valid:
+            g = r.get("gain_from_entry")
+            if g is None:
+                continue
+            if ps is None:
+                # TP fixo: min(g, FIXED_TP) se g > 0, else g (SL)
+                exit_gain = min(g, FIXED_TP) if g >= 0 else max(g, -FIXED_SL)
+            else:
+                if g >= ps:
+                    # Trailing ativou: sai no pico × (1 - dr), convertido para gain
+                    # peak_mc = entry × (1 + g)
+                    # exit_mc = peak_mc × (1 - dr) = entry × (1 + g) × (1 - dr)
+                    exit_gain = (1 + g) * (1 - dr) - 1
+                    # Mas se o trailing exit for pior que o TP fixo (para picos pequenos),
+                    # o TP fixo teria disparado primeiro — guarda o melhor entre os dois
+                    # (na prática, com trailing puro, o TP fixo não existe; simulamos trailing puro)
+                else:
+                    # Trailing nunca ativou: TP fixo captura (se chegou lá) ou sai no pico
+                    exit_gain = min(g, FIXED_TP) if g >= FIXED_TP else g
+                    # Se caiu abaixo do SL: -SL (simplificado — não temos dados de SL aqui)
+                    exit_gain = max(exit_gain, -FIXED_SL)
+            gains.append(exit_gain)
+        avg  = sum(gains) / len(gains) if gains else 0
+        wins = sum(1 for g in gains if g >= FIXED_TP)
+        bigs = sum(1 for g in gains if g >= 1.00)
+        sim_results[label] = {
+            "avg_gain": avg,
+            "n": len(gains),
+            "wins_75": wins,
+            "wins_100": bigs,
+            "p50": _pcts(gains).get(50),
+            "p75": _pcts(gains).get(75),
+        }
+
+    # ── HTML ─────────────────────────────────────────────────────────────────
+    CSS = """<!DOCTYPE html><html lang="pt-BR"><head>
+<meta charset="utf-8"><title>Trailing — Análise Big Player</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: 'Courier New', monospace; background: #0d1117; color: #c9d1d9;
        padding: 20px; font-size: 13px; }
 h1 { color: #58a6ff; margin-bottom: 4px; }
-h2 { color: #58a6ff; margin: 28px 0 10px; font-size: 15px; border-bottom: 1px solid #30363d; padding-bottom: 6px; }
-h3 { color: #8b949e; margin: 16px 0 8px; font-size: 13px; }
-.sub { color: #8b949e; margin-bottom: 24px; font-size: 12px; }
+h2 { color: #58a6ff; margin: 28px 0 10px; font-size: 15px;
+     border-bottom: 1px solid #30363d; padding-bottom: 6px; }
+.sub { color: #8b949e; margin-bottom: 20px; font-size: 12px; }
 .nav { margin-bottom: 20px; display: flex; gap: 8px; flex-wrap: wrap; }
-.nav a { color: #58a6ff; font-size: 12px; text-decoration: none; border: 1px solid #30363d;
-         padding: 3px 10px; border-radius: 4px; }
+.nav a { color: #58a6ff; font-size: 12px; text-decoration: none;
+         border: 1px solid #30363d; padding: 3px 10px; border-radius: 4px; }
 .nav a:hover { background: #161b22; }
-.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin-bottom: 24px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px,1fr));
+        gap: 16px; margin-bottom: 24px; }
 .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
-.card-title { color: #8b949e; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 12px; }
-.row { display: flex; justify-content: space-between; padding: 4px 0;
+.card-title { color: #8b949e; font-size: 11px; text-transform: uppercase;
+              letter-spacing:.05em; margin-bottom: 12px; }
+.row { display: flex; justify-content: space-between; padding: 5px 0;
        border-bottom: 1px solid #21262d; }
 .row:last-child { border-bottom: none; }
 .label { color: #8b949e; }
 .val { font-weight: bold; }
 .green { color: #3fb950; } .yellow { color: #d29922; } .red { color: #f85149; }
+.blue  { color: #58a6ff; }
 .insight { background: #0d2137; border-left: 3px solid #58a6ff; padding: 12px 16px;
-           margin: 12px 0; border-radius: 0 6px 6px 0; line-height: 1.6; }
-table { border-collapse: collapse; width: 100%; margin-top: 10px; }
+           margin: 14px 0; border-radius: 0 6px 6px 0; line-height: 1.7; }
+.warn { background: #1e1500; border-left: 3px solid #d29922; padding: 12px 16px;
+        margin: 14px 0; border-radius: 0 6px 6px 0; line-height: 1.7; }
+table { border-collapse: collapse; width: 100%; }
 th { background: #161b22; color: #8b949e; padding: 7px 10px; text-align: left;
      border-bottom: 2px solid #30363d; font-size: 11px; text-transform: uppercase; }
-td { padding: 5px 10px; border-bottom: 1px solid #21262d; font-size: 12px; }
+td { padding: 5px 10px; border-bottom: 1px solid #21262d; }
 tr:hover td { background: #161b22; }
-.bar-wrap { background: #21262d; border-radius: 3px; height: 12px; flex: 1; margin-left: 10px; }
-.bar { height: 12px; border-radius: 3px; background: #238636; }
-.bar-row { display: flex; align-items: center; }
+.highlight td { background: #0d2137 !important; }
+.badge { border-radius: 4px; padding: 1px 7px; font-size: 11px; font-weight: bold;
+         display: inline-block; }
+.b-green { background: #1a3a2a; color: #3fb950; }
+.b-red   { background: #3a1a1a; color: #f85149; }
+.b-blue  { background: #0d2137; color: #58a6ff; }
+.stat-big { font-size: 28px; font-weight: bold; margin-top: 4px; }
 </style></head><body>
-<h1>Análise Trailing Profit</h1>
-<p class="sub">Dados reais de """ + str(n_total) + """ bounce_signals — base para calibrar price_scale e drawdown_rate</p>
+<h1>Trailing Profit — Análise Big Player</h1>
+<p class="sub">Metodologia: separa universo utilizável → mede volatilidade correta → simula P&L real</p>
 <div class="nav">
   <a href="/analise">← Análise</a>
-  <a href="/analise/h10">H10</a>
   <a href="/analise/backtest">Backtester</a>
   <a href="/export/bounces">CSV Bounces</a>
   <a href="/export/bounce-ticks">CSV Ticks</a>
 </div>
+"""
 
-<h2>1. Distribuição de Ganho Máximo — a partir do entry (mc_bottom × 1.15)</h2>
-<p class="sub" style="margin-top:-6px">Pergunta: se compramos no sinal, qual é o upside máximo disponível antes de vender?</p>
+    # ── Seção 1: Universo ─────────────────────────────────────────────────────
+    pct_valid_n   = len(valid) / n_total * 100 if n_total else 0
+    pct_invalid_n = len(invalid) / n_total * 100 if n_total else 0
+
+    html = CSS + f"""
+<h2>1. Universo Utilizável — pico veio depois do sinal?</h2>
+<p class="sub" style="margin-top:-6px">
+  Trailing só funciona se o pico não passou ainda. Quantos dos {n_total} sinais eram utilizáveis?
+</p>
 <div class="grid">
   <div class="card">
-    <div class="card-title">Percentis — Ganho do Entry (""" + str(len(gains_entry)) + """ bounces c/ pico)</div>
-""" + "".join(f"""
-    <div class="row">
-      <span class="label">P{p}</span>
-      <span class="val {'green' if (pct_entry.get(p) or 0) > 0.5 else 'yellow'}">{_fp(pct_entry.get(p))}</span>
-    </div>""" for p in [25, 50, 75, 90, 95]) + """
+    <div class="card-title">Válidos — pico DEPOIS do sinal ✅</div>
+    <div class="stat-big green">{len(valid)}</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:6px">{pct_valid_n:.1f}% dos sinais</div>
+    <div style="margin-top:12px;font-size:12px;color:#8b949e">
+      Trailing pode funcionar — o token ainda vai subir após a entrada
+    </div>
   </div>
   <div class="card">
-    <div class="card-title">Percentis — Ganho do Fundo (mc_bottom raw)</div>
-""" + "".join(f"""
-    <div class="row">
-      <span class="label">P{p}</span>
-      <span class="val {'green' if (pct_bottom.get(p) or 0) > 0.5 else 'yellow'}">{_fp(pct_bottom.get(p))}</span>
-    </div>""" for p in [25, 50, 75, 90, 95]) + """
+    <div class="card-title">Inválidos — pico JÁ PASSOU ❌</div>
+    <div class="stat-big red">{len(invalid)}</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:6px">{pct_invalid_n:.1f}% dos sinais</div>
+    <div style="margin-top:12px;font-size:12px;color:#8b949e">
+      Compramos depois do pico — trailing não salva, SL que limita o dano
+    </div>
   </div>
   <div class="card">
-    <div class="card-title">Tempo Bounce → Pico (""" + str(len(time_to_peak)) + """ tokens)</div>
-""" + "".join(f"""
-    <div class="row">
-      <span class="label">P{p}</span>
-      <span class="val">{_fm(_pcts(time_to_peak).get(p))}</span>
-    </div>""" for p in [25, 50, 75, 90, 95]) + """
+    <div class="card-title">Tempo Sinal → Pico (válidos, {len(ttp_valid)} tokens)</div>
+    {"".join(f'<div class="row"><span class="label">P{p}</span><span class="val">{_fm(_pcts(ttp_valid).get(p))}</span></div>' for p in [25,50,75,90,95])}
   </div>
 </div>
-
-<h2>2. Tokens que Atingem Cada Threshold (a partir do entry)</h2>
-<p class="sub" style="margin-top:-6px">Pergunta: para qual % de tokens faz sentido ter trailing? Quantos chegam a +150%, +200%, +300%?</p>
-<div class="card" style="max-width:640px">
-  <table>
-    <thead><tr><th>Threshold</th><th>Atingem</th><th>% do total</th><th>Distribuição</th></tr></thead>
-    <tbody>
-""" + "".join(f"""
-      <tr>
-        <td class="{'green' if t >= 1.0 else 'yellow'}">{t*100:.0f}%</td>
-        <td>{thresh_counts[t]['n']}</td>
-        <td>{thresh_counts[t]['pct']:.1f}%</td>
-        <td>
-          <div class="bar-row">
-            <div class="bar-wrap"><div class="bar" style="width:{min(thresh_counts[t]['pct'],100):.1f}%"></div></div>
-          </div>
-        </td>
-      </tr>""" for t in thresholds) + """
-    </tbody>
-  </table>
+<div class="warn">
+  <b>Insight crítico:</b> {pct_invalid_n:.0f}% dos sinais disparam <em>depois</em> do pico.
+  São tokens onde já compramos errado — independente do trailing.
+  A análise de trailing a seguir usa <b>apenas os {len(valid)} válidos</b>.
 </div>
 
-<div class="insight">
-  <b>Como ler:</b> Se P50 do ganho é X%, significa que metade dos tokens não vai além de X% — ativar o trailing em X% deixaria metade dos tokens sem trailing (saindo pelo TP fixo).
-  O <b>price_scale</b> ideal fica abaixo do P50 para capturar a maioria dos movimentos.
-</div>
-
-<h2>3. Volatilidade Intra-Rally — Drawdown Intermediário</h2>
-<p class="sub" style="margin-top:-6px">Pergunta: quanto os tokens oscilam <em>no caminho</em> até o pico? Isso define o drawdown_rate mínimo seguro.</p>
+<h2>2. Ganho Disponível nos Bounces Válidos</h2>
+<p class="sub" style="margin-top:-6px">Distribuição do upside máximo a partir do entry (mc_bottom × 1.15) — apenas bounces onde pico veio depois</p>
 <div class="grid">
   <div class="card">
-    <div class="card-title">Max Drawdown Intermediário (""" + str(len(dd_vals)) + """ tokens c/ ticks)</div>
-""" + (("".join(f"""
-    <div class="row">
-      <span class="label">P{p}</span>
-      <span class="val red">{_fp(dd_pcts.get(p))}</span>
-    </div>""" for p in [25, 50, 75, 90, 95])) if dd_pcts else "<div class='row'><span class='label'>Sem dados de ticks suficientes</span></div>") + """
+    <div class="card-title">Percentis de Ganho Máximo ({len(gains_valid)} tokens)</div>
+    {"".join(f'<div class="row"><span class="label">P{p}</span><span class="val {("green" if (pct_valid.get(p) or 0)>0.5 else "yellow")}">{_fp(pct_valid.get(p))}</span></div>' for p in [25,50,75,90,95])}
   </div>
   <div class="card">
-    <div class="card-title">Ganho Máximo Observado em Ticks (""" + str(len(gains_ticks)) + """ tokens)</div>
-""" + (("".join(f"""
-    <div class="row">
-      <span class="label">P{p}</span>
-      <span class="val green">{_fp(gains_ticks_pcts.get(p))}</span>
-    </div>""" for p in [25, 50, 75, 90, 95])) if gains_ticks_pcts else "<div class='row'><span class='label'>Sem dados de ticks suficientes</span></div>") + """
+    <div class="card-title">Tokens que Atingem Cada Nível</div>
+    {"".join(f'<div class="row"><span class="label">+{t*100:.0f}%</span><span class="val {("green" if thresh[t]["pct"]>50 else "yellow")}">{thresh[t]["n"]} ({thresh[t]["pct"]:.0f}%)</span></div>' for t in thresholds)}
+  </div>
+  <div class="card">
+    <div class="card-title">Ganho nos Inválidos (ref: o que perdemos)</div>
+    {"".join(f'<div class="row"><span class="label">P{p}</span><span class="val red">{_fp(pct_invalid.get(p))}</span></div>' for p in [25,50,75,90,95])}
+    <div style="color:#8b949e;font-size:11px;margin-top:8px">
+      Pico JÁ passou — esse ganho nunca foi capturável
+    </div>
   </div>
 </div>
-
 <div class="insight">
-  <b>Regra de ouro:</b> O <b>drawdown_rate</b> precisa ser <em>maior</em> que o P75 do drawdown intermediário.
-  Se tokens oscilam até X% no caminho ao pico, usar drawdown menor que X% vai vender prematuramente na volatilidade normal.
-  O drawdown_rate ideal fica acima do P75 de drawdown intermediário, abaixo do P50 de queda pós-pico.
+  <b>O que os dados dizem:</b> Nos bounces válidos, P50 = {_fp(pct_valid.get(50))} de ganho máximo.
+  Nosso TP fixo em +75% está capturando menos que o mediano disponível em {thresh[0.75]["pct"]:.0f}% dos casos.
+  {thresh[2.00]["pct"]:.0f}% dos tokens válidos vão além de +200% — são esses que o trailing captura e o TP fixo perde.
 </div>
 
-<h2>4. Distribuição Individual — Top Bounces por Upside</h2>
+<h2>3. Volatilidade Intra-Rally — Drawdown Real Durante a Subida</h2>
+<p class="sub" style="margin-top:-6px">
+  Ticks apenas do intervalo [ts_signal → ts_peak_estimado], apenas tokens válidos,
+  drawdown medido só após o token entrar em lucro (running_max > entry).
+  Esse é o número real que o drawdown_rate precisa superar.
+</p>
+<div class="grid">
+  <div class="card">
+    <div class="card-title">Max Drawdown Intra-Rally ({len(dd_vals)} tokens c/ ticks)</div>
+    {("".join(f'<div class="row"><span class="label">P{p}</span><span class="val {"red" if p>=75 else "yellow"}">{_fp(dd_pcts.get(p))}</span></div>' for p in [25,50,75,90,95])) if dd_pcts else "<div class='row'><span>Ticks insuficientes neste filtro</span></div>"}
+  </div>
+  <div class="card">
+    <div class="card-title">Interpretação do Drawdown</div>
+    <div class="row"><span class="label">drawdown_rate < P25</span><span class="val red">Shakeout frequente</span></div>
+    <div class="row"><span class="label">drawdown_rate = P50</span><span class="val yellow">Shakeout em metade</span></div>
+    <div class="row"><span class="label">drawdown_rate = P75</span><span class="val yellow">Shakeout em 25%</span></div>
+    <div class="row"><span class="label">drawdown_rate > P90</span><span class="val green">Raro shakeout</span></div>
+  </div>
+</div>
+<div class="insight">
+  <b>Regra objetiva:</b> O drawdown_rate deve estar acima do P75 do intra-rally para não ser stopado
+  por volatilidade normal durante a subida. Abaixo do P75 = damos saída ao trailing antes do pico real
+  em 25%+ dos trades.
+</div>
+
+<h2>4. Simulação Head-to-Head — Estratégias vs TP Fixo 75%</h2>
+<p class="sub" style="margin-top:-6px">
+  Usando os picos reais de cada bounce válido como referência.
+  Trailing = sai no pico × (1 − drawdown_rate). SL = −15% em todos.
+  <b>Sem ticks</b>: assume trailing dispara exatamente no pico (melhor caso para trailing).
+</p>
 <table>
-  <thead><tr>
-    <th>Token</th><th>Gain Entry</th><th>Gain Bottom</th><th>Drop Mig</th>
-    <th>T Bounce</th><th>T Pico</th><th>Bounce→Pico</th><th>Recovery</th>
-  </tr></thead>
+  <thead>
+    <tr>
+      <th>Estratégia</th>
+      <th>Avg Gain</th>
+      <th>P50 Gain</th>
+      <th>P75 Gain</th>
+      <th>Saídas ≥+75%</th>
+      <th>Saídas ≥+100%</th>
+      <th>N</th>
+    </tr>
+  </thead>
   <tbody>
-""" + "".join(f"""
-  <tr>
-    <td><b>{r['symbol'] or r['mint'][:8]}</b></td>
-    <td class="{'green' if (r.get('gain_from_entry') or 0) > 0.5 else 'yellow'}">{_fp(r.get('gain_from_entry'))}</td>
-    <td class="green">{_fp(r.get('gain_from_bottom'))}</td>
-    <td class="red">{_fp(r.get('drop_from_mig'))}</td>
-    <td>{_fm(r.get('elapsed_min'))}</td>
-    <td>{_fm(r.get('time_to_peak'))}</td>
-    <td>{_fm(r.get('min_bounce_to_peak'))}</td>
-    <td class="{'green' if r.get('recovery') else 'red'}">{('TRUE' if r.get('recovery') else 'FALSE') if r.get('recovery') is not None else '—'}</td>
-  </tr>""" for r in bounce_rows[:60]) + """
+"""
+    best_avg = max(v["avg_gain"] for v in sim_results.values())
+    for label, res in sim_results.items():
+        is_best = abs(res["avg_gain"] - best_avg) < 0.001
+        row_cls = ' class="highlight"' if is_best else ''
+        label_badge = f'<span class="badge b-blue">{label}</span>' if is_best else label
+        html += f"""
+    <tr{row_cls}>
+      <td>{label_badge}{"⭐" if is_best else ""}</td>
+      <td class="{'green' if res['avg_gain']>0.75 else 'yellow' if res['avg_gain']>0 else 'red'}">{_fp(res['avg_gain'])}</td>
+      <td>{_fp(res['p50'])}</td>
+      <td>{_fp(res['p75'])}</td>
+      <td>{res['wins_75']} ({res['wins_75']/res['n']*100:.0f}%)</td>
+      <td>{res['wins_100']} ({res['wins_100']/res['n']*100:.0f}%)</td>
+      <td>{res['n']}</td>
+    </tr>"""
+
+    html += """
   </tbody>
 </table>
-</body></html>"""
+<div class="warn" style="margin-top:16px">
+  <b>Limitação importante:</b> Esta simulação assume que o trailing dispara <em>exatamente</em> no pico — o melhor caso possível.
+  Na prática, o GMGN rastreia o pico em tempo real com granularidade de 1min.
+  Em tokens que picam e despencam em segundos (comum em memes), o trailing pode não disparar no pico exato.
+  Use estes números como teto de EV, não como expectativa realista.
+</div>
 
+<h2>5. Detalhe — Bounces Válidos (pico depois do sinal)</h2>
+<table>
+  <thead><tr>
+    <th>Token</th><th>Gain Máx (entry)</th><th>Sinal→Pico</th><th>Trailing 30%@75%</th><th>TP Fixo 75%</th><th>Delta</th><th>Recovery</th>
+  </tr></thead>
+  <tbody>
+"""
+    for r in sorted(valid, key=lambda x: x.get("gain_from_entry") or 0, reverse=True)[:50]:
+        g = r.get("gain_from_entry")
+        if g is None:
+            continue
+        tp_fixed   = min(g, FIXED_TP) if g >= FIXED_TP else max(g, -FIXED_SL)
+        if g >= 0.75:
+            tp_trail = (1 + g) * (1 - 0.30) - 1
+        else:
+            tp_trail = tp_fixed
+        delta = tp_trail - tp_fixed
+        rec = r.get("recovery")
+        html += f"""
+  <tr>
+    <td><b>{r.get('symbol') or r['mint'][:8]}</b></td>
+    <td class="{'green' if g>1.0 else 'yellow'}">{_fp(g)}</td>
+    <td>{_fm(r.get('min_signal_to_peak'))}</td>
+    <td class="{'green' if tp_trail>0.75 else 'yellow'}">{_fp(tp_trail)}</td>
+    <td class="yellow">{_fp(tp_fixed)}</td>
+    <td class="{'green' if delta>0.05 else 'red' if delta<-0.05 else ''}">{_fp(delta)}</td>
+    <td class="{'green' if rec else 'red'}">{('TRUE' if rec else 'FALSE') if rec is not None else '—'}</td>
+  </tr>"""
+
+    html += "</tbody></table></body></html>"
     return html
 
 
