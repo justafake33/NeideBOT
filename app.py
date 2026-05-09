@@ -1002,14 +1002,16 @@ tr:hover td {{ background: #161b22; }}
   <a href="/export/bounces">CSV Bounces</a>
 </div>
 
-<h2>1. Hipótese — O que provavelmente acontece</h2>
+<h2>1. Diagnóstico — O que os dados confirmam</h2>
 <div class="insight">
-  <b>Mecanismo identificado:</b> O token bouncea, atinge o pico e começa a cair — tudo dentro de uma janela
-  menor que o poll do GMGN (5s + latência de agregação ~10-20s = ~30s total).<br><br>
-  Quando nosso scanner lê o próximo dado, o preço já passou pelo pico e está na <b>descida</b>.
-  O preço ainda está acima do fundo (+15%), então o sinal dispara — mas compramos na curva errada.<br><br>
-  <b>Com Helius RPC:</b> eventos on-chain chegam em &lt;100ms. A primeira vez que o preço cruza
-  bottom × 1.15 é detectada na <b>subida real</b>, não na descida.
+  <b>Hipótese original refutada:</b> Imaginávamos que o pico passava antes do poll GMGN (~30s).
+  Os dados mostram P10 de atraso = <b>2.1min</b>, P50 = <b>6.7min</b>. Isso não é latência.<br><br>
+  <b>Mecanismo real:</b> Esses tokens tiveram um spike relâmpago nos primeiros <b>0.5–3min</b>
+  pós-migração (velocity P50 = 89%/min vs 11.8% dos válidos — 7.5× mais rápido).
+  Depois dumpearam por 10–20 minutos. O sinal disparou quando o preço cruzou mc_min × 1.15
+  num mini-rally tardio — o fundo estava <b>estagnado há muito tempo</b> quando o sinal chegou.<br><br>
+  <b>Helius resolve apenas 3.8% dos inválidos.</b> A solução real é detectar que o fundo é "velho"
+  — filtro <b>A.6 (Bottom Freshness)</b> implementado nesta versão.
 </div>
 
 <h2>2. Quanto Tempo Depois do Pico o Sinal Chegou?</h2>
@@ -1104,19 +1106,31 @@ tr:hover td {{ background: #161b22; }}
   </div>
 </div>
 
-<div class="ok">
-  <b>Impacto total do Helius nos trades:</b><br>
-  De {len(all_rows)} sinais totais:
-  <b>{len(valid)}</b> válidos (47.4%) + <b>{len(helius_would_catch)}</b> inválidos resolvidos pelo Helius =
-  <b>{len(valid) + len(helius_would_catch)}</b> trades utilizáveis
-  ({(len(valid) + len(helius_would_catch))/len(all_rows)*100:.1f}% vs 47.4% atual).
-  O Helius não é só uma melhoria de custo — é uma melhoria de qualidade de sinal.
+<div class="warn">
+  <b>Conclusão:</b> Helius resolve apenas 5 de 132 inválidos (3.8%). O problema é estrutural —
+  92% dos inválidos têm fundo estabelecido há 10+ minutos quando o sinal dispara.
+  Helius continua válido para <b>redução de custo</b> (Jupiter swap, tips menores),
+  mas <b>não resolve a qualidade do sinal</b>. O filtro A.6 é a solução correta.
 </div>
 
-<h2>4. Os Inválidos com &gt;2min de Atraso — O que são?</h2>
+<h2>4. Filtro A.6 — Bottom Freshness (IMPLEMENTADO)</h2>
+<div class="ok">
+  <b>Lógica:</b> O HotMonitor já rastreia <code>state["ts_min"]</code> — o timestamp da última vez
+  que mc_min foi atualizado (push_mc + kline). O sinal só dispara se
+  <code>(now − ts_min) ≤ BOTTOM_FRESHNESS_SEC</code> (padrão: <b>300s = 5min</b>).<br><br>
+  <b>Por que funciona:</b><br>
+  &bull; <b>Inválidos:</b> spike em 0.5–2min → ts_min estabelecido em ~3–5min → sinal 13–17min depois → gap enorme → <span class="red">BLOQUEADO</span><br>
+  &bull; <b>Válidos:</b> dump progressivo → ts_min atualizado continuamente → sinal 1–3min após o fundo → gap pequeno → <span class="green">PASSA</span><br><br>
+  <b>Impacto estimado:</b> {len(helius_no_help)} dos {len(invalid)} inválidos ({len(helius_no_help)/len(invalid)*100:.0f}%) teriam sido bloqueados.
+  Universo utilizável: {len(valid)}/{len(all_rows)} ({len(valid)/len(all_rows)*100:.1f}%) → potencialmente
+  {len(valid)}/{len(all_rows) - len(helius_no_help)} ({len(valid)/max(len(all_rows)-len(helius_no_help),1)*100:.1f}% dos sinais restantes).<br><br>
+  Configurável via env: <code>BOTTOM_FRESHNESS_SEC=300</code>
+</div>
+
+<h2>5. Os Inválidos com &gt;2min de Atraso — Análise de Padrão</h2>
 <p class="sub" style="margin-top:-6px">
-  Esses {len(helius_no_help)} tokens tiveram pico muito antes do sinal. Padrão provável:
-  bounce duplo — o token bounceou, caiu, o sinal disparou num segundo bounce menor.
+  {len(helius_no_help)} tokens com spike rápido (&lt;3min) e sinal tardio (10–22min).
+  A.6 bloqueia todos esses. Tabela para referência histórica.
 </p>
 <table>
   <thead><tr>
@@ -1146,11 +1160,10 @@ tr:hover td {{ background: #161b22; }}
     html += """
   </tbody>
 </table>
-<div class="warn" style="margin-top:16px">
-  <b>Próximo passo:</b> Os inválidos com &gt;2min de atraso provavelmente têm padrão de bounce duplo
-  (o bot dispara num segundo rally menor após o pico real já ter passado).
-  Investigar se um filtro de "bounce_pct crescente" — exigir que o bounce atual seja maior
-  que qualquer bounce anterior para o mesmo token — eliminaria esses casos.
+<div class="insight" style="margin-top:16px">
+  <b>Próximo passo após A.6:</b> Validar impacto real nos próximos 30+ sinais.
+  Se WR subir de ~25% para ~35%+, A.6 é confirmado. Ajustar BOTTOM_FRESHNESS_SEC se necessário.
+  Helius/Jupiter continuam no roadmap mas como <b>redução de custo</b>, não como melhoria de sinal.
 </div>
 </body></html>"""
 
