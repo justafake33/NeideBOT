@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 POLL_INTERVAL      = int(os.getenv("POLL_INTERVAL_SEC",    "5"))
 HOT_INTERVAL       = 30
-HOT_PRECISE_SEC    = int(os.getenv("HOT_PRECISE_SEC",      "30"))   # B.4: 60→30s dobra cobertura de ticks
+HOT_PRECISE_SEC    = int(os.getenv("HOT_PRECISE_SEC",      "5"))    # alinhado com trenches poll — mc_min sempre fresco na detecção
 HOT_WINDOW_MIN     = 60
 
 # ------------------------------------------------------------------
