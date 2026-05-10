@@ -6266,6 +6266,162 @@ def _start_services():
 _start_services()
 
 
+@app.route("/debug/executor-status")
+def debug_executor_status():
+    """Diagnóstico completo do pipeline de trading — mostra onde a cadeia pode estar bloqueada."""
+    import traceback
+    try:
+        return _executor_status_inner()
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
+def _executor_status_inner():
+    import datetime as _dt
+
+    trading_enabled = os.getenv("TRADING_ENABLED", "false").lower() == "true"
+    cal_max         = int(os.getenv("CALIBRATION_MAX_TRADES", "50"))
+    cal_amount      = float(os.getenv("CALIBRATION_AMOUNT_USD", "1.0"))
+    bounce_min      = float(os.getenv("BOUNCE_MIN_PCT", "0.15"))
+    bounce_drop     = float(os.getenv("BOUNCE_DROP_MIN", "0.30"))
+    bounce_time_max = float(os.getenv("BOUNCE_TIME_MAX", "20.0"))
+    freshness_sec   = int(os.getenv("BOTTOM_FRESHNESS_SEC", "300"))
+
+    # Contagem de trades no DB
+    try:
+        n_trades = db.count_trades()
+        executor_paused = n_trades >= cal_max
+    except Exception as e:
+        n_trades = f"erro: {e}"
+        executor_paused = False
+
+    # Último bounce signal
+    last_bounce = None
+    last_bounce_ts = None
+    try:
+        conn = db.get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM bounce_signals ORDER BY created_at DESC LIMIT 1")
+            row = cur.fetchone()
+            if row:
+                last_bounce    = dict(row)
+                last_bounce_ts = row.get("created_at")
+        conn.close()
+    except Exception:
+        pass
+
+    # Tokens ativos no HotMonitor
+    hot_count = 0
+    hot_mints = []
+    try:
+        if scanner and hasattr(scanner, 'hot'):
+            hot_tokens = scanner.hot._tokens
+            hot_count  = len(hot_tokens)
+            hot_mints  = list(hot_tokens.keys())[:10]
+    except Exception:
+        pass
+
+    # Último scan (via scanner global)
+    last_scan_ts = None
+    try:
+        if scanner and hasattr(scanner, '_last_tick_ts'):
+            last_scan_ts = scanner._last_tick_ts
+    except Exception:
+        pass
+
+    # Status global
+    ok   = "✅"
+    warn = "⚠️"
+    bad  = "❌"
+
+    def row(label, value, status=""):
+        color = {"✅": "#4CAF50", "⚠️": "#FF9800", "❌": "#f44336"}.get(status, "#ddd")
+        return f"<tr><th>{label}</th><td style='color:{color}'>{value}</td></tr>"
+
+    rows = []
+    rows.append(row("TRADING_ENABLED",
+                    "true ✅" if trading_enabled else "false ❌  ← se bounces disparam mas nenhum trade acontece, este é o problema",
+                    ok if trading_enabled else bad))
+    rows.append(row("Trades no DB (não-error)",
+                    f"{n_trades} / {cal_max} {'⚠️ LIMITE ATINGIDO — executor pausado' if executor_paused else ok}",
+                    bad if executor_paused else ok))
+    rows.append(row("CALIBRATION_AMOUNT_USD", f"${cal_amount:.2f} por trade"))
+    rows.append(row("BOUNCE_DROP_MIN",    f"{bounce_drop*100:.0f}% queda mínima da migração"))
+    rows.append(row("BOUNCE_MIN_PCT",     f"{bounce_min*100:.0f}% bounce mínimo do fundo"))
+    rows.append(row("BOUNCE_TIME_MAX",    f"{bounce_time_max:.0f}min janela máxima pós-migração"))
+    rows.append(row("BOTTOM_FRESHNESS_SEC", f"{freshness_sec}s (A.6 — fundo deve ser recente)"))
+    rows.append(row("HotMonitor tokens ativos", f"{hot_count} token(s) sendo monitorados",
+                    ok if hot_count > 0 else warn))
+
+    if last_bounce_ts:
+        ago = (_dt.datetime.now(_dt.timezone.utc) - last_bounce_ts).total_seconds()
+        ago_str = f"{ago/60:.0f}min atrás" if ago < 3600 else f"{ago/3600:.1f}h atrás"
+        b = last_bounce
+        rows.append(row("Último bounce detectado",
+                        f"{ago_str} — {b.get('symbol','?')} drop={b.get('drop_from_mig',0)*100:.0f}% "
+                        f"bounce={b.get('bounce_pct',0)*100:.0f}% em {b.get('elapsed_sec',0)//60}min",
+                        ok if ago < 1800 else warn))
+    else:
+        rows.append(row("Último bounce detectado", "Nenhum no DB", warn))
+
+    # Diagnóstico conclusivo
+    if not trading_enabled:
+        diagnosis = "❌ <b>TRADING_ENABLED=false</b> — bounces disparam mas executor descarta silenciosamente. Logs mostram 'DRY-RUN'. Ative no Railway."
+    elif executor_paused:
+        diagnosis = f"❌ <b>Limite de trades atingido</b> ({n_trades}/{cal_max}). Aumente CALIBRATION_MAX_TRADES no Railway (ex: 150)."
+    elif hot_count == 0:
+        diagnosis = "⚠️ <b>Nenhum token no HotMonitor</b> — scanner não encontrou migrações recentes ou bot acabou de iniciar."
+    else:
+        diagnosis = "✅ Pipeline parece OK. Se não há trades, provavelmente nenhum bounce passou pelos filtros A.2/A.3/A.5/A.6 ainda."
+
+    h = f"""<!DOCTYPE html><html><head>
+<meta charset="utf-8">
+<title>Executor Status — NeideBOT</title>
+<style>
+  body {{ background:#111; color:#ddd; font-family:monospace; padding:20px; }}
+  h1,h2 {{ color:#FFD700; }}
+  table {{ border-collapse:collapse; width:100%; margin:12px 0; font-size:13px; }}
+  th,td {{ border:1px solid #333; padding:8px 10px; text-align:left; }}
+  th {{ background:#1e1e1e; color:#aaa; width:280px; }}
+  .box {{ background:#1a1a1a; border:1px solid #333; padding:16px; border-radius:6px; margin:12px 0; }}
+  .diag {{ font-size:14px; padding:14px; border-radius:4px; background:#1e1e1e; border-left:4px solid #FF9800; }}
+</style>
+</head><body>
+<h1>Executor Status — Pipeline Diagnóstico</h1>
+<p style="color:#888;font-size:11px">Atualizado: {_dt.datetime.now(_dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC</p>
+
+<div class="box diag">{diagnosis}</div>
+
+<div class="box">
+  <h2>Configuração do Executor</h2>
+  <table>{''.join(rows)}</table>
+</div>
+
+<div class="box">
+  <h2>HotMonitor — Tokens Ativos ({hot_count})</h2>
+  {"<p style='color:#888'>Nenhum token sendo monitorado agora.</p>" if not hot_mints else
+   "<p style='color:#888;font-size:11px'>" + " | ".join(f"<code>{m[:12]}…</code>" for m in hot_mints) + "</p>"}
+</div>
+
+<div class="box">
+  <h2>Checklist rápida</h2>
+  <table>
+    <tr><th>1. TRADING_ENABLED=true no Railway?</th><td>{'✅' if trading_enabled else '❌ não está ativo'}</td></tr>
+    <tr><th>2. Trades abaixo do limite?</th><td>{'✅' if not executor_paused else f'❌ {n_trades}/{cal_max} — aumente CALIBRATION_MAX_TRADES'}</td></tr>
+    <tr><th>3. HotMonitor com tokens?</th><td>{'✅' if hot_count > 0 else '⚠️ vazio agora (normal se sem migrações recentes)'}</td></tr>
+    <tr><th>4. Algum bounce recente?</th><td>{'✅ ' + ago_str if last_bounce_ts else '⚠️ nenhum ainda'}</td></tr>
+  </table>
+</div>
+
+<p style="color:#555;font-size:11px">
+  Links: <a href="/debug/trade-audit" style="color:#4FC3F7">/debug/trade-audit</a> |
+  <a href="/scanner" style="color:#4FC3F7">/scanner</a> |
+  <a href="/debug/signal-live" style="color:#4FC3F7">/debug/signal-live</a>
+</p>
+</body></html>"""
+    return h
+
+
 @app.route("/debug/my-ip")
 def debug_my_ip():
     """Retorna o IP de saída do Railway — necessário para whitelist GMGN."""
