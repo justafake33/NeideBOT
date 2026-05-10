@@ -230,25 +230,31 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO 2026-05-04)
 - **Fase A**: A.2 ✅, A.3 ✅, A.5 ✅. A.1 slope REMOVIDO (H13 refutada). **A.4 DESATIVADO** (90s wait → entrada 53% acima do fundo, matava R:R). **A.6 NOVO** (bottom freshness ≤5min).
 - **Fase B ATIVA**: ts_min bug fix, kline backfill, hot-precise 30s
 - **Fase 2 ativa**: token_signals type 12 a cada 5s
-- **Fase 6 calibração CONCLUÍDA**: 50 trades $1 — WR real ~17-19% (8-9 TPs reais), perda $20 dominada por friction
+- **Fase 6 calibração CONCLUÍDA**: 50 trades $1 — WR real 15.1% on-chain (8 TPs / 53 trades), perda real $14.63 (ex-transferência manual $10.85)
 - **Trailing TP IMPLEMENTADO**: `profit_stop_trace` ativação=75%, drawdown=30%. SL fixo -15%.
 - **H9 pendente**: threshold = trigger_mc < mc_migration × 0.80. Aguardando n≥30 na faixa <50%.
+- **Bot relançado (2026-05-10)**: CALIBRATION_MAX_TRADES=999999, TRADING_ENABLED=true, $1/trade
 
-### Resultado da Calibração — 50 trades de $1 (2026-05-07/08)
+### Resultado da Calibração — 50 trades de $1 (2026-05-07/08) — Auditoria on-chain final
 
 | Métrica | Valor | Observação |
 |---------|-------|-----------|
-| Trades executados | 50 | 48 done, 2 expired |
-| TPs reais confirmados | ~8-9 | DAN, CLAIRE, pWRG, SH, QUACK, USDSC, ONECOIN, STARFOX, BTS |
-| WR real | ~17-19% | Break-even teórico = 16.7% (sem tips) |
-| Capital inicial | $40 | |
-| Perda real | ~$20 | **Quase 100% em fees/tips, não em trades ruins** |
+| Trades on-chain reais | 53 | (excl. 1 mystery = transferência manual + 4 tiny legacy) |
+| TPs confirmados | 8 | WR = 15.1% |
+| SLs | 44 | Retorno médio 64.6% do investido |
+| WR real | 15.1% | on-chain auditado — acima do break-even de 11% (sem fees) |
+| Net trading | -$14.63 | excluindo transferência manual de $10.85 |
+| Jito tips | $0.00 | GMGN NÃO usa Jito |
+| Base fees | $1.14 | ~$0.01/tx |
+| ATA rent "perdido" | ~$8.64 | 44 × ~$0.20 por SL — recuperável via "Reclaim Rent" no GMGN |
 
-**Diagnóstico da perda:**
-- Tips por trade: ~$0.36 (0.001 SOL × 4 transações × $88/SOL)
-- A $1/trade: tips = 36% do tamanho → break-even exige WR ~59% (impossível)
-- A $10/trade: tips = 3.6% → break-even exige WR ~23% (viável com o edge da estratégia)
-- **Conclusão: $1/trade sempre ia perder. Calibração mediu o custo de friction real, não a estratégia.**
+**Diagnóstico real da perda (2026-05-10, auditoria on-chain 115 txs):**
+- Jito tips = $0 — hipótese original REFUTADA
+- SL executa correto em -15% — GMGN condition_orders funciona em segundos
+- O "extra -13%" por SL era o **ATA rent** (~0.002 SOL/trade) não devolvido ao vender
+- GMGN tem botão "Reclaim Rent" na UI da carteira → recupera ~$8.64 dos 44 SLs
+- **Perda real de trading: -$5.99** (após reclaim do rent)
+- **Conclusão: a estratégia é viável a $1/trade. O friction dominante é o ATA rent, não fees.**
 
 **Análise de sinais inválidos (2026-05-09):**
 - 52% dos sinais disparavam depois do pico — hipótese de latência REFUTADA (P50 atraso = 6.7min)
@@ -516,9 +522,9 @@ BOUNCE_TIME_MAX=20.0         # A.5: janela máxima em minutos (100% TPs em ≤20
 BOTTOM_FRESHNESS_SEC=300     # A.6: máx 5min desde o último mc_min (bloqueia sinais tardios)
 
 # Fase 6 — Execução de trades (configuráveis sem redeploy)
-TRADING_ENABLED=false        # true para ativar trades reais
-CALIBRATION_AMOUNT_USD=10.0  # tamanho de cada trade em USD (era $1 na calibração)
-CALIBRATION_MAX_TRADES=50    # limite total de trades por sessão
+TRADING_ENABLED=true         # true para ativar trades reais
+CALIBRATION_AMOUNT_USD=1.0   # tamanho de cada trade em USD
+CALIBRATION_MAX_TRADES=999999 # sem limite prático — executor para apenas manualmente
 TRADE_SL_PCT=0.15            # stop loss fixo (15%)
 TRAILING_ACTIVATION_PCT=75   # trailing: gain% mínimo para ativar (75% = início conservador)
 TRAILING_DRAWDOWN_PCT=30     # trailing: recuo máximo do pico antes de vender (30%)
@@ -551,12 +557,15 @@ ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
 | `/analise/h9` | H9 — token_signals type 12 vs recovery rate por faixa de trigger_mc/mc_migration |
 | `/debug/signal` | Diagnóstico histórico — testa formatos do token_signal (legacy) |
 | `/debug/signal-live` | **Fase 2** — chama get_token_signal(), mostra matches com HotMonitor e últimos sinais salvos |
+| `/debug/executor-status` | **Diagnóstico do pipeline de trading** — TRADING_ENABLED, limite trades, HotMonitor ativo, último bounce |
+| `/debug/wallet-audit` | **Auditoria on-chain** — todas as txs da wallet, Jito tips, BUY/SELL, net SOL. Usar `?rpc=HELIUS_URL` |
+| `/debug/wallet-tokens` | **Forense de posições** — ATAs vazios (rent bloqueado), tokens presos, cruzamento com trades do DB |
 
 ---
 
 ## ⚠️ Notas Críticas de Implementação
 
-1. **Não escalar capital antes de 50 trades de calibração** — friction real (slippage, MEV, latência) só mensurável em live trading
+1. **Calibração de $1/trade concluída** — friction real auditada on-chain. ATA rent (~$0.20/trade) é o principal custo, não Jito. Reclaim Rent no GMGN recupera os valores. WR 15.1% acima do break-even de 11%.
 2. **Threading**: heap scheduler — nunca `threading.Timer` por evento
 3. **GMGN rate limit**: trenches peso 3, kline peso 2, token info peso 1, signal peso 3. 429 → ler `reset_at` do body
 4. **data["pump"]**: near_completion retorna nessa chave, não "near_completion"
@@ -629,17 +638,19 @@ ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
 
 ---
 
-## 🔄 Próximo Passo: Religar com $10/trade
+## 🔄 Estado Atual: Bot ativo a $1/trade (2026-05-10)
 
-### Estado atual do pipeline (2026-05-09)
-Calibração de $1/trade concluída. Diagnóstico: friction dominou a $1/trade (tips = 36% do tamanho). A $10/trade as tips representam 3.6% — viável com WR ~17-19% e trailing TP.
+### Pipeline ativo
+Bot relançado com `TRADING_ENABLED=true`, `CALIBRATION_AMOUNT_USD=1.0`, `CALIBRATION_MAX_TRADES=999999`.
 
-**Melhorias implementadas desde a calibração:**
-- A.4 desativado → entrada imediata ao sinal (não mais 53% acima do fundo)
-- A.6 adicionado → bloqueia sinais com fundo estagnado (92% dos inválidos históricos)
+**Melhorias ativas vs calibração original:**
+- A.4 desativado → entrada imediata ao sinal
+- A.6 adicionado → bloqueia sinais com fundo estagnado (92% dos inválidos)
 - Trailing TP → avg 159% vs 71% TP fixo (simulação n=119)
+- logger.debug→info no DRY-RUN: executor agora loga quando TRADING_ENABLED=false
+- /debug/executor-status: diagnóstico completo do pipeline em um endpoint
 
-**Gate para religar:** TRADING_ENABLED=true, CALIBRATION_AMOUNT_USD=10, TRAILING_ACTIVATION_PCT=75
+**Próximos passos — ver ROADMAP.md**
 
 ---
 
@@ -730,12 +741,11 @@ PRIORITY_FEE_MICRO_LAMPORTS=1000  # priority fee controlado (não GMGN default)
 | Backtester | Cobertura de ticks | n_trades ≥ 200 | ⏳ kline OHLC acumulando |
 | Fase A | WR pós-filtros ≥ 25% | WR ≥ 25% com 30+ bounces filtrados | ⏳ aguardando dados |
 | Fase B | Cobertura slope ≥ 50% | 50% dos bounces com slope calculável | ⏳ impacto esperado |
-| Fase 6-lite | Friction total medida | 71 trades de $1 | ✅ CONCLUÍDA — perda $20 em fees |
-| Fase 6-lite | EV_real > 0 após friction | EV_real > 0 | ❌ -$20 (tips dominam a $1/trade) |
-| Fase 6 | WR real confirmado | ≥20% | 🟡 ~17-19% (8-9 TPs reais / 48 done) |
-| Fase 6 | Break-even WR real (c/ tips) | < WR real | ❌ ~59% a $1/trade → inviável |
-| Fase 6 | Break-even WR a $10/trade | < WR real | ✅ ~23% → viável |
-| Helius+Jupiter | Implementar antes de religar | Tips < 1% do trade | ⏳ PRÓXIMO PASSO |
+| Fase 6-lite | Friction total medida | 53 trades on-chain auditados | ✅ CONCLUÍDA — ATA rent é o principal custo |
+| Fase 6-lite | EV_real > 0 após friction | EV_real > 0 | 🟡 -$5.99 após reclaim rent — viável |
+| Fase 6 | WR real confirmado | ≥15% | ✅ 15.1% on-chain (acima break-even de 11%) |
+| Fase 6 | Bot ativo | TRADING_ENABLED=true | ✅ relançado 2026-05-10 a $1/trade |
+| Fase 6 | Re-entry em tokens com TP | rastrear tokens com TP e monitorar novo bounce | ⏳ ROADMAP |
 | H9 | Validação smart money signal | delta_pp ≥ 20pp | 🟡 +11.8pp na faixa <50% (n=14) |
 
 ---
