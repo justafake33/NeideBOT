@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 POLL_INTERVAL      = int(os.getenv("POLL_INTERVAL_SEC",    "5"))
 HOT_INTERVAL       = 30
-HOT_PRECISE_SEC    = int(os.getenv("HOT_PRECISE_SEC",      "30"))   # B.4: 60→30s dobra cobertura de ticks
+HOT_PRECISE_SEC    = int(os.getenv("HOT_PRECISE_SEC",      "5"))    # alinhado com trenches poll — mc_min sempre fresco na detecção
 HOT_WINDOW_MIN     = 60
 
 # ------------------------------------------------------------------
@@ -541,6 +541,23 @@ class HotMonitor:
 
                 # Back-filla volume_1m nos ticks trenches existentes
                 db.backfill_tick_volumes(mint, candles, state["ts_mig_unix"])
+
+                # Dispara bounce check usando close da vela mais recente.
+                # Garante que o sinal dispara com o fundo correto (kline low) em vez de
+                # aguardar o próximo poll trenches que pode já estar 50-100% acima do fundo.
+                if candles:
+                    most_recent   = max(candles, key=lambda c: int(c.get("time", 0)))
+                    close_price   = _float(most_recent.get("close"))
+                    if close_price and close_price > 0:
+                        mc_close      = close_price * state["total_supply"]
+                        candle_ts_sec = int(most_recent.get("time", 0)) / 1000
+                        elapsed_kline = int(candle_ts_sec - state["ts_mig_unix"])
+                        if elapsed_kline >= 0:
+                            with self._lock:
+                                inner = self._tokens.get(mint)
+                            if inner and not inner.get("bounce_fired") and mint not in self._cancelled:
+                                self._check_bounce(mint, inner, mc_close, elapsed_kline)
+
             except Exception as e:
                 logger.debug("precise bottom %s: %s", mint[:8], e)
             time.sleep(0.5)
