@@ -8194,13 +8194,29 @@ def _wallet_audit_inner():
         "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
     }
 
-    def rpc(method, params):
-        r = _req.post(RPC_URL, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=30)
-        r.raise_for_status()
-        body = r.json()
-        if "error" in body:
-            raise RuntimeError(f"RPC error: {body['error']}")
-        return body.get("result")
+    IS_PUBLIC_RPC = "mainnet-beta.solana.com" in RPC_URL
+    SLEEP_BETWEEN = 1.2 if IS_PUBLIC_RPC else 0.1   # público = 1req/s max prático
+    MAX_TX        = 30  if IS_PUBLIC_RPC else 200    # público = limitar para não timeout HTTP
+
+    def rpc(method, params, retries=3):
+        for attempt in range(retries):
+            try:
+                r = _req.post(RPC_URL, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=30)
+                r.raise_for_status()
+                body = r.json()
+                if "error" in body:
+                    code = body["error"].get("code", 0)
+                    if code == 429 or code == -32429:   # rate limit
+                        _time.sleep(3 * (attempt + 1))
+                        continue
+                    raise RuntimeError(f"RPC error: {body['error']}")
+                return body.get("result")
+            except (_req.exceptions.RequestException, RuntimeError) as e:
+                if attempt < retries - 1:
+                    _time.sleep(2 * (attempt + 1))
+                else:
+                    raise
+        return None
 
     lines_html = []
 
@@ -8224,22 +8240,33 @@ def _wallet_audit_inner():
         return "<pre>Nenhuma transação no período especificado. Tente ?days=7</pre>"
 
     # 2. Buscar detalhes de cada tx
+    # RPC público: muito lento (1 req/s), limitado a MAX_TX para evitar timeout Flask
+    sigs_to_fetch = sigs_in_range[:MAX_TX]
+    if IS_PUBLIC_RPC and len(sigs_in_range) > MAX_TX:
+        lines_html.append(
+            f"<p class='warn'>⚠️ RPC público limitado a {MAX_TX} txs (de {len(sigs_in_range)}) para evitar timeout. "
+            f"Para análise completa: adicione <code>HELIUS_RPC_URL</code> no Railway ou use "
+            f"<code>?rpc=https://mainnet.helius-rpc.com/?api-key=SEU_KEY</code> (free tier suficiente).</p>"
+        )
+
     tx_details = []
     errors_fetch = 0
-    for s in sigs_in_range:
+    for s in sigs_to_fetch:
         sig = s["signature"]
         try:
             tx = rpc("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
             if not tx:
+                errors_fetch += 1
                 continue
             tx["_sig"] = sig
             tx["_blockTime"] = s.get("blockTime")
             tx_details.append(tx)
         except Exception:
             errors_fetch += 1
-        _time.sleep(0.15)  # respeita rate limit do RPC público
+        _time.sleep(SLEEP_BETWEEN)
 
-    lines_html.append(f"<p>Transações detalhadas: <b>{len(tx_details)}</b> | erros fetch: {errors_fetch}</p>")
+    coverage = f"{len(tx_details)}/{len(sigs_in_range)}"
+    lines_html.append(f"<p>Transações detalhadas: <b>{len(tx_details)}</b> | erros: {errors_fetch} | cobertura: {coverage}</p>")
 
     # 3. Parsear cada tx
     SOL = 1_000_000_000  # lamports per SOL
@@ -8269,9 +8296,19 @@ def _wallet_audit_inner():
         if is_failed:
             totals["n_failed"] += 1
 
-        # Base fee
+        # Base fee (inclui priority fee — Solana meta.fee = base + priority)
         base_fee = meta.get("fee", 0)  # lamports
         totals["base_fee_lamports"] += base_fee
+        # Priority fee separado (quando disponível)
+        prio_fee = 0
+        try:
+            prio_fee = (meta.get("computeUnitsConsumed") or 0) * 0  # placeholder — extraído abaixo
+            # Tentar extrair priority fee do log de rewards
+            for reward in (meta.get("rewards") or []):
+                if reward.get("rewardType") == "Fee":
+                    prio_fee = reward.get("lamports", 0)
+        except Exception:
+            pass
 
         # Pre/post balances da nossa wallet
         accounts = []
@@ -8294,36 +8331,33 @@ def _wallet_audit_inner():
         if wallet_idx is not None and wallet_idx < len(pre_bals) and wallet_idx < len(post_bals):
             wallet_delta = post_bals[wallet_idx] - pre_bals[wallet_idx]  # positivo = ganhou SOL
 
-        # Jito tips — procurar transferências para contas Jito
+        # Jito tips — detectar via pre/postBalances das contas Jito
+        # Mais robusto que parsear instructions (funciona mesmo sem encoding jsonParsed)
         jito_lamports = 0
-        inner = meta.get("innerInstructions") or []
-        # Também parsear instruções top-level
-        all_instructions = []
         try:
-            all_instructions = tx.get("transaction", {}).get("message", {}).get("instructions", [])
+            for i, acc in enumerate(accounts):
+                if str(acc) in JITO_TIPS:
+                    if i < len(pre_bals) and i < len(post_bals):
+                        delta = post_bals[i] - pre_bals[i]
+                        if delta > 0:
+                            jito_lamports += delta
         except Exception:
             pass
-        for ix in all_instructions:
-            if not isinstance(ix, dict):
-                continue
-            parsed = ix.get("parsed")
-            if isinstance(parsed, dict) and parsed.get("type") == "transfer":
-                info = parsed.get("info", {})
-                dest = info.get("destination", "")
-                if dest in JITO_TIPS:
-                    try:
-                        jito_lamports += int(info.get("lamports", 0))
-                    except Exception:
-                        pass
-        for inner_group in inner:
-            for ix in inner_group.get("instructions", []):
+        # Fallback: parsed instructions (para casos sem lookup table)
+        if jito_lamports == 0:
+            inner = meta.get("innerInstructions") or []
+            all_instructions = []
+            try:
+                all_instructions = tx.get("transaction", {}).get("message", {}).get("instructions", [])
+            except Exception:
+                pass
+            for ix in list(all_instructions) + [ix2 for g in inner for ix2 in g.get("instructions", [])]:
                 if not isinstance(ix, dict):
                     continue
                 parsed = ix.get("parsed")
                 if isinstance(parsed, dict) and parsed.get("type") == "transfer":
                     info = parsed.get("info", {})
-                    dest = info.get("destination", "")
-                    if dest in JITO_TIPS:
+                    if info.get("destination", "") in JITO_TIPS:
                         try:
                             jito_lamports += int(info.get("lamports", 0))
                         except Exception:
