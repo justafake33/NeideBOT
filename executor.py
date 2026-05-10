@@ -76,7 +76,7 @@ class TradeExecutor:
     def on_bounce(self, mint: str, symbol: str, mc_bottom: float,
                   mc_migration: float, elapsed_sec: int):
         if not TRADING_ENABLED:
-            logger.debug("DRY-RUN bounce %s mc_bottom=$%.0f", symbol, mc_bottom)
+            logger.info("DRY-RUN bounce %s mc_bottom=$%.0f (TRADING_ENABLED=false)", symbol, mc_bottom)
             return
 
         with self._lock:
