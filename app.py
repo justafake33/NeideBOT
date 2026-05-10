@@ -8531,21 +8531,30 @@ def _wallet_tokens_inner():
         {"encoding": "jsonParsed"}
     ])
 
-    tokens_in_wallet = []
+    tokens_in_wallet = []   # ATAs com tokens (amount > 0)
+    empty_atas       = []   # ATAs vazios com rent preso (amount == 0)
     if spl_result and "value" in spl_result:
         for acct in spl_result["value"]:
             try:
-                info = acct["account"]["data"]["parsed"]["info"]
-                mint   = info["mint"]
-                amount = int(info["tokenAmount"]["amount"])
-                dec    = int(info["tokenAmount"]["decimals"])
-                ui_amt = float(info["tokenAmount"]["uiAmount"] or 0)
+                info       = acct["account"]["data"]["parsed"]["info"]
+                mint       = info["mint"]
+                amount     = int(info["tokenAmount"]["amount"])
+                dec        = int(info["tokenAmount"]["decimals"])
+                ui_amt     = float(info["tokenAmount"]["uiAmount"] or 0)
+                # SOL preso no ATA (rent-exempt deposit, em lamports)
+                ata_sol    = acct["account"].get("lamports", 0) / 1e9
+                ata_pubkey = acct.get("pubkey", "")
                 if amount > 0:
                     tokens_in_wallet.append({
-                        "mint": mint,
-                        "amount_raw": amount,
-                        "decimals": dec,
-                        "ui_amount": ui_amt,
+                        "mint": mint, "amount_raw": amount,
+                        "decimals": dec, "ui_amount": ui_amt,
+                        "ata_sol": ata_sol, "ata_pubkey": ata_pubkey,
+                    })
+                else:
+                    # ATA vazio — rent preso aqui
+                    empty_atas.append({
+                        "mint": mint, "ata_sol": ata_sol,
+                        "ata_pubkey": ata_pubkey,
                     })
             except Exception:
                 continue
@@ -8691,12 +8700,30 @@ def _wallet_tokens_inner():
 <div class="box">
   <h2>Resumo</h2>
   <table style="width:auto">
-    <tr><th>Saldo SOL</th><td><b>{sol_bal:.6f} SOL</b> (${sol_bal*sol_usd:.2f})</td></tr>
-    <tr><th>Tokens SPL na wallet</th><td>{len(tokens_in_wallet)}</td></tr>
+    <tr><th>Saldo SOL (nativo)</th><td><b>{sol_bal:.6f} SOL</b> (${sol_bal*sol_usd:.2f})</td></tr>
+    <tr><th>ATAs vazios (rent preso)</th><td class="bad"><b>{len(empty_atas)}</b> contas | {sum(a["ata_sol"] for a in empty_atas):.6f} SOL (${sum(a["ata_sol"] for a in empty_atas)*sol_usd:.2f}) bloqueados</td></tr>
+    <tr><th>Tokens SPL com saldo</th><td>{len(tokens_in_wallet)}</td></tr>
     <tr><th>Tokens de trades (presos?)</th><td class="warn">{len(stuck_mints)} | valor estimado: ${total_stuck_usd:.2f}</td></tr>
     <tr><th>Tokens sem trade registrado</th><td class="warn">{len(unknown_mints)}</td></tr>
     <tr><th>Trades sem token na wallet</th><td style="color:#888">{len(resolved_no_token)} (resolvidos/vendidos/perdidos)</td></tr>
   </table>
+</div>
+
+<div class="box">
+  <h2>🔒 ATAs Vazios — Rent Bloqueado ({len(empty_atas)} contas)</h2>
+  <p style="color:#888;font-size:11px">
+    Cada token comprado cria um "armário" (ATA) na Solana que custa ~0.002 SOL de depósito (rent).
+    Quando a GMGN vende os tokens via condition_orders, ela NÃO fecha esse armário.
+    O depósito fica preso. Para recuperar: fechar cada ATA via <code>spl-token close-account</code> ou Phantom UI.
+  </p>
+  <p style="color:#FF9800">Total bloqueado: <b>{sum(a["ata_sol"] for a in empty_atas):.6f} SOL = ${sum(a["ata_sol"] for a in empty_atas)*sol_usd:.2f}</b>
+    | Média por ATA: {sum(a["ata_sol"] for a in empty_atas)/max(len(empty_atas),1)*1000:.2f} mSOL</p>
+  {"<table><tr><th>Mint</th><th>SOL preso</th><th>ATA address</th><th>Links</th></tr>" + "".join(f'''<tr>
+    <td style="font-size:10px"><a href="https://solscan.io/token/{a["mint"]}" target="_blank" style="color:#4FC3F7">{a["mint"][:20]}…</a></td>
+    <td style="color:#f44336">{a["ata_sol"]:.6f} SOL (${a["ata_sol"]*sol_usd:.3f})</td>
+    <td style="font-size:10px"><a href="https://solscan.io/account/{a["ata_pubkey"]}" target="_blank" style="color:#888">{a["ata_pubkey"][:20]}…</a></td>
+    <td><a href="https://gmgn.ai/sol/token/{a["mint"]}" target="_blank" style="color:#FF9800;font-size:9px">GMGN ↗</a></td>
+  </tr>''' for a in sorted(empty_atas, key=lambda x: -x["ata_sol"])) + "</table>" if empty_atas else "<p class='ok'>Nenhum ATA vazio — GMGN está fechando as contas corretamente.</p>"}
 </div>
 
 <div class="box">
