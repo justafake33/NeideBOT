@@ -8156,5 +8156,285 @@ DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL
     return h
 
 
+@app.route("/debug/wallet-audit")
+def debug_wallet_audit():
+    """
+    Analisa TODAS as transações on-chain da wallet no período de calibração.
+    Usa Solana RPC para buscar txs, parsear fees reais e Jito tips.
+    GET /debug/wallet-audit?days=3&rpc=<url>
+    """
+    import traceback
+    try:
+        return _wallet_audit_inner()
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
+def _wallet_audit_inner():
+    import requests as _req
+    import time as _time
+
+    WALLET    = os.getenv("GMGN_WALLET_ADDRESS", "")
+    RPC_URL   = request.args.get("rpc") or os.getenv("HELIUS_RPC_URL") or "https://api.mainnet-beta.solana.com"
+    DAYS_BACK = int(request.args.get("days", "4"))
+    sol_usd   = _get_sol_usd() or 94.0
+
+    if not WALLET:
+        return "<pre>GMGN_WALLET_ADDRESS não configurado</pre>", 400
+
+    # Jito tip accounts conhecidos
+    JITO_TIPS = {
+        "T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt",
+        "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+        "HFqU5x63VTqvB8ky8HFGjWGcuGkEbT9fvkdnxwxGaHi",
+        "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+        "ADaUMid9sspnBwsm7iHSTe4q3YFe4EtUBfyvYTyMSXgo",
+        "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+        "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+        "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+    }
+
+    def rpc(method, params):
+        r = _req.post(RPC_URL, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=30)
+        r.raise_for_status()
+        body = r.json()
+        if "error" in body:
+            raise RuntimeError(f"RPC error: {body['error']}")
+        return body.get("result")
+
+    lines_html = []
+
+    # 1. Buscar assinaturas do período
+    since_ts = int(_time.time()) - DAYS_BACK * 86400
+    lines_html.append(f"<p>Buscando transações dos últimos {DAYS_BACK} dias para <code>{WALLET[:16]}…</code> via <code>{RPC_URL.split('/')[2]}</code></p>")
+
+    try:
+        sigs_result = rpc("getSignaturesForAddress", [WALLET, {"limit": 200}])
+    except Exception as e:
+        return f"<pre>Erro ao buscar assinaturas: {e}\n\nTente: /debug/wallet-audit?rpc=https://YOUR_HELIUS_URL</pre>", 500
+
+    if not sigs_result:
+        return "<pre>Nenhuma transação encontrada.</pre>"
+
+    # Filtrar pelo período
+    sigs_in_range = [s for s in sigs_result if s.get("blockTime", 0) >= since_ts]
+    lines_html.append(f"<p>Total assinaturas: <b>{len(sigs_result)}</b> | No período: <b>{len(sigs_in_range)}</b></p>")
+
+    if not sigs_in_range:
+        return "<pre>Nenhuma transação no período especificado. Tente ?days=7</pre>"
+
+    # 2. Buscar detalhes de cada tx
+    tx_details = []
+    errors_fetch = 0
+    for s in sigs_in_range:
+        sig = s["signature"]
+        try:
+            tx = rpc("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
+            if not tx:
+                continue
+            tx["_sig"] = sig
+            tx["_blockTime"] = s.get("blockTime")
+            tx_details.append(tx)
+        except Exception:
+            errors_fetch += 1
+        _time.sleep(0.15)  # respeita rate limit do RPC público
+
+    lines_html.append(f"<p>Transações detalhadas: <b>{len(tx_details)}</b> | erros fetch: {errors_fetch}</p>")
+
+    # 3. Parsear cada tx
+    SOL = 1_000_000_000  # lamports per SOL
+    totals = {
+        "n_tx": 0,
+        "base_fee_lamports": 0,
+        "priority_fee_lamports": 0,
+        "jito_tip_lamports": 0,
+        "sol_out_lamports": 0,   # total SOL que saiu (compras)
+        "sol_in_lamports": 0,    # total SOL que entrou (vendas)
+        "n_buy": 0,
+        "n_sell": 0,
+        "n_failed": 0,
+    }
+
+    tx_rows = []
+    for tx in sorted(tx_details, key=lambda x: x.get("_blockTime", 0)):
+        import datetime as _dt
+        sig     = tx["_sig"]
+        btime   = tx.get("_blockTime", 0)
+        dt_str  = _dt.datetime.fromtimestamp(btime).strftime("%m/%d %H:%M:%S") if btime else "—"
+
+        meta    = tx.get("meta") or {}
+        err     = meta.get("err")
+        is_failed = err is not None
+
+        if is_failed:
+            totals["n_failed"] += 1
+
+        # Base fee
+        base_fee = meta.get("fee", 0)  # lamports
+        totals["base_fee_lamports"] += base_fee
+
+        # Pre/post balances da nossa wallet
+        accounts = []
+        try:
+            msg = tx.get("transaction", {}).get("message", {})
+            accounts = [a.get("pubkey") if isinstance(a, dict) else a
+                        for a in msg.get("accountKeys", [])]
+        except Exception:
+            pass
+
+        wallet_idx = None
+        for i, a in enumerate(accounts):
+            if str(a) == WALLET:
+                wallet_idx = i
+                break
+
+        pre_bals  = meta.get("preBalances",  [])
+        post_bals = meta.get("postBalances", [])
+        wallet_delta = 0
+        if wallet_idx is not None and wallet_idx < len(pre_bals) and wallet_idx < len(post_bals):
+            wallet_delta = post_bals[wallet_idx] - pre_bals[wallet_idx]  # positivo = ganhou SOL
+
+        # Jito tips — procurar transferências para contas Jito
+        jito_lamports = 0
+        inner = meta.get("innerInstructions") or []
+        # Também parsear instruções top-level
+        all_instructions = []
+        try:
+            all_instructions = tx.get("transaction", {}).get("message", {}).get("instructions", [])
+        except Exception:
+            pass
+        for ix in all_instructions:
+            if not isinstance(ix, dict):
+                continue
+            parsed = ix.get("parsed")
+            if isinstance(parsed, dict) and parsed.get("type") == "transfer":
+                info = parsed.get("info", {})
+                dest = info.get("destination", "")
+                if dest in JITO_TIPS:
+                    try:
+                        jito_lamports += int(info.get("lamports", 0))
+                    except Exception:
+                        pass
+        for inner_group in inner:
+            for ix in inner_group.get("instructions", []):
+                if not isinstance(ix, dict):
+                    continue
+                parsed = ix.get("parsed")
+                if isinstance(parsed, dict) and parsed.get("type") == "transfer":
+                    info = parsed.get("info", {})
+                    dest = info.get("destination", "")
+                    if dest in JITO_TIPS:
+                        try:
+                            jito_lamports += int(info.get("lamports", 0))
+                        except Exception:
+                            pass
+        totals["jito_tip_lamports"] += jito_lamports
+
+        # Classificar tx: buy (SOL sai, token entra) ou sell (token sai, SOL entra)
+        # Usa delta da wallet como proxy
+        tx_type = "—"
+        if not is_failed:
+            if wallet_delta < -50_000:   # saiu SOL líquido (compra)
+                tx_type = "BUY"
+                totals["n_buy"] += 1
+                totals["sol_out_lamports"] += abs(wallet_delta)
+            elif wallet_delta > 50_000:  # entrou SOL líquido (venda)
+                tx_type = "SELL"
+                totals["n_sell"] += 1
+                totals["sol_in_lamports"] += wallet_delta
+            else:
+                tx_type = "OTHER"
+        totals["n_tx"] += 1
+
+        # Cor
+        color = {"BUY": "#2196F3", "SELL": "#4CAF50", "OTHER": "#888", "—": "#555"}.get(tx_type, "#888")
+        err_str = "❌ FAILED" if is_failed else ""
+
+        tx_rows.append(f"""<tr>
+          <td style="font-size:10px">{dt_str}</td>
+          <td><span style="color:{color}">{tx_type}</span> {err_str}</td>
+          <td style="font-size:10px">{sig[:20]}…
+            <a href="https://solscan.io/tx/{sig}" target="_blank" style="color:#4FC3F7;font-size:9px">↗</a>
+          </td>
+          <td style="font-size:11px">{wallet_delta/SOL:+.6f} SOL<br>
+            <span style="color:#888">${wallet_delta/SOL*sol_usd:+.4f}</span></td>
+          <td style="font-size:11px;color:#FF9800">{jito_lamports/SOL:.6f} SOL<br>
+            <span style="color:#888">${jito_lamports/SOL*sol_usd:.4f}</span></td>
+          <td style="font-size:11px;color:#888">{base_fee/SOL:.6f} SOL</td>
+        </tr>""")
+
+    # 4. Sumário
+    net_sol    = (totals["sol_in_lamports"] - totals["sol_out_lamports"]) / SOL
+    jito_total = totals["jito_tip_lamports"] / SOL
+    base_total = totals["base_fee_lamports"] / SOL
+
+    # Buscar saldo atual
+    current_bal = None
+    try:
+        bal_result = rpc("getBalance", [WALLET])
+        if bal_result and "value" in bal_result:
+            current_bal = bal_result["value"] / SOL
+    except Exception:
+        pass
+
+    bal_str = f"{current_bal:.6f} SOL (${current_bal*sol_usd:.2f})" if current_bal is not None else "—"
+
+    rows_html = "\n".join(tx_rows)
+
+    h = f"""<!DOCTYPE html><html><head>
+<meta charset="utf-8">
+<title>Wallet Audit — NeideBOT</title>
+<style>
+  body {{ background:#111; color:#ddd; font-family:monospace; padding:20px; }}
+  h1,h2 {{ color:#FFD700; }}
+  table {{ border-collapse:collapse; width:100%; margin:12px 0; font-size:12px; }}
+  th,td {{ border:1px solid #333; padding:6px 8px; text-align:left; }}
+  th {{ background:#1e1e1e; color:#aaa; }}
+  tr:hover {{ background:#1a1a1a; }}
+  .box {{ background:#1a1a1a; border:1px solid #333; padding:16px; border-radius:6px; margin:12px 0; }}
+  a {{ color:#4FC3F7; }}
+  .warn {{ color:#FF9800; }} .ok {{ color:#4CAF50; }} .bad {{ color:#f44336; }}
+</style>
+</head><body>
+<h1>Wallet Audit — On-chain</h1>
+<p>Wallet: <a href="https://solscan.io/account/{WALLET}#transfers" target="_blank"><code>{WALLET}</code></a></p>
+{"".join(lines_html)}
+
+<div class="box">
+  <h2>Breakdown de Custos — Período de {DAYS_BACK} dias</h2>
+  <table style="width:auto">
+    <tr><th>Saldo atual</th><td>{bal_str}</td></tr>
+    <tr><th>Transações totais</th><td>{totals["n_tx"]}</td></tr>
+    <tr><th>BUY (SOL saiu)</th><td class="bad">{totals["n_buy"]} txs | {totals["sol_out_lamports"]/SOL:.5f} SOL (${totals["sol_out_lamports"]/SOL*sol_usd:.2f})</td></tr>
+    <tr><th>SELL (SOL entrou)</th><td class="ok">{totals["n_sell"]} txs | {totals["sol_in_lamports"]/SOL:.5f} SOL (${totals["sol_in_lamports"]/SOL*sol_usd:.2f})</td></tr>
+    <tr><th>Failed txs</th><td class="warn">{totals["n_failed"]}</td></tr>
+    <tr><th>Net SOL (sell − buy)</th>
+      <td class="{'ok' if net_sol >= 0 else 'bad'}">{net_sol:+.5f} SOL (${net_sol*sol_usd:+.2f})</td></tr>
+    <tr><th>Jito Tips totais</th>
+      <td class="warn">{jito_total:.6f} SOL (${jito_total*sol_usd:.2f}) — média {jito_total/max(totals["n_tx"],1)*1000:.2f} mSOL/tx</td></tr>
+    <tr><th>Base fees totais</th>
+      <td style="color:#888">{base_total:.6f} SOL (${base_total*sol_usd:.4f})</td></tr>
+  </table>
+  <p class="warn"><b>Jito tip médio por tx:</b> {jito_total/max(totals["n_tx"],1)*SOL:.0f} lamports
+    = {jito_total/max(totals["n_tx"],1)*1000:.3f} mSOL
+    = ${jito_total/max(totals["n_tx"],1)*sol_usd:.4f}</p>
+  <p style="color:#888;font-size:11px">
+    GMGN platform fee (1% buy+sell) aparece como slippage no delta da wallet, não como campo separado.
+    Net SOL = capital retornado − capital investido.
+    Friction total = |Net SOL| se negativo + Jito tips.
+  </p>
+</div>
+
+<h2>Todas as {len(tx_details)} transações</h2>
+<table>
+  <tr><th>Data (local)</th><th>Tipo</th><th>Assinatura</th><th>Delta wallet</th><th>Jito Tip</th><th>Base Fee</th></tr>
+  {rows_html}
+</table>
+
+<p style="color:#555;font-size:11px">SOL/USD: ${sol_usd:.2f} | RPC: {RPC_URL.split('/')[2]}</p>
+</body></html>"""
+    return h
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
