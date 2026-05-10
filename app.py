@@ -8194,13 +8194,29 @@ def _wallet_audit_inner():
         "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
     }
 
-    def rpc(method, params):
-        r = _req.post(RPC_URL, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=30)
-        r.raise_for_status()
-        body = r.json()
-        if "error" in body:
-            raise RuntimeError(f"RPC error: {body['error']}")
-        return body.get("result")
+    IS_PUBLIC_RPC = "mainnet-beta.solana.com" in RPC_URL
+    SLEEP_BETWEEN = 1.2 if IS_PUBLIC_RPC else 0.1   # público = 1req/s max prático
+    MAX_TX        = 30  if IS_PUBLIC_RPC else 200    # público = limitar para não timeout HTTP
+
+    def rpc(method, params, retries=3):
+        for attempt in range(retries):
+            try:
+                r = _req.post(RPC_URL, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=30)
+                r.raise_for_status()
+                body = r.json()
+                if "error" in body:
+                    code = body["error"].get("code", 0)
+                    if code == 429 or code == -32429:   # rate limit
+                        _time.sleep(3 * (attempt + 1))
+                        continue
+                    raise RuntimeError(f"RPC error: {body['error']}")
+                return body.get("result")
+            except (_req.exceptions.RequestException, RuntimeError) as e:
+                if attempt < retries - 1:
+                    _time.sleep(2 * (attempt + 1))
+                else:
+                    raise
+        return None
 
     lines_html = []
 
@@ -8224,22 +8240,33 @@ def _wallet_audit_inner():
         return "<pre>Nenhuma transação no período especificado. Tente ?days=7</pre>"
 
     # 2. Buscar detalhes de cada tx
+    # RPC público: muito lento (1 req/s), limitado a MAX_TX para evitar timeout Flask
+    sigs_to_fetch = sigs_in_range[:MAX_TX]
+    if IS_PUBLIC_RPC and len(sigs_in_range) > MAX_TX:
+        lines_html.append(
+            f"<p class='warn'>⚠️ RPC público limitado a {MAX_TX} txs (de {len(sigs_in_range)}) para evitar timeout. "
+            f"Para análise completa: adicione <code>HELIUS_RPC_URL</code> no Railway ou use "
+            f"<code>?rpc=https://mainnet.helius-rpc.com/?api-key=SEU_KEY</code> (free tier suficiente).</p>"
+        )
+
     tx_details = []
     errors_fetch = 0
-    for s in sigs_in_range:
+    for s in sigs_to_fetch:
         sig = s["signature"]
         try:
             tx = rpc("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
             if not tx:
+                errors_fetch += 1
                 continue
             tx["_sig"] = sig
             tx["_blockTime"] = s.get("blockTime")
             tx_details.append(tx)
         except Exception:
             errors_fetch += 1
-        _time.sleep(0.15)  # respeita rate limit do RPC público
+        _time.sleep(SLEEP_BETWEEN)
 
-    lines_html.append(f"<p>Transações detalhadas: <b>{len(tx_details)}</b> | erros fetch: {errors_fetch}</p>")
+    coverage = f"{len(tx_details)}/{len(sigs_in_range)}"
+    lines_html.append(f"<p>Transações detalhadas: <b>{len(tx_details)}</b> | erros: {errors_fetch} | cobertura: {coverage}</p>")
 
     # 3. Parsear cada tx
     SOL = 1_000_000_000  # lamports per SOL
@@ -8269,9 +8296,19 @@ def _wallet_audit_inner():
         if is_failed:
             totals["n_failed"] += 1
 
-        # Base fee
+        # Base fee (inclui priority fee — Solana meta.fee = base + priority)
         base_fee = meta.get("fee", 0)  # lamports
         totals["base_fee_lamports"] += base_fee
+        # Priority fee separado (quando disponível)
+        prio_fee = 0
+        try:
+            prio_fee = (meta.get("computeUnitsConsumed") or 0) * 0  # placeholder — extraído abaixo
+            # Tentar extrair priority fee do log de rewards
+            for reward in (meta.get("rewards") or []):
+                if reward.get("rewardType") == "Fee":
+                    prio_fee = reward.get("lamports", 0)
+        except Exception:
+            pass
 
         # Pre/post balances da nossa wallet
         accounts = []
@@ -8294,36 +8331,33 @@ def _wallet_audit_inner():
         if wallet_idx is not None and wallet_idx < len(pre_bals) and wallet_idx < len(post_bals):
             wallet_delta = post_bals[wallet_idx] - pre_bals[wallet_idx]  # positivo = ganhou SOL
 
-        # Jito tips — procurar transferências para contas Jito
+        # Jito tips — detectar via pre/postBalances das contas Jito
+        # Mais robusto que parsear instructions (funciona mesmo sem encoding jsonParsed)
         jito_lamports = 0
-        inner = meta.get("innerInstructions") or []
-        # Também parsear instruções top-level
-        all_instructions = []
         try:
-            all_instructions = tx.get("transaction", {}).get("message", {}).get("instructions", [])
+            for i, acc in enumerate(accounts):
+                if str(acc) in JITO_TIPS:
+                    if i < len(pre_bals) and i < len(post_bals):
+                        delta = post_bals[i] - pre_bals[i]
+                        if delta > 0:
+                            jito_lamports += delta
         except Exception:
             pass
-        for ix in all_instructions:
-            if not isinstance(ix, dict):
-                continue
-            parsed = ix.get("parsed")
-            if isinstance(parsed, dict) and parsed.get("type") == "transfer":
-                info = parsed.get("info", {})
-                dest = info.get("destination", "")
-                if dest in JITO_TIPS:
-                    try:
-                        jito_lamports += int(info.get("lamports", 0))
-                    except Exception:
-                        pass
-        for inner_group in inner:
-            for ix in inner_group.get("instructions", []):
+        # Fallback: parsed instructions (para casos sem lookup table)
+        if jito_lamports == 0:
+            inner = meta.get("innerInstructions") or []
+            all_instructions = []
+            try:
+                all_instructions = tx.get("transaction", {}).get("message", {}).get("instructions", [])
+            except Exception:
+                pass
+            for ix in list(all_instructions) + [ix2 for g in inner for ix2 in g.get("instructions", [])]:
                 if not isinstance(ix, dict):
                     continue
                 parsed = ix.get("parsed")
                 if isinstance(parsed, dict) and parsed.get("type") == "transfer":
                     info = parsed.get("info", {})
-                    dest = info.get("destination", "")
-                    if dest in JITO_TIPS:
+                    if info.get("destination", "") in JITO_TIPS:
                         try:
                             jito_lamports += int(info.get("lamports", 0))
                         except Exception:
@@ -8432,6 +8466,261 @@ def _wallet_audit_inner():
 </table>
 
 <p style="color:#555;font-size:11px">SOL/USD: ${sol_usd:.2f} | RPC: {RPC_URL.split('/')[2]}</p>
+</body></html>"""
+    return h
+
+
+@app.route("/debug/wallet-tokens")
+def debug_wallet_tokens():
+    """
+    Lista todos os tokens SPL na wallet com saldo > 0.
+    Cruza com mints dos trades no DB para identificar posições presas.
+    GET /debug/wallet-tokens?rpc=<url>
+    """
+    import traceback
+    try:
+        return _wallet_tokens_inner()
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
+def _wallet_tokens_inner():
+    import requests as _req
+    import time as _time
+
+    WALLET  = os.getenv("GMGN_WALLET_ADDRESS", "")
+    RPC_URL = request.args.get("rpc") or os.getenv("HELIUS_RPC_URL") or "https://api.mainnet-beta.solana.com"
+    sol_usd = _get_sol_usd() or 94.0
+
+    if not WALLET:
+        return "<pre>GMGN_WALLET_ADDRESS não configurado</pre>", 400
+
+    def rpc(method, params, retries=3):
+        for attempt in range(retries):
+            try:
+                r = _req.post(RPC_URL, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=30)
+                r.raise_for_status()
+                body = r.json()
+                if "error" in body:
+                    code = body["error"].get("code", 0)
+                    if code in (429, -32429):
+                        _time.sleep(3 * (attempt + 1))
+                        continue
+                    raise RuntimeError(f"RPC error: {body['error']}")
+                return body.get("result")
+            except (_req.exceptions.RequestException, RuntimeError) as e:
+                if attempt < retries - 1:
+                    _time.sleep(2 * (attempt + 1))
+                else:
+                    raise
+        return None
+
+    # 1. Saldo SOL atual
+    sol_bal = 0.0
+    try:
+        r = rpc("getBalance", [WALLET])
+        if r and "value" in r:
+            sol_bal = r["value"] / 1e9
+    except Exception:
+        pass
+
+    # 2. Todos os token accounts (SPL) com saldo > 0
+    spl_result = rpc("getTokenAccountsByOwner", [
+        WALLET,
+        {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+        {"encoding": "jsonParsed"}
+    ])
+
+    tokens_in_wallet = []
+    if spl_result and "value" in spl_result:
+        for acct in spl_result["value"]:
+            try:
+                info = acct["account"]["data"]["parsed"]["info"]
+                mint   = info["mint"]
+                amount = int(info["tokenAmount"]["amount"])
+                dec    = int(info["tokenAmount"]["decimals"])
+                ui_amt = float(info["tokenAmount"]["uiAmount"] or 0)
+                if amount > 0:
+                    tokens_in_wallet.append({
+                        "mint": mint,
+                        "amount_raw": amount,
+                        "decimals": dec,
+                        "ui_amount": ui_amt,
+                    })
+            except Exception:
+                continue
+
+    # 3. Buscar mints dos trades no DB para cruzar
+    conn = db.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT t.id, t.mint, t.status, t.ts_signal, t.entry_expected,
+                       t.order_id, t.fee_sol, t.tokens_received
+                FROM trades t
+                ORDER BY t.ts_signal DESC
+            """)
+            db_trades = cur.fetchall()
+    finally:
+        conn.close()
+
+    trade_by_mint = {}
+    for row in db_trades:
+        tid, mint, status, ts_sig, entry_exp, order_id, fee_sol, tok_recv = row
+        trade_by_mint[mint] = {
+            "id": tid,
+            "status": status,
+            "ts_signal": ts_sig,
+            "entry_expected": entry_exp,
+            "order_id": order_id,
+            "fee_sol": fee_sol,
+            "tokens_received": tok_recv,
+        }
+
+    # 4. Cruzar tokens na wallet com trades DB
+    wallet_mints = {t["mint"] for t in tokens_in_wallet}
+    db_mints     = set(trade_by_mint.keys())
+    stuck_mints  = wallet_mints & db_mints  # tokens que vieram de um trade
+    unknown_mints = wallet_mints - db_mints  # tokens que não têm trade registrado
+
+    # Todos os trades com status buy-like mas sem confirmação de sell
+    open_trades = {
+        m: v for m, v in trade_by_mint.items()
+        if v["status"] in ("pending", "error", "sl", "expired", "tp")
+    }
+    # Trades onde o mint NÃO está mais na wallet = posição resolvida
+    resolved_no_token = {m: v for m, v in open_trades.items() if m not in wallet_mints}
+    # Trades onde o mint ESTÁ na wallet = posição potencialmente presa
+    stuck_trades = {m: v for m, v in open_trades.items() if m in wallet_mints}
+
+    # 5. Tentar buscar preço atual dos tokens presos via GMGN token/info
+    gmgn_prices = {}
+    gmgn_client = GmgnClient()
+    for mint in list(stuck_mints)[:10]:  # limitar a 10 para não gastar rate limit
+        try:
+            info = gmgn_client.get_token_info(mint, chain="sol")
+            if info:
+                price_usd = float(info.get("price") or 0)
+                gmgn_prices[mint] = price_usd
+        except Exception:
+            pass
+        _time.sleep(0.15)
+
+    # 6. Calcular valor estimado dos tokens presos
+    def token_usd(mint, ui_amt):
+        p = gmgn_prices.get(mint, 0)
+        if p and ui_amt:
+            return p * ui_amt
+        return None
+
+    # === HTML ===
+    def status_badge(s):
+        colors = {"tp": "#4CAF50", "sl": "#f44336", "error": "#FF9800",
+                  "expired": "#9E9E9E", "pending": "#2196F3", "done": "#4CAF50"}
+        c = colors.get(s, "#888")
+        return f'<span style="color:{c};font-weight:bold">{s}</span>'
+
+    stuck_rows = ""
+    total_stuck_usd = 0.0
+    for t in tokens_in_wallet:
+        mint = t["mint"]
+        if mint not in stuck_mints:
+            continue
+        trade = trade_by_mint[mint]
+        usd_val = token_usd(mint, t["ui_amount"])
+        if usd_val:
+            total_stuck_usd += usd_val
+        entry_mc = trade["entry_expected"]
+        ts_sig   = trade["ts_signal"]
+        ts_str   = ts_sig.strftime("%m/%d %H:%M") if ts_sig else "—"
+        usd_str  = f"${usd_val:.2f}" if usd_val else "N/A"
+        stuck_rows += f"""<tr>
+          <td style="font-size:10px">{ts_str}</td>
+          <td style="font-size:10px"><a href="https://solscan.io/token/{mint}" target="_blank" style="color:#4FC3F7">{mint[:16]}…</a></td>
+          <td>{status_badge(trade['status'])}</td>
+          <td>{t['ui_amount']:.2f}</td>
+          <td style="color:{'#4CAF50' if usd_val else '#888'}">{usd_str}</td>
+          <td style="font-size:10px">{trade.get('order_id','—') or '—'}</td>
+        </tr>"""
+
+    unknown_rows = ""
+    for t in tokens_in_wallet:
+        if t["mint"] in stuck_mints:
+            continue
+        mint   = t["mint"]
+        usd_val = token_usd(mint, t["ui_amount"])
+        usd_str = f"${usd_val:.2f}" if usd_val else "N/A"
+        unknown_rows += f"""<tr>
+          <td style="font-size:10px"><a href="https://solscan.io/token/{mint}" target="_blank" style="color:#4FC3F7">{mint[:16]}…</a></td>
+          <td>{t['ui_amount']:.2f}</td>
+          <td style="color:#888">{usd_str}</td>
+          <td><a href="https://gmgn.ai/sol/token/{mint}" target="_blank" style="color:#FF9800;font-size:10px">GMGN ↗</a></td>
+        </tr>"""
+
+    # Trades no DB com status != done/tp que NÃO têm tokens na wallet
+    missing_rows = ""
+    for mint, trade in sorted(resolved_no_token.items(), key=lambda x: x[1]["ts_signal"] or ""):
+        ts_sig = trade["ts_signal"]
+        ts_str = ts_sig.strftime("%m/%d %H:%M") if ts_sig else "—"
+        missing_rows += f"""<tr>
+          <td style="font-size:10px">{ts_str}</td>
+          <td style="font-size:10px"><a href="https://solscan.io/token/{mint}" target="_blank" style="color:#4FC3F7">{mint[:16]}…</a></td>
+          <td>{status_badge(trade['status'])}</td>
+          <td style="color:#888;font-size:10px">{trade.get('order_id','—') or '—'}</td>
+        </tr>"""
+
+    h = f"""<!DOCTYPE html><html><head>
+<meta charset="utf-8">
+<title>Wallet Tokens — NeideBOT</title>
+<style>
+  body {{ background:#111; color:#ddd; font-family:monospace; padding:20px; }}
+  h1,h2,h3 {{ color:#FFD700; }}
+  table {{ border-collapse:collapse; width:100%; margin:12px 0; font-size:12px; }}
+  th,td {{ border:1px solid #333; padding:6px 8px; text-align:left; }}
+  th {{ background:#1e1e1e; color:#aaa; }}
+  tr:hover {{ background:#1a1a1a; }}
+  .box {{ background:#1a1a1a; border:1px solid #333; padding:16px; border-radius:6px; margin:12px 0; }}
+  a {{ color:#4FC3F7; }}
+  .warn {{ color:#FF9800; }} .ok {{ color:#4CAF50; }} .bad {{ color:#f44336; }}
+</style>
+</head><body>
+<h1>Wallet Tokens — Forense de Posições</h1>
+<p>Wallet: <a href="https://solscan.io/account/{WALLET}#spl-transfers" target="_blank"><code>{WALLET}</code></a></p>
+<p>RPC: <code>{RPC_URL.split('/')[2]}</code> | SOL/USD: ${sol_usd:.2f}</p>
+
+<div class="box">
+  <h2>Resumo</h2>
+  <table style="width:auto">
+    <tr><th>Saldo SOL</th><td><b>{sol_bal:.6f} SOL</b> (${sol_bal*sol_usd:.2f})</td></tr>
+    <tr><th>Tokens SPL na wallet</th><td>{len(tokens_in_wallet)}</td></tr>
+    <tr><th>Tokens de trades (presos?)</th><td class="warn">{len(stuck_mints)} | valor estimado: ${total_stuck_usd:.2f}</td></tr>
+    <tr><th>Tokens sem trade registrado</th><td class="warn">{len(unknown_mints)}</td></tr>
+    <tr><th>Trades sem token na wallet</th><td style="color:#888">{len(resolved_no_token)} (resolvidos/vendidos/perdidos)</td></tr>
+  </table>
+</div>
+
+<div class="box">
+  <h2>⚠️ Tokens Presos — de trades registrados no DB ({len(stuck_mints)})</h2>
+  <p style="color:#888;font-size:11px">Tokens que vieram de um trade e ainda estão na wallet — podem ter SL não executado ou TP não disparado.</p>
+  {"<table><tr><th>Data Trade</th><th>Mint</th><th>Status DB</th><th>Quantidade</th><th>Valor Atual</th><th>Order ID</th></tr>" + stuck_rows + "</table>" if stuck_mints else "<p class='ok'>Nenhum — todos os tokens de trades foram vendidos.</p>"}
+</div>
+
+<div class="box">
+  <h2>Tokens Desconhecidos na Wallet ({len(unknown_mints)})</h2>
+  <p style="color:#888;font-size:11px">Tokens sem trade correspondente no DB — podem ser de trades manuais ou airdrops.</p>
+  {"<table><tr><th>Mint</th><th>Quantidade</th><th>Valor</th><th>Links</th></tr>" + unknown_rows + "</table>" if unknown_mints else "<p class='ok'>Nenhum.</p>"}
+</div>
+
+<div class="box">
+  <h2>Trades no DB sem Token na Wallet ({len(resolved_no_token)})</h2>
+  <p style="color:#888;font-size:11px">Trades com status != done/tp mas cujo token NÃO está mais na wallet — posição resolvida (vendida pela GMGN, SL executado on-chain, ou token sem valor).</p>
+  {"<table><tr><th>Data</th><th>Mint</th><th>Status</th><th>Order ID</th></tr>" + missing_rows + "</table>" if resolved_no_token else "<p class='ok'>Nenhum.</p>"}
+</div>
+
+<p style="color:#555;font-size:11px">
+  Preços via GMGN (primeiros 10 tokens). Tokens sem preço = token muito novo ou sem liquidez.<br>
+  Para ver todas as txs: <a href="/debug/wallet-audit">Wallet Audit</a>
+</p>
 </body></html>"""
     return h
 
