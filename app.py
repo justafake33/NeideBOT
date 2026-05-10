@@ -7922,5 +7922,239 @@ def _persistence_sim_inner():
     return h
 
 
+@app.route("/debug/trade-audit")
+def debug_trade_audit():
+    """
+    Auditoria completa dos 48 trades de calibração.
+    Mostra tudo que temos no banco para correlacionar com Solscan.
+    """
+    import traceback
+    try:
+        return _trade_audit_inner()
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
+def _trade_audit_inner():
+    sol_usd = _get_sol_usd() or 88.0
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT id, symbol, mint, ts_signal, ts_order_sent, ts_order_confirmed,
+                   order_id, strategy_id,
+                   amount_sol, amount_usd, tokens_received,
+                   entry_price_sol, entry_price_usd,
+                   fee_sol, slippage_pct, latency_sec,
+                   tp_pct, sl_pct, status, exit_type, exit_ts,
+                   pnl_pct_real, pnl_pct_expected,
+                   mc_bottom, mc_migration, entry_expected,
+                   error_msg, created_at
+            FROM trades
+            ORDER BY created_at ASC
+        """)
+        trades = [dict(r) for r in cur.fetchall()]
+
+    # ---------- Agregados ----------
+    total_trades   = len(trades)
+    total_sol_in   = sum((t.get("amount_sol") or 0) for t in trades)
+    total_fee_sol  = sum((t.get("fee_sol")    or 0) for t in trades)
+    total_fee_usd  = total_fee_sol * sol_usd
+
+    status_counts = {}
+    for t in trades:
+        s = t.get("status") or "unknown"
+        status_counts[s] = status_counts.get(s, 0) + 1
+
+    # Trades com fee_sol capturado vs não capturado
+    with_fee    = sum(1 for t in trades if t.get("fee_sol") and t["fee_sol"] > 0)
+    without_fee = total_trades - with_fee
+
+    # Slippage médio
+    slips = [t["slippage_pct"] for t in trades if t.get("slippage_pct") is not None]
+    avg_slip = (sum(slips) / len(slips) * 100) if slips else 0
+
+    def brt(dt):
+        if not dt: return "—"
+        return (dt + BRT).strftime("%m/%d %H:%M:%S")
+
+    def sol_str(v, decimals=6):
+        if v is None: return "—"
+        return f"{v:.{decimals}f}"
+
+    # ---------- Tabela de trades ----------
+    rows = []
+    for t in trades:
+        status = t.get("status") or "?"
+        color = {"tp": "#4CAF50", "sl": "#f44336", "trailing_active": "#FF9800",
+                 "expired": "#9E9E9E", "error": "#FF5722", "open": "#2196F3",
+                 "pending": "#607D8B"}.get(status, "#888")
+
+        order_id = t.get("order_id") or "—"
+        order_short = order_id[:16] + "…" if len(order_id) > 16 else order_id
+
+        fee_sol_v  = t.get("fee_sol") or 0
+        fee_usd_v  = fee_sol_v * sol_usd
+        slip_v     = t.get("slippage_pct")
+        slip_str   = f"{slip_v*100:+.2f}%" if slip_v is not None else "—"
+
+        pnl = t.get("pnl_pct_real")
+        pnl_str = f"{pnl*100:+.1f}%" if pnl is not None else "—"
+        pnl_color = "#4CAF50" if pnl and pnl > 0 else "#f44336" if pnl and pnl < 0 else "#888"
+
+        rows.append(f"""
+        <tr>
+          <td>{t['id']}</td>
+          <td><b>{t.get('symbol','?')}</b></td>
+          <td style="font-size:10px;color:#888">{brt(t.get('ts_signal'))}</td>
+          <td style="font-size:10px">{sol_str(t.get('amount_sol'),5)} SOL</td>
+          <td style="font-size:10px">{sol_str(t.get('entry_price_sol'),8)}</td>
+          <td style="font-size:10px">{int(t['tokens_received']) if t.get('tokens_received') else '—'}</td>
+          <td style="color:{'#f44336' if fee_sol_v==0 else '#ccc'};font-size:10px">
+            {sol_str(fee_sol_v,6)} SOL<br>
+            <span style="color:#888">${fee_usd_v:.4f}</span>
+          </td>
+          <td style="font-size:10px;color:#aaa">{slip_str}</td>
+          <td><span style="color:{color}">{status}</span></td>
+          <td style="color:{pnl_color}">{pnl_str}</td>
+          <td style="font-size:9px;color:#666;word-break:break-all" title="{order_id}">{order_short}</td>
+          <td style="font-size:9px;color:#555;word-break:break-all">{(t.get('mint') or '')[:16]}…</td>
+        </tr>""")
+
+    rows_html = "\n".join(rows)
+
+    # ---------- Instruções Solscan ----------
+    wallet_hint = os.getenv("GMGN_WALLET_ADDRESS", "")
+    wallet_display = wallet_hint if wallet_hint else "— configure GMGN_WALLET_ADDRESS —"
+    wallet_link = f"https://solscan.io/account/{wallet_hint}#transfers" if wallet_hint else "#"
+
+    # Datas do range de calibração
+    if trades:
+        dt_start = min((t["created_at"] for t in trades if t.get("created_at")), default=None)
+        dt_end   = max((t["created_at"] for t in trades if t.get("created_at")), default=None)
+        range_str = f"{brt(dt_start)} → {brt(dt_end)}"
+    else:
+        range_str = "—"
+
+    # Breakdown esperado vs capturado
+    gmgn_fee_pct  = 0.01  # 1% por swap
+    expected_gmgn = total_sol_in * gmgn_fee_pct * sol_usd  # buy side only (sell unknown)
+    captured_str  = f"${total_fee_usd:.4f}" if total_fee_usd > 0 else "R$0 (não capturado)"
+
+    h = f"""<!DOCTYPE html><html><head>
+<meta charset="utf-8">
+<title>Trade Audit — NeideBOT</title>
+<style>
+  body {{ background:#111; color:#ddd; font-family:monospace; padding:20px; }}
+  h1,h2,h3 {{ color:#FFD700; }}
+  table {{ border-collapse:collapse; width:100%; margin:16px 0; font-size:12px; }}
+  th,td {{ border:1px solid #333; padding:6px 8px; text-align:left; vertical-align:top; }}
+  th {{ background:#1e1e1e; color:#aaa; }}
+  tr:hover {{ background:#1a1a1a; }}
+  .box {{ background:#1a1a1a; border:1px solid #333; padding:16px; border-radius:6px; margin:16px 0; }}
+  .warn {{ color:#FF9800; }}
+  .ok {{ color:#4CAF50; }}
+  .bad {{ color:#f44336; }}
+  a {{ color:#4FC3F7; }}
+  code {{ background:#222; padding:2px 6px; border-radius:3px; }}
+</style>
+</head><body>
+<h1>Trade Audit — Calibração $1/trade</h1>
+<p style="color:#888">Dados do banco + instruções para correlacionar com Solscan</p>
+
+<div class="box">
+  <h2>Resumo</h2>
+  <table style="width:auto">
+    <tr><th>Total trades</th><td>{total_trades}</td></tr>
+    <tr><th>Range de datas (BRT)</th><td>{range_str}</td></tr>
+    <tr><th>SOL total enviado</th><td>{sol_str(total_sol_in,5)} SOL (${total_sol_in*sol_usd:.2f})</td></tr>
+    <tr><th>Status breakdown</th><td>{"  |  ".join(f"{k}: {v}" for k,v in status_counts.items())}</td></tr>
+    <tr><th>fee_sol capturado no DB</th><td>{captured_str}
+      <span class="warn"> ({with_fee}/{total_trades} trades com fee)</span></td></tr>
+    <tr><th>Slippage médio capturado</th><td>{avg_slip:.2f}%</td></tr>
+    <tr><th>GMGN 1% fee estimado (só buy)</th><td class="warn">${expected_gmgn:.2f}</td></tr>
+  </table>
+  <p class="warn"><b>Atenção:</b> o campo <code>fee_sol</code> do banco vem da resposta do GMGN
+  ao poll do fill (<code>query_order</code>). Se o GMGN não retornou esse campo,
+  fica 0 — <b>não significa que não foi cobrado</b>. A taxa real só aparece on-chain.</p>
+</div>
+
+<div class="box">
+  <h2>Como investigar no Solscan</h2>
+  <p><b>Wallet:</b> <a href="{wallet_link}" target="_blank"><code>{wallet_display}</code></a></p>
+  <p>Abra o link acima e vá na aba <b>Transfers</b> ou <b>Transactions</b>.</p>
+  <p><b>Range de tempo para filtrar:</b> {range_str}</p>
+
+  <h3>O que procurar em cada transação</h3>
+  <ol>
+    <li><b>Swap de compra (SOL → TOKEN):</b>
+      <ul>
+        <li>Aparece como: saída de SOL + entrada de token na wallet</li>
+        <li>Na aba "Transaction", você vê: <b>Transaction Fee</b> (base, ~0.000005 SOL) e <b>Priority Fee</b></li>
+        <li>Jito tip: procure por uma pequena transferência SOL para um endereço terminando em <code>tip</code> ou para <a href="https://solscan.io/account/T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt" target="_blank">T1pyy…</a> (conta tip Jito)</li>
+        <li>GMGN fee: deduzido do swap internamente — aparece como diferença no output amount</li>
+      </ul>
+    </li>
+    <li><b>Swap de venda (TOKEN → SOL) — executado pelo GMGN quando TP/SL bate:</b>
+      <ul>
+        <li>Aparece como: saída de token + entrada de SOL</li>
+        <li><b>Este tx tem fee/tip pagos PELO GMGN, mas debitados da sua wallet</b></li>
+        <li>Comparar: SOL recebido vs valor esperado pelo TP/SL</li>
+      </ul>
+    </li>
+  </ol>
+
+  <h3>Fórmula para calcular friction de cada trade</h3>
+  <pre style="background:#1e1e1e;padding:12px;border-radius:4px">
+Friction = (SOL_total_saiu_da_wallet) - (SOL_recebido_na_venda)
+         = SOL_enviado_na_compra + fees_buy + tips_buy
+           - SOL_recebido_na_venda + fees_sell + tips_sell
+
+# Onde:
+#   SOL_enviado_na_compra ≈ amount_sol abaixo (o capital real do trade)
+#   fees_buy + tips_buy   = o que aparece além do amount_sol na tx de compra
+#   fees_sell + tips_sell = aparece deduzido do retorno na tx de venda
+  </pre>
+
+  <h3>Endereços de tip Jito (para identificar na tx)</h3>
+  <pre style="background:#1e1e1e;padding:12px;border-radius:4px">
+T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt
+96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5
+HFqU5x63VTqvB8ky8HFGjWGcuGkEbT9fvkdnxwxGaHi
+Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY
+ADaUMid9sspnBwsm7iHSTe4q3YFe4EtUBfyvYTyMSXgo
+DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh
+ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt
+DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL
+96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5
+  </pre>
+</div>
+
+<h2>Todos os {total_trades} trades — dados do banco</h2>
+<table>
+  <tr>
+    <th>#</th><th>Token</th><th>Timestamp (BRT)</th>
+    <th>SOL enviado</th><th>Preço entry</th><th>Tokens rec.</th>
+    <th>Fee (DB)</th><th>Slippage</th>
+    <th>Status</th><th>P&L</th>
+    <th>Order ID</th><th>Mint</th>
+  </tr>
+  {rows_html}
+</table>
+
+<div class="box">
+  <h2>O que o banco NÃO captura (lacunas na auditoria)</h2>
+  <ul>
+    <li><b>Fee da venda (condition_orders):</b> quando o GMGN executa o TP/SL, ele cria uma transação de venda separada usando credenciais da sua wallet. O fee dessa tx <b>não volta para o bot</b> — só aparece on-chain.</li>
+    <li><b>Jito tip real:</b> a GMGN pode ignorar os valores de <code>priority_fee="0.0001"</code> que mandamos e usar valores próprios (mínimo recomendado deles: 0.002-0.006 SOL para condition_orders). Essa é a hipótese principal do $20 perdido.</li>
+    <li><b>GMGN platform fee (1%):</b> deduzido internamente no swap, não aparece como campo separado — só como diferença entre SOL enviado × preço de mercado vs tokens recebidos.</li>
+  </ul>
+  <p class="warn"><b>Hipótese principal:</b> a condition_orders (TP/SL) gera pelo menos 1 transação de venda adicional. Se o GMGN usa 0.003 SOL de tip por conta própria: <code>48 trades × 0.003 SOL × ${sol_usd:.0f}/SOL = ${48*0.003*sol_usd:.2f}</code> só em tips de saída.</p>
+</div>
+
+<p style="color:#555;font-size:11px">SOL/USD usado: ${sol_usd:.2f} | {total_trades} trades</p>
+</body></html>"""
+    return h
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
