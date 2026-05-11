@@ -9320,6 +9320,7 @@ tr:hover td{background:#161b22}
 <h1>Simulação: Entrada com Dip Limit (−{DIP_PCT*100:.0f}%)</h1>
 <div class='nav'>
   <a href='/trades'>Trades</a><a href='/analise/wr-breakdown'>WR Breakdown</a>
+  <a href='?dip=0.05'>dip −5%</a>
   <a href='?dip=0.10'>dip −10%</a>
   <a href='?dip=0.15'>dip −15%</a>
   <a href='?dip=0.20'>dip −20%</a>
