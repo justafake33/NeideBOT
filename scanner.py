@@ -28,7 +28,7 @@ F_BOT_MAX        = float(os.getenv("FILTER_BOT_MAX",        "0.80"))  # dados: s
 F_SNIPER_MAX     = float(os.getenv("FILTER_SNIPER_MAX",     "0.05"))  # dados: >5% recovery cai de 33% para 14%
 F_RAT_MAX        = float(os.getenv("FILTER_RAT_MAX",        "0.20"))
 F_TOP10_MAX      = float(os.getenv("FILTER_TOP10_MAX",      "0.50"))  # dados: >40% recovery cai para 7-15%
-F_SMART_MIN      = int(os.getenv(  "FILTER_SMART_MIN",      "0"))     # dados: não discrimina — desativado
+F_SMART_MIN      = int(os.getenv(  "FILTER_SMART_MIN",      "2"))     # live: smart=1 → 0% WR (n=6). smart=2 → 20%, smart=3 → 57%
 F_WASH_BLOCK     = os.getenv(      "FILTER_WASH_BLOCK",     "true").lower() == "true"
 BC_MIN_WATCHLIST = float(os.getenv("BC_MIN_WATCHLIST",      "80"))
 F_MC_MIN         = float(os.getenv("FILTER_MC_MIN",         "5000"))
@@ -192,7 +192,7 @@ class HotMonitor:
     # Bounce detector
     # ------------------------------------------------------------------
 
-    BOUNCE_MIN_PCT       = float(os.getenv("BOUNCE_MIN_PCT",         "0.15"))  # bounce mínimo do mc_min
+    BOUNCE_MIN_PCT       = float(os.getenv("BOUNCE_MIN_PCT",         "0.30"))  # A.7: bounce mínimo 30% (live WR 9.1% abaixo disso)
     BOUNCE_MAX_PCT       = float(os.getenv("BOUNCE_MAX_PCT",         "0.55"))  # bounce máximo — bloqueia entradas tardias (55% above bottom)
     BOUNCE_DROP_MIN      = float(os.getenv("BOUNCE_DROP_MIN",        "0.30"))  # queda mínima da migração
     BOUNCE_TIME_MAX      = float(os.getenv("BOUNCE_TIME_MAX",        "20.0"))  # A.5: janela 30→20min (100% TPs em ≤20min)
