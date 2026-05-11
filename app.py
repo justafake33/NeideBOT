@@ -9201,19 +9201,19 @@ def _wr_breakdown_inner():
                 m.liq_migration,
                 m.has_social,
                 m.cto_flag,
-                -- H9: melhor sinal type 12 antes do bounce
+                -- H9: melhor sinal type 12 antes do bounce (trigger_at é BIGINT unix ts)
                 (
                     SELECT COUNT(*)
                     FROM token_signals ts
                     WHERE ts.mint = t.mint
-                      AND ts.trigger_at <= COALESCE(t.ts_signal, t.created_at)
+                      AND TO_TIMESTAMP(ts.trigger_at) <= COALESCE(t.ts_signal, t.created_at)
                 ) AS n_h9_signals,
                 (
                     SELECT MIN(ts.trigger_mc / NULLIF(m2.mc_migration, 0))
                     FROM token_signals ts
                     JOIN migrations m2 ON m2.mint = ts.mint
                     WHERE ts.mint = t.mint
-                      AND ts.trigger_at <= COALESCE(t.ts_signal, t.created_at)
+                      AND TO_TIMESTAMP(ts.trigger_at) <= COALESCE(t.ts_signal, t.created_at)
                 ) AS h9_best_ratio
             FROM trades t
             LEFT JOIN bounce_signals b ON b.mint = t.mint
