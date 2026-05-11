@@ -2,17 +2,23 @@
 Helius WebSocket — preço real-time via logsSubscribe + parse Anchor direto.
 
 Fluxo por token:
-  1. subscribe(mint, pool_address, total_supply)
-       → logsSubscribe(pool_address) no WebSocket Helius (~200ms pós on-chain)
-  2. Swap detectado na notificação:
-       → Tier 1: parse Program data: <base64> da notificação (zero chamadas, ~0ms)
+  1. subscribe(mint, total_supply)
+       → logsSubscribe(mentions=[mint]) — qualquer tx que mencione o mint,
+         sem precisar descobrir o pool address. Subscrição imediata na migração.
+  2. Swap detectado na notificação (~200ms pós on-chain):
+       → Tier 1: parse Program data: <base64> (zero chamadas, ~0ms)
          O Meteora DAMM v2 é Anchor — emite SwapEvent com in_amount/out_amount
-         no próprio payload que já recebemos. Preço exato sem custo extra.
-       → Tier 2: DexScreener fallback se o parse falhar (1-3s, gratuito)
+         no próprio payload. Preço exato sem custo extra.
+       → Tier 2: DexScreener fallback se parse falhar (1-3s, gratuito)
   3. cancel(mint) → logsUnsubscribe
 
+Por que mentions=[mint] e não mentions=[pool]:
+  - Pool address requer chamada ao DexScreener antes da subscrição
+  - DexScreener leva 1-5min para indexar tokens novos — janela do V-bottom perdida
+  - O mint já é conhecido na migração; está sempre presente em transações de swap
+  - Ruído extra (transfers, LP) filtrado pelo check "Instruction: Swap"
+
 Rate limit: 1 parse por 2s por token.
-Tokens em dump ativo geram 5-20 swaps/s — não precisamos processar todos.
 """
 import base64
 import hashlib
@@ -29,8 +35,9 @@ logger = logging.getLogger(__name__)
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
 _WS_URL        = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 
-# Program ID do Meteora DAMM v2 (CP AMM)
+# Program IDs relevantes para filtrar swaps (Meteora DAMM v2 e Raydium AMM v4)
 METEORA_PROGRAM = "cpamdpKoS7RUn9RDdHsS3SuRH5BVTTvovCHQnGFumm9"
+RAYDIUM_PROGRAM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 
 _RATE_LIMIT_SEC = 2.0
 _TOKEN_DECIMALS = 6        # Pump.fun SPL tokens (6 casas decimais)
@@ -48,15 +55,8 @@ def _anchor_disc(event_name: str) -> bytes:
     return hashlib.sha256(f"event:{event_name}".encode()).digest()[:8]
 
 
-# Candidatos para o nome do evento de swap do Meteora DAMM v2.
-# O programa se chama "cpamd" (CP AMM Dynamic) — tentamos as variações mais prováveis.
-_SWAP_DISCS: set[bytes] = {
-    _anchor_disc("Swap"),
-    _anchor_disc("SwapEvent"),
-    _anchor_disc("CpAmmSwapEvent"),
-    _anchor_disc("AddLiquidity"),   # ignoramos se bater — detectado pelo check de swap abaixo
-}
-# Apenas estes dois são eventos de swap (os outros são líquidos — descartamos)
+# Candidatos para o nome do evento de swap do Meteora DAMM v2 (CP AMM Dynamic).
+# Se nenhum bater em produção, o log INFO mostra o disc.hex() real para adicionar aqui.
 _SWAP_ONLY_DISCS: set[bytes] = {
     _anchor_disc("Swap"),
     _anchor_disc("SwapEvent"),
@@ -66,24 +66,22 @@ _SWAP_ONLY_DISCS: set[bytes] = {
 
 def _parse_swap_amounts(raw: bytes) -> tuple[int, int] | None:
     """
-    Tenta extrair (in_amount_raw, out_amount_raw) de um evento Anchor de swap.
+    Extrai (in_amount_raw, out_amount_raw) de um evento Anchor de swap.
 
-    Layout do payload após 8 bytes de discriminador:
+    Layout após 8 bytes de discriminador:
       pool:       Pubkey  = 32 bytes (ignorado)
-      in_amount:  u64     = 8 bytes  ← montante de entrada (lamports OU raw tokens)
-      out_amount: u64     = 8 bytes  ← montante de saída
+      in_amount:  u64     = 8 bytes
+      out_amount: u64     = 8 bytes
 
     Recebe bytes já decodificados de base64.
     """
-    # Mínimo: discriminador(8) + pool(32) + in_amount(8) + out_amount(8) = 56 bytes
-    if len(raw) < 56:
+    if len(raw) < 56:  # disc(8) + pool(32) + in(8) + out(8)
         return None
 
-    disc = raw[:8]
-    if disc not in _SWAP_ONLY_DISCS:
+    if raw[:8] not in _SWAP_ONLY_DISCS:
         return None
 
-    offset     = 8 + 32  # pula discriminador + pool pubkey
+    offset     = 8 + 32
     in_amount  = struct.unpack_from("<Q", raw, offset)[0]
     out_amount = struct.unpack_from("<Q", raw, offset + 8)[0]
 
@@ -95,12 +93,12 @@ def _parse_swap_amounts(raw: bytes) -> tuple[int, int] | None:
 
 def _mc_from_amounts(in_raw: int, out_raw: int, supply: float, sol_usd: float) -> float | None:
     """
-    Computa MC em USD a partir de in_amount/out_amount de um swap SOL↔Token.
-    Tenta as duas direções (compra e venda) e aceita a que der MC plausível.
+    Computa MC em USD a partir dos montantes de um swap SOL↔Token.
+    Tenta as duas direções e aceita a que produzir MC plausível ($1K–$10M).
     """
     supply = supply or 1_000_000_000
 
-    # Direção 1: in=SOL(lamports), out=token(raw) → compra de token
+    # Direção 1: in=SOL(lamports), out=token(raw) → compra
     sol_in  = in_raw  / 10 ** _SOL_DECIMALS
     tok_out = out_raw / 10 ** _TOKEN_DECIMALS
     if tok_out > 0:
@@ -108,7 +106,7 @@ def _mc_from_amounts(in_raw: int, out_raw: int, supply: float, sol_usd: float) -
         if _MC_MIN < mc1 < _MC_MAX:
             return mc1
 
-    # Direção 2: in=token(raw), out=SOL(lamports) → venda de token
+    # Direção 2: in=token(raw), out=SOL(lamports) → venda
     tok_in  = in_raw  / 10 ** _TOKEN_DECIMALS
     sol_out = out_raw / 10 ** _SOL_DECIMALS
     if tok_in > 0:
@@ -121,11 +119,8 @@ def _mc_from_amounts(in_raw: int, out_raw: int, supply: float, sol_usd: float) -
 
 def _parse_mc_from_logs(logs: list, supply: float, sol_usd: float) -> float | None:
     """
-    Percorre os logs de uma logsNotification e retorna o MC calculado
-    a partir dos eventos Anchor. Retorna None se nada reconhecido.
-
-    Loga INFO para discriminadores desconhecidos — ajuda a identificar o nome
-    correto do evento do Meteora DAMM v2 na primeira execução real.
+    Percorre os logs e retorna o MC calculado dos eventos Anchor.
+    Loga INFO para discriminadores desconhecidos — calibração rápida em produção.
     """
     for log in logs:
         if not log.startswith("Program data: "):
@@ -141,7 +136,6 @@ def _parse_mc_from_logs(logs: list, supply: float, sol_usd: float) -> float | No
 
         disc = raw[:8]
         if disc not in _SWAP_ONLY_DISCS:
-            # Discriminador não reconhecido — loga para calibrar na produção
             logger.info(
                 "HeliusWS: Program data desconhecido disc=%s len=%d — "
                 "adicionar a _SWAP_ONLY_DISCS se for swap do Meteora DAMM v2",
@@ -152,8 +146,7 @@ def _parse_mc_from_logs(logs: list, supply: float, sol_usd: float) -> float | No
         result = _parse_swap_amounts(raw)
         if result is None:
             continue
-        in_raw, out_raw = result
-        mc = _mc_from_amounts(in_raw, out_raw, supply, sol_usd)
+        mc = _mc_from_amounts(result[0], result[1], supply, sol_usd)
         if mc:
             return mc
     return None
@@ -164,18 +157,16 @@ def _parse_mc_from_logs(logs: list, supply: float, sol_usd: float) -> float | No
 # ─────────────────────────────────────────────────────────────────────────────
 
 class HeliusWS:
-    """WebSocket manager — rastreamento de preço via Helius logsSubscribe."""
+    """WebSocket manager — subscrição por mint, sem depender de pool address."""
 
     def __init__(self, on_price: Callable[[str, float], None]):
         """on_price(mint, market_cap_usd) — compatível com HotMonitor.push_mc."""
         self._on_price = on_price
 
-        self._mint_pool:   dict[str, str]   = {}
-        self._pool_mint:   dict[str, str]   = {}
-        self._mint_supply: dict[str, float] = {}
-        self._sub_id_mint: dict[int, str]   = {}
-        self._req_mint:    dict[int, str]   = {}
-        self._last_fetch:  dict[str, float] = {}
+        self._mint_supply: dict[str, float] = {}   # mint → total_supply
+        self._sub_id_mint: dict[int, str]   = {}   # ws_sub_id → mint
+        self._req_mint:    dict[int, str]   = {}   # req_id → mint (aguardando confirmação)
+        self._last_fetch:  dict[str, float] = {}   # mint → timestamp último parse
 
         self._lock      = threading.Lock()
         self._ws_lock   = threading.Lock()
@@ -196,26 +187,22 @@ class HeliusWS:
         threading.Thread(target=self._run_loop, daemon=True, name="helius-ws").start()
         logger.info("HeliusWS iniciado (url=%s...)", _WS_URL[:40])
 
-    def subscribe(self, mint: str, pool_address: str, total_supply: float):
+    def subscribe(self, mint: str, total_supply: float):
+        """Subscreve ao mint no WebSocket — sem precisar do pool address."""
         with self._lock:
-            if mint in self._mint_pool:
+            if mint in self._mint_supply:
                 return
-            self._mint_pool[mint]        = pool_address
-            self._pool_mint[pool_address] = mint
-            self._mint_supply[mint]      = total_supply
+            self._mint_supply[mint] = total_supply
 
         if self._connected:
-            self._send_subscribe(mint, pool_address)
+            self._send_subscribe(mint)
+        # Se não conectado ainda, _on_open resubscreve tudo de _mint_supply
 
-        logger.info("HeliusWS: subscribe %s pool=%s...", mint[:8], pool_address[:8])
+        logger.info("HeliusWS: subscribe mint=%s...", mint[:8])
 
     def unsubscribe(self, mint: str):
         sub_id_to_remove = None
         with self._lock:
-            self._mint_pool.pop(mint, None)
-            pool = next((p for p, m in self._pool_mint.items() if m == mint), None)
-            if pool:
-                self._pool_mint.pop(pool, None)
             self._mint_supply.pop(mint, None)
             self._last_fetch.pop(mint, None)
             for sid, m in list(self._sub_id_mint.items()):
@@ -279,11 +266,11 @@ class HeliusWS:
         with self._lock:
             self._sub_id_mint.clear()
             self._req_mint.clear()
-            active = list(self._mint_pool.items())
+            active = list(self._mint_supply.keys())
 
         logger.info("HeliusWS conectado — resubscrevendo %d tokens", len(active))
-        for mint, pool in active:
-            self._send_subscribe(mint, pool)
+        for mint in active:
+            self._send_subscribe(mint)
 
     def _on_message(self, ws, message):
         try:
@@ -312,18 +299,16 @@ class HeliusWS:
         if value.get("err"):
             return
 
-        signature = value.get("signature")
-        if not signature:
-            return
-
         with self._lock:
             mint = self._sub_id_mint.get(sub_id)
         if not mint:
             return
 
         logs = value.get("logs", [])
+
+        # Filtra: só swaps dos DEXes relevantes
         is_swap = any(
-            METEORA_PROGRAM in log or "Instruction: Swap" in log
+            METEORA_PROGRAM in log or RAYDIUM_PROGRAM in log or "Instruction: Swap" in log
             for log in logs
         )
         if not is_swap:
@@ -337,8 +322,6 @@ class HeliusWS:
             self._last_fetch[mint] = now
             supply = self._mint_supply.get(mint)
 
-        # Processa na mesma thread do WS se o parse for rápido (Anchor logs),
-        # ou em thread separada apenas para o fallback DexScreener (I/O bloqueante)
         threading.Thread(
             target=self._fetch_and_notify,
             args=(mint, supply, logs),
@@ -359,18 +342,13 @@ class HeliusWS:
 
     def _fetch_and_notify(self, mint: str, supply: Optional[float], logs: list):
         """
-        Tier 1 — Parse Anchor event dos logs (zero chamadas, ~0ms):
-          Program data: <base64> já contém in_amount/out_amount do swap.
-          Decodificamos Borsh com o discriminador do Meteora DAMM v2.
-
-        Tier 2 — DexScreener fallback (1-3s) se o parse falhar:
-          Programa novo, IDL mudou, formato diferente, etc.
+        Tier 1 — Parse Anchor event dos logs (~0ms, zero chamadas extras).
+        Tier 2 — DexScreener se parse falhar (1-3s).
         """
         from gmgn_client import get_sol_usd
 
         supply = supply or 1_000_000_000
 
-        # Tier 1: parse direto dos logs Anchor
         sol_usd = get_sol_usd()
         if sol_usd:
             try:
@@ -382,7 +360,6 @@ class HeliusWS:
             except Exception as e:
                 logger.debug("HeliusWS anchor parse %s: %s", mint[:8], e)
 
-        # Tier 2: DexScreener
         from pool_resolver import get_price_usd
         try:
             price_usd = get_price_usd(mint)
@@ -397,7 +374,7 @@ class HeliusWS:
     # Helpers
     # ──────────────────────────────────────────────────────────────────
 
-    def _send_subscribe(self, mint: str, pool: str):
+    def _send_subscribe(self, mint: str):
         req_id = self._next_req_id()
         with self._lock:
             self._req_mint[req_id] = mint
@@ -406,7 +383,7 @@ class HeliusWS:
             "id":      req_id,
             "method":  "logsSubscribe",
             "params":  [
-                {"mentions": [pool]},
+                {"mentions": [mint]},
                 {"commitment": "processed"},
             ],
         })

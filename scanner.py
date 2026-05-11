@@ -119,24 +119,12 @@ class HotMonitor:
                 }
                 added = True
 
-        # Helius: resolve pool address em background e subscreve ao WebSocket
-        if added and self._helius:
-            threading.Thread(
-                target=self._resolve_and_subscribe,
-                args=(mint, total_supply),
-                daemon=True,
-                name=f"pool-{mint[:6]}",
-            ).start()
-
-    def _resolve_and_subscribe(self, mint: str, total_supply: float):
-        """Background: descobre pool address via DexScreener e subscreve ao Helius."""
-        import pool_resolver
-        try:
-            pool = pool_resolver.get_pool_address(mint)
-            if pool and self._helius and mint not in self._cancelled:
-                self._helius.subscribe(mint, pool, total_supply)
-        except Exception as e:
-            logger.debug("_resolve_and_subscribe %s: %s", mint[:8], e)
+        # Helius: subscrição imediata por mint — sem precisar do pool address
+        if added and self._helius and mint not in self._cancelled:
+            try:
+                self._helius.subscribe(mint, total_supply)
+            except Exception as e:
+                logger.debug("helius.subscribe %s: %s", mint[:8], e)
 
     def cancel(self, mint: str):
         with self._lock:
