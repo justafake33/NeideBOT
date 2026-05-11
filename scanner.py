@@ -205,6 +205,7 @@ class HotMonitor:
     # ------------------------------------------------------------------
 
     BOUNCE_MIN_PCT       = float(os.getenv("BOUNCE_MIN_PCT",         "0.15"))  # bounce mínimo do mc_min
+    BOUNCE_MAX_PCT       = float(os.getenv("BOUNCE_MAX_PCT",         "0.55"))  # bounce máximo — bloqueia entradas tardias (55% above bottom)
     BOUNCE_DROP_MIN      = float(os.getenv("BOUNCE_DROP_MIN",        "0.30"))  # queda mínima da migração
     BOUNCE_TIME_MAX      = float(os.getenv("BOUNCE_TIME_MAX",        "20.0"))  # A.5: janela 30→20min (100% TPs em ≤20min)
     BOTTOM_FRESHNESS_SEC = int(os.getenv(  "BOTTOM_FRESHNESS_SEC",  "300"))   # A.6: máx 5min desde o último mc_min
@@ -229,6 +230,10 @@ class HotMonitor:
 
         bounce_pct = (mc - mc_min) / mc_min
         if bounce_pct < self.BOUNCE_MIN_PCT:
+            return
+        if self.BOUNCE_MAX_PCT < 1.0 and bounce_pct > self.BOUNCE_MAX_PCT:
+            logger.debug("BOUNCE skip %s — bounce tardio=%.1f%% (max=%.0f%%)",
+                         mint[:8], bounce_pct * 100, self.BOUNCE_MAX_PCT * 100)
             return
 
         # A.6 — Bottom freshness: sinal deve vir logo após o fundo ser confirmado.

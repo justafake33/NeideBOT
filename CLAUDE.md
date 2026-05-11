@@ -500,10 +500,10 @@ SENTRY_DSN=xxxx              # DSN padrão (não o obsoleto)
 # Filtros do Scanner (configuráveis sem redeploy)
 FILTER_RUG_MAX=0.15          # máx token["rug_ratio"] (score interno GMGN, 0-1)
 FILTER_BUNDLER_MAX=0.20      # máx bundler_trader_amount_rate (% bundlers real)
-FILTER_BOT_MAX=0.50          # máx bot_degen_rate
+FILTER_BOT_MAX=0.80          # máx bot_degen_rate (default código=0.80, não discrimina WR em live trades)
 FILTER_RAT_MAX=0.20          # máx rat_trader_amount_rate
 FILTER_TOP10_MAX=0.80        # máx top_10_holder_rate
-FILTER_SMART_MIN=1           # mín smart_degen_count
+FILTER_SMART_MIN=2           # mín smart_degen_count (smart=1 → 0% WR live, n=6)
 FILTER_WASH_BLOCK=true       # bloquear is_wash_trading
 FILTER_MC_MIN=5000           # MC mínimo USD
 FILTER_MC_MAX=200000         # MC máximo USD
@@ -516,7 +516,7 @@ HOT_PRECISE_SEC=5            # alinhado com trenches poll — mc_min sempre fres
 MIGRATION_SOL_UNITS=410      # SOL teórico da bonding curve → mc_migration_bc_ref
 
 # Bounce detector (configuráveis sem redeploy)
-BOUNCE_MIN_PCT=0.15          # bounce mínimo do fundo para disparar sinal (15%)
+BOUNCE_MIN_PCT=0.30          # bounce mínimo do fundo para disparar sinal — A.7 (era 0.15; 15-20% → 9.1% WR live, n=11)
 BOUNCE_DROP_MIN=0.30         # drop mínimo da migração para considerar (30%)
 BOUNCE_TIME_MAX=20.0         # A.5: janela máxima em minutos (100% TPs em ≤20min)
 BOTTOM_FRESHNESS_SEC=300     # A.6: máx 5min desde o último mc_min (bloqueia sinais tardios)
@@ -555,6 +555,8 @@ ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
 | `/analise/invalidos` | **Sinais tardios** — diagnóstico dos 52% de bounces inválidos, impacto Helius, filtro A.6 |
 | `/analise/a6-trades` | **Retroativo A.6** — dos 50 trades reais, quantos A.6 teria bloqueado e se eram bons/ruins |
 | `/analise/h9` | H9 — token_signals type 12 vs recovery rate por faixa de trigger_mc/mc_migration |
+| `/analise/wr-breakdown` | **Discriminadores de WR** — cross-referencia trades com migrations/bounce_signals/H9. Suporta `?since=YYYY-MM-DD` |
+| `/analise/dip-entry-sim` | **Simulação dip entry** — e se esperássemos queda X% do sinal antes de entrar? Suporta `?dip=0.05` até `?dip=0.25` |
 | `/debug/signal` | Diagnóstico histórico — testa formatos do token_signal (legacy) |
 | `/debug/signal-live` | **Fase 2** — chama get_token_signal(), mostra matches com HotMonitor e últimos sinais salvos |
 | `/debug/executor-status` | **Diagnóstico do pipeline de trading** — TRADING_ENABLED, limite trades, HotMonitor ativo, último bounce |
@@ -639,27 +641,40 @@ ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
 72. **HOT_PRECISE_SEC reduzido de 30s para 5s** (2026-05-10): alinhado com o poll do trenches. A cada 5s tanto trenches quanto kline rodam — mc_min é sempre o mais preciso possível quando `_check_bounce()` dispara. Rate limit: 10 tokens → 5.8 peso/s vs limite de 10. O `time.sleep(0.5)` entre tokens distribui as chamadas sem burst.
 73. **Frequência filtrada real vs calibração**: calibração (48 trades/48h) foi sem A.6. Com todos os filtros ativos (A.2+A.3+A.6): frequência estimada de 7-8 sinais válidos/dia (vs 24 brutos). A.6 bloqueia 92% dos inválidos, que eram 52% do total → reduz ~47% dos sinais brutos. A.2 bloqueia mais 39%. WR sobe de 15.1% para estimado 29% em troca da menor frequência.
 74. **Meta 1 BTC via volume, não via size**: estratégia correta é manter $50-100/trade e maximizar frequência de sinais válidos. A $100/trade com 8 sinais/dia e Jupiter (EV ~17%/trade): ~$136/dia → ~$50k/ano. Para atingir ~$100k/ano: re-entry (+50-80% frequência) + Jupiter/Helius + mercado ativo (~20 sinais/dia). Não escalar size acima de $100-200 — o edge é no volume de trades qualificados, não no size.
+75. **TradeMonitor overwrite bug — CORRIGIDO** (2026-05-11): `get_open_trades()` incluía status `'trailing_active'`, mantendo trades em monitoramento após GMGN executar o trailing stop. Após 4h (`MONITOR_MAX_AGE_H=4`), o TradeMonitor sobrescrevia status para `'expired'` — apagando o registro de TP. Corrigido: `get_open_trades()` agora retorna apenas `status='open'`. `trailing_active` é estado terminal — GMGN gerencia a saída, código não toca mais. `wr-breakdown` trata `expired` com `pnl_pct_real > 0` como TP para dados históricos.
+76. **WR real confirmado: 29% em 31 trades pós-fix (2026-05-11)**: 9 TP / 22 SL. Consistente com estimativa histórica de ~29% pós-A.2+A.3. Filtros ativos: A.2, A.3, A.5, A.6. Gate de escala $1→$10 tecnicamente atingido (WR ≥ 20% em ≥30 trades), mas novos filtros A.7 + smart≥2 recém-adicionados — aguardar 20+ trades com novos filtros antes de escalar.
+77. **A.7 — Bounce mínimo 30% (2026-05-11)**: `BOUNCE_MIN_PCT` elevado de 0.15 para 0.30. Dados live (n=11 trades com 15-20% bounce): WR 9.1% — pior que qualquer outra faixa. Dead zone estende-se abaixo de 30%, não apenas 20-30% (A.2). Com A.7, A.2 torna-se redundante como safety net. WR esperado pós-filtro: ~40%.
+78. **FILTER_SMART_MIN elevado para 2 (2026-05-11)**: smart=1 → 0% WR em 6/6 trades live (GOBBI, 🟥🟩, Goblin, Troll, OARPE, Birdclaw — todos SL). smart=2 → 20% WR. smart=3 → 57% WR. Contradiz análise histórica de tokens (sem discriminação), mas é consistente na execução live. Possível explicação: no token-level, smart_count acumula holders históricos; no trade-level, smart=1 pode indicar token sem demanda suficiente para bounce sustentado.
+79. **Estratégia de dip entry REFUTADA (2026-05-11)**: testado aguardar queda de -5%, -10%, -15%, -20%, -25% do sinal antes de entrar. Todos os thresholds pioraram o WR. Razão: tokens com demanda real (SS, OCEAN, BIRDCLAW) nunca retrocederam o suficiente — foram direto ao TP. Quando o token SÍ retrocedeu (goingpt, OG, NOEL), continuou caindo até o SL mesmo com nova entrada mais baixa. Conclusão: o timing de entrada atual está correto. O problema era qualidade dos sinais (filtros), não quando entrar.
+80. **H9 em trades live (2026-05-11, n=31 trades)**: sem sinal H9 → 24% WR (n=25). Com H9 qualquer → 50% WR (n=6, +21pp). H9 ratio < 0.80 (preditivo) → **75% WR (n=4)**. H9 ratio > 1.00 (pós-bounce) → 0% WR (n=2, reverse causality confirmada). Sinal mais forte encontrado nos dados live. Gate para adicionar como filtro: n≥15 na zona ratio<0.80. Candidato a multiplicador de size (2× quando H9 ratio<0.80 presente).
+81. **FILTER_BOT_MAX default no código é 0.80 (não 0.50)**: código usa `os.getenv("FILTER_BOT_MAX", "0.80")`. O valor 0.50 no CLAUDE.md estava desatualizado. bot_degen_rate não discrimina WR em live trades — o único TP real (BIRDCLAW) tinha 77% de bots. Não alterar este filtro.
 
 ---
 
-## 🔄 Estado Atual: Bot ativo a $1/trade (2026-05-10)
+## 🔄 Estado Atual: Bot ativo a $1/trade (2026-05-11)
 
 ### Pipeline ativo
-Bot relançado com `TRADING_ENABLED=true`, `CALIBRATION_AMOUNT_USD=1.0`, `CALIBRATION_MAX_TRADES=999999`.
+`TRADING_ENABLED=true`, `CALIBRATION_AMOUNT_USD=1.0`, `CALIBRATION_MAX_TRADES=999999`.
 
-**Melhorias ativas vs calibração original:**
-- A.4 desativado → entrada imediata ao sinal
-- A.6 adicionado → bloqueia sinais com fundo estagnado (92% dos inválidos)
-- Trailing TP → avg 159% vs 71% TP fixo (simulação n=119)
-- logger.debug→info no DRY-RUN: executor agora loga quando TRADING_ENABLED=false
-- /debug/executor-status: diagnóstico completo do pipeline em um endpoint
-- `_precise_bottom_tick()` dispara `_check_bounce()` com kline close → elimina entradas 50-100% acima do fundo
-- HOT_PRECISE_SEC=5s → alinhado com trenches poll, mc_min sempre fresco
+**Filtros ativos (ordem de aplicação no _check_bounce):**
+- A.2: bloqueia bounce_pct 20-30% (dead zone histórica)
+- A.3: bloqueia entry 50-65% do mc_migration (zona morta absoluta)
+- A.5: bloqueia elapsed > 20min (BOUNCE_TIME_MAX)
+- A.6: bloqueia fundo estagnado > 5min (BOTTOM_FRESHNESS_SEC)
+- **A.7 (novo 2026-05-11)**: bloqueia bounce_pct < 30% (BOUNCE_MIN_PCT=0.30 — era 0.15)
+- **smart≥2 (novo 2026-05-11)**: FILTER_SMART_MIN=2 — smart=1 → 0% WR live
 
-**Aguardando (próxima semana):**
-- WR real com A.6 ativo (30+ trades) — valor desconhecido, calibração foi sem A.6
-- Frequência real de sinais válidos/dia com filtros completos
-- Esses dois números definem o caminho para escalar
+**WR real confirmado (2026-05-11):**
+- 31 trades pós-fix: **29% WR** (9 TP / 22 SL)
+- Gate de escala $1→$10 atingido (≥30 trades, WR ≥ 20%)
+- Aguardando 20+ trades com novos filtros A.7+smart≥2 antes de escalar
+
+**Discriminadores identificados em dados live:**
+- H9 ratio < 0.80: **75% WR** (n=4) — maior sinal encontrado, aguardando n≥15
+- creator_hold: **60% WR** (n=5) — aguardando n≥10
+- bounce ≥ 30%: **36-44% WR** (confirmado, A.7 implementado)
+- TTB < 10min: **43% WR** (+14pp vs baseline)
+- smart=3: **57% WR** (n=7) — padrão não monotônico, aguardar mais dados
 
 **Próximos passos — ver ROADMAP.md**
 
