@@ -319,17 +319,27 @@ class TradeMonitor:
                 logger.debug("TradeMonitor trade #%s: %s", trade.get("id"), e)
 
     def _check_trade(self, trade: dict, sol_usd: float, now: datetime):
-        trade_id   = trade["id"]
-        mint       = trade["mint"]
-        symbol     = trade.get("symbol", mint[:8])
-        entry_mc   = trade.get("entry_expected")
-        tp_pct     = trade.get("tp_pct") or (TRAILING_ACTIVATION_PCT / 100)
-        sl_pct     = trade.get("sl_pct") or TRADE_SL_PCT
-        created_at = trade.get("created_at")
-        ref_ts     = trade.get("ts_order_sent") or trade.get("ts_signal") or created_at
+        trade_id        = trade["id"]
+        mint            = trade["mint"]
+        symbol          = trade.get("symbol", mint[:8])
+        entry_mc        = trade.get("entry_expected")
+        tp_pct          = trade.get("tp_pct") or (TRAILING_ACTIVATION_PCT / 100)
+        sl_pct          = trade.get("sl_pct") or TRADE_SL_PCT
+        created_at      = trade.get("created_at")
+        ref_ts          = trade.get("ts_order_sent") or trade.get("ts_signal") or created_at
+        entry_price_usd = trade.get("entry_price_usd")   # preço real de fill (USD gasto)
+        tokens_received = trade.get("tokens_received")   # tokens recebidos no fill
 
         if not entry_mc or entry_mc <= 0:
             return
+
+        # Calcula MC real de entrada a partir do fill, se disponível.
+        # entry_price_usd = SOL_gasto × SOL/USD. price_per_token = entry_price_usd / tokens.
+        # MC = price_per_token × supply (sempre 1B em tokens Pump.fun).
+        entry_mc_real = None
+        if entry_price_usd and tokens_received and tokens_received > 0 and sol_usd > 0:
+            price_per_token_usd = entry_price_usd / tokens_received
+            entry_mc_real = price_per_token_usd * 1_000_000_000
 
         # Trades muito antigos sem ticks → marca expired
         if created_at:
@@ -339,8 +349,13 @@ class TradeMonitor:
                 db.update_trade(trade_id, {"status": "expired", "exit_type": "expired", "exit_ts": now})
                 return
 
-        tp_mc = entry_mc * (1 + tp_pct)
-        sl_mc = entry_mc * (1 - sl_pct)
+        # SL usa entry_mc real se disponível; fallback para entry_expected.
+        # TP/trailing só dispara com entry_mc real — entry_expected × 1.75 é baixo
+        # demais para trades antigos (entrada real era 30-100% acima do esperado),
+        # gerando falsos positivos que mostram +75% quando o real foi -15%.
+        sl_ref  = entry_mc_real or entry_mc
+        sl_mc   = sl_ref * (1 - sl_pct)
+        tp_mc   = entry_mc_real * (1 + tp_pct) if entry_mc_real else None
 
         ticks = db.get_ticks_after(mint, min_ts=ref_ts)
         if not ticks:
@@ -351,8 +366,9 @@ class TradeMonitor:
             low     = float(tick["mc_low"]  or 0)
             tick_ts = tick["tick_ts"]
 
-            if high >= tp_mc:
-                # trailing: activation level atingida — GMGN trailing continua rodando
+            # TP/trailing: só detecta se temos o preço real de fill.
+            # Sem entry_mc_real, tp_mc é None e este bloco nunca executa.
+            if tp_mc and high >= tp_mc:
                 self._record_exit(trade, "trailing_active", tp_pct, tick_ts, sol_usd)
                 return
             if low > 0 and low <= sl_mc:
@@ -362,11 +378,14 @@ class TradeMonitor:
     def _record_exit(self, trade: dict, exit_type: str, pnl_target: float,
                      exit_ts, sol_usd: float):
         """
-        Registra saída no DB com P&L real calculado a partir dos dados de fill.
+        Registra saída no DB.
 
-        P&L bruto = pnl_target (tp_pct ou -sl_pct) — condition_orders disparam
-        exatamente nessa porcentagem sobre o preço de fill.
-        P&L líquido = P&L bruto − fee_fraction (fee_sol / fill_sol).
+        exit_type interno: "trailing_active" | "sl"
+        status gravado: "trailing_active" (TP detectado, GMGN gerencia trailing)
+                        "sl" (SL detectado via token_ticks)
+        P&L: pnl_target bruto − fee_frac. Negativo para SL, positivo para trailing.
+        Para trailing_active, pnl_pct_real é o nível de ativação (+75%), não o exit real.
+        O exit real depende do trailing do GMGN — pode ser maior ou menor.
         """
         trade_id   = trade["id"]
         symbol     = trade.get("symbol", trade["mint"][:8])
@@ -378,7 +397,6 @@ class TradeMonitor:
         fee_frac = (fee_sol / fill_sol) if fill_sol > 0 else 0.0
         pnl_real = pnl_target - fee_frac
 
-        # Valor de saída em USD
         exit_usd = amount_usd * (1 + pnl_target)
 
         db.update_trade(trade_id, {

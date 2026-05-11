@@ -5225,13 +5225,17 @@ _TRADES_HTML = """
   td     { padding: 5px 8px; border-bottom: 1px solid #21262d; }
   tr:hover td { background: #161b22; }
   .badge { border-radius: 4px; padding: 2px 6px; font-size: 11px; }
-  .b-pending  { background: #3d3b00; color: #d29922; }
-  .b-open     { background: #003d00; color: #3fb950; }
+  .b-pending          { background: #3d3b00; color: #d29922; }
+  .b-open             { background: #003d00; color: #3fb950; }
   .b-strategy_pending { background: #003d3d; color: #39d0d0; }
-  .b-tp_hit   { background: #003d00; color: #3fb950; }
-  .b-sl_hit   { background: #3d0000; color: #f85149; }
-  .b-error    { background: #3d0000; color: #f85149; }
-  .b-timeout  { background: #3d3b00; color: #d29922; }
+  .b-tp_hit           { background: #003d00; color: #3fb950; }
+  .b-trailing_active  { background: #004d20; color: #56d364; }
+  .b-sl_hit           { background: #3d0000; color: #f85149; }
+  .b-sl               { background: #3d0000; color: #f85149; }
+  .b-error            { background: #3d0000; color: #f85149; }
+  .b-timeout          { background: #3d3b00; color: #d29922; }
+  .b-expired          { background: #2d2d2d; color: #8b949e; }
+  .est { color: #8b949e; font-size: 10px; }
   .section    { padding: 16px; }
 </style>
 </head>
@@ -5284,6 +5288,11 @@ _TRADES_HTML = """
       <span class="{% if t.pnl_pct_real > 0 %}green{% else %}red{% endif %}">
         {{ "%+.1f%%"|format(t.pnl_pct_real*100) }}
       </span>
+      {% if t.status == 'trailing_active' %}
+        <span class="est">⚡trailing</span>
+      {% endif %}
+    {% elif t.status in ('open', 'pending') %}
+      <span class="est">GMGN</span>
     {% else %}—{% endif %}
   </td>
   <td>{{ t.strategy_id[:12] if t.strategy_id else '—' }}</td>
@@ -5310,12 +5319,15 @@ def trades_dashboard():
         ts = t.get("ts_signal")
         t["ts_signal_brt"] = (ts + BRT).strftime("%m/%d %H:%M:%S") if ts else None
 
-    # Métricas
-    closed   = [t for t in trades_raw if t["status"] in ("tp_hit", "sl_hit")]
-    tp_count = sum(1 for t in trades_raw if t["status"] == "tp_hit")
-    sl_count = sum(1 for t in trades_raw if t["status"] == "sl_hit")
+    # Métricas — statuses reais do TradeMonitor: "sl", "trailing_active", "expired"
+    TP_STATUSES = ("tp_hit", "trailing_active")
+    SL_STATUSES = ("sl_hit", "sl")
+    OPEN_STATUSES = ("open", "pending", "strategy_pending")
+    closed   = [t for t in trades_raw if t["status"] in TP_STATUSES + SL_STATUSES]
+    tp_count = sum(1 for t in trades_raw if t["status"] in TP_STATUSES)
+    sl_count = sum(1 for t in trades_raw if t["status"] in SL_STATUSES)
     err_count= sum(1 for t in trades_raw if t["status"] == "error")
-    open_cnt = sum(1 for t in trades_raw if t["status"] in ("open", "pending", "strategy_pending"))
+    open_cnt = sum(1 for t in trades_raw if t["status"] in OPEN_STATUSES)
 
     win_rate     = tp_count / len(closed) if closed else None
     latencies    = [t["latency_sec"] for t in trades_raw if t.get("latency_sec")]
@@ -6904,6 +6916,232 @@ def _calibration_inner():
   Friction = EV_teórico − EV_real (inclui GMGN fee, tip, priority, slippage).
 </p>
 </body></html>"""
+
+
+@app.route("/analise/sl-investigation")
+def analise_sl_investigation():
+    """
+    Investigação dos SL trades: quantos eram runners que perdemos por SL apertado?
+    Mostra para cada SL: mc_bottom, entry, SL floor, low real, recovery (mc_1h).
+    Identifica padrão W-bottom: tokens que foram abaixo do SL floor mas depois subiram.
+    """
+    try:
+        return _sl_investigation_inner()
+    except Exception as e:
+        import traceback
+        return f"<pre>{traceback.format_exc()}</pre>", 500
+
+
+def _sl_investigation_inner():
+    SL_PCT  = float(os.getenv("TRADE_SL_PCT", "0.15"))
+    TP_PCT  = 0.75  # trailing activation
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                t.id,
+                t.symbol,
+                t.mint,
+                t.ts_signal,
+                t.mc_bottom,
+                t.entry_expected,
+                t.status,
+                t.exit_type,
+                t.pnl_pct_real,
+                b.mc_min        AS bottom_kline,
+                b.mc_at_signal  AS entry_signal,
+                b.bounce_pct,
+                m.mc_1h,
+                m.mc_migration,
+                m.time_to_bottom
+            FROM trades t
+            LEFT JOIN bounce_signals b ON b.mint = t.mint
+            LEFT JOIN migrations     m ON m.mint = t.mint
+            WHERE t.status IN ('sl', 'sl_hit', 'open', 'trailing_active', 'expired')
+               OR t.exit_type IN ('sl', 'sl_hit')
+            ORDER BY t.id DESC
+            LIMIT 100
+        """)
+        trades = [dict(r) for r in cur.fetchall()]
+
+    rows = []
+    for t in trades:
+        mint        = t["mint"]
+        ts_signal   = t["ts_signal"]
+        mc_bottom   = t["bottom_kline"] or t["mc_bottom"]
+        entry_mc    = t["entry_signal"] or t["entry_expected"]
+        if not mc_bottom or not entry_mc:
+            continue
+
+        sl_floor = entry_mc * (1 - SL_PCT)
+
+        # Ticks após o sinal para ver o trajeto real de preço
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT
+                    MIN(COALESCE(mc_low, mc)) AS actual_low,
+                    MAX(COALESCE(mc_high, mc)) AS actual_high,
+                    COUNT(*) AS n_ticks
+                FROM token_ticks
+                WHERE mint = %s AND tick_ts >= %s
+            """, (mint, ts_signal))
+            tick_agg = cur.fetchone()
+
+        actual_low  = tick_agg["actual_low"]  if tick_agg else None
+        actual_high = tick_agg["actual_high"] if tick_agg else None
+        n_ticks     = tick_agg["n_ticks"]     if tick_agg else 0
+
+        mc_1h        = t.get("mc_1h")
+        recovery_ref = mc_1h or actual_high
+
+        # Quanto o preço caiu abaixo do fundo detectado
+        w_depth_pct = (actual_low / mc_bottom - 1) if actual_low and mc_bottom else None
+        # Quanto subiu no pico
+        peak_gain   = (actual_high / entry_mc - 1) if actual_high and entry_mc else None
+        # O SL floor ficou ABAIXO do fundo real? (i.e., o SL está colado no fundo)
+        sl_vs_bottom = (sl_floor / mc_bottom - 1) if mc_bottom else None
+        # O token era um runner? (mc_1h > entry × 2.0 = +100%)
+        is_runner   = recovery_ref and entry_mc and recovery_ref >= entry_mc * 2.0
+        # O low real cruzou o SL floor?
+        crossed_sl  = actual_low and actual_low <= sl_floor
+        # Runner perdido: cruzou SL mas depois subiu muito
+        lost_runner = crossed_sl and is_runner
+
+        rows.append({
+            **t,
+            "mc_bottom":     mc_bottom,
+            "entry_mc":      entry_mc,
+            "sl_floor":      sl_floor,
+            "sl_vs_bottom":  sl_vs_bottom,
+            "actual_low":    actual_low,
+            "actual_high":   actual_high,
+            "w_depth_pct":   w_depth_pct,
+            "peak_gain":     peak_gain,
+            "mc_1h":         mc_1h,
+            "n_ticks":       n_ticks,
+            "is_runner":     is_runner,
+            "crossed_sl":    crossed_sl,
+            "lost_runner":   lost_runner,
+        })
+
+    total          = len(rows)
+    n_crossed_sl   = sum(1 for r in rows if r["crossed_sl"])
+    n_runners      = sum(1 for r in rows if r["is_runner"])
+    n_lost_runners = sum(1 for r in rows if r["lost_runner"])
+    # Distribuição de W-bottom depth nos lost runners
+    lr_depths      = [r["w_depth_pct"] for r in rows if r["lost_runner"] and r["w_depth_pct"] is not None]
+    lr_peaks       = [r["peak_gain"]   for r in rows if r["lost_runner"] and r["peak_gain"]   is not None]
+    # Profundidade média do W-bottom em todos os SL trades com ticks
+    all_depths     = [r["w_depth_pct"] for r in rows if r["w_depth_pct"] is not None]
+    # SL floor médio relativo ao mc_bottom
+    sl_vs_btm_vals = [r["sl_vs_bottom"] for r in rows if r["sl_vs_bottom"] is not None]
+    avg_sl_vs_btm  = sum(sl_vs_btm_vals)/len(sl_vs_btm_vals) if sl_vs_btm_vals else None
+
+    def _fp(v, mult=100): return f"{v*mult:+.1f}%" if v is not None else "—"
+    def _fm(v): return f"${v:,.0f}" if v is not None else "—"
+
+    _CSS = """<style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;font-size:12px}
+    h1{padding:14px 16px;color:#58a6ff;font-size:16px;border-bottom:1px solid #21262d}
+    h2{font-size:13px;color:#58a6ff;padding:8px 16px 4px;margin-top:12px}
+    .grid{display:flex;gap:10px;padding:8px 16px;flex-wrap:wrap}
+    .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 14px;min-width:120px}
+    .lbl{color:#8b949e;font-size:10px;margin-bottom:2px}
+    .val{font-size:16px;font-weight:bold}
+    .green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}.muted{color:#8b949e}
+    table{width:100%;border-collapse:collapse;margin:0 0 16px}
+    th{background:#161b22;color:#8b949e;padding:4px 8px;text-align:left;border-bottom:1px solid #30363d;font-size:10px;white-space:nowrap}
+    td{padding:3px 8px;border-bottom:1px solid #21262d;font-size:11px}
+    tr:hover td{background:#161b22}
+    .sec{padding:4px 16px 12px}
+    .insight{background:#0d2137;color:#79c0ff;padding:8px 14px;margin:6px 16px;border-radius:4px;font-size:11px;border-left:3px solid #58a6ff}
+    .warn{background:#3d2200;color:#d29922;padding:8px 14px;margin:6px 16px;border-radius:4px;font-size:11px}
+    .nav{padding:8px 16px;display:flex;gap:10px;flex-wrap:wrap;border-bottom:1px solid #21262d}
+    .nav a{color:#58a6ff;font-size:11px;text-decoration:none}
+    .runner{background:#1a2a1a}
+    .lost{background:#2a1a1a}
+    </style>"""
+
+    h = f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>SL Investigation</title>{_CSS}</head><body>"
+    h += "<h1>Investigação SL — Runners Perdidos</h1>"
+    h += "<div class='nav'><a href='/trades'>Trades</a><a href='/analise'>Analise</a></div>"
+
+    # Cards de resumo
+    h += "<div class='grid'>"
+    h += f"<div class='card'><div class='lbl'>SL trades</div><div class='val'>{total}</div></div>"
+    h += f"<div class='card'><div class='lbl'>Cruzaram SL floor</div><div class='val red'>{n_crossed_sl}</div></div>"
+    h += f"<div class='card'><div class='lbl'>Runners (≥+100% mc_1h)</div><div class='val yellow'>{n_runners}</div></div>"
+    h += f"<div class='card'><div class='lbl'>Runners PERDIDOS</div><div class='val red'>{n_lost_runners}</div></div>"
+    if avg_sl_vs_btm is not None:
+        h += f"<div class='card'><div class='lbl'>SL floor vs fundo (avg)</div><div class='val {'red' if avg_sl_vs_btm < 0 else 'green'}'>{_fp(avg_sl_vs_btm)}</div></div>"
+    h += "</div>"
+
+    # Diagnóstico
+    if avg_sl_vs_btm is not None and avg_sl_vs_btm > -0.05:
+        h += f"""<div class='warn'>
+⚠ SL floor médio está <b>{_fp(avg_sl_vs_btm)}</b> do mc_bottom detectado — praticamente no fundo.
+Qualquer retest do fundo (W-bottom) dispara o SL antes do rally real.
+</div>"""
+
+    if n_lost_runners > 0:
+        avg_depth = sum(lr_depths)/len(lr_depths) if lr_depths else None
+        avg_peak  = sum(lr_peaks)/len(lr_peaks)   if lr_peaks  else None
+        h += f"""<div class='insight'>
+📊 <b>Runners perdidos ({n_lost_runners}):</b>
+W-bottom médio = <b>{_fp(avg_depth)}</b> abaixo do mc_bottom detectado.
+Peak médio após entrada = <b>{_fp(avg_peak)}</b>.
+→ Para capturar esses runners, SL floor deveria estar ≥ <b>{_fp(min(lr_depths) if lr_depths else None)}</b> abaixo do fundo.
+</div>"""
+
+    # Tabela principal
+    h += "<h2>Detalhe por trade</h2><div class='sec'><table>"
+    h += "<tr><th>#</th><th>Symbol</th><th>Fundo</th><th>Entry</th><th>SL floor</th><th>SL vs fundo</th><th>Low real</th><th>W-depth</th><th>Peak</th><th>mc_1h</th><th>Runner?</th><th>Perdido?</th></tr>"
+
+    for r in rows:
+        row_cls = "runner" if r["is_runner"] and not r["lost_runner"] else ("lost" if r["lost_runner"] else "")
+        runner_icon = "🏆" if r["is_runner"] and not r["lost_runner"] else ("💸" if r["lost_runner"] else "💀")
+        sl_vs_btm_color = "red" if r["sl_vs_bottom"] and r["sl_vs_bottom"] > -0.05 else "green"
+        w_depth_color   = "red" if r["w_depth_pct"] and r["w_depth_pct"] < -0.05 else "yellow"
+
+        h += f"""<tr class='{row_cls}'>
+<td>{r['id']}</td>
+<td><b>{r['symbol'] or r['mint'][:8]}</b></td>
+<td>{_fm(r['mc_bottom'])}</td>
+<td>{_fm(r['entry_mc'])}</td>
+<td>{_fm(r['sl_floor'])}</td>
+<td class='{sl_vs_btm_color}'>{_fp(r['sl_vs_bottom'])}</td>
+<td>{_fm(r['actual_low'])}</td>
+<td class='{w_depth_color}'>{_fp(r['w_depth_pct'])}</td>
+<td class='green'>{_fp(r['peak_gain'])}</td>
+<td>{_fm(r['mc_1h'])}</td>
+<td>{"✅" if r['is_runner'] else "❌"}</td>
+<td>{runner_icon}</td>
+</tr>"""
+
+    h += "</table></div>"
+
+    # Insight sobre o SL ideal
+    if lr_depths:
+        # Qual SL (% abaixo do mc_bottom) capturaria os runners?
+        # SL deve estar abaixo do W-bottom mais profundo dos runners
+        # SL floor = mc_bottom × (1 + sl_floor_pct_below_bottom)
+        # Para capturar: sl_floor_pct_below_bottom < min(lr_depths)
+        safe_floor = min(lr_depths) - 0.02  # 2% de margem abaixo do pior W-bottom
+        # SL % from entry = 1 - (mc_bottom × (1+safe_floor)) / (mc_bottom × 1.15)
+        sl_from_entry = 1 - (1 + safe_floor) / 1.15
+        h += f"""<div class='insight'>
+💡 <b>Recomendação baseada nos dados:</b><br>
+W-bottom mais profundo nos runners perdidos: <b>{_fp(min(lr_depths))}</b> abaixo do mc_bottom.<br>
+SL floor ideal: mc_bottom × {(1+safe_floor):.2f} (= {_fp(safe_floor)} do fundo).<br>
+Traduzido para GMGN price_scale (de entry_expected): <b>~{sl_from_entry*100:.0f}%</b> em vez de {SL_PCT*100:.0f}%.<br>
+<br>
+Mas atenção: tokens que morrem também passam pelo W-bottom.
+Precisamos checar se os "mortos" foram mais fundo que os runners.
+</div>"""
+
+    h += "</body></html>"
+    return h
 
 
 @app.route("/debug/trade-analysis")

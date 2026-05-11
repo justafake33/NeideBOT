@@ -790,11 +790,11 @@ def get_trades(limit: int = 200) -> list:
 
 
 def get_open_trades() -> list:
-    """Retorna trades com status='open' e entry_price_sol preenchido."""
+    """Retorna trades ainda sob monitoramento (open + trailing_active aguardando saída real)."""
     with _cursor() as cur:
         cur.execute("""
             SELECT * FROM trades
-            WHERE status = 'open'
+            WHERE status IN ('open', 'trailing_active')
               AND entry_expected IS NOT NULL
             ORDER BY created_at ASC
         """)

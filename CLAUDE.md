@@ -512,7 +512,7 @@ FILTER_FEE_MIN=1.0           # fee mínimo em SOL
 BC_MIN_WATCHLIST=80          # % BC mínimo para watchlist
 MAX_MIG_AGE_SEC=600          # ignorar migrações > 10min no restart
 POLL_INTERVAL_SEC=5          # intervalo do scanner
-HOT_PRECISE_SEC=30           # intervalo kline hot-precise (B.4: era 60s)
+HOT_PRECISE_SEC=5            # alinhado com trenches poll — mc_min sempre fresco (era 30s)
 MIGRATION_SOL_UNITS=410      # SOL teórico da bonding curve → mc_migration_bc_ref
 
 # Bounce detector (configuráveis sem redeploy)
@@ -635,6 +635,10 @@ ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
 68. **Sinais inválidos são padrão estrutural, não latência** (2026-05-09): 52% dos bounces disparavam depois do pico. Hipótese de latência (Helius resolve) REFUTADA — P50 atraso = 6.7min, apenas 3.8% dentro da janela de 30s do GMGN. Padrão real: tokens com spike relâmpago em <3min (velocity 7.5× maior que válidos), dump de 10-20min, sinal em mini-rally tardio. Helius continua no roadmap mas como **redução de custo** (Jupiter swap), não como melhoria de sinal.
 69. **TradeMonitor "trailing_active"**: com trailing TP, o TradeMonitor soft-detector marca o trade como "trailing_active" quando price atinge a activation level (tp_pct armazenado = TRAILING_ACTIVATION_PCT/100). Não é saída real — GMGN condition_orders gerencia o trailing. É apenas visibilidade de que o trailing está ativo.
 70. **Inválidos A.6 não afetam os 50 trades reais**: retroativo mostrou que A.6 só teria bloqueado 1/50 trades (QUACK, que era TP). Os 50 trades executados eram todos "frescos" — o tick de menor MC estava a 0.1-4.5min do sinal. Os inválidos da análise geral são de períodos anteriores sem A.5 ativo.
+71. **`_precise_bottom_tick()` agora dispara `_check_bounce()`** (2026-05-10): após processar os candles de cada token, chama `_check_bounce()` com o close da vela mais recente. Antes, kline corrigia `mc_min` mas nunca disparava bounce — o sinal só vinha do poll trenches (5s depois), quando o preço já estava 50-100% acima do fundo corrigido. Fix: bounce agora dispara com fundo preciso (kline low) e preço atual (kline close), sem esperar o trenches.
+72. **HOT_PRECISE_SEC reduzido de 30s para 5s** (2026-05-10): alinhado com o poll do trenches. A cada 5s tanto trenches quanto kline rodam — mc_min é sempre o mais preciso possível quando `_check_bounce()` dispara. Rate limit: 10 tokens → 5.8 peso/s vs limite de 10. O `time.sleep(0.5)` entre tokens distribui as chamadas sem burst.
+73. **Frequência filtrada real vs calibração**: calibração (48 trades/48h) foi sem A.6. Com todos os filtros ativos (A.2+A.3+A.6): frequência estimada de 7-8 sinais válidos/dia (vs 24 brutos). A.6 bloqueia 92% dos inválidos, que eram 52% do total → reduz ~47% dos sinais brutos. A.2 bloqueia mais 39%. WR sobe de 15.1% para estimado 29% em troca da menor frequência.
+74. **Meta 1 BTC via volume, não via size**: estratégia correta é manter $50-100/trade e maximizar frequência de sinais válidos. A $100/trade com 8 sinais/dia e Jupiter (EV ~17%/trade): ~$136/dia → ~$50k/ano. Para atingir ~$100k/ano: re-entry (+50-80% frequência) + Jupiter/Helius + mercado ativo (~20 sinais/dia). Não escalar size acima de $100-200 — o edge é no volume de trades qualificados, não no size.
 
 ---
 
@@ -649,6 +653,13 @@ Bot relançado com `TRADING_ENABLED=true`, `CALIBRATION_AMOUNT_USD=1.0`, `CALIBR
 - Trailing TP → avg 159% vs 71% TP fixo (simulação n=119)
 - logger.debug→info no DRY-RUN: executor agora loga quando TRADING_ENABLED=false
 - /debug/executor-status: diagnóstico completo do pipeline em um endpoint
+- `_precise_bottom_tick()` dispara `_check_bounce()` com kline close → elimina entradas 50-100% acima do fundo
+- HOT_PRECISE_SEC=5s → alinhado com trenches poll, mc_min sempre fresco
+
+**Aguardando (próxima semana):**
+- WR real com A.6 ativo (30+ trades) — valor desconhecido, calibração foi sem A.6
+- Frequência real de sinais válidos/dia com filtros completos
+- Esses dois números definem o caminho para escalar
 
 **Próximos passos — ver ROADMAP.md**
 
