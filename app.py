@@ -9146,6 +9146,267 @@ def _wallet_tokens_inner():
     return h
 
 
+@app.route("/analise/dip-entry-sim")
+def analise_dip_entry_sim():
+    """
+    Simulação: e se esperássemos o preço cair X% desde o sinal antes de entrar?
+    Compara a estratégia atual (entrada imediata) vs entrada com dip limit.
+    """
+    import traceback
+    try:
+        return _dip_entry_sim_inner()
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
+def _dip_entry_sim_inner():
+    DIP_PCT   = float(request.args.get("dip",  "0.15"))  # % queda do sinal para gatilhar nova entrada
+    TP_PCT    = float(request.args.get("tp",   "0.75"))  # TP da nova entrada
+    SL_PCT    = float(request.args.get("sl",   "0.15"))  # SL da nova entrada
+
+    TP_STATUSES = ("tp_hit", "trailing_active")
+    SL_STATUSES = ("sl_hit", "sl")
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                t.id, t.symbol, t.mint, t.status, t.exit_type, t.pnl_pct_real,
+                t.ts_signal, t.created_at,
+                COALESCE(b.mc_at_signal, t.entry_expected) AS signal_price,
+                b.bounce_pct, b.drop_from_mig AS drop_pct, b.mc_min AS bottom_price
+            FROM trades t
+            LEFT JOIN bounce_signals b ON b.mint = t.mint
+            WHERE t.status IN ('tp_hit','trailing_active','sl_hit','sl','expired')
+              AND COALESCE(b.mc_at_signal, t.entry_expected) IS NOT NULL
+            ORDER BY t.id ASC
+        """)
+        trades = [dict(r) for r in cur.fetchall()]
+
+    def is_tp_real(t):
+        if t["status"] == "expired" and t.get("pnl_pct_real") and t["pnl_pct_real"] > 0:
+            return True
+        return t["status"] in TP_STATUSES or t["exit_type"] in TP_STATUSES
+
+    results = []
+    n_no_ticks = 0
+
+    for t in trades:
+        signal_price = float(t["signal_price"])
+        ref_ts       = t["ts_signal"] or t["created_at"]
+        mint         = t["mint"]
+        was_tp       = is_tp_real(t)
+
+        # Ticks após o sinal
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT tick_ts,
+                       COALESCE(mc_low,  mc) AS low,
+                       COALESCE(mc_high, mc) AS high,
+                       mc
+                FROM token_ticks
+                WHERE mint = %s AND tick_ts >= %s AND mc IS NOT NULL
+                ORDER BY tick_ts ASC
+            """, (mint, ref_ts))
+            ticks = [dict(r) for r in cur.fetchall()]
+
+        if not ticks:
+            n_no_ticks += 1
+            results.append({**t, "was_tp": was_tp, "sim": "no_ticks",
+                            "new_entry": None, "sim_tp": None, "sim_sl": None})
+            continue
+
+        # Gatilho: primeiro tick onde low <= signal_price * (1 - DIP_PCT)
+        dip_trigger  = signal_price * (1 - DIP_PCT)
+        new_entry    = None
+        trigger_idx  = None
+        for i, tick in enumerate(ticks):
+            if float(tick["low"]) <= dip_trigger:
+                new_entry   = dip_trigger  # entramos no preço alvo
+                trigger_idx = i
+                break
+
+        if new_entry is None:
+            # Preço nunca caiu o suficiente — não entramos
+            # Se era TP → perdemos o trade; se era SL → nos salvamos
+            sim = "missed_tp" if was_tp else "saved_sl"
+            results.append({**t, "was_tp": was_tp, "sim": sim,
+                            "new_entry": None, "sim_tp": None, "sim_sl": None,
+                            "dip_trigger": dip_trigger})
+            continue
+
+        # A partir da nova entrada, procura TP ou SL nos ticks seguintes
+        new_tp_price = new_entry * (1 + TP_PCT)
+        new_sl_price = new_entry * (1 - SL_PCT)
+        sim_outcome  = "open"  # se nenhum hit até o fim dos ticks
+
+        for tick in ticks[trigger_idx:]:
+            high = float(tick["high"])
+            low  = float(tick["low"])
+            if high >= new_tp_price:
+                sim_outcome = "tp"
+                break
+            if low > 0 and low <= new_sl_price:
+                sim_outcome = "sl"
+                break
+
+        results.append({
+            **t,
+            "was_tp":      was_tp,
+            "sim":         sim_outcome,
+            "new_entry":   new_entry,
+            "dip_trigger": dip_trigger,
+            "sim_tp":      new_tp_price,
+            "sim_sl":      new_sl_price,
+            "bottom_price": t.get("bottom_price"),
+            "entry_vs_bottom": (new_entry / float(t["bottom_price"]) - 1) if t.get("bottom_price") and t["bottom_price"] else None,
+        })
+
+    # ── Estatísticas ────────────────────────────────────────────────────────
+    real_closed  = [r for r in results if r["was_tp"] is not None and r["sim"] != "no_ticks"]
+    real_tp      = sum(1 for r in real_closed if r["was_tp"])
+    real_sl      = len(real_closed) - real_tp
+    real_wr      = real_tp / len(real_closed) if real_closed else 0
+
+    triggered    = [r for r in results if r["sim"] in ("tp", "sl", "open")]
+    missed_tp    = [r for r in results if r["sim"] == "missed_tp"]
+    saved_sl     = [r for r in results if r["sim"] == "saved_sl"]
+
+    sim_tp_count = sum(1 for r in triggered if r["sim"] == "tp")
+    sim_sl_count = sum(1 for r in triggered if r["sim"] == "sl")
+    sim_open     = sum(1 for r in triggered if r["sim"] == "open")
+    sim_closed   = [r for r in triggered if r["sim"] in ("tp", "sl")]
+    sim_wr       = sim_tp_count / len(sim_closed) if sim_closed else 0
+
+    # EV comparado
+    ev_real = real_tp * TP_PCT - real_sl * SL_PCT
+    ev_sim  = sim_tp_count * TP_PCT - sim_sl_count * SL_PCT
+
+    _CSS = """<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;font-size:12px}
+h1{padding:14px 16px;color:#58a6ff;font-size:16px;border-bottom:1px solid #21262d}
+h2{font-size:13px;color:#58a6ff;padding:8px 0 4px}
+.grid{display:flex;gap:10px;padding:12px 16px;flex-wrap:wrap}
+.card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px 16px;min-width:130px}
+.lbl{color:#8b949e;font-size:10px;margin-bottom:3px}
+.val{font-size:20px;font-weight:bold}
+.green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}.muted{color:#8b949e}.blue{color:#58a6ff}
+.block{padding:6px 16px 14px;border-bottom:1px solid #21262d}
+table{width:100%;border-collapse:collapse;margin:6px 0}
+th{background:#161b22;color:#8b949e;padding:4px 8px;text-align:left;border-bottom:1px solid #30363d;font-size:10px}
+td{padding:3px 8px;border-bottom:1px solid #21262d;font-size:11px}
+tr:hover td{background:#161b22}
+.nav{padding:8px 16px;display:flex;gap:12px;border-bottom:1px solid #21262d}
+.nav a{color:#58a6ff;font-size:11px;text-decoration:none}
+.insight{background:#0d2137;color:#79c0ff;padding:10px 14px;margin:8px 16px;border-radius:4px;font-size:12px;border-left:3px solid #58a6ff}
+.warn{background:#3d2200;color:#d29922;padding:10px 14px;margin:8px 16px;border-radius:4px;font-size:12px}
+.vs{display:flex;gap:24px;padding:12px 16px;align-items:flex-start;flex-wrap:wrap}
+.col{flex:1;min-width:200px;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px 16px}
+.col-title{color:#8b949e;font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px}
+.big{font-size:28px;font-weight:bold;margin-bottom:4px}
+.sub{font-size:11px;color:#8b949e}
+</style>"""
+
+    def _fp(v, mult=100): return f"{v*mult:+.1f}%" if v is not None else "—"
+    def _fm(v): return f"${v:,.0f}" if v is not None else "—"
+
+    # Comparativo visual
+    wr_delta  = sim_wr - real_wr
+    ev_delta  = ev_sim - ev_real
+    wr_color  = "green" if wr_delta > 0 else "red"
+    ev_color  = "green" if ev_delta > 0 else "red"
+
+    h = f"""<!DOCTYPE html><html><head><meta charset='utf-8'><title>Dip Entry Sim</title>{_CSS}</head><body>
+<h1>Simulação: Entrada com Dip Limit (−{DIP_PCT*100:.0f}%)</h1>
+<div class='nav'>
+  <a href='/trades'>Trades</a><a href='/analise/wr-breakdown'>WR Breakdown</a>
+  <a href='?dip=0.10'>dip −10%</a>
+  <a href='?dip=0.15'>dip −15%</a>
+  <a href='?dip=0.20'>dip −20%</a>
+  <a href='?dip=0.25'>dip −25%</a>
+</div>
+<p style='padding:6px 16px;color:#8b949e;font-size:11px'>
+  Lógica: aguarda preço cair {DIP_PCT*100:.0f}% do sinal → entra → TP +{TP_PCT*100:.0f}% / SL −{SL_PCT*100:.0f}% da nova entrada.
+  Trades sem ticks excluídos da simulação (n={n_no_ticks}).
+</p>
+
+<div class='vs'>
+  <div class='col'>
+    <div class='col-title'>📍 Atual — entrada imediata</div>
+    <div class='big {'green' if real_wr > 0.25 else 'red'}'>{real_wr*100:.1f}%</div>
+    <div class='sub'>WR | {real_tp} TP / {real_sl} SL / {len(real_closed)} fechados</div>
+    <div style='margin-top:10px;font-size:13px'>EV bruto: <b class='{'green' if ev_real >= 0 else 'red'}'>{_fp(ev_real/len(real_closed) if real_closed else None)}</b>/trade</div>
+  </div>
+  <div class='col'>
+    <div class='col-title'>⏳ Simulado — dip −{DIP_PCT*100:.0f}%</div>
+    <div class='big {wr_color}'>{sim_wr*100:.1f}%</div>
+    <div class='sub'>WR | {sim_tp_count} TP / {sim_sl_count} SL / {len(sim_closed)} fechados</div>
+    <div style='margin-top:10px;font-size:13px'>EV bruto: <b class='{'green' if ev_sim >= 0 else 'red'}'>{_fp(ev_sim/len(sim_closed) if sim_closed else None)}</b>/trade</div>
+  </div>
+  <div class='col'>
+    <div class='col-title'>📊 Delta</div>
+    <div class='big {wr_color}'>{wr_delta*100:+.1f}pp</div>
+    <div class='sub'>variação de WR</div>
+    <div style='margin-top:10px;font-size:13px'>
+      TPs perdidos: <b class='red'>{len(missed_tp)}</b><br>
+      SLs evitados: <b class='green'>{len(saved_sl)}</b><br>
+      Dip não atingido: <b class='muted'>{len(missed_tp)+len(saved_sl)}</b> trades (preço foi para cima direto)
+    </div>
+  </div>
+</div>
+"""
+
+    # Insight
+    if sim_wr > real_wr:
+        h += f"""<div class='insight'>
+✅ <b>A estratégia dip melhorou o WR em {wr_delta*100:+.1f}pp.</b><br>
+De {len(real_closed)} trades, {len(triggered)} teriam atingido o dip (entramos) e {len(saved_sl)+len(missed_tp)} não (preço subiu direto).<br>
+Dos {len(saved_sl)} SLs que não atingiram o dip: salvamos todos. Dos {len(missed_tp)} TPs que não atingiram: perdemos todos.<br>
+Tradeoff: <b>{len(saved_sl)} SLs evitados</b> vs <b>{len(missed_tp)} TPs perdidos</b>.
+</div>"""
+    else:
+        h += f"""<div class='warn'>
+⚠ A estratégia dip <b>piorou ou manteve</b> o WR ({wr_delta*100:+.1f}pp).<br>
+Muitos TPs foram perdidos porque o preço subiu sem retroceder {DIP_PCT*100:.0f}%.
+</div>"""
+
+    # Tabela de detalhes
+    sim_color = {"tp": "green", "sl": "red", "open": "yellow",
+                 "missed_tp": "red", "saved_sl": "green", "no_ticks": "muted"}
+    sim_label = {"tp": "TP ✅ (sim)", "sl": "SL 💀 (sim)", "open": "⏳ aberto",
+                 "missed_tp": "🚫 perdeu TP", "saved_sl": "💾 evitou SL", "no_ticks": "— sem ticks"}
+
+    rows = ""
+    for r in results:
+        real_cls  = "green" if r["was_tp"] else "red"
+        real_txt  = "TP" if r["was_tp"] else "SL"
+        s         = r["sim"]
+        sc        = sim_color.get(s, "muted")
+        sl_txt    = sim_label.get(s, s)
+        bp        = f"{r['bounce_pct']*100:.0f}%" if r.get("bounce_pct") else "—"
+        ne        = _fm(r.get("new_entry"))
+        evb       = f"{r['entry_vs_bottom']*100:+.1f}%" if r.get("entry_vs_bottom") is not None else "—"
+        rows += f"""<tr>
+<td>{r['id']}</td>
+<td><b>{r['symbol'] or r['mint'][:8]}</b></td>
+<td class='{real_cls}'>{real_txt}</td>
+<td>{bp}</td>
+<td class='{sc}'>{sl_txt}</td>
+<td>{ne}</td>
+<td class='muted'>{evb}</td>
+</tr>"""
+
+    h += f"""<div class='block'>
+<h2>Detalhe por trade</h2>
+<table>
+<tr><th>#</th><th>Symbol</th><th>Real</th><th>Bounce%</th><th>Simulado</th><th>Nova entrada</th><th>vs fundo</th></tr>
+{rows}
+</table>
+</div>
+</body></html>"""
+    return h
+
+
 @app.route("/analise/wr-breakdown")
 def analise_wr_breakdown():
     """
