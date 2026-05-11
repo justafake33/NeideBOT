@@ -9146,5 +9146,354 @@ def _wallet_tokens_inner():
     return h
 
 
+@app.route("/analise/wr-breakdown")
+def analise_wr_breakdown():
+    """
+    Breakdown completo do WR por feature — identifica o que discrimina TP de SL.
+    Cross-referencia trades com migrations (qualidade), bounce_signals (timing),
+    token_signals (H9 smart money), para cada combinação mostra WR.
+    """
+    import traceback
+    try:
+        return _wr_breakdown_inner()
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
+def _wr_breakdown_inner():
+    # Gate: data mínima para filtrar trades pós-fix (A.6 + kline-bounce fix)
+    # Parâmetro opcional: ?since=2026-05-09 (padrão = todos)
+    since = request.args.get("since", "")
+
+    TP_STATUSES = ("tp_hit", "trailing_active")
+    SL_STATUSES = ("sl_hit", "sl")
+
+    with db._cursor() as cur:
+        since_clause = "AND t.created_at >= %s" if since else ""
+        params = [since] if since else []
+        cur.execute(f"""
+            SELECT
+                t.id,
+                t.symbol,
+                t.mint,
+                t.ts_signal,
+                t.created_at,
+                t.status,
+                t.exit_type,
+                t.pnl_pct_real,
+                t.entry_expected,
+                t.mc_bottom,
+                -- bounce_signals
+                b.mc_min        AS b_mc_min,
+                b.mc_at_signal  AS b_mc_at_signal,
+                b.bounce_pct    AS b_bounce_pct,
+                b.drop_pct      AS b_drop_pct,
+                b.elapsed_min   AS b_elapsed_min,
+                -- migrations
+                m.mc_migration,
+                m.time_to_bottom,
+                m.creator_token_status,
+                m.creator_balance_rate,
+                m.bot_degen_rate,
+                m.rat_trader_rate,
+                m.top10_holder_rate,
+                m.smart_wallets,
+                m.liq_migration,
+                m.has_social,
+                m.cto_flag,
+                -- H9: melhor sinal type 12 antes do bounce
+                (
+                    SELECT COUNT(*)
+                    FROM token_signals ts
+                    WHERE ts.mint = t.mint
+                      AND ts.trigger_at <= COALESCE(t.ts_signal, t.created_at)
+                ) AS n_h9_signals,
+                (
+                    SELECT MIN(ts.trigger_mc / NULLIF(m2.mc_migration, 0))
+                    FROM token_signals ts
+                    JOIN migrations m2 ON m2.mint = ts.mint
+                    WHERE ts.mint = t.mint
+                      AND ts.trigger_at <= COALESCE(t.ts_signal, t.created_at)
+                ) AS h9_best_ratio
+            FROM trades t
+            LEFT JOIN bounce_signals b ON b.mint = t.mint
+            LEFT JOIN migrations     m ON m.mint = t.mint
+            WHERE t.status IN ('tp_hit','trailing_active','sl_hit','sl','expired')
+              {since_clause}
+            ORDER BY t.id ASC
+        """, params)
+        trades = [dict(r) for r in cur.fetchall()]
+
+    if not trades:
+        return "<pre>Nenhum trade fechado encontrado.</pre>"
+
+    def is_tp(t):
+        return t["status"] in TP_STATUSES or t["exit_type"] in TP_STATUSES
+
+    def is_sl(t):
+        return t["status"] in SL_STATUSES or t["exit_type"] in SL_STATUSES
+
+    closed = [t for t in trades if is_tp(t) or is_sl(t)]
+    total  = len(closed)
+    n_tp   = sum(1 for t in closed if is_tp(t))
+    n_sl   = sum(1 for t in closed if is_sl(t))
+    wr_base = n_tp / total if total else 0
+
+    def wr_bucket(rows):
+        if not rows: return None, 0
+        n = len(rows)
+        w = sum(1 for r in rows if is_tp(r))
+        return w / n, n
+
+    def bucket_table(title, splits):
+        """splits: list of (label, [rows])"""
+        rows_html = ""
+        for label, rows in splits:
+            w, n = wr_bucket(rows)
+            if n == 0:
+                continue
+            delta = (w - wr_base) if w is not None else None
+            bar_w = int((w or 0) * 120)
+            delta_s = f"{delta*100:+.1f}pp" if delta is not None else "—"
+            color = "green" if delta and delta > 0.03 else ("red" if delta and delta < -0.03 else "yellow")
+            rows_html += f"""<tr>
+<td>{label}</td>
+<td><div style='background:#21262d;border-radius:2px;height:8px;width:120px'>
+    <div style='background:#3fb950;height:8px;border-radius:2px;width:{bar_w}px'></div></div></td>
+<td class='{color}'><b>{(w or 0)*100:.1f}%</b></td>
+<td>{n}</td>
+<td class='{color}'>{delta_s}</td>
+</tr>"""
+        if not rows_html:
+            return ""
+        return f"""<div class='block'>
+<h2>{title}</h2>
+<table>
+<tr><th>Bucket</th><th>WR visual</th><th>WR</th><th>N</th><th>vs baseline</th></tr>
+{rows_html}
+</table></div>"""
+
+    # ── Splits por feature ──────────────────────────────────────────────────
+    sections = ""
+
+    # 1. bounce_pct (entry timing)
+    splits_bounce = [
+        ("15–20% bounce",  [t for t in closed if t["b_bounce_pct"] and 0.15 <= t["b_bounce_pct"] < 0.20]),
+        ("20–30% bounce",  [t for t in closed if t["b_bounce_pct"] and 0.20 <= t["b_bounce_pct"] < 0.30]),
+        ("30–50% bounce",  [t for t in closed if t["b_bounce_pct"] and 0.30 <= t["b_bounce_pct"] < 0.50]),
+        (">50% bounce",    [t for t in closed if t["b_bounce_pct"] and t["b_bounce_pct"] >= 0.50]),
+    ]
+    sections += bucket_table("Bounce % no sinal (timing da entrada)", splits_bounce)
+
+    # 2. elapsed_min (tempo desde migração)
+    splits_elapsed = [
+        ("<5 min pós-migração",   [t for t in closed if t["b_elapsed_min"] is not None and t["b_elapsed_min"] < 5]),
+        ("5–10 min",              [t for t in closed if t["b_elapsed_min"] is not None and 5 <= t["b_elapsed_min"] < 10]),
+        ("10–15 min",             [t for t in closed if t["b_elapsed_min"] is not None and 10 <= t["b_elapsed_min"] < 15]),
+        ("15–20 min",             [t for t in closed if t["b_elapsed_min"] is not None and 15 <= t["b_elapsed_min"] < 20]),
+    ]
+    sections += bucket_table("Elapsed min (migração → sinal)", splits_elapsed)
+
+    # 3. drop_pct (profundidade do dump)
+    splits_drop = [
+        ("30–50% drop",  [t for t in closed if t["b_drop_pct"] and 0.30 <= t["b_drop_pct"] < 0.50]),
+        ("50–70% drop",  [t for t in closed if t["b_drop_pct"] and 0.50 <= t["b_drop_pct"] < 0.70]),
+        ("70–85% drop",  [t for t in closed if t["b_drop_pct"] and 0.70 <= t["b_drop_pct"] < 0.85]),
+        (">85% drop",    [t for t in closed if t["b_drop_pct"] and t["b_drop_pct"] >= 0.85]),
+    ]
+    sections += bucket_table("Drop % do mc_migration (profundidade do dump)", splits_drop)
+
+    # 4. time_to_bottom (H10)
+    splits_ttb = [
+        ("<10 min até fundo",    [t for t in closed if t["time_to_bottom"] is not None and t["time_to_bottom"] < 10]),
+        ("10–15 min",            [t for t in closed if t["time_to_bottom"] is not None and 10 <= t["time_to_bottom"] < 15]),
+        ("15–20 min",            [t for t in closed if t["time_to_bottom"] is not None and 15 <= t["time_to_bottom"] < 20]),
+        (">20 min (A.5 borda)",  [t for t in closed if t["time_to_bottom"] is not None and t["time_to_bottom"] >= 20]),
+    ]
+    sections += bucket_table("Time to bottom (H10) — minutos até o fundo", splits_ttb)
+
+    # 5. H9 smart money signal
+    splits_h9 = [
+        ("Sem sinal H9",                  [t for t in closed if not t["n_h9_signals"]]),
+        ("Com sinal H9 (qualquer ratio)", [t for t in closed if t["n_h9_signals"] and t["n_h9_signals"] > 0]),
+        ("H9 ratio < 0.80 (preditivo)",  [t for t in closed if t["h9_best_ratio"] and t["h9_best_ratio"] < 0.80]),
+        ("H9 ratio 0.80–1.00",           [t for t in closed if t["h9_best_ratio"] and 0.80 <= t["h9_best_ratio"] < 1.00]),
+        ("H9 ratio > 1.00 (pós-bounce)", [t for t in closed if t["h9_best_ratio"] and t["h9_best_ratio"] >= 1.00]),
+    ]
+    sections += bucket_table("H9 — Smart money signal antes do bounce", splits_h9)
+
+    # 6. creator_token_status
+    splits_creator = [
+        ("creator_close (dev vendeu)",    [t for t in closed if t["creator_token_status"] == "creator_close"]),
+        ("creator_hold (dev segura)",     [t for t in closed if t["creator_token_status"] == "creator_hold"]),
+        ("creator_status desconhecido",   [t for t in closed if not t["creator_token_status"]]),
+    ]
+    sections += bucket_table("Creator status (dev ainda segura?)", splits_creator)
+
+    # 7. bot_degen_rate
+    splits_bot = [
+        ("<20% bots",   [t for t in closed if t["bot_degen_rate"] is not None and t["bot_degen_rate"] < 0.20]),
+        ("20–35% bots", [t for t in closed if t["bot_degen_rate"] is not None and 0.20 <= t["bot_degen_rate"] < 0.35]),
+        ("35–50% bots", [t for t in closed if t["bot_degen_rate"] is not None and 0.35 <= t["bot_degen_rate"] < 0.50]),
+    ]
+    sections += bucket_table("Bot degen rate", splits_bot)
+
+    # 8. smart_wallets
+    splits_smart = [
+        ("smart=1",    [t for t in closed if t["smart_wallets"] == 1]),
+        ("smart=2",    [t for t in closed if t["smart_wallets"] == 2]),
+        ("smart=3",    [t for t in closed if t["smart_wallets"] == 3]),
+        ("smart≥4",    [t for t in closed if t["smart_wallets"] and t["smart_wallets"] >= 4]),
+    ]
+    sections += bucket_table("Smart wallets count (FILTER_SMART_MIN=1)", splits_smart)
+
+    # 9. liq_migration
+    splits_liq = [
+        ("liq $10k–20k",  [t for t in closed if t["liq_migration"] and 10000 <= t["liq_migration"] < 20000]),
+        ("liq $20k–50k",  [t for t in closed if t["liq_migration"] and 20000 <= t["liq_migration"] < 50000]),
+        ("liq $50k–100k", [t for t in closed if t["liq_migration"] and 50000 <= t["liq_migration"] < 100000]),
+        ("liq >$100k",    [t for t in closed if t["liq_migration"] and t["liq_migration"] >= 100000]),
+    ]
+    sections += bucket_table("Liquidez na migração (H7)", splits_liq)
+
+    # 10. has_social / cto_flag
+    splits_social = [
+        ("Tem rede social",  [t for t in closed if t["has_social"]]),
+        ("Sem rede social",  [t for t in closed if not t["has_social"]]),
+        ("CTO flag ativo",   [t for t in closed if t["cto_flag"]]),
+        ("Sem CTO",          [t for t in closed if not t["cto_flag"]]),
+    ]
+    sections += bucket_table("Comunidade (social / CTO)", splits_social)
+
+    # ── Tabela individual de todos os trades ──────────────────────────────
+    def _fp(v, mult=100): return f"{v*mult:+.1f}%" if v is not None else "—"
+    def _fn(v): return f"{v:.0%}" if v is not None else "—"
+
+    rows_html = ""
+    for t in sorted(closed, key=lambda x: x["id"]):
+        outcome_cls = "green" if is_tp(t) else "red"
+        outcome_txt = "TP ✅" if is_tp(t) else "SL 💀"
+        pnl = _fp(t.get("pnl_pct_real"))
+        h9_r = f"{t['h9_best_ratio']:.2f}" if t["h9_best_ratio"] else "—"
+        rows_html += f"""<tr>
+<td>{t['id']}</td>
+<td><b>{t['symbol'] or t['mint'][:8]}</b></td>
+<td class='{outcome_cls}'>{outcome_txt}</td>
+<td class='{outcome_cls}'>{pnl}</td>
+<td>{t['b_bounce_pct']*100:.0f}% if t['b_bounce_pct'] else '—'</td>
+<td>{t['b_elapsed_min']:.0f}m if t['b_elapsed_min'] is not None else '—'</td>
+<td>{t['b_drop_pct']*100:.0f}% if t['b_drop_pct'] else '—'</td>
+<td>{t['time_to_bottom']:.0f}m if t['time_to_bottom'] is not None else '—'</td>
+<td>{t['creator_token_status'] or '—'}</td>
+<td>{int(t['n_h9_signals'] or 0)}</td>
+<td>{h9_r}</td>
+<td>{_fn(t.get('bot_degen_rate'))}</td>
+<td>{t.get('smart_wallets') or '—'}</td>
+</tr>"""
+
+    # Fix: use proper Python f-string for table cells
+    rows_html2 = ""
+    for t in sorted(closed, key=lambda x: x["id"]):
+        outcome_cls = "green" if is_tp(t) else "red"
+        outcome_txt = "TP ✅" if is_tp(t) else "SL 💀"
+        pnl = _fp(t.get("pnl_pct_real"))
+        h9_r = f"{t['h9_best_ratio']:.2f}" if t["h9_best_ratio"] else "—"
+        bp   = f"{t['b_bounce_pct']*100:.0f}%" if t.get("b_bounce_pct") else "—"
+        el   = f"{t['b_elapsed_min']:.0f}m"     if t.get("b_elapsed_min") is not None else "—"
+        dp   = f"{t['b_drop_pct']*100:.0f}%"   if t.get("b_drop_pct") else "—"
+        ttb  = f"{t['time_to_bottom']:.0f}m"   if t.get("time_to_bottom") is not None else "—"
+        rows_html2 += f"""<tr>
+<td>{t['id']}</td>
+<td><b>{t['symbol'] or t['mint'][:8]}</b></td>
+<td class='{outcome_cls}'>{outcome_txt}</td>
+<td class='{outcome_cls}'>{pnl}</td>
+<td>{bp}</td><td>{el}</td><td>{dp}</td><td>{ttb}</td>
+<td>{t['creator_token_status'] or '—'}</td>
+<td>{int(t['n_h9_signals'] or 0)}</td>
+<td>{h9_r}</td>
+<td>{_fn(t.get('bot_degen_rate'))}</td>
+<td>{t.get('smart_wallets') or '—'}</td>
+</tr>"""
+
+    _CSS = """<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;font-size:12px}
+h1{padding:14px 16px;color:#58a6ff;font-size:16px;border-bottom:1px solid #21262d}
+h2{font-size:13px;color:#58a6ff;padding:8px 0 4px}
+.grid{display:flex;gap:10px;padding:8px 16px;flex-wrap:wrap;margin-bottom:8px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 14px;min-width:110px}
+.lbl{color:#8b949e;font-size:10px;margin-bottom:2px}
+.val{font-size:18px;font-weight:bold}
+.green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}.muted{color:#8b949e}
+.block{padding:6px 16px 14px;border-bottom:1px solid #21262d}
+table{width:100%;border-collapse:collapse;margin:6px 0}
+th{background:#161b22;color:#8b949e;padding:4px 8px;text-align:left;border-bottom:1px solid #30363d;font-size:10px}
+td{padding:3px 8px;border-bottom:1px solid #21262d;font-size:11px}
+tr:hover td{background:#161b22}
+.nav{padding:8px 16px;display:flex;gap:12px;border-bottom:1px solid #21262d}
+.nav a{color:#58a6ff;font-size:11px;text-decoration:none}
+.insight{background:#0d2137;color:#79c0ff;padding:8px 14px;margin:6px 16px;border-radius:4px;font-size:11px;border-left:3px solid #58a6ff}
+.warn{background:#3d2200;color:#d29922;padding:8px 14px;margin:6px 16px;border-radius:4px;font-size:11px}
+.filt{padding:6px 16px;color:#8b949e;font-size:11px}
+</style>"""
+
+    # Find the highest-delta discriminator for the summary box
+    all_splits = [
+        ("bounce 15-20%",      [t for t in closed if t["b_bounce_pct"] and 0.15 <= t["b_bounce_pct"] < 0.20]),
+        ("bounce 30-50%",      [t for t in closed if t["b_bounce_pct"] and 0.30 <= t["b_bounce_pct"] < 0.50]),
+        ("elapsed <5m",        [t for t in closed if t["b_elapsed_min"] is not None and t["b_elapsed_min"] < 5]),
+        ("elapsed 5-10m",      [t for t in closed if t["b_elapsed_min"] is not None and 5 <= t["b_elapsed_min"] < 10]),
+        ("H9 ratio<0.80",      [t for t in closed if t["h9_best_ratio"] and t["h9_best_ratio"] < 0.80]),
+        ("creator_close",      [t for t in closed if t["creator_token_status"] == "creator_close"]),
+        ("creator_hold",       [t for t in closed if t["creator_token_status"] == "creator_hold"]),
+        ("ttb <10m",           [t for t in closed if t["time_to_bottom"] is not None and t["time_to_bottom"] < 10]),
+        ("ttb 15-20m",         [t for t in closed if t["time_to_bottom"] is not None and 15 <= t["time_to_bottom"] < 20]),
+        ("bot <20%",           [t for t in closed if t["bot_degen_rate"] is not None and t["bot_degen_rate"] < 0.20]),
+        ("drop 70-85%",        [t for t in closed if t["b_drop_pct"] and 0.70 <= t["b_drop_pct"] < 0.85]),
+        ("tem social",         [t for t in closed if t["has_social"]]),
+        ("sem social",         [t for t in closed if not t["has_social"]]),
+    ]
+    best_label, best_delta, best_wr, best_n = "", 0, 0, 0
+    for label, rows in all_splits:
+        w, n = wr_bucket(rows)
+        if n >= 5 and w is not None:
+            delta = abs(w - wr_base)
+            if delta > best_delta:
+                best_delta, best_label, best_wr, best_n = delta, label, w, n
+
+    since_display = since or "todos os trades"
+    h = f"""<!DOCTYPE html><html><head><meta charset='utf-8'><title>WR Breakdown</title>{_CSS}</head><body>
+<h1>WR Breakdown — Discriminadores de TP vs SL</h1>
+<div class='nav'>
+  <a href='/trades'>Trades</a>
+  <a href='/analise'>Analise</a>
+  <a href='/analise/sl-investigation'>SL Investigation</a>
+  <a href='/analise/h9'>H9</a>
+  <a href='?since=2026-05-09'>Pós-fix (since 2026-05-09)</a>
+  <a href='?'>Todos</a>
+</div>
+<div class='filt'>Filtro ativo: <b>{since_display}</b> | {total} trades fechados | Baseline WR: <b>{wr_base*100:.1f}%</b> ({n_tp} TP / {n_sl} SL)</div>
+"""
+
+    if best_label:
+        direction = "positivo" if best_wr > wr_base else "negativo"
+        h += f"""<div class='insight'>
+🔍 <b>Maior discriminador encontrado (n≥5):</b> <b>{best_label}</b> → WR {best_wr*100:.1f}% vs baseline {wr_base*100:.1f}%
+({best_delta*100:+.1f}pp, n={best_n}). Efeito <b>{direction}</b>.
+</div>"""
+
+    h += sections
+
+    h += f"""<div class='block'>
+<h2>Todos os trades ({total})</h2>
+<table>
+<tr><th>#</th><th>Symbol</th><th>Outcome</th><th>P&L</th><th>Bounce%</th><th>Elapsed</th>
+<th>Drop%</th><th>TTB</th><th>Creator</th><th>H9 n</th><th>H9 ratio</th><th>Bots</th><th>Smart</th></tr>
+{rows_html2}
+</table></div>
+</body></html>"""
+    return h
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
