@@ -90,8 +90,18 @@ class HotMonitor:
         self._tick_buffer: list = []
         self._tick_lock = threading.Lock()
 
+        # Helius WebSocket — preço real-time via logsSubscribe + DexScreener
+        self._helius = None
+        if os.getenv("HELIUS_API_KEY"):
+            try:
+                from helius_ws import HeliusWS
+                self._helius = HeliusWS(on_price=self.push_mc)
+            except Exception as e:
+                logger.warning("HeliusWS não iniciado: %s", e)
+
     def add(self, mint: str, mc_migration: float, ts_migration: datetime,
             symbol: str, total_supply: float = 1_000_000_000):
+        added = False
         with self._lock:
             if mint not in self._tokens and mint not in self._cancelled:
                 self._tokens[mint] = {
@@ -107,11 +117,33 @@ class HotMonitor:
                     "mc_last":      mc_migration,
                     "total_supply": total_supply,
                 }
+                added = True
+
+        # Helius: resolve pool address em background e subscreve ao WebSocket
+        if added and self._helius:
+            threading.Thread(
+                target=self._resolve_and_subscribe,
+                args=(mint, total_supply),
+                daemon=True,
+                name=f"pool-{mint[:6]}",
+            ).start()
+
+    def _resolve_and_subscribe(self, mint: str, total_supply: float):
+        """Background: descobre pool address via DexScreener e subscreve ao Helius."""
+        import pool_resolver
+        try:
+            pool = pool_resolver.get_pool_address(mint)
+            if pool and self._helius and mint not in self._cancelled:
+                self._helius.subscribe(mint, pool, total_supply)
+        except Exception as e:
+            logger.debug("_resolve_and_subscribe %s: %s", mint[:8], e)
 
     def cancel(self, mint: str):
         with self._lock:
             self._cancelled.add(mint)
             self._tokens.pop(mint, None)
+        if self._helius:
+            self._helius.unsubscribe(mint)
 
     def push_mc(self, mint: str, mc: float, token_data: dict = None):
         """Chamado pelo Scanner a cada poll — detecção rápida de rug, bottom e coleta de série temporal."""
@@ -338,8 +370,11 @@ class HotMonitor:
         threading.Thread(target=self._loop,         daemon=True, name="hot-monitor").start()
         threading.Thread(target=self._precise_loop, daemon=True, name="hot-precise").start()
         threading.Thread(target=self.startup_backfill, daemon=True, name="hot-backfill").start()
-        logger.info("HotMonitor iniciado (grad=%ds precise=%ds janela=%dmin)",
-                    HOT_INTERVAL, HOT_PRECISE_SEC, HOT_WINDOW_MIN)
+        if self._helius:
+            self._helius.start()
+        logger.info("HotMonitor iniciado (grad=%ds precise=%ds janela=%dmin helius=%s)",
+                    HOT_INTERVAL, HOT_PRECISE_SEC, HOT_WINDOW_MIN,
+                    "ON" if self._helius else "OFF")
 
     def startup_backfill(self):
         """

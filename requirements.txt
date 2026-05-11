@@ -5,3 +5,4 @@ requests>=2.31
 sentry-sdk[flask]>=2.0
 cryptography>=42.0
 base58>=2.1
+websocket-client>=1.6
