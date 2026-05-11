@@ -1,7 +1,7 @@
 # NeideBOT — Roadmap
 
-**Atualizado:** 2026-05-10  
-**Estado:** Bot ativo a $1/trade · WR 15.1% (sem A.6) · aguardando WR real com filtros completos
+**Atualizado:** 2026-05-11  
+**Estado:** Bot ativo a $1/trade · WR **29%** confirmado (31 trades) · filtros A.7+smart≥2 ativos · aguardando 20+ trades com novos filtros antes de escalar
 
 ---
 
@@ -19,20 +19,35 @@
 | Bot relançado | 2026-05-10 | TRADING_ENABLED=true, CALIBRATION_MAX=999999 |
 | Fix entry 50-100% acima do fundo | 2026-05-10 | `_precise_bottom_tick()` dispara `_check_bounce()` com kline close — elimina defasagem do poll trenches |
 | HOT_PRECISE_SEC 30s → 5s | 2026-05-10 | Kline alinhado com trenches poll — mc_min sempre fresco na detecção |
+| WR real confirmado pós-fix | 2026-05-11 | **29% WR** (9 TP / 22 SL, 31 trades) — consistente com estimativa histórica de 29% |
+| A.7 — BOUNCE_MIN_PCT=0.30 | 2026-05-11 | bounce 15-20% → 9.1% WR (n=11) → dead zone estende abaixo de 30%. WR esperado ~40% |
+| FILTER_SMART_MIN=2 | 2026-05-11 | smart=1 → 0% WR live (n=6, todos SL). WR esperado ~40-45% combinado com A.7 |
+| Fix TradeMonitor overwrite bug | 2026-05-11 | `get_open_trades()` só retorna `status='open'`. trailing_active era sobrescrito para `expired` após 4h → TPs desapareciam do registro |
+| Dip entry strategy refutada | 2026-05-11 | Simulado -5% a -25%: todos piores que entrada imediata. TPs reais não retrocederam — foram direto ao TP. Timing de entrada está correto. |
 
 ---
 
 ## 🔜 Curto Prazo (próximas semanas)
 
-### 0. Confirmar WR real com A.6 ativo ← **PRÓXIMO GATE**
-**Problema:** A calibração de 53 trades foi feita SEM A.6 (adicionado 2026-05-09). O WR real com todos os filtros ativos (A.2+A.3+A.6) é desconhecido.
+### 0. ✅ WR real confirmado — GATE CUMPRIDO
+29% WR em 31 trades pós-fix (A.2+A.3+A.5+A.6 ativos). Gate de escala $1→$10 atingido (≥30 trades, WR ≥ 20%).
+
+**Novos filtros adicionados (2026-05-11):** A.7 (BOUNCE_MIN_PCT=0.30) + FILTER_SMART_MIN=2.
+WR esperado com novos filtros: ~40-45%.
+
+**Próximo gate:** ≥20 trades com A.7+smart≥2 ativos, confirmar WR ≥ 25% antes de escalar para $10.
+
+---
+
+### 0.1. Confirmar WR com A.7 + smart≥2 ← **PRÓXIMO GATE**
+**Por quê:** A.7 e smart≥2 foram adicionados com base em 31 trades. Os próximos 20+ trades vão confirmar se o WR esperado (~40%) se realiza ou se há overfitting nos filtros.
 
 **O que medir:**
-- WR ao longo de 30+ trades com filtros completos
-- Frequência real de sinais válidos/dia (estimativa: 7-8/dia vs 24 brutos sem filtros)
-- Confirmar se WR ≥ 20% antes de qualquer escala de size
+- WR em ≥20 novos trades com filtros completos (A.2+A.3+A.5+A.6+A.7+smart≥2)
+- Frequência real de sinais/dia com os filtros mais restritivos
+- H9 acumulando: quando n≥15 em ratio<0.80, avaliar como gate adicional
 
-**Ação:** Aguardar ~1 semana de dados. Não mudar nada enquanto coleta.
+**Ação:** Aguardar. Não mudar nada enquanto coleta.
 
 ---
 
@@ -133,7 +148,9 @@
 Antes de escalar acima de $100/trade, confirmar que `liq_migration ≥ size × 30` previne slippage inaceitável. Regra sugerida: ao escalar size, subir `FILTER_LIQ_MIN` proporcionalmente.
 
 ### 7. H9 — Smart money signal como gate adicional
-Se H9 for validada (n≥30, delta≥20pp), adicionar como filtro opcional: só entra se houver ≥1 signal type 12 com `trigger_mc < mc_migration × 0.80` durante o dump.
+**Dados live (2026-05-11, n=31 trades):** H9 ratio < 0.80 → **75% WR** (n=4). Sem H9 → 24% WR (n=25).
+Gate para implementar: n≥15 na zona ratio<0.80 nos trades live.
+Candidato intermediário: usar como **multiplicador de size** (2× quando H9 ratio<0.80 presente) antes de tornar gate obrigatório.
 
 ### 8. Multi-token monitoring ampliado
 HotMonitor observa primeiros 60min pós-migração. Com re-entry ativo, expandir para detectar bounces secundários em tokens que já bouncearam — usando token_signals como trigger em vez de janela de tempo fixo.
@@ -144,12 +161,14 @@ HotMonitor observa primeiros 60min pós-migração. Com re-entry ativo, expandir
 
 | Decisão | Gate |
 |---------|------|
-| Escalar $1 → $10 | ≥30 trades com filtros A.2+A.3+A.6 ativos, WR ≥ 20% |
-| Escalar $10 → $50 | WR ≥ 20% confirmado em 20 trades a $10 |
+| ~~Escalar $1 → $10~~ | ~~≥30 trades, WR ≥ 20%~~ → **✅ CUMPRIDO** (29% WR, 31 trades) |
+| Escalar $1 → $10 (efetivo) | ≥20 trades com A.7+smart≥2 ativos, WR ≥ 25% |
+| Escalar $10 → $50 | WR ≥ 25% confirmado em ≥20 trades a $10 |
 | Escalar $50 → $100 | EV_real > 0 confirmado em 20 trades a $50 |
 | Migrar GMGN → Jupiter | WR confirmado a $50+ + disponibilidade de implementação |
-| Ativar re-entry | ≥5 tokens com TP histórico disponíveis + 1 semana de dados A.6 |
-| Ativar H9 como gate | n≥30 na faixa <50%, delta_pp ≥ 20pp |
+| Ativar re-entry | ≥9 tokens com TP histórico já disponíveis → avaliar agora |
+| H9 como size multiplier (2×) | n≥15 em ratio<0.80 nos trades live |
+| H9 como gate obrigatório | n≥30 em ratio<0.80, WR ≥ 50% confirmado |
 | Ajustar FILTER_LIQ_MIN | ao escalar size acima de $100/trade |
 
 ---
