@@ -419,7 +419,7 @@ class HeliusWS:
             try:
                 mc = _parse_mc_from_logs(logs, supply, sol_usd)
                 if mc and mc > 0:
-                    logger.debug("HeliusWS price(anchor) %s: $%.0f MC", mint[:8], mc)
+                    logger.info("HeliusWS price(anchor) %s: $%.0f MC", mint[:8], mc)
                     self._on_price(mint, mc)
                     return
             except Exception as e:
@@ -430,7 +430,7 @@ class HeliusWS:
             price_usd = get_price_usd(mint)
             if price_usd and price_usd > 0:
                 mc = price_usd * supply
-                logger.debug("HeliusWS price(dex) %s: $%.0f MC", mint[:8], mc)
+                logger.info("HeliusWS price(dex) %s: $%.0f MC", mint[:8], mc)
                 self._on_price(mint, mc)
         except Exception as e:
             logger.debug("HeliusWS dex fallback %s: %s", mint[:8], e)
