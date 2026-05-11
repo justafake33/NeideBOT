@@ -474,12 +474,21 @@ class HotMonitor:
                     from_ts=now_ts - 300,   # B.2: 2min→5min — cobre gaps entre polls
                     to_ts=now_ts,
                 )
-                for c in candles:
+                # Loop único cronológico: mc_min/max, ticks e bounce num passo só.
+                # Dispara no PRIMEIRO close que passa todos os filtros (A.2, A.3, A.6).
+                # Antes: só verificava a última vela → entrava 50-100% acima do fundo.
+                # Agora: verifica cada vela em ordem, para no primeiro sinal válido.
+                kline_ticks = []
+                candles_sorted = sorted(candles, key=lambda c: int(c.get("time", 0)))
+                for c in candles_sorted:
                     candle_ts   = int(c.get("time", 0)) / 1000
-                    elapsed_min = (candle_ts - state["ts_mig_unix"]) / 60
-                    if elapsed_min < 0:
+                    elapsed_sec = int(candle_ts - state["ts_mig_unix"])
+                    elapsed_min = elapsed_sec / 60
+                    if elapsed_sec < 0 or elapsed_sec > 3660:
                         continue
 
+                    # 1. Atualiza mc_min com o low desta vela ANTES de checar bounce.
+                    #    Garante que bounce_pct e A.6 usam o fundo correto desta vela.
                     low_price = _float(c.get("low"))
                     if low_price and low_price > 0:
                         mc_low = low_price * state["total_supply"]
@@ -490,13 +499,14 @@ class HotMonitor:
                                 if inner and mc_low < inner["mc_min"]:
                                     inner["mc_min"]   = mc_low
                                     inner["time_min"] = elapsed_min
-                                    inner["ts_min"]   = candle_dt  # B.1: fix — slope filter precisa deste timestamp
+                                    inner["ts_min"]   = candle_dt
                             db.update_bottom(mint, mc_low, elapsed_min)
                             logger.info("Fundo(kline) %s: $%.0f em %.1fmin (%.0f%% abaixo ATH)",
                                         state["symbol"], mc_low, elapsed_min,
                                         (1 - mc_low / state["mc_migration"]) * 100)
                             state["mc_min"] = mc_low
 
+                    # 2. Atualiza mc_max com o high desta vela.
                     high_price = _float(c.get("high"))
                     if high_price and high_price > 0:
                         mc_high = high_price * state["total_supply"]
@@ -504,7 +514,7 @@ class HotMonitor:
                             with self._lock:
                                 inner = self._tokens.get(mint)
                                 if inner and mc_high > inner["mc_max"]:
-                                    inner["mc_max"] = mc_high
+                                    inner["mc_max"]   = mc_high
                                     inner["time_max"] = elapsed_min
                             db.update_peak(mint, mc_high, elapsed_min)
                             logger.info("Pico(kline)  %s: $%.0f em %.1fmin (+%.0f%% vs mig)",
@@ -512,51 +522,38 @@ class HotMonitor:
                                         (mc_high / state["mc_migration"] - 1) * 100)
                             state["mc_max"] = mc_high
 
-                # Insere ticks kline com OHLC completo para cada vela
-                kline_ticks = []
-                for c in candles:
-                    candle_ts   = int(c.get("time", 0)) / 1000
-                    elapsed_sec = int(candle_ts - state["ts_mig_unix"])
-                    if elapsed_sec < 0 or elapsed_sec > 3660:
-                        continue
+                    # 3. Acumula tick kline com OHLC completo.
                     close_p = _float(c.get("close"))
                     open_p  = _float(c.get("open"))
                     high_p  = _float(c.get("high"))
                     low_p   = _float(c.get("low"))
                     vol     = _float(c.get("volume"))
                     supply  = state["total_supply"]
-                    if not close_p or close_p <= 0 or not supply:
-                        continue
-                    kline_ticks.append({
-                        "mint":        mint,
-                        "elapsed_sec": elapsed_sec,
-                        "mc":          close_p * supply,
-                        "mc_open":     open_p  * supply if open_p  else None,
-                        "mc_high":     high_p  * supply if high_p  else None,
-                        "mc_low":      low_p   * supply if low_p   else None,
-                        "volume_1m":   vol,
-                    })
+                    if close_p and close_p > 0 and supply:
+                        kline_ticks.append({
+                            "mint":        mint,
+                            "elapsed_sec": elapsed_sec,
+                            "mc":          close_p * supply,
+                            "mc_open":     open_p  * supply if open_p  else None,
+                            "mc_high":     high_p  * supply if high_p  else None,
+                            "mc_low":      low_p   * supply if low_p   else None,
+                            "volume_1m":   vol,
+                        })
+
+                    # 4. Verifica bounce com o close desta vela (mc_min já atualizado acima).
+                    #    Para no primeiro sinal válido — não espera a última vela.
+                    if close_p and close_p > 0:
+                        mc_close = close_p * state["total_supply"]
+                        with self._lock:
+                            inner = self._tokens.get(mint)
+                        if inner and not inner.get("bounce_fired") and mint not in self._cancelled:
+                            self._check_bounce(mint, inner, mc_close, elapsed_sec)
+
                 if kline_ticks:
                     db.insert_kline_ticks_batch(kline_ticks)
 
                 # Back-filla volume_1m nos ticks trenches existentes
                 db.backfill_tick_volumes(mint, candles, state["ts_mig_unix"])
-
-                # Dispara bounce check usando close da vela mais recente.
-                # Garante que o sinal dispara com o fundo correto (kline low) em vez de
-                # aguardar o próximo poll trenches que pode já estar 50-100% acima do fundo.
-                if candles:
-                    most_recent   = max(candles, key=lambda c: int(c.get("time", 0)))
-                    close_price   = _float(most_recent.get("close"))
-                    if close_price and close_price > 0:
-                        mc_close      = close_price * state["total_supply"]
-                        candle_ts_sec = int(most_recent.get("time", 0)) / 1000
-                        elapsed_kline = int(candle_ts_sec - state["ts_mig_unix"])
-                        if elapsed_kline >= 0:
-                            with self._lock:
-                                inner = self._tokens.get(mint)
-                            if inner and not inner.get("bounce_fired") and mint not in self._cancelled:
-                                self._check_bounce(mint, inner, mc_close, elapsed_kline)
 
             except Exception as e:
                 logger.debug("precise bottom %s: %s", mint[:8], e)
