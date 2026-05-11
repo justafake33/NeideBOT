@@ -5225,13 +5225,17 @@ _TRADES_HTML = """
   td     { padding: 5px 8px; border-bottom: 1px solid #21262d; }
   tr:hover td { background: #161b22; }
   .badge { border-radius: 4px; padding: 2px 6px; font-size: 11px; }
-  .b-pending  { background: #3d3b00; color: #d29922; }
-  .b-open     { background: #003d00; color: #3fb950; }
+  .b-pending          { background: #3d3b00; color: #d29922; }
+  .b-open             { background: #003d00; color: #3fb950; }
   .b-strategy_pending { background: #003d3d; color: #39d0d0; }
-  .b-tp_hit   { background: #003d00; color: #3fb950; }
-  .b-sl_hit   { background: #3d0000; color: #f85149; }
-  .b-error    { background: #3d0000; color: #f85149; }
-  .b-timeout  { background: #3d3b00; color: #d29922; }
+  .b-tp_hit           { background: #003d00; color: #3fb950; }
+  .b-trailing_active  { background: #004d20; color: #56d364; }
+  .b-sl_hit           { background: #3d0000; color: #f85149; }
+  .b-sl               { background: #3d0000; color: #f85149; }
+  .b-error            { background: #3d0000; color: #f85149; }
+  .b-timeout          { background: #3d3b00; color: #d29922; }
+  .b-expired          { background: #2d2d2d; color: #8b949e; }
+  .est { color: #8b949e; font-size: 10px; }
   .section    { padding: 16px; }
 </style>
 </head>
@@ -5284,6 +5288,11 @@ _TRADES_HTML = """
       <span class="{% if t.pnl_pct_real > 0 %}green{% else %}red{% endif %}">
         {{ "%+.1f%%"|format(t.pnl_pct_real*100) }}
       </span>
+      {% if t.status == 'trailing_active' %}
+        <span class="est">⚡trailing</span>
+      {% endif %}
+    {% elif t.status in ('open', 'pending') %}
+      <span class="est">GMGN</span>
     {% else %}—{% endif %}
   </td>
   <td>{{ t.strategy_id[:12] if t.strategy_id else '—' }}</td>
@@ -5310,12 +5319,15 @@ def trades_dashboard():
         ts = t.get("ts_signal")
         t["ts_signal_brt"] = (ts + BRT).strftime("%m/%d %H:%M:%S") if ts else None
 
-    # Métricas
-    closed   = [t for t in trades_raw if t["status"] in ("tp_hit", "sl_hit")]
-    tp_count = sum(1 for t in trades_raw if t["status"] == "tp_hit")
-    sl_count = sum(1 for t in trades_raw if t["status"] == "sl_hit")
+    # Métricas — statuses reais do TradeMonitor: "sl", "trailing_active", "expired"
+    TP_STATUSES = ("tp_hit", "trailing_active")
+    SL_STATUSES = ("sl_hit", "sl")
+    OPEN_STATUSES = ("open", "pending", "strategy_pending")
+    closed   = [t for t in trades_raw if t["status"] in TP_STATUSES + SL_STATUSES]
+    tp_count = sum(1 for t in trades_raw if t["status"] in TP_STATUSES)
+    sl_count = sum(1 for t in trades_raw if t["status"] in SL_STATUSES)
     err_count= sum(1 for t in trades_raw if t["status"] == "error")
-    open_cnt = sum(1 for t in trades_raw if t["status"] in ("open", "pending", "strategy_pending"))
+    open_cnt = sum(1 for t in trades_raw if t["status"] in OPEN_STATUSES)
 
     win_rate     = tp_count / len(closed) if closed else None
     latencies    = [t["latency_sec"] for t in trades_raw if t.get("latency_sec")]
