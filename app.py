@@ -9161,8 +9161,7 @@ def analise_wr_breakdown():
 
 
 def _wr_breakdown_inner():
-    # Gate: data mínima para filtrar trades pós-fix (A.6 + kline-bounce fix)
-    # Parâmetro opcional: ?since=2026-05-09 (padrão = todos)
+    # Parâmetro opcional: ?since=YYYY-MM-DD (padrão = todos os trades)
     since = request.args.get("since", "")
 
     TP_STATUSES = ("tp_hit", "trailing_active")
@@ -9171,6 +9170,11 @@ def _wr_breakdown_inner():
     with db._cursor() as cur:
         since_clause = "AND t.created_at >= %s" if since else ""
         params = [since] if since else []
+
+        # Diagnóstico: distribuição de status antes de filtrar
+        cur.execute(f"SELECT status, exit_type, COUNT(*) as n FROM trades {('WHERE created_at >= %s' if since else '')} GROUP BY status, exit_type ORDER BY n DESC", params)
+        status_dist = [dict(r) for r in cur.fetchall()]
+
         cur.execute(f"""
             SELECT
                 t.id,
@@ -9228,9 +9232,15 @@ def _wr_breakdown_inner():
         return "<pre>Nenhum trade fechado encontrado.</pre>"
 
     def is_tp(t):
+        # "expired" com pnl positivo = trailing_active que o monitor age-out sobrescreveu
+        # (bug corrigido: get_open_trades() já não retorna trailing_active; fix para dados históricos)
+        if t["status"] == "expired" and t.get("pnl_pct_real") and t["pnl_pct_real"] > 0:
+            return True
         return t["status"] in TP_STATUSES or t["exit_type"] in TP_STATUSES
 
     def is_sl(t):
+        if t["status"] == "expired" and t.get("pnl_pct_real") and t["pnl_pct_real"] > 0:
+            return False  # não é SL — é TP que expirou (ver is_tp acima)
         return t["status"] in SL_STATUSES or t["exit_type"] in SL_STATUSES
 
     closed = [t for t in trades if is_tp(t) or is_sl(t)]
@@ -9461,6 +9471,14 @@ tr:hover td{background:#161b22}
             if delta > best_delta:
                 best_delta, best_label, best_wr, best_n = delta, label, w, n
 
+    # Status distribution HTML
+    sd_rows = "".join(
+        f"<tr><td>{r['status']}</td><td>{r['exit_type'] or '—'}</td><td>{r['n']}</td>"
+        f"<td class='{'yellow' if r['status'] in ('trailing_active','tp_hit') else ('red' if r['status'] in ('sl','sl_hit') else 'muted')}'>"
+        f"{'TP' if r['status'] in ('trailing_active','tp_hit') else ('SL' if r['status'] in ('sl','sl_hit') else r['status'])}</td></tr>"
+        for r in status_dist
+    )
+
     since_display = since or "todos os trades"
     h = f"""<!DOCTYPE html><html><head><meta charset='utf-8'><title>WR Breakdown</title>{_CSS}</head><body>
 <h1>WR Breakdown — Discriminadores de TP vs SL</h1>
@@ -9469,10 +9487,15 @@ tr:hover td{background:#161b22}
   <a href='/analise'>Analise</a>
   <a href='/analise/sl-investigation'>SL Investigation</a>
   <a href='/analise/h9'>H9</a>
-  <a href='?since=2026-05-09'>Pós-fix (since 2026-05-09)</a>
+  <a href='?since=2026-05-10'>Pós-fix (since 2026-05-10)</a>
   <a href='?'>Todos</a>
 </div>
-<div class='filt'>Filtro ativo: <b>{since_display}</b> | {total} trades fechados | Baseline WR: <b>{wr_base*100:.1f}%</b> ({n_tp} TP / {n_sl} SL)</div>
+<div class='filt'>Filtro ativo: <b>{since_display}</b> | {total} trades fechados (TP+SL) | Baseline WR: <b>{wr_base*100:.1f}%</b> ({n_tp} TP / {n_sl} SL)</div>
+<div class='block'>
+<h2>Distribuição de status no DB (diagnóstico)</h2>
+<table><tr><th>status</th><th>exit_type</th><th>n</th><th>tipo</th></tr>{sd_rows}</table>
+<p style='color:#8b949e;font-size:10px;padding:4px 0'>expired com pnl&gt;0 = trailing_active que o monitor age-out sobrescreveu (bug corrigido no db.py)</p>
+</div>
 """
 
     if best_label:
