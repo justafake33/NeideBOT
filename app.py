@@ -10008,5 +10008,204 @@ def debug_kline_live():
         return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
+@app.route("/analise/wbottom")
+def analise_wbottom():
+    """
+    Hipótese W-bottom: o preço retesta o fundo após a entrada?
+    Para cada SL, mostra onde o preço foi depois da entrada vs mc_bottom.
+    Responde: SL ancorado no fundo (em vez de % fixo da entrada) teria sobrevivido?
+    """
+    import traceback
+    try:
+        FLOOR_PCT = float(request.args.get("floor", "0.90"))  # SL floor = mc_bottom × floor_pct
+
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                # Busca SL trades com mc_bottom + entry real
+                cur.execute("""
+                    SELECT
+                        t.id,
+                        t.symbol,
+                        t.mint,
+                        t.status,
+                        t.mc_bottom,
+                        t.entry_expected,
+                        t.entry_price_usd,
+                        t.tokens_received,
+                        t.ts_signal,
+                        t.pnl_pct_real,
+                        t.sl_pct,
+                        t.tp_pct
+                    FROM trades t
+                    WHERE t.status IN ('sl', 'expired', 'tp', 'trailing_active')
+                      AND t.mc_bottom IS NOT NULL AND t.mc_bottom > 0
+                      AND t.entry_price_usd IS NOT NULL
+                      AND t.tokens_received IS NOT NULL AND t.tokens_received > 0
+                      AND t.ts_signal IS NOT NULL
+                    ORDER BY t.created_at DESC
+                    LIMIT 200
+                """)
+                trades_raw = [dict(zip([d[0] for d in cur.description], r)) for r in cur.fetchall()]
+
+                if not trades_raw:
+                    return "<pre>Sem trades com dados suficientes.</pre>"
+
+                mints_ts = [(t["mint"], t["ts_signal"]) for t in trades_raw]
+
+                # Busca mínimo MC após entrada para cada trade (nos 30min seguintes)
+                min_mc_map = {}
+                for tr in trades_raw:
+                    cur.execute("""
+                        SELECT MIN(COALESCE(mc_low, mc)) AS min_mc
+                        FROM token_ticks
+                        WHERE mint = %(mint)s
+                          AND tick_ts > %(ts)s
+                          AND tick_ts < %(ts)s + INTERVAL '30 minutes'
+                    """, {"mint": tr["mint"], "ts": tr["ts_signal"]})
+                    row = cur.fetchone()
+                    min_mc_map[tr["id"]] = row[0] if row and row[0] else None
+
+        rows = []
+        n_no_ticks = 0
+        n_survived  = 0  # SL trades where floor-anchor would have survived
+        n_sl_total  = 0
+
+        for t in trades_raw:
+            entry_mc_real = (t["entry_price_usd"] / t["tokens_received"]) * 1_000_000_000
+            mc_bottom     = t["mc_bottom"]
+            min_after     = min_mc_map.get(t["id"])
+            is_sl         = t["status"] in ("sl", "expired") and (t.get("pnl_pct_real") or 0) < 0
+
+            if is_sl:
+                n_sl_total += 1
+
+            if min_after is None:
+                n_no_ticks += 1
+                retest_depth = None
+                retest_ratio = None
+                floor_survives = None
+            else:
+                retest_depth  = (entry_mc_real - min_after) / entry_mc_real  # % queda pós-entrada
+                retest_ratio  = min_after / mc_bottom if mc_bottom > 0 else None  # min / bottom
+                sl_floor_mc   = mc_bottom * FLOOR_PCT
+                floor_survives = min_after > sl_floor_mc  # anchor teria sobrevivido?
+
+                if is_sl and floor_survives:
+                    n_survived += 1
+
+            rows.append({
+                **t,
+                "entry_mc_real":  entry_mc_real,
+                "min_after":      min_after,
+                "retest_depth":   retest_depth,
+                "retest_ratio":   retest_ratio,
+                "floor_survives": floor_survives,
+                "is_sl":          is_sl,
+            })
+
+        n_sl_with_ticks = sum(1 for r in rows if r["is_sl"] and r["min_after"] is not None)
+        pct_survived    = n_survived / n_sl_with_ticks * 100 if n_sl_with_ticks else 0
+
+        def _pct(v):
+            return f"{v*100:.1f}%" if v is not None else "—"
+        def _mc(v):
+            return f"${v:,.0f}" if v is not None else "—"
+        def _color_ratio(v):
+            if v is None: return ""
+            if v >= 1.0:  return "color:#f85149"   # abaixo do fundo = rug
+            if v >= 0.90: return "color:#e3b341"   # zona critica
+            return "color:#3fb950"                  # sobreviveria anchor
+
+        CSS = "<style>body{background:#0d1117;color:#e6edf3;font:13px/1.5 monospace;padding:20px}table{border-collapse:collapse;width:100%}th{background:#161b22;padding:6px 10px;text-align:left;font-size:11px;color:#8b949e}td{padding:5px 10px;border-bottom:1px solid #21262d;font-size:12px}.green{color:#3fb950}.red{color:#f85149}.yellow{color:#e3b341}.nav a{color:#58a6ff;margin-right:16px;text-decoration:none}.big{font-size:28px;font-weight:bold;margin:8px 0}.card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:16px;margin:12px 0;display:inline-block;min-width:180px;margin-right:12px;vertical-align:top}</style>"
+
+        # Cards de resumo
+        cards = f"""
+        <div class='card'>
+          <div style='color:#8b949e;font-size:11px'>SL trades analisados</div>
+          <div class='big'>{n_sl_with_ticks}</div>
+          <div style='color:#8b949e;font-size:11px'>com ticks disponíveis ({n_no_ticks} sem ticks)</div>
+        </div>
+        <div class='card'>
+          <div style='color:#8b949e;font-size:11px'>Anchor floor = mc_bottom × {FLOOR_PCT:.0%}</div>
+          <div class='big {'green' if pct_survived > 50 else 'red'}'>{pct_survived:.0f}%</div>
+          <div style='color:#8b949e;font-size:11px'>dos SLs teriam sobrevivido</div>
+        </div>
+        <div class='card'>
+          <div style='color:#8b949e;font-size:11px'>SLs que teriam virado TP</div>
+          <div class='big green'>{n_survived}</div>
+          <div style='color:#8b949e;font-size:11px'>se anchor sobrevive → assumindo recuperação</div>
+        </div>
+        """
+
+        # Tabela detalhada
+        table_rows = ""
+        for r in sorted(rows, key=lambda x: x["is_sl"], reverse=True):
+            status_label = "🔴 SL" if r["is_sl"] else ("🟢 TP" if r["status"] == "tp" else "🟡 " + r["status"])
+            floor_label  = ""
+            if r["floor_survives"] is not None:
+                floor_label = "<span class='green'>✓ sobrevive</span>" if r["floor_survives"] else "<span class='red'>✗ rug</span>"
+
+            table_rows += f"""<tr>
+              <td>{r['symbol']}</td>
+              <td>{status_label}</td>
+              <td>{_mc(r['mc_bottom'])}</td>
+              <td>{_mc(r['entry_mc_real'])}</td>
+              <td>{_pct((r['entry_mc_real'] - r['mc_bottom']) / r['mc_bottom'] if r['mc_bottom'] else None)}</td>
+              <td>{_mc(r['min_after'])}</td>
+              <td style='{_color_ratio(r["retest_ratio"])}'>{_pct(r["retest_depth"])}</td>
+              <td style='{_color_ratio(r["retest_ratio"])}'>{f"{r['retest_ratio']:.2f}×" if r["retest_ratio"] else "—"}</td>
+              <td>{floor_label}</td>
+              <td class='{"green" if (r.get("pnl_pct_real") or 0) > 0 else "red"}'>{_pct(r.get("pnl_pct_real"))}</td>
+            </tr>"""
+
+        html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'><title>W-Bottom Analysis</title>{CSS}</head><body>
+<h1>📊 Hipótese W-Bottom — Retest do Fundo Após Entrada</h1>
+<div class='nav'>
+  <a href='/trades'>Trades</a>
+  <a href='/analise/wr-breakdown'>WR Breakdown</a>
+  <a href='?floor=0.85'>floor 85%</a>
+  <a href='?floor=0.90'>floor 90%</a>
+  <a href='?floor=0.95'>floor 95%</a>
+</div>
+
+<p style='color:#8b949e;margin:12px 0'>
+  Pergunta: <b style='color:#e6edf3'>nos SLs, o preço chegou a cair abaixo de mc_bottom × {FLOOR_PCT:.0%}?</b><br>
+  Se a maioria ficou <i>acima</i> desse floor → hipótese confirmada → SL ancorado no fundo resolve.
+</p>
+
+{cards}
+
+<h2>Legenda das colunas</h2>
+<p style='color:#8b949e;font-size:11px'>
+  <b>mc_bottom</b>: fundo detectado pelo bot no momento do sinal |
+  <b>entry_mc_real</b>: MC real de execução (entry_price_usd / tokens × 1B) |
+  <b>entry acima fundo</b>: quanto entramos acima do fundo |
+  <b>min_mc pós-entrada</b>: menor MC visto nos ticks 30min após entrada |
+  <b>retest depth</b>: queda do entry_mc_real até o min_mc |
+  <b>min/bottom</b>: <span class='green'>≥1.0</span> não passou do fundo · <span class='yellow'>0.90-1.0</span> zona crítica · <span class='red'>&lt;0.90</span> rug real |
+  <b>anchor {FLOOR_PCT:.0%}</b>: SL em mc_bottom × {FLOOR_PCT:.0%} teria sobrevivido?
+</p>
+
+<table>
+  <thead><tr>
+    <th>Token</th><th>Status</th><th>mc_bottom</th><th>entry_mc_real</th>
+    <th>entry acima fundo</th><th>min_mc pós-entrada</th>
+    <th>retest depth</th><th>min/bottom</th>
+    <th>anchor {FLOOR_PCT:.0%}</th><th>PnL real</th>
+  </tr></thead>
+  <tbody>{table_rows}</tbody>
+</table>
+<p style='color:#8b949e;font-size:11px;margin-top:16px'>
+  {n_no_ticks} trades sem ticks — excluídos da análise de retest.
+  Ticks disponíveis apenas quando token apareceu no trenches poll durante a janela quente.
+</p>
+</body></html>"""
+
+        return html
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
