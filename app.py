@@ -10019,51 +10019,49 @@ def analise_wbottom():
     try:
         FLOOR_PCT = float(request.args.get("floor", "0.90"))  # SL floor = mc_bottom × floor_pct
 
-        with db.get_conn() as conn:
-            with conn.cursor() as cur:
-                # Busca SL trades com mc_bottom + entry real
+        with db._cursor() as cur:
+            # Busca SL trades com mc_bottom + entry real
+            cur.execute("""
+                SELECT
+                    t.id,
+                    t.symbol,
+                    t.mint,
+                    t.status,
+                    t.mc_bottom,
+                    t.entry_expected,
+                    t.entry_price_usd,
+                    t.tokens_received,
+                    t.ts_signal,
+                    t.pnl_pct_real,
+                    t.sl_pct,
+                    t.tp_pct
+                FROM trades t
+                WHERE t.status IN ('sl', 'expired', 'tp', 'trailing_active')
+                  AND t.mc_bottom IS NOT NULL AND t.mc_bottom > 0
+                  AND t.entry_price_usd IS NOT NULL
+                  AND t.tokens_received IS NOT NULL AND t.tokens_received > 0
+                  AND t.ts_signal IS NOT NULL
+                ORDER BY t.created_at DESC
+                LIMIT 200
+            """)
+            trades_raw = [dict(r) for r in cur.fetchall()]
+
+        if not trades_raw:
+            return "<pre>Sem trades com dados suficientes.</pre>"
+
+        # Busca mínimo MC após entrada para cada trade (nos 30min seguintes)
+        min_mc_map = {}
+        for tr in trades_raw:
+            with db._cursor() as cur:
                 cur.execute("""
-                    SELECT
-                        t.id,
-                        t.symbol,
-                        t.mint,
-                        t.status,
-                        t.mc_bottom,
-                        t.entry_expected,
-                        t.entry_price_usd,
-                        t.tokens_received,
-                        t.ts_signal,
-                        t.pnl_pct_real,
-                        t.sl_pct,
-                        t.tp_pct
-                    FROM trades t
-                    WHERE t.status IN ('sl', 'expired', 'tp', 'trailing_active')
-                      AND t.mc_bottom IS NOT NULL AND t.mc_bottom > 0
-                      AND t.entry_price_usd IS NOT NULL
-                      AND t.tokens_received IS NOT NULL AND t.tokens_received > 0
-                      AND t.ts_signal IS NOT NULL
-                    ORDER BY t.created_at DESC
-                    LIMIT 200
-                """)
-                trades_raw = [dict(zip([d[0] for d in cur.description], r)) for r in cur.fetchall()]
-
-                if not trades_raw:
-                    return "<pre>Sem trades com dados suficientes.</pre>"
-
-                mints_ts = [(t["mint"], t["ts_signal"]) for t in trades_raw]
-
-                # Busca mínimo MC após entrada para cada trade (nos 30min seguintes)
-                min_mc_map = {}
-                for tr in trades_raw:
-                    cur.execute("""
-                        SELECT MIN(COALESCE(mc_low, mc)) AS min_mc
-                        FROM token_ticks
-                        WHERE mint = %(mint)s
-                          AND tick_ts > %(ts)s
-                          AND tick_ts < %(ts)s + INTERVAL '30 minutes'
-                    """, {"mint": tr["mint"], "ts": tr["ts_signal"]})
-                    row = cur.fetchone()
-                    min_mc_map[tr["id"]] = row[0] if row and row[0] else None
+                    SELECT MIN(COALESCE(mc_low, mc)) AS min_mc
+                    FROM token_ticks
+                    WHERE mint = %(mint)s
+                      AND tick_ts > %(ts)s
+                      AND tick_ts < %(ts)s + INTERVAL '30 minutes'
+                """, {"mint": tr["mint"], "ts": tr["ts_signal"]})
+                row = cur.fetchone()
+                min_mc_map[tr["id"]] = row["min_mc"] if row and row["min_mc"] else None
 
         rows = []
         n_no_ticks = 0
