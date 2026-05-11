@@ -790,11 +790,14 @@ def get_trades(limit: int = 200) -> list:
 
 
 def get_open_trades() -> list:
-    """Retorna trades ainda sob monitoramento (open + trailing_active aguardando saída real)."""
+    """Retorna trades ainda sob monitoramento — apenas 'open'.
+    'trailing_active' é estado terminal: GMGN gerencia a saída, não monitoramos mais.
+    Remover trailing_active daqui impede que o MONITOR_MAX_AGE_H sobrescreva o TP para 'expired'.
+    """
     with _cursor() as cur:
         cur.execute("""
             SELECT * FROM trades
-            WHERE status IN ('open', 'trailing_active')
+            WHERE status = 'open'
               AND entry_expected IS NOT NULL
             ORDER BY created_at ASC
         """)
