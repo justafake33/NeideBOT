@@ -9807,5 +9807,206 @@ tr:hover td{background:#161b22}
     return h
 
 
+
+
+@app.route("/debug/kline-live")
+def debug_kline_live():
+    """
+    Diagnóstico: GMGN retorna candles parciais (não fechados) no kline?
+
+    Parâmetros:
+      mint=<mint>   token a consultar (obrigatório, ou usa um hot token ativo)
+      window=120    segundos de lookback (padrão 120s)
+
+    Resposta mostra:
+      - Candles retornados com timestamps e OHLCV
+      - Se o último candle está dentro do minuto atual (parcial) ou não
+      - Comparação low do último candle vs preço atual (trenches mc_last)
+    """
+    import traceback, time as _time
+    from datetime import datetime, timezone
+
+    try:
+        mint = request.args.get("mint", "").strip()
+        window_sec = int(request.args.get("window", 120))
+
+        # Coleta todos os tokens quentes
+        hot_mints = []
+        if scanner:
+            with scanner.hot._lock:
+                hot_mints = list(scanner.hot._tokens.keys())
+
+        now_ts = int(_time.time())
+        from_ts = now_ts - window_sec
+        to_ts   = now_ts + 120
+
+        lines = []
+        lines.append(f"=== /debug/kline-live ===")
+        lines.append(f"Agora UTC : {datetime.utcnow().strftime('%H:%M:%S')}")
+        lines.append(f"Tokens quentes ativos: {len(hot_mints)}")
+        lines.append(f"Janela    : {window_sec}s lookback + 120s fwd")
+        lines.append("")
+
+        # Se mint explícito, usa ele; senão tenta todos até achar um com candles
+        candidates = [mint] if mint else hot_mints
+        if not candidates:
+            return "<pre>Nenhum token ativo no HotMonitor. Passe ?mint=... explicitamente.</pre>", 400
+
+        # Testa cada candidato para achar um com dados kline
+        chosen_mint   = None
+        candles       = []
+        skipped       = []
+        for m in candidates:
+            c = gmgn.get_token_kline(m, "sol", "1m", from_ts=from_ts, to_ts=to_ts)
+            if c:
+                chosen_mint = m
+                candles     = c
+                break
+            skipped.append(m)
+
+        if skipped:
+            lines.append(f"Tokens sem kline (Meteora DAMM v2?): {len(skipped)}")
+            for m in skipped:
+                lines.append(f"  ✗ {m}")
+            lines.append("")
+
+        if not chosen_mint:
+            lines.append("⚠️  Nenhum dos tokens quentes tem dados kline disponíveis agora.")
+            lines.append("Possíveis causas:")
+            lines.append("  • Todos são Meteora DAMM v2 (sem kline histórico)")
+            lines.append("  • Tokens muito novos (kline demora alguns minutos para aparecer)")
+            lines.append("  • Janela muito curta — tente ?window=3600")
+            return "<pre style='font-family:monospace;font-size:13px'>" + "\n".join(lines) + "</pre>"
+
+        mint = chosen_mint
+        lines.append(f"Mint com kline: {mint}")
+        lines.append("")
+
+        # Busca estado do HotMonitor para o mint escolhido
+        mc_last_hot = None
+        mc_min_hot  = None
+        ts_min_hot  = None
+        supply      = None
+        if scanner:
+            with scanner.hot._lock:
+                state = scanner.hot._tokens.get(mint)
+            if state:
+                mc_last_hot = state.get("mc_last") or state.get("_mc_live")
+                mc_min_hot  = state.get("mc_min")
+                ts_min_hot  = state.get("ts_min")
+                supply      = state.get("total_supply")
+
+        lines.append(f"Candles retornados: {len(candles)}")
+        lines.append("")
+
+        if not candles:
+            lines.append("⚠️  Nenhum candle retornado.")
+        else:
+            now_minute_floor = (now_ts // 60) * 60  # início do minuto atual (UTC)
+            prev_minute_floor = now_minute_floor - 60
+
+            lines.append(f"Minuto atual começa em : {now_minute_floor}  ({datetime.utcfromtimestamp(now_minute_floor).strftime('%H:%M:%S')} UTC)")
+            lines.append(f"Minuto anterior         : {prev_minute_floor}  ({datetime.utcfromtimestamp(prev_minute_floor).strftime('%H:%M:%S')} UTC)")
+            lines.append("")
+
+            header = f"{'#':>3}  {'candle_ts':>12}  {'UTC':>8}  {'open':>12}  {'high':>12}  {'low':>12}  {'close':>12}  {'vol':>10}  {'status':>15}"
+            lines.append(header)
+            lines.append("-" * len(header))
+
+            for i, c in enumerate(candles):
+                raw_ts   = int(c.get("time", 0))
+                # GMGN kline time é em ms
+                c_ts_ms  = raw_ts if raw_ts > 1e10 else raw_ts * 1000
+                c_ts_sec = c_ts_ms // 1000
+                c_dt     = datetime.utcfromtimestamp(c_ts_sec).strftime("%H:%M:%S")
+
+                if c_ts_sec >= now_minute_floor:
+                    status = "⚡ PARCIAL (atual)"
+                elif c_ts_sec >= prev_minute_floor:
+                    status = "✅ fechado (-1min)"
+                else:
+                    status = f"closed ({(now_ts - c_ts_sec)//60}min atrás)"
+
+                o = c.get("open",   "?")
+                h = c.get("high",   "?")
+                l = c.get("low",    "?")
+                cl= c.get("close",  "?")
+                v = c.get("volume", "?")
+                lines.append(f"{i+1:>3}  {c_ts_sec:>12}  {c_dt:>8}  {o:>12}  {h:>12}  {l:>12}  {cl:>12}  {v:>10}  {status:>15}")
+
+            # Análise do último candle
+            last = candles[-1]
+            last_ts_raw = int(last.get("time", 0))
+            last_ts_ms  = last_ts_raw if last_ts_raw > 1e10 else last_ts_raw * 1000
+            last_ts_sec = last_ts_ms // 1000
+            is_partial  = last_ts_sec >= now_minute_floor
+
+            lines.append("")
+            lines.append("=== ANÁLISE DO ÚLTIMO CANDLE ===")
+            lines.append(f"Timestamp : {last_ts_sec}  ({datetime.utcfromtimestamp(last_ts_sec).strftime('%H:%M:%S')} UTC)")
+            lines.append(f"Parcial?  : {'✅ SIM — candle ainda não fechou' if is_partial else '❌ NÃO — candle já fechado'}")
+            lines.append(f"  → Idade : {now_ts - last_ts_sec}s atrás")
+            lines.append(f"  → Secs dentro do minuto: {now_ts % 60}s decorridos no minuto atual")
+
+            last_low   = last.get("low")
+            last_close = last.get("close")
+
+            lines.append("")
+            lines.append("=== COMPARAÇÃO PREÇO ===")
+
+            if supply:
+                try:
+                    low_mc   = float(last_low)   * supply if last_low   else None
+                    close_mc = float(last_close) * supply if last_close else None
+                    lines.append(f"Último candle low   : {last_low}  → MC = ${low_mc:,.0f}" if low_mc else "low: N/A")
+                    lines.append(f"Último candle close : {last_close}  → MC = ${close_mc:,.0f}" if close_mc else "close: N/A")
+                    if mc_last_hot:
+                        lines.append(f"HotMonitor mc_last  : ${mc_last_hot:,.0f}  (trenches poll)")
+                    if mc_min_hot:
+                        lines.append(f"HotMonitor mc_min   : ${mc_min_hot:,.0f}  (mínimo registrado)")
+                    if ts_min_hot:
+                        age_min = (now_ts - ts_min_hot.timestamp()) if hasattr(ts_min_hot, "timestamp") else "?"
+                        lines.append(f"ts_min age          : {age_min:.0f}s atrás" if isinstance(age_min, float) else f"ts_min: {ts_min_hot}")
+
+                    if is_partial and low_mc and mc_last_hot:
+                        delta_pct = (mc_last_hot - low_mc) / low_mc * 100
+                        if low_mc < mc_last_hot:
+                            lines.append(f"\n🔴 kline low (${low_mc:,.0f}) < trenches close (${mc_last_hot:,.0f})")
+                            lines.append(f"   → Diferença: +{delta_pct:.1f}% — kline JÁ captura intra-candle lows!")
+                            lines.append(f"   → GMGN retorna candle parcial com low real-time ✅")
+                        elif low_mc > mc_last_hot:
+                            lines.append(f"\n🟡 kline low (${low_mc:,.0f}) > trenches close (${mc_last_hot:,.0f})")
+                            lines.append(f"   → Trenches é mais baixo — kline NÃO captura o intra-candle low atual")
+                        else:
+                            lines.append(f"\n⚪ kline low ≈ trenches close — valores idênticos")
+                    elif not is_partial:
+                        lines.append(f"\nℹ️  Último candle é fechado — não diz nada sobre candles parciais.")
+                        lines.append(f"   Tente novamente em alguns segundos para ver se GMGN inclui o candle atual.")
+                except Exception as e:
+                    lines.append(f"Erro ao calcular MC: {e}")
+            else:
+                lines.append(f"Último candle low   : {last_low}")
+                lines.append(f"Último candle close : {last_close}")
+                lines.append(f"Supply não disponível — token não está no HotMonitor")
+                if mc_last_hot:
+                    lines.append(f"HotMonitor mc_last  : ${mc_last_hot:,.0f}")
+
+            lines.append("")
+            lines.append("=== CONCLUSÃO ===")
+            if is_partial:
+                lines.append("GMGN retorna o candle do minuto corrente (parcial/não fechado).")
+                lines.append("Isso significa que o 'low' desse candle é o intra-candle low em tempo real.")
+                lines.append("O _precise_bottom_tick já processa esse low a cada HOT_PRECISE_SEC=5s.")
+            else:
+                lines.append("GMGN NÃO retornou o candle do minuto atual.")
+                lines.append("O kline só mostra candles fechados — sem intra-candle precision.")
+                lines.append("Para V-shapes dentro de 1 candle, só trenches poll (5s, close) ou WebSocket ajuda.")
+
+        return "<pre style='font-family:monospace;font-size:13px'>" + "\n".join(lines) + "</pre>"
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
