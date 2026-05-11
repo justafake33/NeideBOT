@@ -34,7 +34,7 @@ import os
 import struct
 import threading
 import time
-from typing import Callable, Optional
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,12 @@ PUMP_AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
 METEORA_PROGRAM  = "cpamdpKoS7RUn9RDdHsS3SuRH5BVTTvovCHQnGFumm9"
 RAYDIUM_PROGRAM  = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 
-_RATE_LIMIT_SEC = 2.0
+# Tier 1 (Anchor parse inline): sem rate limit — cada swap dispara _check_bounce
+# Tier 2 (DexScreener fallback): rate limit de 2s — chamada HTTP externa
+_DEX_RATE_LIMIT_SEC = 2.0
+
+# SOL/USD cache local — atualizado pelo thread DexScreener, nunca bloqueia o WS callback
+_sol_usd_cached: float = 0.0
 _TOKEN_DECIMALS = 6        # Pump.fun SPL tokens (6 casas decimais)
 _SOL_DECIMALS   = 9        # SOL/WSOL em lamports
 _MC_MIN         = 1_000    # $1K — abaixo disso é ruído
@@ -244,8 +249,21 @@ class HeliusWS:
             logger.warning("HELIUS_API_KEY não configurado — HeliusWS desativado")
             return
         self._running = True
+        # Inicializa _sol_usd_cached para o path inline estar pronto imediatamente
+        threading.Thread(target=self._init_sol_usd, daemon=True, name="helius-sol-init").start()
         threading.Thread(target=self._run_loop, daemon=True, name="helius-ws").start()
         logger.info("HeliusWS iniciado (url=%s...)", _WS_URL[:40])
+
+    def _init_sol_usd(self):
+        global _sol_usd_cached
+        try:
+            from gmgn_client import get_sol_usd
+            price = get_sol_usd()
+            if price:
+                _sol_usd_cached = price
+                logger.debug("HeliusWS: SOL/USD inicializado = $%.2f", price)
+        except Exception as e:
+            logger.debug("HeliusWS: _init_sol_usd: %s", e)
 
     def subscribe(self, mint: str, total_supply: float):
         """Subscreve ao mint no WebSocket — sem precisar do pool address."""
@@ -379,19 +397,34 @@ class HeliusWS:
         if not is_swap:
             return
 
-        # Rate limit por token
+        with self._lock:
+            supply = self._mint_supply.get(mint) or 1_000_000_000
+
+        # ── Tier 1: INLINE, sem rate limit, sem thread ─────────────────
+        # Cada swap dispara _check_bounce imediatamente (~5ms no callback WS).
+        # Elimina a janela cega de 2s do rate limit antigo.
+        if _sol_usd_cached > 0:
+            try:
+                mc = _parse_mc_from_logs(logs, supply, _sol_usd_cached)
+                if mc and mc > 0:
+                    logger.info("HeliusWS price(anchor) %s: $%.0f MC", mint[:8], mc)
+                    self._on_price(mint, mc)
+                    return
+            except Exception as e:
+                logger.debug("HeliusWS anchor parse %s: %s", mint[:8], e)
+
+        # ── Tier 2: DexScreener fallback — rate-limitado (HTTP externo) ─
         now = time.time()
         with self._lock:
-            if now - self._last_fetch.get(mint, 0) < _RATE_LIMIT_SEC:
+            if now - self._last_fetch.get(mint, 0) < _DEX_RATE_LIMIT_SEC:
                 return
             self._last_fetch[mint] = now
-            supply = self._mint_supply.get(mint)
 
         threading.Thread(
-            target=self._fetch_and_notify,
-            args=(mint, supply, logs),
+            target=self._dexscreener_fallback,
+            args=(mint, supply),
             daemon=True,
-            name=f"hprice-{mint[:6]}",
+            name=f"hdex-{mint[:6]}",
         ).start()
 
     def _on_error(self, ws, error):
@@ -405,25 +438,17 @@ class HeliusWS:
     # Price resolution — Anchor logs → DexScreener fallback
     # ──────────────────────────────────────────────────────────────────
 
-    def _fetch_and_notify(self, mint: str, supply: Optional[float], logs: list):
+    def _dexscreener_fallback(self, mint: str, supply: float):
         """
-        Tier 1 — Parse Anchor event dos logs (~0ms, zero chamadas extras).
-        Tier 2 — DexScreener se parse falhar (1-3s).
+        Tier 2 — DexScreener fallback quando Anchor parse falha (token não é pAMM).
+        Também atualiza _sol_usd_cached para o path inline do Tier 1.
         """
+        global _sol_usd_cached
         from gmgn_client import get_sol_usd
-
-        supply = supply or 1_000_000_000
 
         sol_usd = get_sol_usd()
         if sol_usd:
-            try:
-                mc = _parse_mc_from_logs(logs, supply, sol_usd)
-                if mc and mc > 0:
-                    logger.info("HeliusWS price(anchor) %s: $%.0f MC", mint[:8], mc)
-                    self._on_price(mint, mc)
-                    return
-            except Exception as e:
-                logger.debug("HeliusWS anchor parse %s: %s", mint[:8], e)
+            _sol_usd_cached = sol_usd  # alimenta o path inline sem bloqueio
 
         from pool_resolver import get_price_usd
         try:
