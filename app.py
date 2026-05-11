@@ -9184,11 +9184,11 @@ def _wr_breakdown_inner():
                 t.entry_expected,
                 t.mc_bottom,
                 -- bounce_signals
-                b.mc_min        AS b_mc_min,
-                b.mc_at_signal  AS b_mc_at_signal,
-                b.bounce_pct    AS b_bounce_pct,
-                b.drop_pct      AS b_drop_pct,
-                b.elapsed_min   AS b_elapsed_min,
+                b.mc_min           AS b_mc_min,
+                b.mc_at_signal     AS b_mc_at_signal,
+                b.bounce_pct       AS b_bounce_pct,
+                b.drop_from_mig    AS b_drop_pct,
+                b.elapsed_sec / 60.0 AS b_elapsed_min,
                 -- migrations
                 m.mc_migration,
                 m.time_to_bottom,
