@@ -7,8 +7,8 @@ Fluxo por token:
          sem precisar descobrir o pool address. Subscrição imediata na migração.
   2. Swap detectado na notificação (~200ms pós on-chain):
        → Tier 1: parse Program data: <base64> (zero chamadas, ~0ms)
-         O Meteora DAMM v2 é Anchor — emite SwapEvent com in_amount/out_amount
-         no próprio payload. Preço exato sem custo extra.
+         pump.fun pAMM (pAMMBay6...) emite BuyEvent/SellEvent com pool reserves.
+         Preço calculado de pool_base/pool_quote — exato, sem ambiguidade de fee/direção.
        → Tier 2: DexScreener fallback se parse falhar (1-3s, gratuito)
   3. cancel(mint) → logsUnsubscribe
 
@@ -16,7 +16,13 @@ Por que mentions=[mint] e não mentions=[pool]:
   - Pool address requer chamada ao DexScreener antes da subscrição
   - DexScreener leva 1-5min para indexar tokens novos — janela do V-bottom perdida
   - O mint já é conhecido na migração; está sempre presente em transações de swap
-  - Ruído extra (transfers, LP) filtrado pelo check "Instruction: Swap"
+  - Ruído extra (transfers, LP) filtrado pelo check de programa/instrução
+
+Programas suportados (Tier 1):
+  - pump.fun pAMM: pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA
+    Eventos: BuyEvent (disc=67f4521f...) e SellEvent (disc=3e2f370a...)
+    Layout: pool_base_token_reserves @ offset 48, pool_quote_token_reserves @ offset 56
+  - Meteora DAMM v2: EvtSwap2 (candidato — não observado ainda)
 
 Rate limit: 1 parse por 2s por token.
 """
@@ -35,9 +41,10 @@ logger = logging.getLogger(__name__)
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
 _WS_URL        = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 
-# Program IDs relevantes para filtrar swaps (Meteora DAMM v2 e Raydium AMM v4)
-METEORA_PROGRAM = "cpamdpKoS7RUn9RDdHsS3SuRH5BVTTvovCHQnGFumm9"
-RAYDIUM_PROGRAM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+# Program IDs relevantes para filtrar swaps
+PUMP_AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+METEORA_PROGRAM  = "cpamdpKoS7RUn9RDdHsS3SuRH5BVTTvovCHQnGFumm9"
+RAYDIUM_PROGRAM  = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 
 _RATE_LIMIT_SEC = 2.0
 _TOKEN_DECIMALS = 6        # Pump.fun SPL tokens (6 casas decimais)
@@ -47,7 +54,7 @@ _MC_MAX         = 10_000_000  # $10M — acima é suspeito para micro-caps
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Parse Anchor — extrai in_amount/out_amount do Program data: <base64>
+# Parse Anchor — discriminadores e parsers por programa
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _anchor_disc(event_name: str) -> bytes:
@@ -55,30 +62,86 @@ def _anchor_disc(event_name: str) -> bytes:
     return hashlib.sha256(f"event:{event_name}".encode()).digest()[:8]
 
 
-# Candidatos para o nome do evento de swap do Meteora DAMM v2 (CP AMM Dynamic).
-# Se nenhum bater em produção, o log INFO mostra o disc.hex() real para adicionar aqui.
-_SWAP_ONLY_DISCS: set[bytes] = {
+# pump.fun pAMM — confirmado via IDL pump-fun/pump-public-docs
+# BuyEvent disc=67f4521f2cf57777, SellEvent disc=3e2f370aa503dc2a
+_BUY_DISC  = _anchor_disc("BuyEvent")
+_SELL_DISC = _anchor_disc("SellEvent")
+_PUMP_AMM_DISCS: set[bytes] = {_BUY_DISC, _SELL_DISC}
+
+# Meteora DAMM v2 — candidatos (EvtSwap2 não observado ainda nos logs)
+_METEORA_DISCS: set[bytes] = {
     _anchor_disc("Swap"),
     _anchor_disc("SwapEvent"),
     _anchor_disc("CpAmmSwapEvent"),
+    _anchor_disc("EvtSwap2"),
 }
 
+_SWAP_ONLY_DISCS: set[bytes] = _PUMP_AMM_DISCS | _METEORA_DISCS
 
-def _parse_swap_amounts(raw: bytes) -> tuple[int, int] | None:
+
+def _parse_pump_amm_mc(raw: bytes, sol_usd: float, supply: float) -> float | None:
     """
-    Extrai (in_amount_raw, out_amount_raw) de um evento Anchor de swap.
+    Parse pump.fun pAMM BuyEvent ou SellEvent — retorna MC em USD.
 
-    Layout após 8 bytes de discriminador:
-      pool:       Pubkey  = 32 bytes (ignorado)
-      in_amount:  u64     = 8 bytes
-      out_amount: u64     = 8 bytes
+    Layout Borsh (offset a partir do início dos bytes, incluindo 8 bytes de disc):
+      offset  0: disc                          8 bytes
+      offset  8: timestamp                     i64  (ignorado)
+      offset 16: base_amount_out/in            u64  (tokens)
+      offset 24: max_quote_amount_in/min_...   u64  (limite, ignorado)
+      offset 32: user_base_token_reserves      u64
+      offset 40: user_quote_token_reserves     u64
+      offset 48: pool_base_token_reserves      u64  ← reservas de token no pool
+      offset 56: pool_quote_token_reserves     u64  ← reservas de SOL no pool
+      offset 64: quote_amount_in/out           u64  (SOL transacionado)
+      ... (mais campos: fees, pubkeys, ix_name, etc.)
 
-    Recebe bytes já decodificados de base64.
+    Fonte: pump-fun/pump-public-docs/idl/pump_amm.json
     """
-    if len(raw) < 56:  # disc(8) + pool(32) + in(8) + out(8)
+    if len(raw) < 64:
         return None
 
-    if raw[:8] not in _SWAP_ONLY_DISCS:
+    pool_base  = struct.unpack_from("<Q", raw, 48)[0]  # tokens no pool
+    pool_quote = struct.unpack_from("<Q", raw, 56)[0]  # SOL no pool (lamports)
+
+    if pool_base > 0 and pool_quote > 0:
+        # Preço = (SOL_reserves / 10^9) / (token_reserves / 10^6) SOL/token
+        price_sol = (pool_quote / 10 ** _SOL_DECIMALS) / (pool_base / 10 ** _TOKEN_DECIMALS)
+        mc = price_sol * sol_usd * supply
+        if _MC_MIN < mc < _MC_MAX:
+            return mc
+
+    # Fallback: usar amounts da swap (buy=SOL→token, sell=token→SOL)
+    disc         = raw[:8]
+    base_amount  = struct.unpack_from("<Q", raw, 16)[0]
+    quote_amount = struct.unpack_from("<Q", raw, 64)[0]
+
+    if base_amount == 0 or quote_amount == 0:
+        return None
+
+    if disc == _BUY_DISC:
+        sol_in  = quote_amount / 10 ** _SOL_DECIMALS
+        tok_out = base_amount  / 10 ** _TOKEN_DECIMALS
+        if tok_out > 0:
+            mc2 = (sol_in / tok_out) * sol_usd * supply
+            if _MC_MIN < mc2 < _MC_MAX:
+                return mc2
+    else:  # SellEvent
+        tok_in  = base_amount  / 10 ** _TOKEN_DECIMALS
+        sol_out = quote_amount / 10 ** _SOL_DECIMALS
+        if tok_in > 0:
+            mc2 = (sol_out / tok_in) * sol_usd * supply
+            if _MC_MIN < mc2 < _MC_MAX:
+                return mc2
+
+    return None
+
+
+def _parse_meteora_mc(raw: bytes, sol_usd: float, supply: float) -> float | None:
+    """
+    Parse Meteora DAMM v2 swap event — layout legado: disc(8)+pool(32)+in(8)+out(8).
+    Tenta as duas direções SOL↔Token.
+    """
+    if len(raw) < 56:
         return None
 
     offset     = 8 + 32
@@ -88,27 +151,19 @@ def _parse_swap_amounts(raw: bytes) -> tuple[int, int] | None:
     if in_amount == 0 or out_amount == 0:
         return None
 
-    return in_amount, out_amount
-
-
-def _mc_from_amounts(in_raw: int, out_raw: int, supply: float, sol_usd: float) -> float | None:
-    """
-    Computa MC em USD a partir dos montantes de um swap SOL↔Token.
-    Tenta as duas direções e aceita a que produzir MC plausível ($1K–$10M).
-    """
     supply = supply or 1_000_000_000
 
-    # Direção 1: in=SOL(lamports), out=token(raw) → compra
-    sol_in  = in_raw  / 10 ** _SOL_DECIMALS
-    tok_out = out_raw / 10 ** _TOKEN_DECIMALS
+    # Direção 1: in=SOL, out=token (compra)
+    sol_in  = in_amount  / 10 ** _SOL_DECIMALS
+    tok_out = out_amount / 10 ** _TOKEN_DECIMALS
     if tok_out > 0:
         mc1 = (sol_in * sol_usd / tok_out) * supply
         if _MC_MIN < mc1 < _MC_MAX:
             return mc1
 
-    # Direção 2: in=token(raw), out=SOL(lamports) → venda
-    tok_in  = in_raw  / 10 ** _TOKEN_DECIMALS
-    sol_out = out_raw / 10 ** _SOL_DECIMALS
+    # Direção 2: in=token, out=SOL (venda)
+    tok_in  = in_amount  / 10 ** _TOKEN_DECIMALS
+    sol_out = out_amount / 10 ** _SOL_DECIMALS
     if tok_in > 0:
         mc2 = (sol_out * sol_usd / tok_in) * supply
         if _MC_MIN < mc2 < _MC_MAX:
@@ -120,8 +175,10 @@ def _mc_from_amounts(in_raw: int, out_raw: int, supply: float, sol_usd: float) -
 def _parse_mc_from_logs(logs: list, supply: float, sol_usd: float) -> float | None:
     """
     Percorre os logs e retorna o MC calculado dos eventos Anchor.
-    Loga INFO para discriminadores desconhecidos — calibração rápida em produção.
+    Prioridade: pump.fun pAMM → Meteora DAMM v2 → ignora (log DEBUG).
     """
+    supply = supply or 1_000_000_000
+
     for log in logs:
         if not log.startswith("Program data: "):
             continue
@@ -135,20 +192,23 @@ def _parse_mc_from_logs(logs: list, supply: float, sol_usd: float) -> float | No
             continue
 
         disc = raw[:8]
-        if disc not in _SWAP_ONLY_DISCS:
-            logger.info(
-                "HeliusWS: Program data desconhecido disc=%s len=%d — "
-                "adicionar a _SWAP_ONLY_DISCS se for swap do Meteora DAMM v2",
+
+        if disc in _PUMP_AMM_DISCS:
+            mc = _parse_pump_amm_mc(raw, sol_usd, supply)
+            if mc:
+                return mc
+
+        elif disc in _METEORA_DISCS:
+            mc = _parse_meteora_mc(raw, sol_usd, supply)
+            if mc:
+                return mc
+
+        else:
+            logger.debug(
+                "HeliusWS: Program data desconhecido disc=%s len=%d",
                 disc.hex(), len(raw),
             )
-            continue
 
-        result = _parse_swap_amounts(raw)
-        if result is None:
-            continue
-        mc = _mc_from_amounts(result[0], result[1], supply, sol_usd)
-        if mc:
-            return mc
     return None
 
 
@@ -308,7 +368,12 @@ class HeliusWS:
 
         # Filtra: só swaps dos DEXes relevantes
         is_swap = any(
-            METEORA_PROGRAM in log or RAYDIUM_PROGRAM in log or "Instruction: Swap" in log
+            PUMP_AMM_PROGRAM in log
+            or METEORA_PROGRAM in log
+            or RAYDIUM_PROGRAM in log
+            or "Instruction: Swap" in log
+            or "Instruction: Buy" in log
+            or "Instruction: Sell" in log
             for log in logs
         )
         if not is_swap:
