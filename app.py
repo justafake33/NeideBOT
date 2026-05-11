@@ -9803,33 +9803,63 @@ def debug_kline_live():
         mint = request.args.get("mint", "").strip()
         window_sec = int(request.args.get("window", 120))
 
-        # Se não informado, pega o primeiro token ativo no HotMonitor
+        # Coleta todos os tokens quentes
         hot_mints = []
         if scanner:
             with scanner.hot._lock:
                 hot_mints = list(scanner.hot._tokens.keys())
 
-        if not mint:
-            if not hot_mints:
-                return "<pre>Nenhum token ativo no HotMonitor. Passe ?mint=... explicitamente.</pre>", 400
-            mint = hot_mints[0]
-
         now_ts = int(_time.time())
         from_ts = now_ts - window_sec
-        to_ts   = now_ts + 120  # margem para garantir que último candle seja incluído
+        to_ts   = now_ts + 120
 
         lines = []
         lines.append(f"=== /debug/kline-live ===")
-        lines.append(f"Mint      : {mint}")
-        lines.append(f"Janela    : {from_ts} → {to_ts}  ({window_sec}s lookback + 120s fwd)")
         lines.append(f"Agora UTC : {datetime.utcnow().strftime('%H:%M:%S')}")
         lines.append(f"Tokens quentes ativos: {len(hot_mints)}")
+        lines.append(f"Janela    : {window_sec}s lookback + 120s fwd")
         lines.append("")
 
-        # Busca preço atual do HotMonitor para comparação
+        # Se mint explícito, usa ele; senão tenta todos até achar um com candles
+        candidates = [mint] if mint else hot_mints
+        if not candidates:
+            return "<pre>Nenhum token ativo no HotMonitor. Passe ?mint=... explicitamente.</pre>", 400
+
+        # Testa cada candidato para achar um com dados kline
+        chosen_mint   = None
+        candles       = []
+        skipped       = []
+        for m in candidates:
+            c = gmgn.get_token_kline(m, "sol", "1m", from_ts=from_ts, to_ts=to_ts)
+            if c:
+                chosen_mint = m
+                candles     = c
+                break
+            skipped.append(m)
+
+        if skipped:
+            lines.append(f"Tokens sem kline (Meteora DAMM v2?): {len(skipped)}")
+            for m in skipped:
+                lines.append(f"  ✗ {m}")
+            lines.append("")
+
+        if not chosen_mint:
+            lines.append("⚠️  Nenhum dos tokens quentes tem dados kline disponíveis agora.")
+            lines.append("Possíveis causas:")
+            lines.append("  • Todos são Meteora DAMM v2 (sem kline histórico)")
+            lines.append("  • Tokens muito novos (kline demora alguns minutos para aparecer)")
+            lines.append("  • Janela muito curta — tente ?window=3600")
+            return "<pre style='font-family:monospace;font-size:13px'>" + "\n".join(lines) + "</pre>"
+
+        mint = chosen_mint
+        lines.append(f"Mint com kline: {mint}")
+        lines.append("")
+
+        # Busca estado do HotMonitor para o mint escolhido
         mc_last_hot = None
         mc_min_hot  = None
         ts_min_hot  = None
+        supply      = None
         if scanner:
             with scanner.hot._lock:
                 state = scanner.hot._tokens.get(mint)
@@ -9837,22 +9867,13 @@ def debug_kline_live():
                 mc_last_hot = state.get("mc_last") or state.get("_mc_live")
                 mc_min_hot  = state.get("mc_min")
                 ts_min_hot  = state.get("ts_min")
-
-        supply = None
-        if scanner:
-            with scanner.hot._lock:
-                s = scanner.hot._tokens.get(mint)
-            if s:
-                supply = s.get("total_supply")
-
-        # Busca kline
-        candles = gmgn.get_token_kline(mint, "sol", "1m", from_ts=from_ts, to_ts=to_ts)
+                supply      = state.get("total_supply")
 
         lines.append(f"Candles retornados: {len(candles)}")
         lines.append("")
 
         if not candles:
-            lines.append("⚠️  Nenhum candle retornado. Token pode não ter dados kline (Meteora DAMM v2?).")
+            lines.append("⚠️  Nenhum candle retornado.")
         else:
             now_minute_floor = (now_ts // 60) * 60  # início do minuto atual (UTC)
             prev_minute_floor = now_minute_floor - 60
