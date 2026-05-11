@@ -5265,7 +5265,7 @@ _TRADES_HTML = """
 <table>
 <thead><tr>
   <th>#</th><th>Symbol</th><th>Status</th><th>Sinal</th>
-  <th>MC bottom</th><th>Entry esperado</th><th>Fill USD</th>
+  <th>MC bottom</th><th>Entry REAL</th><th>+% above bot</th>
   <th>Slippage</th><th>Fee SOL</th><th>Latência</th>
   <th>Tokens</th><th>P&L real</th><th>Strategy</th>
 </tr></thead>
@@ -5277,8 +5277,20 @@ _TRADES_HTML = """
   <td><span class="badge b-{{ t.status }}">{{ t.status }}</span></td>
   <td>{{ t.ts_signal_brt or '—' }}</td>
   <td>{{ fmt_mc(t.mc_bottom) }}</td>
-  <td>{{ fmt_mc(t.entry_expected) }}</td>
-  <td>{{ ("$%.4f"|format(t.entry_price_usd)) if t.entry_price_usd else '—' }}</td>
+  <td>
+    {% if t.entry_mc_real %}
+      {{ fmt_mc(t.entry_mc_real) }}
+    {% else %}
+      <span class="est">{{ fmt_mc(t.entry_expected) }}*</span>
+    {% endif %}
+  </td>
+  <td>
+    {% if t.entry_divergence is not none %}
+      <span class="{% if t.entry_divergence > 0.50 %}red{% elif t.entry_divergence > 0.30 %}yellow{% else %}green{% endif %}">
+        +{{ "%.0f%%"|format(t.entry_divergence * 100) }}
+      </span>
+    {% else %}—{% endif %}
+  </td>
   <td>{{ ("%+.2f%%"|format(t.slippage_pct*100)) if t.slippage_pct is not none else '—' }}</td>
   <td>{{ ("%.5f"|format(t.fee_sol)) if t.fee_sol else '—' }}</td>
   <td>{{ ("%.1fs"|format(t.latency_sec)) if t.latency_sec else '—' }}</td>
@@ -5314,10 +5326,25 @@ def trades_dashboard():
     import os as _os
     trades_raw = db.get_trades(limit=200)
 
-    # Formata timestamps em BRT
+    # Formata timestamps em BRT + calcula entry_mc_real a partir do fill real
     for t in trades_raw:
         ts = t.get("ts_signal")
         t["ts_signal_brt"] = (ts + BRT).strftime("%m/%d %H:%M:%S") if ts else None
+
+        # MC real de execução: preço_por_token × supply (1B Pump.fun)
+        usd = t.get("entry_price_usd")
+        tkn = t.get("tokens_received")
+        if usd and tkn and tkn > 0:
+            t["entry_mc_real"] = (usd / tkn) * 1_000_000_000
+        else:
+            t["entry_mc_real"] = None
+
+        # Divergência: quanto % acima do mc_bottom detectado entramos de fato
+        bot = t.get("mc_bottom")
+        if t["entry_mc_real"] and bot and bot > 0:
+            t["entry_divergence"] = (t["entry_mc_real"] - bot) / bot
+        else:
+            t["entry_divergence"] = None
 
     # Métricas — statuses reais do TradeMonitor: "sl", "trailing_active", "expired"
     TP_STATUSES = ("tp_hit", "trailing_active")
