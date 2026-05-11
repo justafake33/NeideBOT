@@ -10020,7 +10020,23 @@ def analise_wbottom():
         FLOOR_PCT = float(request.args.get("floor", "0.90"))  # SL floor = mc_bottom × floor_pct
 
         with db._cursor() as cur:
-            # Busca SL trades com mc_bottom + entry real
+            # Diagnóstico: conta trades por status e quais têm os campos necessários
+            cur.execute("""
+                SELECT
+                    status,
+                    COUNT(*) AS total,
+                    COUNT(mc_bottom) AS has_mc_bottom,
+                    COUNT(entry_price_usd) AS has_entry_usd,
+                    COUNT(tokens_received) AS has_tokens,
+                    COUNT(ts_signal) AS has_ts_signal,
+                    COUNT(entry_expected) AS has_entry_expected
+                FROM trades
+                GROUP BY status
+                ORDER BY status
+            """)
+            diag = [dict(r) for r in cur.fetchall()]
+
+            # Busca trades — relaxado: aceita entry_expected como fallback de entry_mc_real
             cur.execute("""
                 SELECT
                     t.id,
@@ -10034,20 +10050,26 @@ def analise_wbottom():
                     t.ts_signal,
                     t.pnl_pct_real,
                     t.sl_pct,
-                    t.tp_pct
+                    t.tp_pct,
+                    t.amount_usd
                 FROM trades t
                 WHERE t.status IN ('sl', 'expired', 'tp', 'trailing_active')
                   AND t.mc_bottom IS NOT NULL AND t.mc_bottom > 0
-                  AND t.entry_price_usd IS NOT NULL
-                  AND t.tokens_received IS NOT NULL AND t.tokens_received > 0
                   AND t.ts_signal IS NOT NULL
+                  AND (t.entry_price_usd IS NOT NULL OR t.entry_expected IS NOT NULL)
                 ORDER BY t.created_at DESC
                 LIMIT 200
             """)
             trades_raw = [dict(r) for r in cur.fetchall()]
 
         if not trades_raw:
-            return "<pre>Sem trades com dados suficientes.</pre>"
+            diag_html = "<br>".join(
+                f"status={d['status']}: total={d['total']} mc_bottom={d['has_mc_bottom']} "
+                f"entry_usd={d['has_entry_usd']} tokens={d['has_tokens']} "
+                f"ts_signal={d['has_ts_signal']} entry_expected={d['has_entry_expected']}"
+                for d in diag
+            )
+            return f"<pre>Sem trades com dados suficientes.\n\nDiagnóstico:\n{diag_html}</pre>"
 
         # Busca mínimo MC após entrada para cada trade (nos 30min seguintes)
         min_mc_map = {}
@@ -10069,7 +10091,13 @@ def analise_wbottom():
         n_sl_total  = 0
 
         for t in trades_raw:
-            entry_mc_real = (t["entry_price_usd"] / t["tokens_received"]) * 1_000_000_000
+            # entry_mc_real: preferir price/tokens (mais preciso), fallback entry_expected
+            if t["entry_price_usd"] and t["tokens_received"] and t["tokens_received"] > 0:
+                entry_mc_real = (t["entry_price_usd"] / t["tokens_received"]) * 1_000_000_000
+            elif t["entry_expected"]:
+                entry_mc_real = t["entry_expected"]
+            else:
+                entry_mc_real = None
             mc_bottom     = t["mc_bottom"]
             min_after     = min_mc_map.get(t["id"])
             is_sl         = t["status"] in ("sl", "expired") and (t.get("pnl_pct_real") or 0) < 0
@@ -10083,10 +10111,10 @@ def analise_wbottom():
                 retest_ratio = None
                 floor_survives = None
             else:
-                retest_depth  = (entry_mc_real - min_after) / entry_mc_real  # % queda pós-entrada
-                retest_ratio  = min_after / mc_bottom if mc_bottom > 0 else None  # min / bottom
+                retest_depth  = (entry_mc_real - min_after) / entry_mc_real if entry_mc_real else None
+                retest_ratio  = min_after / mc_bottom if mc_bottom > 0 else None
                 sl_floor_mc   = mc_bottom * FLOOR_PCT
-                floor_survives = min_after > sl_floor_mc  # anchor teria sobrevivido?
+                floor_survives = min_after > sl_floor_mc
 
                 if is_sl and floor_survives:
                     n_survived += 1
@@ -10148,7 +10176,7 @@ def analise_wbottom():
               <td>{status_label}</td>
               <td>{_mc(r['mc_bottom'])}</td>
               <td>{_mc(r['entry_mc_real'])}</td>
-              <td>{_pct((r['entry_mc_real'] - r['mc_bottom']) / r['mc_bottom'] if r['mc_bottom'] else None)}</td>
+              <td>{_pct((r['entry_mc_real'] - r['mc_bottom']) / r['mc_bottom'] if (r['entry_mc_real'] and r['mc_bottom']) else None)}</td>
               <td>{_mc(r['min_after'])}</td>
               <td style='{_color_ratio(r["retest_ratio"])}'>{_pct(r["retest_depth"])}</td>
               <td style='{_color_ratio(r["retest_ratio"])}'>{f"{r['retest_ratio']:.2f}×" if r["retest_ratio"] else "—"}</td>
