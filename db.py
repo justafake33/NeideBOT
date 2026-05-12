@@ -804,6 +804,18 @@ def get_open_trades() -> list:
         return [dict(row) for row in cur.fetchall()]
 
 
+def get_trailing_active_trades() -> list:
+    """Trades com trailing ativo ainda sem exit final — detectar quando GMGN executa o trailing."""
+    with _cursor() as cur:
+        cur.execute("""
+            SELECT * FROM trades
+            WHERE status = 'trailing_active'
+              AND exit_ts > NOW() - INTERVAL '8 hours'
+            ORDER BY exit_ts ASC
+        """)
+        return [dict(row) for row in cur.fetchall()]
+
+
 def get_ticks_after(mint: str, min_ts) -> list:
     """Retorna ticks (mc, mc_high, mc_low, tick_ts) para um mint após min_ts."""
     with _cursor() as cur:
