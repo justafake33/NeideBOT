@@ -10414,6 +10414,200 @@ def debug_bounce_list():
         return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
+@app.route("/debug/absorption")
+def debug_absorption():
+    """
+    H22 — Diagnóstico da coleta de absorção em tempo real.
+    Mostra:
+      1. Tokens ativos no HotMonitor com janela de absorção ao vivo (Helius deque)
+      2. Últimos bounce_signals com campos H22 preenchidos (ou NULL)
+      3. Stats de cobertura geral
+    """
+    import traceback
+    try:
+        CSS = ("<style>body{background:#0d1117;color:#e6edf3;font:13px/1.6 monospace;padding:20px}"
+               "a{color:#58a6ff}table{border-collapse:collapse;width:100%}"
+               "th{background:#161b22;padding:6px 10px;text-align:left;font-size:11px;color:#8b949e}"
+               "td{padding:5px 10px;border-bottom:1px solid #21262d;font-size:12px}"
+               ".box{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px 16px;"
+               "margin:8px 4px;display:inline-block;vertical-align:top}"
+               ".lbl{color:#8b949e;font-size:11px}.val{font-size:20px;font-weight:bold}"
+               ".ok{color:#3fb950}.warn{color:#e3b341}.bad{color:#f85149}"
+               ".nav a{color:#58a6ff;margin-right:14px;text-decoration:none;font-size:12px}"
+               "h3{margin:20px 0 8px;color:#8b949e;font-size:12px;text-transform:uppercase}</style>")
+
+        # ── 1. Tokens ativos com janela de absorção ao vivo ──────────────────
+        live_rows_html = ""
+        helius_active = False
+        if scanner and hasattr(scanner, "hot") and scanner.hot._helius:
+            helius_active = True
+            with scanner.hot._lock:
+                active = dict(scanner.hot._tokens)
+
+            for mint, state in active.items():
+                symbol = state.get("symbol", mint[:8])
+                try:
+                    w = scanner.hot._helius.get_absorption_window(mint, window_sec=60)
+                except Exception:
+                    w = {}
+
+                total    = w.get("total_events", 0)
+                buy_vol  = w.get("buy_vol_sol",  0) or 0
+                sell_vol = w.get("sell_vol_sol", 0) or 0
+                buy_cnt  = w.get("buy_count",    0) or 0
+                sell_cnt = w.get("sell_count",   0) or 0
+
+                # Score on-the-fly para visualização
+                mc_last  = state.get("mc_last") or state.get("mc_migration", 0)
+                mc_min   = state.get("mc_min",  mc_last)
+                from scanner import _absorption_score
+                score, grade = _absorption_score(w, mc_last, mc_min) if total > 0 else (None, "no_data")
+
+                grade_cls = "ok" if grade in ("A+","A") else ("warn" if grade == "B" else ("bad" if grade == "C" else ""))
+                event_cls = "ok" if total >= 5 else ("warn" if total >= 1 else "bad")
+
+                elapsed = int((
+                    __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+                    - state["ts_migration"]
+                ).total_seconds() / 60)
+
+                dex_url = f"https://dexscreener.com/solana/{mint}"
+                live_rows_html += f"""<tr>
+                  <td><b>{symbol}</b></td>
+                  <td>{elapsed}min</td>
+                  <td class='{event_cls}'>{total} eventos</td>
+                  <td class='ok'>{buy_vol:.3f} SOL ({buy_cnt}x)</td>
+                  <td class='bad'>{sell_vol:.3f} SOL ({sell_cnt}x)</td>
+                  <td>lrg_buy={w.get('largest_buy',0):.3f}</td>
+                  <td class='{grade_cls}'>{f"score={score} ({grade})" if score is not None else "no_data"}</td>
+                  <td style='font-size:10px;color:#8b949e'>{mint[:12]}…</td>
+                  <td><a href='{dex_url}' target='_blank'>DEX</a></td>
+                </tr>"""
+
+        if not live_rows_html:
+            live_rows_html = "<tr><td colspan='9' style='color:#484f58'>Nenhum token ativo no HotMonitor agora</td></tr>"
+
+        # ── 2. Últimos 20 bounce_signals com campos H22 ──────────────────────
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT b.mint, b.symbol, b.ts_signal, b.bounce_pct, b.drop_from_mig,
+                       b.absorption_score, b.absorption_grade,
+                       b.absorption_buy_vol, b.absorption_sell_vol,
+                       b.absorption_buy_cnt, b.absorption_sell_cnt,
+                       b.absorption_events,
+                       t.status AS trade_status
+                FROM bounce_signals b
+                LEFT JOIN trades t ON t.mint = b.mint
+                ORDER BY b.ts_signal DESC
+                LIMIT 30
+            """)
+            bounces = [dict(r) for r in cur.fetchall()]
+
+            # Stats gerais de cobertura
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(absorption_events) AS with_data,
+                    COUNT(CASE WHEN absorption_grade IN ('A+','A') THEN 1 END) AS grade_a,
+                    COUNT(CASE WHEN absorption_grade = 'B'         THEN 1 END) AS grade_b,
+                    COUNT(CASE WHEN absorption_grade = 'C'         THEN 1 END) AS grade_c,
+                    COUNT(CASE WHEN absorption_events = 0 OR absorption_events IS NULL THEN 1 END) AS no_data
+                FROM bounce_signals
+            """)
+            stats = dict(cur.fetchone())
+
+        bounce_rows_html = ""
+        for r in bounces:
+            ts = r["ts_signal"].strftime("%m-%d %H:%M") if r.get("ts_signal") else "—"
+            symbol = r.get("symbol") or r["mint"][:8]
+            grade  = r.get("absorption_grade") or "—"
+            score  = r.get("absorption_score")
+            ev     = r.get("absorption_events")
+            bv     = r.get("absorption_buy_vol")
+            sv     = r.get("absorption_sell_vol")
+            bc     = r.get("absorption_buy_cnt")
+            sc     = r.get("absorption_sell_cnt")
+            outcome= r.get("trade_status") or "—"
+
+            grade_cls = "ok" if grade in ("A+","A") else ("warn" if grade == "B" else ("bad" if grade == "C" else ""))
+            out_cls   = "ok" if outcome == "tp" else ("bad" if outcome == "sl" else "")
+
+            bounce_rows_html += f"""<tr>
+              <td>{ts}</td>
+              <td><b>{symbol}</b></td>
+              <td>{float(r['bounce_pct'])*100:.0f}%</td>
+              <td class='{grade_cls}'><b>{grade}</b> {f"(score={score:.0f})" if score is not None else ""}</td>
+              <td>{f"{bv:.3f} SOL ({bc}x)" if bv is not None else "<span style='color:#484f58'>NULL</span>"}</td>
+              <td>{f"{sv:.3f} SOL ({sc}x)" if sv is not None else "<span style='color:#484f58'>NULL</span>"}</td>
+              <td>{ev if ev is not None else "<span style='color:#f85149'>NULL ← sem Helius</span>"}</td>
+              <td class='{out_cls}'>{outcome}</td>
+            </tr>"""
+
+        total     = stats.get("total", 0)
+        with_data = stats.get("with_data", 0)
+        no_data   = stats.get("no_data", 0)
+        cov_pct   = f"{with_data/total*100:.0f}%" if total else "—"
+
+        def _box(label, val, color="#e6edf3"):
+            return f"<div class='box'><div class='lbl'>{label}</div><div class='val' style='color:{color}'>{val}</div></div>"
+
+        summary = (
+            _box("Helius WebSocket", "ON" if helius_active else "OFF",
+                 "#3fb950" if helius_active else "#f85149") +
+            _box("Bounce signals totais", total) +
+            _box("Com dados H22", f"{with_data} ({cov_pct})",
+                 "#3fb950" if with_data > 0 else "#f85149") +
+            _box("NULL (sem eventos)", no_data,
+                 "#f85149" if no_data > with_data else "#e3b341") +
+            _box("Grade A+/A", stats.get("grade_a", 0), "#3fb950") +
+            _box("Grade B", stats.get("grade_b", 0), "#e3b341") +
+            _box("Grade C", stats.get("grade_c", 0), "#f85149")
+        )
+
+        html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>Debug Absorption</title>{CSS}
+<meta http-equiv='refresh' content='10'>
+</head><body>
+<h2>H22 — Absorption Debug</h2>
+<p style='color:#8b949e;font-size:11px'>auto-refresh 10s · janela de absorção = 60s · fonte: Helius pAMM (pump.fun)</p>
+<div class='nav'>
+  <a href='/analise/post-sl-recovery'>Post-SL Recovery</a>
+  <a href='/debug/bounce-list'>Bounce List</a>
+  <a href='/debug/executor-status'>Executor</a>
+</div>
+<br>
+{summary}
+
+<h3>Tokens Ativos — Janela de Absorção Ao Vivo (últimos 60s)</h3>
+<table>
+  <thead><tr>
+    <th>Token</th><th>Elapsed</th><th>Eventos Helius</th>
+    <th>Buy vol</th><th>Sell vol</th><th>Largest buy</th>
+    <th>Score H22</th><th>Mint</th><th></th>
+  </tr></thead>
+  <tbody>{live_rows_html}</tbody>
+</table>
+
+<h3>Últimos 30 Bounce Signals — Cobertura H22</h3>
+<p style='color:#8b949e;font-size:11px'>
+  NULL em "Eventos" = bounce disparou mas Helius não tinha eventos na deque para esse mint.<br>
+  Causas: token recém-adicionado ao HotMonitor, WS desconectado, ou token não é pump.fun pAMM.
+</p>
+<table>
+  <thead><tr>
+    <th>Hora</th><th>Token</th><th>Bounce</th>
+    <th>Grade H22</th><th>Buy vol</th><th>Sell vol</th>
+    <th>Eventos</th><th>Trade</th>
+  </tr></thead>
+  <tbody>{bounce_rows_html}</tbody>
+</table>
+</body></html>"""
+        return html
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
 @app.route("/analise/post-sl-recovery")
 def analise_post_sl_recovery():
     """H22 — Para cada SL, o que o token fez depois do nosso stop?
