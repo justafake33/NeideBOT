@@ -10233,5 +10233,109 @@ def analise_wbottom():
         return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
+@app.route("/debug/bounce-list")
+def debug_bounce_list():
+    """Lista tokens com bounce > X% das últimas 48h com links DexScreener/GMGN."""
+    import traceback
+    try:
+        min_bounce = float(request.args.get("bounce", "0.50"))
+        hours      = int(request.args.get("hours", "48"))
+
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT
+                    b.mint,
+                    b.symbol,
+                    b.ts_signal,
+                    b.bounce_pct,
+                    b.drop_from_mig,
+                    b.elapsed_sec,
+                    b.mc_min,
+                    b.mc_at_signal,
+                    b.mc_migration,
+                    t.status   AS trade_status,
+                    t.pnl_pct_real
+                FROM bounce_signals b
+                LEFT JOIN trades t ON t.mint = b.mint
+                WHERE b.bounce_pct >= %(min_bounce)s
+                  AND b.ts_signal >= NOW() - INTERVAL '%(hours)s hours'
+                ORDER BY b.ts_signal DESC
+            """, {"min_bounce": min_bounce, "hours": hours})
+            rows = [dict(r) for r in cur.fetchall()]
+
+        if not rows:
+            return f"<pre>Nenhum bounce ≥ {min_bounce:.0%} nas últimas {hours}h.</pre>"
+
+        def _pct(v):
+            return f"{float(v)*100:.0f}%" if v is not None else "—"
+        def _mc(v):
+            return f"${float(v):,.0f}" if v is not None else "—"
+        def _outcome(r):
+            s = r.get("trade_status")
+            if not s:            return "<span style='color:#8b949e'>sem trade</span>"
+            if s == "tp":        return f"<span style='color:#3fb950'>TP {_pct(r['pnl_pct_real'])}</span>"
+            if s == "sl":        return f"<span style='color:#f85149'>SL {_pct(r['pnl_pct_real'])}</span>"
+            if s == "trailing_active": return "<span style='color:#e3b341'>trailing ativo</span>"
+            return f"<span style='color:#8b949e'>{s}</span>"
+
+        CSS = "<style>body{background:#0d1117;color:#e6edf3;font:13px/1.6 monospace;padding:20px}a{color:#58a6ff}table{border-collapse:collapse;width:100%}th{background:#161b22;padding:6px 10px;text-align:left;font-size:11px;color:#8b949e}td{padding:5px 10px;border-bottom:1px solid #21262d;font-size:12px}.nav a{color:#58a6ff;margin-right:16px;text-decoration:none;font-size:12px}</style>"
+
+        rows_html = ""
+        for r in rows:
+            mint      = r["mint"]
+            symbol    = r["symbol"] or mint[:8]
+            elapsed   = f"{int(r['elapsed_sec'] or 0)//60}min" if r.get("elapsed_sec") else "—"
+            dex_url   = f"https://dexscreener.com/solana/{mint}"
+            gmgn_url  = f"https://gmgn.ai/sol/token/{mint}"
+            ts        = r["ts_signal"].strftime("%H:%M:%S") if r.get("ts_signal") else "—"
+
+            rows_html += f"""<tr>
+              <td>{ts}</td>
+              <td><b>{symbol}</b></td>
+              <td style='color:#3fb950;font-weight:bold'>{_pct(r['bounce_pct'])}</td>
+              <td>{_pct(r['drop_from_mig'])}</td>
+              <td>{elapsed}</td>
+              <td>{_mc(r['mc_min'])}</td>
+              <td>{_mc(r['mc_at_signal'])}</td>
+              <td>{_outcome(r)}</td>
+              <td>
+                <a href='{dex_url}' target='_blank'>DEX</a>
+                &nbsp;
+                <a href='{gmgn_url}' target='_blank'>GMGN</a>
+              </td>
+              <td style='font-size:10px;color:#8b949e'>{mint}</td>
+            </tr>"""
+
+        html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>Bounce List</title>{CSS}
+<meta http-equiv='refresh' content='30'>
+</head><body>
+<h2>Bounces ≥ {min_bounce:.0%} — últimas {hours}h</h2>
+<div class='nav'>
+  <a href='?bounce=0.30'>≥30%</a>
+  <a href='?bounce=0.50'>≥50%</a>
+  <a href='?bounce=0.75'>≥75%</a>
+  <a href='?bounce=1.00'>≥100%</a>
+  &nbsp;|&nbsp;
+  <a href='?bounce={min_bounce}&hours=24'>24h</a>
+  <a href='?bounce={min_bounce}&hours=48'>48h</a>
+  <a href='?bounce={min_bounce}&hours=168'>7d</a>
+</div>
+<p style='color:#8b949e;font-size:11px'>{len(rows)} tokens encontrados · auto-refresh 30s</p>
+<table>
+  <thead><tr>
+    <th>Hora</th><th>Token</th><th>Bounce</th><th>Drop mig</th>
+    <th>Elapsed</th><th>MC fundo</th><th>MC sinal</th>
+    <th>Trade</th><th>Links</th><th>Mint</th>
+  </tr></thead>
+  <tbody>{rows_html}</tbody>
+</table>
+</body></html>"""
+        return html
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
