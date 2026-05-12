@@ -179,20 +179,41 @@ def init_db():
         # Bounce signals — detector de bounce em tempo real
         cur.execute("""
             CREATE TABLE IF NOT EXISTS bounce_signals (
-                id              BIGSERIAL PRIMARY KEY,
-                mint            TEXT      NOT NULL,
-                symbol          TEXT,
-                ts_signal       TIMESTAMPTZ DEFAULT NOW(),
-                elapsed_sec     INT,
-                mc_migration    FLOAT,
-                mc_min          FLOAT,
-                mc_at_signal    FLOAT,
-                drop_from_mig   FLOAT,
-                bounce_pct      FLOAT,
+                id                   BIGSERIAL PRIMARY KEY,
+                mint                 TEXT      NOT NULL,
+                symbol               TEXT,
+                ts_signal            TIMESTAMPTZ DEFAULT NOW(),
+                elapsed_sec          INT,
+                mc_migration         FLOAT,
+                mc_min               FLOAT,
+                mc_at_signal         FLOAT,
+                drop_from_mig        FLOAT,
+                bounce_pct           FLOAT,
+                -- H22: absorção pós-fundo (Helius pAMM events, janela 60s)
+                absorption_score     FLOAT,
+                absorption_grade     TEXT,
+                absorption_buy_vol   FLOAT,
+                absorption_sell_vol  FLOAT,
+                absorption_buy_cnt   INT,
+                absorption_sell_cnt  INT,
+                absorption_lrg_buy   FLOAT,
+                absorption_events    INT,
                 UNIQUE (mint)
             )
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_bounce_signals_ts ON bounce_signals (ts_signal)")
+        # Migração: adiciona colunas H22 se a tabela já existir
+        for col in [
+            "ADD COLUMN IF NOT EXISTS absorption_score    FLOAT",
+            "ADD COLUMN IF NOT EXISTS absorption_grade    TEXT",
+            "ADD COLUMN IF NOT EXISTS absorption_buy_vol  FLOAT",
+            "ADD COLUMN IF NOT EXISTS absorption_sell_vol FLOAT",
+            "ADD COLUMN IF NOT EXISTS absorption_buy_cnt  INT",
+            "ADD COLUMN IF NOT EXISTS absorption_sell_cnt INT",
+            "ADD COLUMN IF NOT EXISTS absorption_lrg_buy  FLOAT",
+            "ADD COLUMN IF NOT EXISTS absorption_events   INT",
+        ]:
+            cur.execute(f"ALTER TABLE bounce_signals {col}")
 
         # Tabela de trades — Fase 6-lite (calibração $1/trade)
         cur.execute("""
@@ -518,17 +539,39 @@ def backfill_recovery_false():
 
 
 def insert_bounce_signal(data: dict):
-    """Registra um sinal de bounce. UNIQUE(mint) — um sinal por token."""
+    """Registra um sinal de bounce. UNIQUE(mint) — um sinal por token.
+    Campos H22 opcionais: absorption_score, absorption_grade, absorption_buy_vol,
+    absorption_sell_vol, absorption_buy_cnt, absorption_sell_cnt, absorption_lrg_buy,
+    absorption_events.
+    """
     with _cursor() as cur:
         cur.execute("""
             INSERT INTO bounce_signals
                 (mint, symbol, elapsed_sec, mc_migration, mc_min,
-                 mc_at_signal, drop_from_mig, bounce_pct)
+                 mc_at_signal, drop_from_mig, bounce_pct,
+                 absorption_score, absorption_grade,
+                 absorption_buy_vol, absorption_sell_vol,
+                 absorption_buy_cnt, absorption_sell_cnt,
+                 absorption_lrg_buy, absorption_events)
             VALUES
                 (%(mint)s, %(symbol)s, %(elapsed_sec)s, %(mc_migration)s, %(mc_min)s,
-                 %(mc_at_signal)s, %(drop_from_mig)s, %(bounce_pct)s)
+                 %(mc_at_signal)s, %(drop_from_mig)s, %(bounce_pct)s,
+                 %(absorption_score)s, %(absorption_grade)s,
+                 %(absorption_buy_vol)s, %(absorption_sell_vol)s,
+                 %(absorption_buy_cnt)s, %(absorption_sell_cnt)s,
+                 %(absorption_lrg_buy)s, %(absorption_events)s)
             ON CONFLICT (mint) DO NOTHING
-        """, data)
+        """, {
+            **data,
+            "absorption_score":    data.get("absorption_score"),
+            "absorption_grade":    data.get("absorption_grade"),
+            "absorption_buy_vol":  data.get("absorption_buy_vol"),
+            "absorption_sell_vol": data.get("absorption_sell_vol"),
+            "absorption_buy_cnt":  data.get("absorption_buy_cnt"),
+            "absorption_sell_cnt": data.get("absorption_sell_cnt"),
+            "absorption_lrg_buy":  data.get("absorption_lrg_buy"),
+            "absorption_events":   data.get("absorption_events"),
+        })
 
 
 def insert_ticks_batch(ticks: list):

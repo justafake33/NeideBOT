@@ -39,6 +39,67 @@ MAX_MIG_AGE_SEC  = int(os.getenv(  "MAX_MIG_AGE_SEC",       "600"))
 MIGRATION_SOL_UNITS = float(os.getenv("MIGRATION_SOL_UNITS", "410"))
 
 
+def _absorption_score(window: dict, mc_current: float, mc_bottom: float) -> tuple[int | None, str]:
+    """
+    H22 — score de absorção pós-fundo baseado em flow de ordens Helius pAMM (janela 60s).
+    Observe-only: logar o score, NÃO bloquear o sinal ainda.
+
+    Retorna (score, grade) onde grade é A+/A/B/C/no_data.
+    score=None significa dados insuficientes (Helius sem eventos na janela).
+    """
+    total = window.get("total_events", 0)
+    if total == 0:
+        return None, "no_data"
+
+    buy_vol  = window.get("buy_vol_sol",  0) or 0.0
+    sell_vol = window.get("sell_vol_sol", 0) or 0.0001
+    buy_cnt  = window.get("buy_count",    0) or 0
+    sell_cnt = window.get("sell_count",   0) or 0
+    lrg_buy  = window.get("largest_buy",  0) or 0.0
+    lrg_sell = window.get("largest_sell", 0) or 0.0001
+
+    score = 0
+
+    # +2 preço não fez novo low — compradores absorveram o sell pressure
+    if mc_current > mc_bottom * 0.97:
+        score += 2
+    else:
+        score -= 3  # novo low forte: dump continua
+
+    # +2/-2 volume comprador vs vendedor
+    if buy_vol >= sell_vol:
+        score += 2
+    elif sell_vol > buy_vol * 2:
+        score -= 2
+
+    # +1 quantidade de trades compradores
+    if buy_cnt >= sell_cnt:
+        score += 1
+
+    # +1 tamanho de buy individual significativo vs sells
+    if lrg_buy >= 0.7 * lrg_sell:
+        score += 1
+
+    # +1 preço meaningfully above bottom (≥10%)
+    if mc_current >= mc_bottom * 1.10:
+        score += 1
+
+    # +2 sell volume alto mas preço segurou — padrão clássico de absorção
+    if sell_vol >= 0.5 and mc_current >= mc_bottom * 1.05:
+        score += 2
+
+    # -2 concentração de buy suspeita: um único trade domina (possível manipulação)
+    if buy_vol > 0 and lrg_buy / buy_vol > 0.70:
+        score -= 2
+
+    if score >= 7:   grade = "A+"
+    elif score >= 5: grade = "A"
+    elif score >= 3: grade = "B"
+    else:            grade = "C"
+
+    return score, grade
+
+
 def _passes_filter(token: dict) -> tuple[bool, str]:
     if F_WASH_BLOCK and token.get("is_wash_trading"):
         return False, "wash_trading"
@@ -260,19 +321,57 @@ class HotMonitor:
                 name=f"backfill-{mint[:8]}",
             ).start()
 
+        # H22 — Absorption score (observe-only, NÃO bloqueia o sinal)
+        # Mede fluxo de ordens do pump.fun pAMM via Helius nos últimos 60s.
+        # Gate para virar filtro: n≥30 trades com dados, WR ≥15pp maior com absorção.
+        absorption_window = {}
+        absorption_score  = None
+        absorption_grade  = None
+        if self._helius:
+            try:
+                absorption_window = self._helius.get_absorption_window(mint, window_sec=60)
+                absorption_score, absorption_grade = _absorption_score(
+                    absorption_window, mc, mc_min,
+                )
+                if absorption_score is not None:
+                    logger.info(
+                        "H22 ABSORPTION %s: score=%d grade=%s "
+                        "buy=%.3fSOL(%d) sell=%.3fSOL(%d) lrg_buy=%.3f",
+                        state.get("symbol", mint[:8]),
+                        absorption_score, absorption_grade,
+                        absorption_window.get("buy_vol_sol",  0),
+                        absorption_window.get("buy_count",    0),
+                        absorption_window.get("sell_vol_sol", 0),
+                        absorption_window.get("sell_count",   0),
+                        absorption_window.get("largest_buy",  0),
+                    )
+                else:
+                    logger.info("H22 ABSORPTION %s: no_data (sem eventos Helius nesta janela)",
+                                state.get("symbol", mint[:8]))
+            except Exception as e:
+                logger.debug("absorption_score %s: %s", mint[:8], e)
+
         state["bounce_fired"] = True
         symbol = state.get("symbol", mint[:8])
 
         try:
             db.insert_bounce_signal({
-                "mint":         mint,
-                "symbol":       symbol,
-                "elapsed_sec":  elapsed_sec,
-                "mc_migration": mc_migration,
-                "mc_min":       mc_min,
-                "mc_at_signal": mc,
-                "drop_from_mig": round(drop_from_mig, 4),
-                "bounce_pct":   round(bounce_pct, 4),
+                "mint":                mint,
+                "symbol":              symbol,
+                "elapsed_sec":         elapsed_sec,
+                "mc_migration":        mc_migration,
+                "mc_min":              mc_min,
+                "mc_at_signal":        mc,
+                "drop_from_mig":       round(drop_from_mig, 4),
+                "bounce_pct":          round(bounce_pct, 4),
+                "absorption_score":    absorption_score,
+                "absorption_grade":    absorption_grade,
+                "absorption_buy_vol":  absorption_window.get("buy_vol_sol"),
+                "absorption_sell_vol": absorption_window.get("sell_vol_sol"),
+                "absorption_buy_cnt":  absorption_window.get("buy_count"),
+                "absorption_sell_cnt": absorption_window.get("sell_count"),
+                "absorption_lrg_buy":  absorption_window.get("largest_buy"),
+                "absorption_events":   absorption_window.get("total_events"),
             })
         except Exception as e:
             logger.warning("insert_bounce_signal %s: %s", mint[:8], e)

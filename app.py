@@ -10414,5 +10414,195 @@ def debug_bounce_list():
         return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
+@app.route("/analise/post-sl-recovery")
+def analise_post_sl_recovery():
+    """H22 — Para cada SL, o que o token fez depois do nosso stop?
+    Responde: 'Yankee é padrão ou exceção?'
+    Usa token_ticks (já coletados) — zero chamadas de API.
+    """
+    import traceback
+    try:
+        with db._cursor() as cur:
+            # Para cada SL com exit_ts, busca max MC nos ticks seguintes
+            cur.execute("""
+                WITH sl_trades AS (
+                    SELECT id, mint, symbol,
+                           entry_expected,
+                           amount_usd,
+                           exit_ts,
+                           COALESCE(tp_pct, 0.75) AS tp_pct,
+                           COALESCE(sl_pct, 0.15) AS sl_pct,
+                           pnl_pct_real,
+                           ts_signal,
+                           mc_bottom
+                    FROM trades
+                    WHERE status IN ('sl', 'expired')
+                      AND exit_ts IS NOT NULL
+                      AND entry_expected IS NOT NULL
+                ),
+                ticks_after AS (
+                    SELECT
+                        s.id AS trade_id,
+                        tt.mc,
+                        EXTRACT(EPOCH FROM (tt.tick_ts - s.exit_ts))::INT AS secs_after
+                    FROM sl_trades s
+                    JOIN token_ticks tt ON tt.mint = s.mint
+                    WHERE tt.tick_ts > s.exit_ts
+                      AND tt.tick_ts <= s.exit_ts + INTERVAL '65 minutes'
+                      AND tt.mc IS NOT NULL
+                )
+                SELECT
+                    s.id, s.mint, s.symbol,
+                    s.entry_expected, s.amount_usd,
+                    s.exit_ts, s.tp_pct, s.sl_pct,
+                    s.pnl_pct_real, s.ts_signal, s.mc_bottom,
+                    s.entry_expected * (1 - s.sl_pct) AS sl_mc,
+                    s.entry_expected * (1 + s.tp_pct)  AS tp_mc,
+                    MAX(CASE WHEN ta.secs_after <= 300  THEN ta.mc END) AS max_mc_5m,
+                    MAX(CASE WHEN ta.secs_after <= 600  THEN ta.mc END) AS max_mc_10m,
+                    MAX(CASE WHEN ta.secs_after <= 1200 THEN ta.mc END) AS max_mc_20m,
+                    MAX(CASE WHEN ta.secs_after <= 3600 THEN ta.mc END) AS max_mc_60m,
+                    COUNT(ta.mc) AS tick_count_after
+                FROM sl_trades s
+                LEFT JOIN ticks_after ta ON ta.trade_id = s.id
+                GROUP BY s.id, s.mint, s.symbol, s.entry_expected, s.amount_usd,
+                         s.exit_ts, s.tp_pct, s.sl_pct, s.pnl_pct_real,
+                         s.ts_signal, s.mc_bottom
+                ORDER BY s.exit_ts DESC
+            """)
+            rows = [dict(r) for r in cur.fetchall()]
+
+        # Enriquece cada linha com métricas derivadas
+        for r in rows:
+            entry   = float(r.get("entry_expected") or 0)
+            sl_mc   = float(r.get("sl_mc") or 0)
+            tp_mc   = float(r.get("tp_mc") or 0)
+
+            for win, key in [("5m","max_mc_5m"),("10m","max_mc_10m"),
+                              ("20m","max_mc_20m"),("60m","max_mc_60m")]:
+                mx = r.get(key)
+                if mx and sl_mc:
+                    r[f"gain_sl_{win}"]    = (float(mx) - sl_mc) / sl_mc
+                    r[f"gain_entry_{win}"] = (float(mx) - entry) / entry if entry else None
+                else:
+                    r[f"gain_sl_{win}"]    = None
+                    r[f"gain_entry_{win}"] = None
+
+            mx60 = r.get("max_mc_60m")
+            r["hit_tp"]   = mx60 is not None and tp_mc  > 0 and float(mx60) >= tp_mc
+            r["hit_75"]   = mx60 is not None and entry  > 0 and float(mx60) >= entry * 1.75
+            r["hit_100"]  = mx60 is not None and entry  > 0 and float(mx60) >= entry * 2.00
+            r["hit_150"]  = mx60 is not None and entry  > 0 and float(mx60) >= entry * 2.50
+
+        # Summary — apenas trades com ticks pós-SL (sem ticks = sem dados suficientes)
+        with_ticks = [r for r in rows if (r.get("tick_count_after") or 0) >= 3]
+        n_total    = len(rows)
+        n_with_data = len(with_ticks)
+        n_hit_tp   = sum(1 for r in with_ticks if r.get("hit_tp"))
+        n_hit_75   = sum(1 for r in with_ticks if r.get("hit_75"))
+        n_hit_100  = sum(1 for r in with_ticks if r.get("hit_100"))
+
+        def _pct(v):
+            if v is None: return "—"
+            return f"{float(v)*100:+.0f}%"
+        def _mc(v):
+            if v is None: return "—"
+            v = float(v)
+            if v >= 1_000_000: return f"${v/1_000_000:.1f}M"
+            if v >= 1_000:     return f"${v/1_000:.0f}K"
+            return f"${v:.0f}"
+        def _grade(r):
+            g = r.get("gain_sl_20m")
+            if g is None: return "<span style='color:#484f58'>sem dados</span>"
+            if g >= 0.75: return f"<span style='color:#3fb950'>+{g*100:.0f}% teria TP</span>"
+            if g >= 0.20: return f"<span style='color:#e3b341'>+{g*100:.0f}%</span>"
+            if g >= 0.0:  return f"<span style='color:#8b949e'>+{g*100:.0f}%</span>"
+            return f"<span style='color:#f85149'>{g*100:.0f}%</span>"
+
+        CSS = ("<style>body{background:#0d1117;color:#e6edf3;font:13px/1.6 monospace;padding:20px}"
+               "a{color:#58a6ff}table{border-collapse:collapse;width:100%}th{background:#161b22;"
+               "padding:6px 10px;text-align:left;font-size:11px;color:#8b949e}"
+               "td{padding:5px 10px;border-bottom:1px solid #21262d;font-size:12px}"
+               ".box{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px 16px;"
+               "margin:8px 4px;display:inline-block;vertical-align:top}"
+               ".lbl{color:#8b949e;font-size:11px}.val{font-size:20px;font-weight:bold}"
+               ".nav a{color:#58a6ff;margin-right:14px;text-decoration:none;font-size:12px}</style>")
+
+        def _box(label, val, color="#e6edf3"):
+            return f"<div class='box'><div class='lbl'>{label}</div><div class='val' style='color:{color}'>{val}</div></div>"
+
+        pct_hit_tp  = f"{n_hit_tp/n_with_data*100:.0f}%" if n_with_data else "—"
+        pct_hit_75  = f"{n_hit_75/n_with_data*100:.0f}%" if n_with_data else "—"
+        pct_hit_100 = f"{n_hit_100/n_with_data*100:.0f}%" if n_with_data else "—"
+
+        summary_html = (
+            _box("SLs totais", n_total) +
+            _box("Com dados de ticks", n_with_data, "#8b949e") +
+            _box(f"Hit TP ({rows[0]['tp_pct']*100:.0f}%) após SL" if rows else "Hit TP após SL",
+                 f"{pct_hit_tp} ({n_hit_tp})", "#3fb950") +
+            _box("Hit +75% após SL", f"{pct_hit_75} ({n_hit_75})", "#3fb950") +
+            _box("Hit +100% após SL", f"{pct_hit_100} ({n_hit_100})", "#e3b341")
+        )
+
+        rows_html = ""
+        for r in rows:
+            symbol  = r.get("symbol") or r["mint"][:8]
+            ts      = r["exit_ts"].strftime("%m-%d %H:%M") if r.get("exit_ts") else "—"
+            n_ticks = r.get("tick_count_after") or 0
+            dex_url = f"https://dexscreener.com/solana/{r['mint']}"
+            tp_icon = "✅" if r.get("hit_tp") else ("🟡" if r.get("hit_75") else ("⬜" if n_ticks >= 3 else "❓"))
+
+            rows_html += f"""<tr>
+              <td>{ts}</td>
+              <td><b>{symbol}</b></td>
+              <td>{_pct(r.get('pnl_pct_real'))}</td>
+              <td>{_mc(r.get('entry_expected'))}</td>
+              <td style='color:#8b949e'>{_mc(r.get('mc_bottom'))}</td>
+              <td>{_mc(r.get('max_mc_5m'))}</td>
+              <td>{_mc(r.get('max_mc_10m'))}</td>
+              <td>{_mc(r.get('max_mc_20m'))}</td>
+              <td>{_mc(r.get('max_mc_60m'))}</td>
+              <td>{_grade(r)}</td>
+              <td style='text-align:center'>{tp_icon}</td>
+              <td style='color:#8b949e'>{n_ticks} ticks</td>
+              <td><a href='{dex_url}' target='_blank'>DEX</a></td>
+            </tr>"""
+
+        html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>Post-SL Recovery</title>{CSS}
+</head><body>
+<h2>Post-SL Recovery — o que o token fez depois do nosso stop?</h2>
+<p style='color:#8b949e;font-size:11px'>
+  H22: se sellers foram absorvidos, token recupera após SL.<br>
+  ✅ = teria atingido o TP se não tivéssemos saído &nbsp;|&nbsp;
+  🟡 = subiu ≥75% &nbsp;|&nbsp; ⬜ = sem recuperação relevante &nbsp;|&nbsp; ❓ = sem dados
+</p>
+<div class='nav'>
+  <a href='/analise/wr-breakdown'>WR Breakdown</a>
+  <a href='/debug/bounce-list'>Bounce List</a>
+  <a href='/analise/h9'>H9</a>
+</div>
+<br>
+{summary_html}
+<br><br>
+<table>
+  <thead><tr>
+    <th>Exit</th><th>Token</th><th>PnL SL</th><th>Entry MC</th><th>Bottom</th>
+    <th>Max 5m</th><th>Max 10m</th><th>Max 20m</th><th>Max 60m</th>
+    <th>20m gain from SL</th><th>TP?</th><th>Ticks</th><th></th>
+  </tr></thead>
+  <tbody>{rows_html}</tbody>
+</table>
+<p style='color:#484f58;font-size:11px;margin-top:12px'>
+  Fonte: token_ticks coletados durante os 60min do HotMonitor.<br>
+  Trades sem ticks pós-saída = token saiu da janela quente antes do SL ou pouco depois.
+</p>
+</body></html>"""
+        return html
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)

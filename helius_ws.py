@@ -34,6 +34,7 @@ import os
 import struct
 import threading
 import time
+from collections import deque
 from typing import Callable
 
 logger = logging.getLogger(__name__)
@@ -84,9 +85,10 @@ _METEORA_DISCS: set[bytes] = {
 _SWAP_ONLY_DISCS: set[bytes] = _PUMP_AMM_DISCS | _METEORA_DISCS
 
 
-def _parse_pump_amm_mc(raw: bytes, sol_usd: float, supply: float) -> float | None:
+def _parse_pump_amm_event(raw: bytes, sol_usd: float, supply: float) -> dict | None:
     """
-    Parse pump.fun pAMM BuyEvent ou SellEvent — retorna MC em USD.
+    Parse pump.fun pAMM BuyEvent ou SellEvent.
+    Retorna {mc, side, sol_amount} para uso em MC + absorção (H22), ou None.
 
     Layout Borsh (offset a partir do início dos bytes, incluindo 8 bytes de disc):
       offset  0: disc                          8 bytes
@@ -102,43 +104,45 @@ def _parse_pump_amm_mc(raw: bytes, sol_usd: float, supply: float) -> float | Non
 
     Fonte: pump-fun/pump-public-docs/idl/pump_amm.json
     """
-    if len(raw) < 64:
+    if len(raw) < 72:
         return None
 
-    pool_base  = struct.unpack_from("<Q", raw, 48)[0]  # tokens no pool
-    pool_quote = struct.unpack_from("<Q", raw, 56)[0]  # SOL no pool (lamports)
-
-    if pool_base > 0 and pool_quote > 0:
-        # Preço = (SOL_reserves / 10^9) / (token_reserves / 10^6) SOL/token
-        price_sol = (pool_quote / 10 ** _SOL_DECIMALS) / (pool_base / 10 ** _TOKEN_DECIMALS)
-        mc = price_sol * sol_usd * supply
-        if _MC_MIN < mc < _MC_MAX:
-            return mc
-
-    # Fallback: usar amounts da swap (buy=SOL→token, sell=token→SOL)
     disc         = raw[:8]
-    base_amount  = struct.unpack_from("<Q", raw, 16)[0]
-    quote_amount = struct.unpack_from("<Q", raw, 64)[0]
+    base_amount  = struct.unpack_from("<Q", raw, 16)[0]  # tokens
+    pool_base    = struct.unpack_from("<Q", raw, 48)[0]  # token reserves do pool
+    pool_quote   = struct.unpack_from("<Q", raw, 56)[0]  # SOL reserves do pool (lamports)
+    quote_amount = struct.unpack_from("<Q", raw, 64)[0]  # SOL transacionado
 
-    if base_amount == 0 or quote_amount == 0:
+    side       = "buy" if disc == _BUY_DISC else "sell"
+    sol_amount = quote_amount / 10 ** _SOL_DECIMALS
+
+    # MC via pool reserves (primary — mais preciso que swap amounts)
+    mc = None
+    if pool_base > 0 and pool_quote > 0:
+        price_sol = (pool_quote / 10 ** _SOL_DECIMALS) / (pool_base / 10 ** _TOKEN_DECIMALS)
+        mc_cand   = price_sol * sol_usd * supply
+        if _MC_MIN < mc_cand < _MC_MAX:
+            mc = mc_cand
+
+    # Fallback: swap amounts
+    if mc is None and base_amount > 0 and quote_amount > 0:
+        if side == "buy":
+            tok_out = base_amount / 10 ** _TOKEN_DECIMALS
+            if tok_out > 0:
+                mc_cand = (sol_amount / tok_out) * sol_usd * supply
+                if _MC_MIN < mc_cand < _MC_MAX:
+                    mc = mc_cand
+        else:
+            tok_in = base_amount / 10 ** _TOKEN_DECIMALS
+            if tok_in > 0:
+                mc_cand = (sol_amount / tok_in) * sol_usd * supply
+                if _MC_MIN < mc_cand < _MC_MAX:
+                    mc = mc_cand
+
+    if mc is None:
         return None
 
-    if disc == _BUY_DISC:
-        sol_in  = quote_amount / 10 ** _SOL_DECIMALS
-        tok_out = base_amount  / 10 ** _TOKEN_DECIMALS
-        if tok_out > 0:
-            mc2 = (sol_in / tok_out) * sol_usd * supply
-            if _MC_MIN < mc2 < _MC_MAX:
-                return mc2
-    else:  # SellEvent
-        tok_in  = base_amount  / 10 ** _TOKEN_DECIMALS
-        sol_out = quote_amount / 10 ** _SOL_DECIMALS
-        if tok_in > 0:
-            mc2 = (sol_out / tok_in) * sol_usd * supply
-            if _MC_MIN < mc2 < _MC_MAX:
-                return mc2
-
-    return None
+    return {"mc": mc, "side": side, "sol": sol_amount}
 
 
 def _parse_meteora_mc(raw: bytes, sol_usd: float, supply: float) -> float | None:
@@ -177,10 +181,11 @@ def _parse_meteora_mc(raw: bytes, sol_usd: float, supply: float) -> float | None
     return None
 
 
-def _parse_mc_from_logs(logs: list, supply: float, sol_usd: float) -> float | None:
+def _parse_swap_event_from_logs(logs: list, supply: float, sol_usd: float) -> dict | None:
     """
-    Percorre os logs e retorna o MC calculado dos eventos Anchor.
-    Prioridade: pump.fun pAMM → Meteora DAMM v2 → ignora (log DEBUG).
+    Percorre os logs e retorna {mc, side, sol} do primeiro evento Anchor reconhecido.
+    Prioridade: pump.fun pAMM → Meteora DAMM v2 → None.
+    Para Meteora (sem side/sol), retorna {mc, side='unknown', sol=0}.
     """
     supply = supply or 1_000_000_000
 
@@ -199,14 +204,14 @@ def _parse_mc_from_logs(logs: list, supply: float, sol_usd: float) -> float | No
         disc = raw[:8]
 
         if disc in _PUMP_AMM_DISCS:
-            mc = _parse_pump_amm_mc(raw, sol_usd, supply)
-            if mc:
-                return mc
+            event = _parse_pump_amm_event(raw, sol_usd, supply)
+            if event:
+                return event
 
         elif disc in _METEORA_DISCS:
             mc = _parse_meteora_mc(raw, sol_usd, supply)
             if mc:
-                return mc
+                return {"mc": mc, "side": "unknown", "sol": 0.0}
 
         else:
             logger.debug(
@@ -224,14 +229,21 @@ def _parse_mc_from_logs(logs: list, supply: float, sol_usd: float) -> float | No
 class HeliusWS:
     """WebSocket manager — subscrição por mint, sem depender de pool address."""
 
+    # Janela de eventos por mint — maxlen impede crescimento ilimitado.
+    # Eventos mais velhos que _ABSORPTION_WINDOW_SEC são ignorados na consulta.
+    _ABSORPTION_MAXLEN     = 300
+    _ABSORPTION_WINDOW_SEC = 90   # janela padrão para get_absorption_window()
+
     def __init__(self, on_price: Callable[[str, float], None]):
         """on_price(mint, market_cap_usd) — compatível com HotMonitor.push_mc."""
         self._on_price = on_price
 
-        self._mint_supply: dict[str, float] = {}   # mint → total_supply
-        self._sub_id_mint: dict[int, str]   = {}   # ws_sub_id → mint
-        self._req_mint:    dict[int, str]   = {}   # req_id → mint (aguardando confirmação)
-        self._last_fetch:  dict[str, float] = {}   # mint → timestamp último parse
+        self._mint_supply:  dict[str, float] = {}   # mint → total_supply
+        self._sub_id_mint:  dict[int, str]   = {}   # ws_sub_id → mint
+        self._req_mint:     dict[int, str]   = {}   # req_id → mint (aguardando confirmação)
+        self._last_fetch:   dict[str, float] = {}   # mint → timestamp último parse
+        # H22 — rolling window de swap events por mint (side, sol, mc, ts)
+        self._swap_events:  dict[str, deque] = {}
 
         self._lock      = threading.Lock()
         self._ws_lock   = threading.Lock()
@@ -271,6 +283,7 @@ class HeliusWS:
             if mint in self._mint_supply:
                 return
             self._mint_supply[mint] = total_supply
+            self._swap_events[mint] = deque(maxlen=self._ABSORPTION_MAXLEN)
 
         if self._connected:
             self._send_subscribe(mint)
@@ -283,6 +296,7 @@ class HeliusWS:
         with self._lock:
             self._mint_supply.pop(mint, None)
             self._last_fetch.pop(mint, None)
+            self._swap_events.pop(mint, None)
             for sid, m in list(self._sub_id_mint.items()):
                 if m == mint:
                     sub_id_to_remove = sid
@@ -403,12 +417,25 @@ class HeliusWS:
         # ── Tier 1: INLINE, sem rate limit, sem thread ─────────────────
         # Cada swap dispara _check_bounce imediatamente (~5ms no callback WS).
         # Elimina a janela cega de 2s do rate limit antigo.
+        # Também acumula evento para janela de absorção H22.
         if _sol_usd_cached > 0:
             try:
-                mc = _parse_mc_from_logs(logs, supply, _sol_usd_cached)
-                if mc and mc > 0:
-                    logger.info("HeliusWS price(anchor) %s: $%.0f MC", mint[:8], mc)
-                    self._on_price(mint, mc)
+                event = _parse_swap_event_from_logs(logs, supply, _sol_usd_cached)
+                if event and event["mc"] > 0:
+                    # H22: acumula na rolling window (só pump AMM tem side/sol confiáveis)
+                    if event["side"] != "unknown":
+                        with self._lock:
+                            buf = self._swap_events.get(mint)
+                        if buf is not None:
+                            buf.append({
+                                "ts":   time.time(),
+                                "side": event["side"],
+                                "sol":  event["sol"],
+                                "mc":   event["mc"],
+                            })
+                    logger.info("HeliusWS price(anchor) %s: $%.0f MC [%s %.4f SOL]",
+                                mint[:8], event["mc"], event["side"], event["sol"])
+                    self._on_price(mint, event["mc"])
                     return
             except Exception as e:
                 logger.debug("HeliusWS anchor parse %s: %s", mint[:8], e)
@@ -437,6 +464,35 @@ class HeliusWS:
     # ──────────────────────────────────────────────────────────────────
     # Price resolution — Anchor logs → DexScreener fallback
     # ──────────────────────────────────────────────────────────────────
+
+    def get_absorption_window(self, mint: str, window_sec: int = 60) -> dict:
+        """
+        H22 — retorna métricas de fluxo de ordens para um mint na janela de window_sec.
+        Filtra apenas eventos pump.fun pAMM (side='buy'/'sell') mais recentes que window_sec.
+        Retorna dict com buy_count, sell_count, buy_vol_sol, sell_vol_sol, etc.
+        Seguro para chamar a qualquer momento — retorna zeros se sem dados.
+        """
+        cutoff = time.time() - window_sec
+        with self._lock:
+            events = list(self._swap_events.get(mint, []))
+
+        recent = [e for e in events if e["ts"] >= cutoff]
+        buys   = [e for e in recent if e["side"] == "buy"]
+        sells  = [e for e in recent if e["side"] == "sell"]
+
+        buy_vol  = sum(e["sol"] for e in buys)
+        sell_vol = sum(e["sol"] for e in sells)
+
+        return {
+            "buy_count":      len(buys),
+            "sell_count":     len(sells),
+            "buy_vol_sol":    buy_vol,
+            "sell_vol_sol":   sell_vol,
+            "largest_buy":    max((e["sol"] for e in buys),  default=0.0),
+            "largest_sell":   max((e["sol"] for e in sells), default=0.0),
+            "total_events":   len(recent),
+            "window_sec":     window_sec,
+        }
 
     def _dexscreener_fallback(self, mint: str, supply: float):
         """
