@@ -9511,7 +9511,7 @@ def _wr_breakdown_inner():
             FROM trades t
             LEFT JOIN bounce_signals b ON b.mint = t.mint
             LEFT JOIN migrations     m ON m.mint = t.mint
-            WHERE t.status IN ('tp','tp_hit','trailing_active','sl','sl_hit','expired')
+            WHERE t.status IN ('tp','tp_hit','trailing_active','sl','sl_hit','expired','open','pending')
               {since_clause}
             ORDER BY t.id ASC
         """, params)
@@ -9532,6 +9532,7 @@ def _wr_breakdown_inner():
             return False  # não é SL — é TP que expirou (ver is_tp acima)
         return t["status"] in SL_STATUSES or t["exit_type"] in SL_STATUSES
 
+    open_trades = [t for t in trades if t["status"] in ("open", "pending")]
     closed = [t for t in trades if is_tp(t) or is_sl(t)]
     total  = len(closed)
     n_tp   = sum(1 for t in closed if is_tp(t))
@@ -9779,7 +9780,7 @@ tr:hover td{background:#161b22}
   <a href='?since=2026-05-10'>Pós-fix (since 2026-05-10)</a>
   <a href='?'>Todos</a>
 </div>
-<div class='filt'>Filtro ativo: <b>{since_display}</b> | {total} trades fechados (TP+SL) | Baseline WR: <b>{wr_base*100:.1f}%</b> ({n_tp} TP / {n_sl} SL)</div>
+<div class='filt'>Filtro ativo: <b>{since_display}</b> | {total} trades fechados (TP+SL) | Baseline WR: <b>{wr_base*100:.1f}%</b> ({n_tp} TP / {n_sl} SL){f" | <span class='yellow'>⏳ {len(open_trades)} pendentes (open/pending — GMGN não refletido no DB ainda)</span>" if open_trades else ""}</div>
 <div class='block'>
 <h2>Distribuição de status no DB (diagnóstico)</h2>
 <table><tr><th>status</th><th>exit_type</th><th>n</th><th>tipo</th></tr>{sd_rows}</table>
@@ -9796,13 +9797,54 @@ tr:hover td{background:#161b22}
 
     h += sections
 
+    # Rows for open/pending trades
+    open_rows_html = ""
+    for t in open_trades:
+        age_min = ""
+        if t.get("created_at"):
+            from datetime import datetime, timezone as _tz
+            try:
+                age_s = (datetime.now(_tz.utc) - t["created_at"].replace(tzinfo=_tz.utc) if t["created_at"].tzinfo is None else datetime.now(_tz.utc) - t["created_at"]).total_seconds()
+                age_min = f"{age_s/60:.0f}m atrás"
+            except Exception:
+                pass
+        bp   = f"{t['b_bounce_pct']*100:.0f}%" if t.get("b_bounce_pct") else "—"
+        el   = f"{t['b_elapsed_min']:.0f}m"     if t.get("b_elapsed_min") is not None else "—"
+        dp   = f"{t['b_drop_pct']*100:.0f}%"   if t.get("b_drop_pct") else "—"
+        ttb  = f"{t['time_to_bottom']:.0f}m"   if t.get("time_to_bottom") is not None else "—"
+        h9_r = f"{t['h9_best_ratio']:.2f}" if t.get("h9_best_ratio") else "—"
+        open_rows_html += f"""<tr>
+<td>{t['id']}</td>
+<td><b>{t['symbol'] or t['mint'][:8]}</b></td>
+<td class='yellow'>⏳ {t['status']}</td>
+<td class='muted'>{age_min}</td>
+<td>{bp}</td><td>{el}</td><td>{dp}</td><td>{ttb}</td>
+<td>{t['creator_token_status'] or '—'}</td>
+<td>{int(t['n_h9_signals'] or 0)}</td>
+<td>{h9_r}</td>
+<td>—</td>
+<td>{t.get('smart_wallets') or '—'}</td>
+</tr>"""
+
+    pending_section = ""
+    if open_trades:
+        pending_section = f"""<div class='block'>
+<h2>⏳ Trades pendentes — status DB não atualizado ({len(open_trades)})</h2>
+<p style='color:#8b949e;font-size:10px;padding:4px 0 6px'>GMGN já pode ter executado TP/SL. TradeMonitor atualiza via token_ticks (30s). Não incluídos no WR baseline acima.</p>
+<table>
+<tr><th>#</th><th>Symbol</th><th>Status DB</th><th>Idade</th><th>Bounce%</th><th>Elapsed</th>
+<th>Drop%</th><th>TTB</th><th>Creator</th><th>H9 n</th><th>H9 ratio</th><th>Bots</th><th>Smart</th></tr>
+{open_rows_html}
+</table></div>"""
+
     h += f"""<div class='block'>
-<h2>Todos os trades ({total})</h2>
+<h2>Trades fechados ({total})</h2>
 <table>
 <tr><th>#</th><th>Symbol</th><th>Outcome</th><th>P&L</th><th>Bounce%</th><th>Elapsed</th>
 <th>Drop%</th><th>TTB</th><th>Creator</th><th>H9 n</th><th>H9 ratio</th><th>Bots</th><th>Smart</th></tr>
 {rows_html2}
 </table></div>
+{pending_section}
 </body></html>"""
     return h
 
