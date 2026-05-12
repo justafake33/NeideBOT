@@ -11,7 +11,7 @@ import db
 from monitoring import init_sentry
 from gmgn_client import GmgnClient, get_sol_usd as _get_sol_usd
 from scheduler import HeapScheduler
-from scanner import Scanner, HotMonitor
+from scanner import Scanner, HotMonitor, _absorption_score
 from executor import TradeExecutor, TradeMonitor
 
 logging.basicConfig(
@@ -10460,7 +10460,6 @@ def debug_absorption():
                 # Score on-the-fly para visualização
                 mc_last  = state.get("mc_last") or state.get("mc_migration", 0)
                 mc_min   = state.get("mc_min",  mc_last)
-                from scanner import _absorption_score
                 score, grade = _absorption_score(w, mc_last, mc_min) if total > 0 else (None, "no_data")
 
                 grade_cls = "ok" if grade in ("A+","A") else ("warn" if grade == "B" else ("bad" if grade == "C" else ""))
