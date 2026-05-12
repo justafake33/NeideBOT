@@ -570,21 +570,25 @@ class HotMonitor:
                                         (1 - mc_low / state["mc_migration"]) * 100)
                             state["mc_min"] = mc_low
 
-                    # 2. Atualiza mc_max com o high desta vela.
-                    high_price = _float(c.get("high"))
-                    if high_price and high_price > 0:
-                        mc_high = high_price * state["total_supply"]
-                        if mc_high > state["mc_max"]:
+                    # 2. Atualiza mc_max com o CLOSE desta vela (não o high).
+                    # Kline high captura spikes intra-candle de transações individuais
+                    # em pools com baixa liquidez — um único whale buy pode temporariamente
+                    # empurrar o AMM price para 200x mesmo que o close volte ao normal.
+                    # close = preço sustentado ao final do minuto → valor confiável.
+                    close_for_peak = _float(c.get("close"))
+                    if close_for_peak and close_for_peak > 0:
+                        mc_close_peak = close_for_peak * state["total_supply"]
+                        if mc_close_peak > state["mc_max"]:
                             with self._lock:
                                 inner = self._tokens.get(mint)
-                                if inner and mc_high > inner["mc_max"]:
-                                    inner["mc_max"]   = mc_high
+                                if inner and mc_close_peak > inner["mc_max"]:
+                                    inner["mc_max"]   = mc_close_peak
                                     inner["time_max"] = elapsed_min
-                            db.update_peak(mint, mc_high, elapsed_min)
+                            db.update_peak(mint, mc_close_peak, elapsed_min)
                             logger.info("Pico(kline)  %s: $%.0f em %.1fmin (+%.0f%% vs mig)",
-                                        state["symbol"], mc_high, elapsed_min,
-                                        (mc_high / state["mc_migration"] - 1) * 100)
-                            state["mc_max"] = mc_high
+                                        state["symbol"], mc_close_peak, elapsed_min,
+                                        (mc_close_peak / state["mc_migration"] - 1) * 100)
+                            state["mc_max"] = mc_close_peak
 
                     # 3. Acumula tick kline com OHLC completo.
                     close_p = _float(c.get("close"))
@@ -651,9 +655,9 @@ class HotMonitor:
                 low = _float(c.get("low"))
                 if low and low > 0:
                     db.update_bottom(mint, low * total_supply, elapsed_min)
-                high = _float(c.get("high"))
-                if high and high > 0:
-                    db.update_peak(mint, high * total_supply, elapsed_min)
+                close = _float(c.get("close"))
+                if close and close > 0:
+                    db.update_peak(mint, close * total_supply, elapsed_min)
 
             last        = candles_1h[-1]
             close_price = _float(last.get("close"))
