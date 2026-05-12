@@ -6338,13 +6338,14 @@ def _executor_status_inner():
     last_bounce = None
     last_bounce_ts = None
     try:
-        conn = db.get_conn()
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM bounce_signals ORDER BY created_at DESC LIMIT 1")
+        import psycopg2.extras
+        conn = psycopg2.connect(db.DATABASE_URL)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM bounce_signals ORDER BY ts_signal DESC LIMIT 1")
             row = cur.fetchone()
             if row:
                 last_bounce    = dict(row)
-                last_bounce_ts = row.get("created_at")
+                last_bounce_ts = row.get("ts_signal")
         conn.close()
     except Exception:
         pass
@@ -8981,9 +8982,10 @@ def _wallet_tokens_inner():
                 continue
 
     # 3. Buscar mints dos trades no DB para cruzar
-    conn = db.get_conn()
+    import psycopg2.extras as _pge
+    conn = psycopg2.connect(db.DATABASE_URL)
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=_pge.RealDictCursor) as cur:
             cur.execute("""
                 SELECT t.id, t.mint, t.status, t.ts_signal, t.entry_expected,
                        t.order_id, t.fee_sol, t.tokens_received
