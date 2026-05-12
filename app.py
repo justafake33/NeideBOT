@@ -9533,6 +9533,8 @@ def _wr_breakdown_inner():
         return t["status"] in SL_STATUSES or t["exit_type"] in SL_STATUSES
 
     open_trades = [t for t in trades if t["status"] in ("open", "pending")]
+    # Trades invisíveis: expired sem pnl_pct_real (trailing_active que GMGN fechou mas TradeMonitor não detectou)
+    ghost_trades = [t for t in trades if t["status"] == "expired" and not t.get("pnl_pct_real")]
     closed = [t for t in trades if is_tp(t) or is_sl(t)]
     total  = len(closed)
     n_tp   = sum(1 for t in closed if is_tp(t))
@@ -9780,7 +9782,7 @@ tr:hover td{background:#161b22}
   <a href='?since=2026-05-10'>Pós-fix (since 2026-05-10)</a>
   <a href='?'>Todos</a>
 </div>
-<div class='filt'>Filtro ativo: <b>{since_display}</b> | {total} trades fechados (TP+SL) | Baseline WR: <b>{wr_base*100:.1f}%</b> ({n_tp} TP / {n_sl} SL){f" | <span class='yellow'>⏳ {len(open_trades)} pendentes (open/pending — GMGN não refletido no DB ainda)</span>" if open_trades else ""}</div>
+<div class='filt'>Filtro ativo: <b>{since_display}</b> | {total} trades fechados (TP+SL) | Baseline WR: <b>{wr_base*100:.1f}%</b> ({n_tp} TP / {n_sl} SL){f" | <span class='yellow'>⏳ {len(open_trades)} pendentes</span>" if open_trades else ""}{f" | <span class='red'>👻 {len(ghost_trades)} sem classificação (expired+pnl=NULL)</span>" if ghost_trades else ""}</div>
 <div class='block'>
 <h2>Distribuição de status no DB (diagnóstico)</h2>
 <table><tr><th>status</th><th>exit_type</th><th>n</th><th>tipo</th></tr>{sd_rows}</table>
@@ -9826,6 +9828,27 @@ tr:hover td{background:#161b22}
 <td>{t.get('smart_wallets') or '—'}</td>
 </tr>"""
 
+    # Ghost trades rows (expired sem pnl — TradeMonitor não detectou saída do trailing)
+    ghost_rows_html = ""
+    for t in ghost_trades:
+        bp   = f"{t['b_bounce_pct']*100:.0f}%" if t.get("b_bounce_pct") else "—"
+        el   = f"{t['b_elapsed_min']:.0f}m"     if t.get("b_elapsed_min") is not None else "—"
+        dp   = f"{t['b_drop_pct']*100:.0f}%"   if t.get("b_drop_pct") else "—"
+        ttb  = f"{t['time_to_bottom']:.0f}m"   if t.get("time_to_bottom") is not None else "—"
+        h9_r = f"{t['h9_best_ratio']:.2f}" if t.get("h9_best_ratio") else "—"
+        ghost_rows_html += f"""<tr>
+<td>{t['id']}</td>
+<td><b>{t['symbol'] or t['mint'][:8]}</b></td>
+<td class='red'>👻 expired/sem pnl</td>
+<td class='muted'>—</td>
+<td>{bp}</td><td>{el}</td><td>{dp}</td><td>{ttb}</td>
+<td>{t['creator_token_status'] or '—'}</td>
+<td>{int(t['n_h9_signals'] or 0)}</td>
+<td>{h9_r}</td>
+<td>—</td>
+<td>{t.get('smart_wallets') or '—'}</td>
+</tr>"""
+
     pending_section = ""
     if open_trades:
         pending_section = f"""<div class='block'>
@@ -9837,6 +9860,17 @@ tr:hover td{background:#161b22}
 {open_rows_html}
 </table></div>"""
 
+    ghost_section = ""
+    if ghost_trades:
+        ghost_section = f"""<div class='block'>
+<h2>👻 Sem classificação — expired + pnl=NULL ({len(ghost_trades)})</h2>
+<p style='color:#8b949e;font-size:10px;padding:4px 0 6px'>Esses trades tiveram trailing_active mas o TradeMonitor não detectou a saída (sem ticks após 60min ou fora da janela quente). GMGN fechou, DB não sabe o resultado. Verifique no GMGN se foram TP ou SL para calibrar o WR real.</p>
+<table>
+<tr><th>#</th><th>Symbol</th><th>Status DB</th><th>—</th><th>Bounce%</th><th>Elapsed</th>
+<th>Drop%</th><th>TTB</th><th>Creator</th><th>H9 n</th><th>H9 ratio</th><th>Bots</th><th>Smart</th></tr>
+{ghost_rows_html}
+</table></div>"""
+
     h += f"""<div class='block'>
 <h2>Trades fechados ({total})</h2>
 <table>
@@ -9845,6 +9879,7 @@ tr:hover td{background:#161b22}
 {rows_html2}
 </table></div>
 {pending_section}
+{ghost_section}
 </body></html>"""
     return h
 
