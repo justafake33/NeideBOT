@@ -30,7 +30,6 @@ F_RAT_MAX        = float(os.getenv("FILTER_RAT_MAX",        "0.20"))
 F_TOP10_MAX      = float(os.getenv("FILTER_TOP10_MAX",      "0.50"))  # dados: >40% recovery cai para 7-15%
 F_SMART_MIN      = int(os.getenv(  "FILTER_SMART_MIN",      "2"))     # live: smart=1 → 0% WR (n=6). smart=2 → 20%, smart=3 → 57%
 F_WASH_BLOCK     = os.getenv(      "FILTER_WASH_BLOCK",     "true").lower() == "true"
-F_CTO_BLOCK      = os.getenv(      "FILTER_CTO_BLOCK",      "true").lower() == "true"  # CTO=1 → 24% WR vs 42% sem CTO
 BC_MIN_WATCHLIST = float(os.getenv("BC_MIN_WATCHLIST",      "80"))
 F_MC_MIN         = float(os.getenv("FILTER_MC_MIN",         "5000"))
 F_MC_MAX         = float(os.getenv("FILTER_MC_MAX",         "200000"))
@@ -71,9 +70,6 @@ def _passes_filter(token: dict) -> tuple[bool, str]:
     smart = _int(token.get("smart_degen_count")) or 0
     if smart < F_SMART_MIN:
         return False, f"smart={smart}<{F_SMART_MIN}"
-
-    if F_CTO_BLOCK and token.get("cto_flag"):
-        return False, "cto_flag"
 
     return True, ""
 
