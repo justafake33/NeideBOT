@@ -540,9 +540,9 @@ def backfill_recovery_false():
 
 def insert_bounce_signal(data: dict):
     """Registra um sinal de bounce. UNIQUE(mint) — um sinal por token.
-    Campos H22 opcionais: absorption_score, absorption_grade, absorption_buy_vol,
-    absorption_sell_vol, absorption_buy_cnt, absorption_sell_cnt, absorption_lrg_buy,
-    absorption_events.
+    Se o mint já existe com absorption_events NULL, atualiza os campos H22.
+    Isso permite que tokens que bounçaram antes do deploy H22 recebam dados
+    na próxima sessão (ex: após restart).
     """
     with _cursor() as cur:
         cur.execute("""
@@ -560,7 +560,16 @@ def insert_bounce_signal(data: dict):
                  %(absorption_buy_vol)s, %(absorption_sell_vol)s,
                  %(absorption_buy_cnt)s, %(absorption_sell_cnt)s,
                  %(absorption_lrg_buy)s, %(absorption_events)s)
-            ON CONFLICT (mint) DO NOTHING
+            ON CONFLICT (mint) DO UPDATE SET
+                absorption_score    = EXCLUDED.absorption_score,
+                absorption_grade    = EXCLUDED.absorption_grade,
+                absorption_buy_vol  = EXCLUDED.absorption_buy_vol,
+                absorption_sell_vol = EXCLUDED.absorption_sell_vol,
+                absorption_buy_cnt  = EXCLUDED.absorption_buy_cnt,
+                absorption_sell_cnt = EXCLUDED.absorption_sell_cnt,
+                absorption_lrg_buy  = EXCLUDED.absorption_lrg_buy,
+                absorption_events   = EXCLUDED.absorption_events
+            WHERE bounce_signals.absorption_events IS NULL
         """, {
             **data,
             "absorption_score":    data.get("absorption_score"),
