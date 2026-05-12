@@ -1,7 +1,7 @@
 # NeideBOT — Roadmap
 
-**Atualizado:** 2026-05-12  
-**Estado:** Bot ativo a $1/trade · WR **~15% (GMGN ground truth)** · filtros A.2/A.3/A.5/A.6/A.7/smart≥3 ativos · DB WR inválido — usar apenas GMGN para métricas
+**Atualizado:** 2026-05-12 (sessão 2)
+**Estado:** Bot ativo a $1/trade · WR **~15% (GMGN ground truth)** · filtros A.2/A.3/A.5/A.6/A.7/smart≥3 ativos · H22 em coleta · DB WR inválido — usar apenas GMGN para métricas
 
 ---
 
@@ -30,6 +30,10 @@
 | /debug/bounce-list | 2026-05-12 | Lista bounces ≥ X% com links DexScreener/GMGN, auto-refresh 30s |
 | CODEX_BRIEF.md | 2026-05-12 | Briefing para análise externa — diagnóstico completo + hipóteses abertas |
 | Análise big player (síntese ChatGPT + sessão) | 2026-05-12 | Identificado detector de absorção pós-fundo como próxima grande alavanca |
+| **H22 — Coleta de absorção implementada** | 2026-05-12 | `helius_ws.py`: deque(maxlen=300) por mint acumula `{ts, side, sol, mc}` de cada BuyEvent/SellEvent do pAMM. `get_absorption_window(mint, 60)` expõe buy_vol, sell_vol, counts, ratio, largest_buy. `bounce_signals` recebe 8 campos de absorção. `/debug/absorption` mostra dados ao vivo + histórico. Score/grade **não calculados** — coleta de métricas brutas apenas. |
+| **H22 — Score removido (dados antes de fórmula)** | 2026-05-12 | `_absorption_score()` deletada do scanner.py. Score não existe sem correlação real com TP/SL. Construir fórmula APÓS n≥30 bounces com `absorption_events > 0` e outcomes GMGN confirmados. |
+| **Fix mc_peak inflado (kline high → close)** | 2026-05-12 | Kline `high` incluía spikes intra-candle de transações em pools com baixa liquidez — um único whale buy pode empurrar o AMM price 200x por <1s. Scanner mostrava ganhos de 5000-25000% (ex: DIAMOND $9M peak mas mc_1h = $39K). Fix: `_precise_bottom_tick()` e `_graduate()` agora usam `close × supply` para mc_peak. `mc_high` nos token_ticks mantido para o backtester. |
+| **`/analise/post-sl-recovery`** | 2026-05-12 | Para cada SL, busca o max MC nos token_ticks após exit_ts. 12% dos SLs (8/64 com dados) teriam atingido o TP depois. 88% são dumps genuínos que continuaram. |
 
 > ⚠️ **Nota sobre WR histórico**: O DB WR (chegou a mostrar 34%) é inválido. TradeMonitor infere TP/SL via token_ticks e gera falsos positivos após GMGN fechar a posição. **GMGN = 15% WR = ground truth.**
 
@@ -61,41 +65,28 @@
 
 ---
 
-### 3. Detector de absorção pós-fundo via Helius pAMM ← **PRÓXIMA SESSÃO DE CÓDIGO**
+### 3. Detector de absorção pós-fundo via Helius pAMM ← **✅ IMPLEMENTADO (fase coleta)**
 
-**Por quê:** É o unlock de maior alavancagem disponível com a infraestrutura atual. Ataca o problema raiz: 90% dos SLs são dumps que continuam porque não havia comprador real no fundo. A pergunta muda de *"subiu 30%?"* para *"quem comprou esse fundo e com que força?"*
+**Status:** Infraestrutura de coleta ativa. Score/filtro aguardam dados.
 
-**Infraestrutura já existe:** `helius_ws.py` recebe `BuyEvent`/`SellEvent` do pump.fun pAMM em ~5ms, com volume exato de cada transação. Hoje usado apenas para preço. O próximo nível é medir fluxo de ordens.
+**O que foi implementado:**
+- `helius_ws.py`: deque(maxlen=300) por mint acumula `{ts, side, sol, mc}` de cada BuyEvent/SellEvent do pAMM
+- `get_absorption_window(mint, window_sec=60)` → retorna `{buy_vol, sell_vol, buy_count, sell_count, largest_buy, total_events}`
+- `bounce_signals` table: 8 colunas novas (`absorption_buy_vol`, `sell_vol`, `buy_cnt`, `sell_cnt`, `lrg_buy`, `events`, `score=NULL`, `grade=NULL`)
+- `/debug/absorption`: mostra janela ao vivo por token + últimos 30 bounces com ratio buy/sell
+- `/analise/post-sl-recovery`: para cada SL, busca max MC nos ticks após exit (12% teriam atingido TP)
 
-**Lógica proposta:**
-```python
-# helius_ws.py — janela rolante por mint (deque, maxlen=200, purga > 90s)
-_buy_events[mint].append({ts, volume_sol, price})   # BuyEvent
-_sell_events[mint].append({ts, volume_sol, price})  # SellEvent
+**Score/grade: deliberadamente removidos.** Construir fórmula sem correlação com outcomes é julgar o peixe por não subir em árvore. Coletar → correlacionar → só então pontuar.
 
-# _check_bounce() — gate adicional antes de disparar
-def _absorption_confirmed(mint, mc_min, mc_current):
-    buys  = [e for e in _buy_events[mint]  if now - e.ts <= 60]
-    sells = [e for e in _sell_events[mint] if now - e.ts <= 60]
-    buy_vol  = sum(e.volume_sol for e in buys)
-    sell_vol = sum(e.volume_sol for e in sells) or 0.0001
-    return (
-        buy_vol > sell_vol * 1.3   # compradores dominam em volume
-        and len(buys) >= 3         # pelo menos 3 transações de compra distintas
-        and mc_current > mc_min * 0.97  # preço não retornou ao fundo
-    )
-```
+**Próximos passos desta hipótese:**
+1. ✅ Acumular eventos por mint (done)
+2. ✅ Salvar métricas brutas por bounce (done)
+3. ⏳ Acumular n≥30 bounces com `absorption_events > 0` + outcomes GMGN confirmados
+4. Análise: qual métrica discrimina TP vs SL? (ratio? total_events? largest_buy?)
+5. Construir score baseado na correlação real encontrada
+6. Ativar como filtro se WR ≥15pp maior com absorção confirmada
 
-**Implementação em fases:**
-1. `helius_ws.py`: acumular eventos em `deque` com maxlen por mint, purga > 90s
-2. `scanner.py`: expor `get_absorption_data(mint)` para o bounce detector
-3. `_check_bounce()`: logar resultado de `_absorption_confirmed()` sem bloquear (fase coleta)
-4. Após n≥30 trades logados com/sem absorção: validar discriminação vs GMGN
-5. Ativar como filtro real se WR ≥15pp maior no grupo com absorção confirmada
-
-**Estimativa:** 1-2 dias de código. Começa como log, vira filtro após validação.
-
-**Gate para ativar como filtro:** n≥30 trades com dados de absorção, WR ≥15pp maior com absorção confirmada (GMGN).
+**Gate para virar filtro:** n≥30 bounces com dados Helius + WR ≥15pp maior no grupo com absorção vs sem absorção (GMGN como fonte).
 
 ---
 
@@ -234,7 +225,7 @@ def _absorption_confirmed(mint, mc_min, mc_current):
 | H19 | 1-2min delay melhora EV | ✅ +6.6pp — coberto por A.4, mas A.4 removido |
 | H20 | W-bottom = sinal de confirmação | ❌ 98% prevalência — ubíquo |
 | H21 | SL ancorado no fundo (mc_bottom × 90%) resolveria a maioria dos SLs | ❌ **REFUTADA** — 90% dos SLs caem abaixo de 0.90× o fundo (mediana 0.55×) |
-| H22 | Buy volume > sell volume nos 60s pós-fundo discrimina WR ≥15pp | ⏳ **hipótese formal** — próxima a implementar e testar via Helius pAMM events |
+| H22 | Buy volume > sell volume nos 60s pós-fundo discrimina WR ≥15pp | ⏳ **DATA COLLECTION** — janela rolante ativa, métricas brutas salvas em bounce_signals. Score aguarda n≥30 outcomes GMGN. |
 
 ---
 
@@ -251,3 +242,5 @@ def _absorption_confirmed(mint, mc_min, mc_current):
 9. **Dip entry não funciona**: tokens que foram ao TP nunca retrocederam o suficiente; tokens que retrocederam continuaram caindo. O timing atual está correto — o problema é qualidade do sinal.
 10. **Tiers e scoring são prematuros**: com n<200 trades GMGN limpos, qualquer bucket tem amostra fraca. Acumular dados primeiro, modelar depois.
 11. **BOTTOM_FRESHNESS_SEC=180 é baixa alavancagem**: live trades já têm ts_min a 0.1-4.5min do sinal. A.6 a 300s já resolve o problema em produção. Não apertar sem evidência de inválidos chegando com gap 3-5min nos logs atuais.
+12. **Score sem dados é ilusão de precisão**: fórmula calculável ≠ fórmula útil. `_absorption_score()` foi removida porque não havia correlação validada com TP/SL. Coletar métricas brutas → analisar discriminação → SÓ ENTÃO construir score com pesos que os dados justificam.
+13. **Kline `high` inflava mc_peak com spikes intra-candle**: em pools com 79 SOL de liquidez, um único trade pode temporariamente empurrar o preço AMM 200x. O kline registra isso como o `high` da vela mesmo que o close volte ao normal. Fix: usar `close × supply` para mc_peak (push_mc já usa close implicitamente). `mc_high` mantido nos token_ticks para o backtester (TP detection intra-vela).

@@ -356,6 +356,8 @@ Registradas ANTES de ver os dados. Não alterar retroativamente.
 | H18 | Velocidade de subida do fundo ao sinal (bounce velocity) discrimina WR | ❌ **REFUTADA** — todas as tercis têm WR 40% flat. TTB<25min+Slow=43% vs TTB<25min+Fast=29% (contrário do esperado). Não implementar. |
 | H19 | Aguardar 1-2min após sinal melhora EV vs entrada imediata | ✅ **+6.6pp WR** com 1min delay (18.8% vs 12.2%). **Coberto pelo A.4** (90s persistence wait). Sem implementação adicional necessária. |
 | H20 | W-bottom (double-dip) é sinal de confirmação de suporte | ❌ **NÃO É FILTRO** — 98% dos bounces têm W-bottom, incluindo SLs. Ubíquo demais. Sem W-bottom (n=2) tem 100% WR mas amostra insuficiente. |
+| H21 | SL ancorado no mc_bottom (× 0.90) resolveria maioria dos SLs | ❌ **REFUTADA** (2026-05-12, n=68) — 90% dos SLs caem muito abaixo do fundo (mediana 0.55×). TPs nunca voltam ao fundo (min/bottom > 1.0). Dynamic SL descartado. |
+| H22 | Buy volume > sell volume nos 60s pós-fundo discrimina WR ≥15pp | ⏳ **DATA COLLECTION** — janela rolante ativa em HeliusWS, métricas brutas salvas em bounce_signals. Score aguarda n≥30 bounces com absorption_events > 0 e outcomes GMGN. |
 
 ### Análises de tick-features — resultados documentados
 
@@ -427,6 +429,13 @@ WR base: **13.3%** (EV -3%, TP75/SL15). WR estimado pós-filtros A.2+A.3: **~29%
 ## 🏗️ ARQUITETURA ATUAL
 
 ```
+HeliusWS (WebSocket — background thread, sempre ativo)
+    ├─ logsSubscribe por mint (subscribe/unsubscribe via HotMonitor)
+    ├─ Tier 1 inline (~5ms): parse Anchor BuyEvent/SellEvent do pAMM
+    │       └─ Preço via pool_reserves (offsets 48/56) → _sol_usd_cached
+    │       └─ Acumula {ts, side, sol, mc} em deque(maxlen=300) por mint [H22]
+    └─ Tier 2 (DexScreener HTTP, rate-limited): fallback de preço
+
 Scanner (poll 5s)
     │
     ├─ POST /v1/trenches near_completion → data["pump"]
@@ -436,7 +445,7 @@ Scanner (poll 5s)
     ├─ POST /v1/trenches completed → data["completed"]
     │       └─ Filtros MC/liq/fee → upsert_migration
     │       └─ mc_migration = bonding_curve_ref (MIGRATION_SOL_UNITS × SOL/USD) || kline open || trenches
-    │       └─ HotMonitor.add()
+    │       └─ HotMonitor.add() → HeliusWS.subscribe(mint)
     │       └─ push_mc para TODOS os completed já vistos (atualiza _mc_live)
     │
     ├─ _poll_signals() — Fase 2 (a cada 5s, apenas se HotMonitor tem tokens ativos)
@@ -447,11 +456,14 @@ Scanner (poll 5s)
     │
     └─ HotMonitor (janela 60min)
             ├─ push_mc (5s): rastreia mc_min, mc_max, mc_last, _mc_live
-            │       └─ _check_bounce(): dispara bounce_signal se drop≥30% e bounce≥15%
+            │       └─ _check_bounce(): dispara bounce_signal se drop≥30% e bounce≥30%
+            │               ├─ Coleta get_absorption_window(mint, 60) → H22 métricas brutas
+            │               ├─ Salva em bounce_signals (sem score — coleta only)
             │               └─ TradeExecutor.on_bounce() → thread _execute() [Fase 6]
-            ├─ hot-precise (60s): kline low/high + backfill_tick_volumes()
-            └─ _tick (30s): graduação após 60min
-                    └─ kline scan 1h completo → mc_bottom, mc_peak, mc_1h
+            ├─ hot-precise (5s): kline low + close (NÃO high) → mc_min e mc_peak
+            │       └─ mc_peak atualizado via close × supply (high descartado — spike intra-candle)
+            └─ _tick (30s): graduação após 60min → HeliusWS.unsubscribe(mint)
+                    └─ kline scan 1h completo → mc_bottom (low), mc_peak (close), mc_1h
                     └─ token/info sempre chamado: fallback mc_1h + lock_percent (locked_ratio)
                     └─ Fallback final mc_1h: push_mc (mc_last)
 
@@ -461,7 +473,7 @@ TradeExecutor (Fase 6 — ATIVO)
     └─ _execute() [thread própria]:
             ├─ swap(): POST /v1/trade/swap (Ed25519 signed)
             ├─ _wait_fill(): poll query_order até filled/completed (timeout: ORDER_TIMEOUT_SEC)
-            └─ create_strategy(): POST /v1/trade/strategy/create com TP/SL
+            └─ condition_orders no body do swap: trailing TP (ativ. 75%, drawdown 30%) + SL fixo -15%
 
 get_sol_usd() [gmgn_client.py]
     ├─ Cache 5min (_sol_usd_value / _sol_usd_ts)
@@ -487,7 +499,8 @@ get_sol_usd() [gmgn_client.py]
 | Dado | 1ª fonte | 2ª fonte | 3ª fonte |
 |------|----------|----------|----------|
 | mc_migration | bonding_curve_ref (MIGRATION_SOL_UNITS × SOL/USD) | kline (open no complete_ts) | trenches usd_market_cap |
-| mc_bottom / mc_peak | kline 1m (hot-precise) | push_mc (trenches 5s) | — |
+| mc_bottom | kline 1m low (hot-precise) | push_mc (trenches 5s) | — |
+| mc_peak | push_mc (trenches 5s) | kline 1m close (hot-precise + graduate) | — |
 | mc_1h | kline (ts_mig a ts_mig+3660) | token/info | push_mc (mc_last) |
 | volume_1m (token_ticks) | kline candle volume (hot-precise back-fill) | — | — |
 | lock_percent | token/info locked_ratio (graduação 1h) | — | — |
@@ -575,6 +588,8 @@ ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
 | `/debug/wallet-tokens` | **Forense de posições** — ATAs vazios (rent bloqueado), tokens presos, cruzamento com trades do DB |
 | `/analise/wbottom` | **H21 W-bottom** — analisa se SLs tiveram retest acima de `mc_bottom × floor%`. `?floor=0.90`. REFUTADA: 90% dos SLs caem muito abaixo do fundo. |
 | `/debug/bounce-list` | **Lista de bounces** — tokens com bounce ≥ X% nas últimas 48h com links DexScreener/GMGN. `?bounce=0.50&hours=48`. Auto-refresh 30s. |
+| `/debug/absorption` | **H22 Absorption Debug** — janela buy/sell ao vivo por token ativo + últimos 30 bounces com ratio buy/sell e cobertura Helius. Auto-refresh 10s. Score/grade ausentes — coleta bruta apenas. |
+| `/analise/post-sl-recovery` | **Post-SL Recovery** — para cada SL, max MC nos ticks pós-exit. 12% atingiriam TP (8/64). 88% continuaram dumpando. Confirma H21 estruturalmente. |
 
 ---
 
@@ -674,10 +689,14 @@ ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
 92. **Tiers de entrada (A+/A/B/C) são prematuros**: com ~80 trades GMGN no total, dividir em 4 buckets dá n≈20/bucket — insuficiente. Implementar scoring depois de n≥200 trades com dados limpos. Prioridade correta: acumular dados, não criar tiers agora.
 93. **Detector de absorção pós-fundo via Helius — próxima grande alavanca de código**: infraestrutura já existe (`helius_ws.py` recebe `BuyEvent`/`SellEvent` do pAMM em ~5ms). Hoje usada apenas para preço. O próximo nível é acumular eventos por mint numa janela rolante de 60-90s e, quando `_check_bounce()` dispara, checar: `buy_volume_60s > sell_volume_60s × 1.3` + `buy_count_60s ≥ 3` + `preço não retornou < mc_min × 0.97`. Isso ataca o problema raiz: 90% dos SLs são dumps que continuam porque não havia comprador real no fundo. A pergunta muda de "subiu 30%?" para "quem comprou esse fundo e com que força?". Estimativa: 1-2 dias de código, começa como log/alerta antes de virar filtro. Implementar APÓS acumular n≥30 trades com smart≥3.
 94. **H9 como tier de confluência, não gate obrigatório (2026-05-12)**: H9 live mostra 75% WR (n=4) em ratio<0.80 — sinal mais forte encontrado. Mas n=4 é insuficiente para gate obrigatório. Usar como tier: smart≥3 + fresh + H9<0.80 = setup A+ (candidato a 2× size). smart≥3 + fresh sem H9 = setup A (size normal). Virar gate obrigatório só com n≥30 e WR≥50% confirmado GMGN (gate do roadmap). Kill switches por regime de mercado são válidos como princípio mas complexidade prematura agora — focar em acumular dados primeiro.
+95. **H22 — Coleta de absorção implementada (2026-05-12)**: `helius_ws.py` acumula `{ts, side, sol, mc}` por swap em `deque(maxlen=300)` por mint. `get_absorption_window(mint, window_sec=60)` retorna métricas brutas: `buy_vol_sol`, `sell_vol_sol`, `buy_count`, `sell_count`, `largest_buy`, `total_events`. Estas métricas são salvas em `bounce_signals` (8 colunas novas) em cada bounce. `/debug/absorption` exibe ratio buy/sell ao vivo e cobertura histórica. **Score/grade NÃO existem** — removidos deliberadamente. Princípio: coletar métricas brutas primeiro, correlacionar com outcomes GMGN (TP/SL) após n≥30, construir fórmula somente com pesos validados pelos dados. Gate para filtro: n≥30 bounces com absorption_events > 0 + WR ≥15pp maior com absorção.
+96. **Score sem correlação = ilusão de precisão (2026-05-12)**: `_absorption_score()` foi removida. A fórmula era plausível (baseada em lógica de mercado) mas não validada. Calcular um score antes de ver os dados é "julgar o peixe por não subir em árvore" — o critério de avaliação é arbitrário. Só há sentido em pontuar DEPOIS de saber qual métrica discrimina TP vs SL nos dados reais. Este é o princípio central do big player: coletar → analisar → modelar, nunca o inverso.
+97. **Kline `high` inflava mc_peak com spikes intra-candle (2026-05-12 — fix)**: em pools com ~79 SOL de liquidez, um único whale buy pode momentaneamente empurrar o preço AMM 150-200x antes de reverter. O kline registra esse pico como o `high` da vela (correto tecnicamente). O scanner mostrava ganhos absurdos: DIAMOND +23,034% (Pico $9M mas mc_1h = $39K = +0.0%). Fix: `_precise_bottom_tick()` e `_graduate()` agora usam `close × supply` para `mc_peak`. O `close` é o preço sustentado ao final do minuto. `mc_high` nos `token_ticks` mantido para o backtester (TP detection intra-vela continua correto). `push_mc` (trenches `usd_market_cap`) já usava close implicitamente — unificado agora.
+98. **`/analise/post-sl-recovery` — diagnóstico pós-SL (2026-05-12)**: para cada SL com `exit_ts`, busca max MC nos token_ticks após a saída. Resultado: 12% dos SLs (8/64 com dados) teriam atingido o TP pós-saída. 88% continuaram dumpando — confirma H21 (W-bottom refutada): não é má sorte, é estrutural. Winners recuperam rápido (5-10min). A análise mostra que "hold" após SL seria lucrativo apenas em 12% dos casos — não justifica mudar a estratégia de saída.
 
 ---
 
-## 🔄 Estado Atual: Bot ativo a $1/trade (2026-05-12)
+## 🔄 Estado Atual: Bot ativo a $1/trade (2026-05-12 — sessão 2)
 
 ### Pipeline ativo
 `TRADING_ENABLED=true`, `CALIBRATION_AMOUNT_USD=1.0`, `CALIBRATION_MAX_TRADES=999999`.
@@ -690,11 +709,13 @@ ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
 - A.7: bloqueia bounce_pct < 30% (BOUNCE_MIN_PCT=0.30 — validado live, n=11)
 - smart≥3: FILTER_SMART_MIN=3 — smart=1→0% WR (n=6), smart=2→20%, smart=3→57% (dado live GMGN)
 
+**H22 em coleta:** cada bounce registra buy_vol, sell_vol, ratio, counts, largest_buy via Helius pAMM. Aguardando n≥30 bounces com absorption_events > 0 para análise de discriminação.
+
 **WR ground truth (GMGN):** ~15% (filtros anteriores) → esperado ≥30% com smart≥3. DB WR é inválido — não usar para decisões.
 
 **Regra de ouro para novos filtros:** só implementar com n≥30 trades validados no GMGN. Não usar DB WR como fonte.
 
-**Próxima grande alavanca:** detector de absorção pós-fundo via Helius pAMM — ver nota 93 e ROADMAP.md.
+**Próxima grande alavanca:** analisar discriminação H22 após n≥30 bounces com dados Helius — ver nota 95 e ROADMAP.md.
 
 **Próximos passos — ver ROADMAP.md**
 
