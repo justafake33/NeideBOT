@@ -514,7 +514,7 @@ FILTER_BUNDLER_MAX=0.20      # máx bundler_trader_amount_rate (% bundlers real)
 FILTER_BOT_MAX=0.80          # máx bot_degen_rate (default código=0.80, não discrimina WR em live trades)
 FILTER_RAT_MAX=0.20          # máx rat_trader_amount_rate
 FILTER_TOP10_MAX=0.80        # máx top_10_holder_rate
-FILTER_SMART_MIN=2           # mín smart_degen_count (smart=1 → 0% WR live, n=6)
+FILTER_SMART_MIN=3           # mín smart_degen_count (smart=1→0% WR, smart=2→20%, smart=3→57% — dado live GMGN)
 FILTER_WASH_BLOCK=true       # bloquear is_wash_trading
 FILTER_MC_MIN=5000           # MC mínimo USD
 FILTER_MC_MAX=200000         # MC máximo USD
@@ -669,6 +669,11 @@ ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
 87. **Nunca implementar filtro baseado em DB WR**: DB WR é inflado por falsos positivos do TradeMonitor. Filtros de bounce>50%, TTB<15min e CTO foram implementados E revertidos na mesma sessão porque eram baseados em análise corrompida. Gate mínimo para qualquer novo filtro: n≥30 trades confirmados no GMGN.
 88. **TradeMonitor `_check_trailing_exit()`**: para trades `trailing_active`, simula trailing stop via token_ticks — rastreia peak MC após ativação e detecta queda de TRAILING_DRAWDOWN_PCT do pico. Atualiza para `status='tp'` com P&L estimado. Limitação: funciona apenas se há ticks após a ativação (dentro dos 60min do HotMonitor).
 89. **`get_trailing_active_trades()`**: retorna trades `trailing_active` com `exit_ts > NOW() - 8h`. Chamado em `_check_all()` a cada 30s para detectar saídas de trailing retroativamente.
+90. **FILTER_SMART_MIN=3 — próxima mudança de env var (2026-05-12)**: dado live/GMGN mostra smart=3 → 57% WR vs smart=2 → 20% WR. Discriminação +37pp com dados válidos (não DB). Mudança simples, reversível, zero linhas de código. Fazer antes de qualquer outra coisa na próxima sessão.
+91. **BOTTOM_FRESHNESS_SEC=180 é baixa alavancagem agora**: os 50 trades reais tinham ts_min a 0.1-4.5min do sinal — todos já "frescos". Os 92% de inválidos bloqueados pelo A.6 histórico eram de períodos SEM A.6 ativo. Com A.6 em produção, baixar de 300s para 180s não muda quase nada no fluxo real. Não implementar até ter dados que mostrem inválidos chegando com gap 3-5min.
+92. **Tiers de entrada (A+/A/B/C) são prematuros**: com ~80 trades GMGN no total, dividir em 4 buckets dá n≈20/bucket — insuficiente. Implementar scoring depois de n≥200 trades com dados limpos. Prioridade correta: acumular dados, não criar tiers agora.
+93. **Detector de absorção pós-fundo via Helius — próxima grande alavanca de código**: infraestrutura já existe (`helius_ws.py` recebe `BuyEvent`/`SellEvent` do pAMM em ~5ms). Hoje usada apenas para preço. O próximo nível é acumular eventos por mint numa janela rolante de 60-90s e, quando `_check_bounce()` dispara, checar: `buy_volume_60s > sell_volume_60s × 1.3` + `buy_count_60s ≥ 3` + `preço não retornou < mc_min × 0.97`. Isso ataca o problema raiz: 90% dos SLs são dumps que continuam porque não havia comprador real no fundo. A pergunta muda de "subiu 30%?" para "quem comprou esse fundo e com que força?". Estimativa: 1-2 dias de código, começa como log/alerta antes de virar filtro. Implementar APÓS acumular n≥30 trades com smart≥3.
+94. **H9 como tier de confluência, não gate obrigatório (2026-05-12)**: H9 live mostra 75% WR (n=4) em ratio<0.80 — sinal mais forte encontrado. Mas n=4 é insuficiente para gate obrigatório. Usar como tier: smart≥3 + fresh + H9<0.80 = setup A+ (candidato a 2× size). smart≥3 + fresh sem H9 = setup A (size normal). Virar gate obrigatório só com n≥30 e WR≥50% confirmado GMGN (gate do roadmap). Kill switches por regime de mercado são válidos como princípio mas complexidade prematura agora — focar em acumular dados primeiro.
 
 ---
 
@@ -683,11 +688,13 @@ ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
 - A.5: bloqueia elapsed > 20min (BOUNCE_TIME_MAX — validado live)
 - A.6: bloqueia fundo estagnado > 5min (BOTTOM_FRESHNESS_SEC — validado live)
 - A.7: bloqueia bounce_pct < 30% (BOUNCE_MIN_PCT=0.30 — validado live, n=11)
-- smart≥2: FILTER_SMART_MIN=2 — validado live (smart=1 → 0% WR, n=6)
+- smart≥3: FILTER_SMART_MIN=3 — smart=1→0% WR (n=6), smart=2→20%, smart=3→57% (dado live GMGN)
 
-**WR ground truth (GMGN):** ~15%. DB WR é inválido — não usar para decisões.
+**WR ground truth (GMGN):** ~15% (filtros anteriores) → esperado ≥30% com smart≥3. DB WR é inválido — não usar para decisões.
 
 **Regra de ouro para novos filtros:** só implementar com n≥30 trades validados no GMGN. Não usar DB WR como fonte.
+
+**Próxima grande alavanca:** detector de absorção pós-fundo via Helius pAMM — ver nota 93 e ROADMAP.md.
 
 **Próximos passos — ver ROADMAP.md**
 
