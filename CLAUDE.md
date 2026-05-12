@@ -223,7 +223,18 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO 2026-05-04)
 
 ## 🔍 ESTADO ATUAL
 
-### Situação (2026-05-09) — PRONTO PARA RELIGAR
+### Situação (2026-05-12) — BOT ATIVO $1/TRADE
+
+**Descobertas desta sessão:**
+- **pump.fun pAMM** (`pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA`) identificado como DEX real dos tokens migrados. `BuyEvent`/`SellEvent` com discriminador Anchor (`sha256("event:<name>")[:8]`). Pool reserves em offsets 48/56 dão preço exato.
+- **Helius blind window resolvido**: `_RATE_LIMIT_SEC=2.0` bloqueava TODOS os eventos por 2s após o primeiro. V-bottoms rápidos aconteciam inteiramente nessa janela. Fix: Tier 1 (parse Anchor ~5ms) inline no `_on_message`, sem rate limit. Tier 2 (DexScreener HTTP) mantém rate limit.
+- **W-bottom hipótese REFUTADA** (H21): 90% dos SLs têm `min_after / mc_bottom < 0.90` — o token vai MUITO abaixo do fundo detectado após a entrada. Não é W-bottom, é continuação de dump. TPs têm `min/bottom > 1.0` (nunca voltam ao fundo). SL ancorado no fundo resolveria apenas 10% dos SLs.
+- **DB WR é inválido como métrica**: TradeMonitor usa token_ticks (30s) para inferir TP/SL. Problema: após GMGN fechar posição via condition_orders, ticks posteriores ainda detectam falsos SLs/TPs. WR do DB inflado (~34%) vs GMGN real (~15%). **GMGN é a única fonte de verdade.**
+- **wr-breakdown bug corrigido**: query buscava `status='tp_hit'` mas DB salva `status='tp'`. 27 TPs reais eram ignorados, mostrando apenas 9.
+- **TradeMonitor trailing exit**: adicionado `_check_trailing_exit()` — simula drawdown 30% do pico via token_ticks para detectar quando GMGN executa o trailing. Funciona para tokens com ticks disponíveis (dentro dos 60min do HotMonitor).
+- **Filtros baseados em DB inválido foram adicionados E revertidos**: bounce>50%, TTB<15min, CTO block — todos implementados e revertidos na mesma sessão. Lição: nunca implementar filtro sem validação com GMGN como ground truth.
+
+### Situação (2026-05-09) — HISTÓRICO
 - **1175+ tokens** coletados no banco, **1134** com `recovery` definido
 - Recovery rate baseline: **23.5%**
 - **251 bounce signals** analisados: 119 válidos (47.4%) / 132 inválidos (52.6%)
@@ -562,6 +573,8 @@ ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
 | `/debug/executor-status` | **Diagnóstico do pipeline de trading** — TRADING_ENABLED, limite trades, HotMonitor ativo, último bounce |
 | `/debug/wallet-audit` | **Auditoria on-chain** — todas as txs da wallet, Jito tips, BUY/SELL, net SOL. Usar `?rpc=HELIUS_URL` |
 | `/debug/wallet-tokens` | **Forense de posições** — ATAs vazios (rent bloqueado), tokens presos, cruzamento com trades do DB |
+| `/analise/wbottom` | **H21 W-bottom** — analisa se SLs tiveram retest acima de `mc_bottom × floor%`. `?floor=0.90`. REFUTADA: 90% dos SLs caem muito abaixo do fundo. |
+| `/debug/bounce-list` | **Lista de bounces** — tokens com bounce ≥ X% nas últimas 48h com links DexScreener/GMGN. `?bounce=0.50&hours=48`. Auto-refresh 30s. |
 
 ---
 
@@ -648,33 +661,33 @@ ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
 79. **Estratégia de dip entry REFUTADA (2026-05-11)**: testado aguardar queda de -5%, -10%, -15%, -20%, -25% do sinal antes de entrar. Todos os thresholds pioraram o WR. Razão: tokens com demanda real (SS, OCEAN, BIRDCLAW) nunca retrocederam o suficiente — foram direto ao TP. Quando o token SÍ retrocedeu (goingpt, OG, NOEL), continuou caindo até o SL mesmo com nova entrada mais baixa. Conclusão: o timing de entrada atual está correto. O problema era qualidade dos sinais (filtros), não quando entrar.
 80. **H9 em trades live (2026-05-11, n=31 trades)**: sem sinal H9 → 24% WR (n=25). Com H9 qualquer → 50% WR (n=6, +21pp). H9 ratio < 0.80 (preditivo) → **75% WR (n=4)**. H9 ratio > 1.00 (pós-bounce) → 0% WR (n=2, reverse causality confirmada). Sinal mais forte encontrado nos dados live. Gate para adicionar como filtro: n≥15 na zona ratio<0.80. Candidato a multiplicador de size (2× quando H9 ratio<0.80 presente).
 81. **FILTER_BOT_MAX default no código é 0.80 (não 0.50)**: código usa `os.getenv("FILTER_BOT_MAX", "0.80")`. O valor 0.50 no CLAUDE.md estava desatualizado. bot_degen_rate não discrimina WR em live trades — o único TP real (BIRDCLAW) tinha 77% de bots. Não alterar este filtro.
+82. **pump.fun pAMM é o DEX real dos tokens migrados** (`pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA`). Emite `BuyEvent`/`SellEvent` com discriminador Anchor `sha256("event:<name>")[:8]`. Layout após disc(8): `timestamp(i64)@8 | base_amount@16 | quote_limit@24 | user_base@32 | user_quote@40 | pool_base@48 | pool_quote@56`. Preço = `(pool_quote/1e9) / (pool_base/1e6)`. Não confundir com Meteora CP AMM v2 (`cpamd...`) que não é usado pelos tokens migrados do pump.fun.
+83. **Helius `_RATE_LIMIT_SEC=2.0` criava janela cega de 2s**: bloqueava TODOS os eventos Helius por 2s após o primeiro update. Fix: Tier 1 (parse Anchor, ~5ms) roda inline no `_on_message` sem rate limit. Tier 2 (DexScreener HTTP) mantém rate limit. `_sol_usd_cached` (module-level float) alimenta o Tier 1 sem bloquear o WebSocket callback.
+84. **DB WR é inválido como métrica de desempenho**: TradeMonitor infere TP/SL via token_ticks (30s). Após GMGN fechar posição via condition_orders, ticks posteriores detectam falsos SLs/TPs. wr-breakdown mostrava 34% mas GMGN (ground truth) mostra 15%. Nunca usar DB WR para decisões de filtro — usar GMGN.
+85. **wr-breakdown buscava `status='tp_hit'`** mas DB salva `status='tp'`. Fix: adicionar `'tp'` e `'sl'` ao TP_STATUSES/SL_STATUSES e ao WHERE clause. Os 27 TPs reais eram ignorados, contando apenas 9.
+86. **H21 — W-bottom REFUTADA** (2026-05-12, n=68 SLs com ticks): 90% dos SLs têm `min_after / mc_bottom < 0.90` — preço vai muito abaixo do fundo após entrada (mediana ~0.55×). Não é W-bottom, é continuação de dump. TPs têm `min/bottom > 1.0` (preço nunca volta ao fundo). Ancorar SL no fundo resolveria apenas 10% dos SLs. Implementação de dynamic SL descartada.
+87. **Nunca implementar filtro baseado em DB WR**: DB WR é inflado por falsos positivos do TradeMonitor. Filtros de bounce>50%, TTB<15min e CTO foram implementados E revertidos na mesma sessão porque eram baseados em análise corrompida. Gate mínimo para qualquer novo filtro: n≥30 trades confirmados no GMGN.
+88. **TradeMonitor `_check_trailing_exit()`**: para trades `trailing_active`, simula trailing stop via token_ticks — rastreia peak MC após ativação e detecta queda de TRAILING_DRAWDOWN_PCT do pico. Atualiza para `status='tp'` com P&L estimado. Limitação: funciona apenas se há ticks após a ativação (dentro dos 60min do HotMonitor).
+89. **`get_trailing_active_trades()`**: retorna trades `trailing_active` com `exit_ts > NOW() - 8h`. Chamado em `_check_all()` a cada 30s para detectar saídas de trailing retroativamente.
 
 ---
 
-## 🔄 Estado Atual: Bot ativo a $1/trade (2026-05-11)
+## 🔄 Estado Atual: Bot ativo a $1/trade (2026-05-12)
 
 ### Pipeline ativo
 `TRADING_ENABLED=true`, `CALIBRATION_AMOUNT_USD=1.0`, `CALIBRATION_MAX_TRADES=999999`.
 
 **Filtros ativos (ordem de aplicação no _check_bounce):**
-- A.2: bloqueia bounce_pct 20-30% (dead zone histórica)
-- A.3: bloqueia entry 50-65% do mc_migration (zona morta absoluta)
-- A.5: bloqueia elapsed > 20min (BOUNCE_TIME_MAX)
-- A.6: bloqueia fundo estagnado > 5min (BOTTOM_FRESHNESS_SEC)
-- **A.7 (novo 2026-05-11)**: bloqueia bounce_pct < 30% (BOUNCE_MIN_PCT=0.30 — era 0.15)
-- **smart≥2 (novo 2026-05-11)**: FILTER_SMART_MIN=2 — smart=1 → 0% WR live
+- A.2: bloqueia bounce_pct 20-30% (dead zone histórica — validado live)
+- A.3: bloqueia entry 50-65% do mc_migration (zona morta — validado live)
+- A.5: bloqueia elapsed > 20min (BOUNCE_TIME_MAX — validado live)
+- A.6: bloqueia fundo estagnado > 5min (BOTTOM_FRESHNESS_SEC — validado live)
+- A.7: bloqueia bounce_pct < 30% (BOUNCE_MIN_PCT=0.30 — validado live, n=11)
+- smart≥2: FILTER_SMART_MIN=2 — validado live (smart=1 → 0% WR, n=6)
 
-**WR real confirmado (2026-05-11):**
-- 31 trades pós-fix: **29% WR** (9 TP / 22 SL)
-- Gate de escala $1→$10 atingido (≥30 trades, WR ≥ 20%)
-- Aguardando 20+ trades com novos filtros A.7+smart≥2 antes de escalar
+**WR ground truth (GMGN):** ~15%. DB WR é inválido — não usar para decisões.
 
-**Discriminadores identificados em dados live:**
-- H9 ratio < 0.80: **75% WR** (n=4) — maior sinal encontrado, aguardando n≥15
-- creator_hold: **60% WR** (n=5) — aguardando n≥10
-- bounce ≥ 30%: **36-44% WR** (confirmado, A.7 implementado)
-- TTB < 10min: **43% WR** (+14pp vs baseline)
-- smart=3: **57% WR** (n=7) — padrão não monotônico, aguardar mais dados
+**Regra de ouro para novos filtros:** só implementar com n≥30 trades validados no GMGN. Não usar DB WR como fonte.
 
 **Próximos passos — ver ROADMAP.md**
 
