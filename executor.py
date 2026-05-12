@@ -307,16 +307,19 @@ class TradeMonitor:
             time.sleep(MONITOR_POLL_SEC)
 
     def _check_all(self):
-        trades = db.get_open_trades()
-        if not trades:
-            return
         sol_usd = get_sol_usd() or 0
         now = datetime.now(timezone.utc)
+        trades = db.get_open_trades()
         for trade in trades:
             try:
                 self._check_trade(trade, sol_usd, now)
             except Exception as e:
                 logger.debug("TradeMonitor trade #%s: %s", trade.get("id"), e)
+        for trade in db.get_trailing_active_trades():
+            try:
+                self._check_trailing_exit(trade, sol_usd, now)
+            except Exception as e:
+                logger.debug("TradeMonitor trailing #%s: %s", trade.get("id"), e)
 
     def _check_trade(self, trade: dict, sol_usd: float, now: datetime):
         trade_id        = trade["id"]
@@ -373,6 +376,61 @@ class TradeMonitor:
                 return
             if low > 0 and low <= sl_mc:
                 self._record_exit(trade, "sl", -sl_pct, tick_ts, sol_usd)
+                return
+
+    def _check_trailing_exit(self, trade: dict, sol_usd: float, now: datetime):
+        """
+        Para trades em trailing_active, simula o trailing stop via token_ticks:
+        rastreia o pico de MC após ativação e detecta quando cai TRAILING_DRAWDOWN_PCT do pico.
+        Atualiza status para 'tp' com P&L real estimado.
+        """
+        trade_id        = trade["id"]
+        mint            = trade["mint"]
+        symbol          = trade.get("symbol", mint[:8])
+        entry_price_usd = trade.get("entry_price_usd")
+        tokens_received = trade.get("tokens_received")
+        amount_usd      = trade.get("amount_usd") or 1.0
+        fee_sol         = trade.get("fee_sol") or 0.0
+        fill_sol        = trade.get("amount_sol") or 0.0
+        fee_frac        = (fee_sol / fill_sol) if fill_sol > 0 else 0.0
+
+        if not entry_price_usd or not tokens_received or tokens_received <= 0:
+            return
+        entry_mc_real = (entry_price_usd / tokens_received) * 1_000_000_000
+
+        # Referência: ts_order_sent ou exit_ts (quando trailing_active foi setado)
+        ref_ts = trade.get("ts_order_sent") or trade.get("exit_ts") or trade.get("ts_signal")
+        ticks  = db.get_ticks_after(mint, min_ts=ref_ts)
+        if not ticks:
+            return
+
+        activation_mc = entry_mc_real * (1 + TRAILING_ACTIVATION_PCT / 100)
+        peak_mc       = activation_mc
+        drawdown_pct  = TRAILING_DRAWDOWN_PCT / 100
+
+        for tick in ticks:
+            high    = float(tick.get("mc_high") or tick.get("mc") or 0)
+            low     = float(tick.get("mc_low")  or tick.get("mc") or 0)
+            tick_ts = tick["tick_ts"]
+
+            if high > peak_mc:
+                peak_mc = high
+
+            trailing_exit_mc = peak_mc * (1 - drawdown_pct)
+            if low > 0 and low <= trailing_exit_mc:
+                pnl_pct  = (trailing_exit_mc / entry_mc_real) - 1
+                pnl_real = pnl_pct - fee_frac
+                db.update_trade(trade_id, {
+                    "status":         "tp",
+                    "exit_type":      "trailing",
+                    "exit_ts":        tick_ts,
+                    "exit_price_usd": amount_usd * (1 + pnl_pct),
+                    "pnl_pct_real":   pnl_real,
+                })
+                logger.info(
+                    "TradeMonitor #%d %s — TRAILING EXIT | peak=$%.0f exit=$%.0f pnl=%.1f%%",
+                    trade_id, symbol, peak_mc, trailing_exit_mc, pnl_real * 100,
+                )
                 return
 
     def _record_exit(self, trade: dict, exit_type: str, pnl_target: float,
