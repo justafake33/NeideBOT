@@ -11,7 +11,7 @@ import db
 from monitoring import init_sentry
 from gmgn_client import GmgnClient, get_sol_usd as _get_sol_usd
 from scheduler import HeapScheduler
-from scanner import Scanner, HotMonitor, _absorption_score
+from scanner import Scanner, HotMonitor
 from executor import TradeExecutor, TradeMonitor
 
 logging.basicConfig(
@@ -10435,7 +10435,6 @@ def debug_absorption():
                ".ok{color:#3fb950}.warn{color:#e3b341}.bad{color:#f85149}"
                ".nav a{color:#58a6ff;margin-right:14px;text-decoration:none;font-size:12px}"
                "h3{margin:20px 0 8px;color:#8b949e;font-size:12px;text-transform:uppercase}</style>")
-
         # ── 1. Tokens ativos com janela de absorção ao vivo ──────────────────
         live_rows_html = ""
         helius_active = False
@@ -10456,14 +10455,9 @@ def debug_absorption():
                 sell_vol = w.get("sell_vol_sol", 0) or 0
                 buy_cnt  = w.get("buy_count",    0) or 0
                 sell_cnt = w.get("sell_count",   0) or 0
-
-                # Score on-the-fly para visualização
-                mc_last  = state.get("mc_last") or state.get("mc_migration", 0)
-                mc_min   = state.get("mc_min",  mc_last)
-                score, grade = _absorption_score(w, mc_last, mc_min) if total > 0 else (None, "no_data")
-
-                grade_cls = "ok" if grade in ("A+","A") else ("warn" if grade == "B" else ("bad" if grade == "C" else ""))
+                ratio    = buy_vol / sell_vol if sell_vol > 0 else None
                 event_cls = "ok" if total >= 5 else ("warn" if total >= 1 else "bad")
+                ratio_cls = "ok" if (ratio and ratio >= 1.0) else "bad"
 
                 elapsed = int((
                     __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
@@ -10477,8 +10471,8 @@ def debug_absorption():
                   <td class='{event_cls}'>{total} eventos</td>
                   <td class='ok'>{buy_vol:.3f} SOL ({buy_cnt}x)</td>
                   <td class='bad'>{sell_vol:.3f} SOL ({sell_cnt}x)</td>
+                  <td class='{ratio_cls}'>{f"{ratio:.2f}x" if ratio is not None else "—"}</td>
                   <td>lrg_buy={w.get('largest_buy',0):.3f}</td>
-                  <td class='{grade_cls}'>{f"score={score} ({grade})" if score is not None else "no_data"}</td>
                   <td style='font-size:10px;color:#8b949e'>{mint[:12]}…</td>
                   <td><a href='{dex_url}' target='_blank'>DEX</a></td>
                 </tr>"""
@@ -10486,11 +10480,10 @@ def debug_absorption():
         if not live_rows_html:
             live_rows_html = "<tr><td colspan='9' style='color:#484f58'>Nenhum token ativo no HotMonitor agora</td></tr>"
 
-        # ── 2. Últimos 20 bounce_signals com campos H22 ──────────────────────
+        # ── 2. Últimos 30 bounce_signals com métricas brutas H22 ──────────────────────
         with db._cursor() as cur:
             cur.execute("""
                 SELECT b.mint, b.symbol, b.ts_signal, b.bounce_pct, b.drop_from_mig,
-                       b.absorption_score, b.absorption_grade,
                        b.absorption_buy_vol, b.absorption_sell_vol,
                        b.absorption_buy_cnt, b.absorption_sell_cnt,
                        b.absorption_events,
@@ -10507,9 +10500,6 @@ def debug_absorption():
                 SELECT
                     COUNT(*) AS total,
                     COUNT(absorption_events) AS with_data,
-                    COUNT(CASE WHEN absorption_grade IN ('A+','A') THEN 1 END) AS grade_a,
-                    COUNT(CASE WHEN absorption_grade = 'B'         THEN 1 END) AS grade_b,
-                    COUNT(CASE WHEN absorption_grade = 'C'         THEN 1 END) AS grade_c,
                     COUNT(CASE WHEN absorption_events = 0 OR absorption_events IS NULL THEN 1 END) AS no_data
                 FROM bounce_signals
             """)
@@ -10519,27 +10509,26 @@ def debug_absorption():
         for r in bounces:
             ts = r["ts_signal"].strftime("%m-%d %H:%M") if r.get("ts_signal") else "—"
             symbol = r.get("symbol") or r["mint"][:8]
-            grade  = r.get("absorption_grade") or "—"
-            score  = r.get("absorption_score")
             ev     = r.get("absorption_events")
             bv     = r.get("absorption_buy_vol")
             sv     = r.get("absorption_sell_vol")
             bc     = r.get("absorption_buy_cnt")
             sc     = r.get("absorption_sell_cnt")
             outcome= r.get("trade_status") or "—"
+            ratio  = bv / sv if (bv is not None and sv and sv > 0) else None
 
-            grade_cls = "ok" if grade in ("A+","A") else ("warn" if grade == "B" else ("bad" if grade == "C" else ""))
+            ratio_cls = "ok" if (ratio and ratio >= 1.0) else ("bad" if ratio is not None else "")
             out_cls   = "ok" if outcome == "tp" else ("bad" if outcome == "sl" else "")
 
             bounce_rows_html += f"""<tr>
               <td>{ts}</td>
               <td><b>{symbol}</b></td>
               <td>{float(r['bounce_pct'])*100:.0f}%</td>
-              <td class='{grade_cls}'><b>{grade}</b> {f"(score={score:.0f})" if score is not None else ""}</td>
+              <td class='{out_cls}'>{outcome}</td>
               <td>{f"{bv:.3f} SOL ({bc}x)" if bv is not None else "<span style='color:#484f58'>NULL</span>"}</td>
               <td>{f"{sv:.3f} SOL ({sc}x)" if sv is not None else "<span style='color:#484f58'>NULL</span>"}</td>
+              <td class='{ratio_cls}'>{f"{ratio:.2f}x" if ratio is not None else "—"}</td>
               <td>{ev if ev is not None else "<span style='color:#f85149'>NULL ← sem Helius</span>"}</td>
-              <td class='{out_cls}'>{outcome}</td>
             </tr>"""
 
         total     = stats.get("total", 0)
@@ -10557,10 +10546,7 @@ def debug_absorption():
             _box("Com dados H22", f"{with_data} ({cov_pct})",
                  "#3fb950" if with_data > 0 else "#f85149") +
             _box("NULL (sem eventos)", no_data,
-                 "#f85149" if no_data > with_data else "#e3b341") +
-            _box("Grade A+/A", stats.get("grade_a", 0), "#3fb950") +
-            _box("Grade B", stats.get("grade_b", 0), "#e3b341") +
-            _box("Grade C", stats.get("grade_c", 0), "#f85149")
+                 "#f85149" if no_data > with_data else "#e3b341")
         )
 
         html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
@@ -10568,7 +10554,8 @@ def debug_absorption():
 <meta http-equiv='refresh' content='10'>
 </head><body>
 <h2>H22 — Absorption Debug</h2>
-<p style='color:#8b949e;font-size:11px'>auto-refresh 10s · janela de absorção = 60s · fonte: Helius pAMM (pump.fun)</p>
+<p style='color:#8b949e;font-size:11px'>auto-refresh 10s · janela de absorção = 60s · fonte: Helius pAMM (pump.fun)<br>
+<b>Dados brutos apenas</b> — score/grade removidos. Correlacionar com outcome (TP/SL) após n≥30 bounces com dados.</p>
 <div class='nav'>
   <a href='/analise/post-sl-recovery'>Post-SL Recovery</a>
   <a href='/debug/bounce-list'>Bounce List</a>
@@ -10581,27 +10568,28 @@ def debug_absorption():
 <table>
   <thead><tr>
     <th>Token</th><th>Elapsed</th><th>Eventos Helius</th>
-    <th>Buy vol</th><th>Sell vol</th><th>Largest buy</th>
-    <th>Score H22</th><th>Mint</th><th></th>
+    <th>Buy vol</th><th>Sell vol</th><th>Buy/Sell ratio</th>
+    <th>Largest buy</th><th>Mint</th><th></th>
   </tr></thead>
   <tbody>{live_rows_html}</tbody>
 </table>
 
-<h3>Últimos 30 Bounce Signals — Cobertura H22</h3>
+<h3>Últimos 30 Bounce Signals — Métricas Brutas H22</h3>
 <p style='color:#8b949e;font-size:11px'>
   NULL em "Eventos" = bounce disparou mas Helius não tinha eventos na deque para esse mint.<br>
-  Causas: token recém-adicionado ao HotMonitor, WS desconectado, ou token não é pump.fun pAMM.
+  Causas: token recém-adicionado ao HotMonitor, WS desconectado, ou token não é pump.fun pAMM.<br>
+  <b>Ratio = buy_vol/sell_vol.</b> Acumular outcome para correlacionar com TP/SL.
 </p>
 <table>
   <thead><tr>
-    <th>Hora</th><th>Token</th><th>Bounce</th>
-    <th>Grade H22</th><th>Buy vol</th><th>Sell vol</th>
-    <th>Eventos</th><th>Trade</th>
+    <th>Hora</th><th>Token</th><th>Bounce</th><th>Trade</th>
+    <th>Buy vol</th><th>Sell vol</th><th>Ratio</th><th>Eventos</th>
   </tr></thead>
   <tbody>{bounce_rows_html}</tbody>
 </table>
 </body></html>"""
         return html
+
 
     except Exception:
         return "<pre>" + traceback.format_exc() + "</pre>", 500
