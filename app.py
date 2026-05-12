@@ -9453,8 +9453,8 @@ def _wr_breakdown_inner():
     # Parâmetro opcional: ?since=YYYY-MM-DD (padrão = todos os trades)
     since = request.args.get("since", "")
 
-    TP_STATUSES = ("tp_hit", "trailing_active")
-    SL_STATUSES = ("sl_hit", "sl")
+    TP_STATUSES = ("tp", "tp_hit", "trailing_active")
+    SL_STATUSES = ("sl", "sl_hit")
 
     with db._cursor() as cur:
         since_clause = "AND t.created_at >= %s" if since else ""
@@ -9511,7 +9511,7 @@ def _wr_breakdown_inner():
             FROM trades t
             LEFT JOIN bounce_signals b ON b.mint = t.mint
             LEFT JOIN migrations     m ON m.mint = t.mint
-            WHERE t.status IN ('tp_hit','trailing_active','sl_hit','sl','expired')
+            WHERE t.status IN ('tp','tp_hit','trailing_active','sl','sl_hit','expired')
               {since_clause}
             ORDER BY t.id ASC
         """, params)
