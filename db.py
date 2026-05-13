@@ -901,6 +901,13 @@ def get_trades(limit: int = 200) -> list:
         return [dict(row) for row in cur.fetchall()]
 
 
+def get_trade_by_id(trade_id: int) -> dict | None:
+    with _cursor() as cur:
+        cur.execute("SELECT * FROM trades WHERE id = %s", (trade_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
 def get_open_trades() -> list:
     """Retorna trades ainda sob monitoramento — apenas 'open'.
     'trailing_active' é estado terminal: GMGN gerencia a saída, não monitoramos mais.
