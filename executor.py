@@ -320,11 +320,63 @@ class TradeMonitor:
                 logger.error("TradeMonitor._check_all: %s", e)
             time.sleep(MONITOR_POLL_SEC)
 
+    def _recover_fill(self, trade: dict, sol_usd: float) -> bool:
+        """Re-busca fill data do GMGN para trades com entry_price_usd=NULL.
+
+        O loop de fill em _execute() pode expirar antes de GMGN popular
+        filled_output_amount (race condition: state=confirmed mas amounts ainda NULL).
+        Recupera esses dados retroativamente a cada ciclo do TradeMonitor.
+        Retorna True se fill foi recuperado.
+        """
+        order_id = trade.get("order_id")
+        if not order_id:
+            return False
+        trade_id   = trade["id"]
+        amount_sol = trade.get("amount_sol") or 0
+        symbol     = trade.get("symbol", trade["mint"][:8])
+        try:
+            res    = self.gmgn.query_order(order_id)
+            qd     = res.get("data") or res
+            out_raw = _safe_float(qd.get("filled_output_amount"))
+            if not out_raw or out_raw <= 0:
+                return False
+            in_raw   = _safe_float(qd.get("filled_input_amount"))
+            fill_sol = (in_raw / 1e9 if in_raw and in_raw > 1000 else in_raw) or amount_sol
+            fee_raw  = _safe_float(qd.get("fee"))
+            fee_sol  = (fee_raw / 1e9 if fee_raw and fee_raw > 1000 else fee_raw) or 0.0
+            slippage = (fill_sol - amount_sol) / amount_sol if amount_sol else 0.0
+            db.update_trade(trade_id, {
+                "tokens_received": out_raw,
+                "entry_price_sol": fill_sol / out_raw,
+                "entry_price_usd": fill_sol * sol_usd,
+                "fee_sol":         fee_sol,
+                "slippage_pct":    slippage,
+            })
+            logger.info(
+                "TradeMonitor _recover_fill #%d %s — %.0f tokens @ %.10f SOL (fill recuperado retroativamente)",
+                trade_id, symbol, out_raw, fill_sol / out_raw,
+            )
+            return True
+        except Exception as e:
+            logger.debug("_recover_fill #%d: %s", trade_id, e)
+            return False
+
     def _check_all(self):
         sol_usd = get_sol_usd() or 0
         now = datetime.now(timezone.utc)
         trades = db.get_open_trades()
         for trade in trades:
+            # Recupera fill data se ausente — _execute() pode ter expirado antes de GMGN popular os amounts
+            if not trade.get("entry_price_usd") and trade.get("order_id"):
+                try:
+                    recovered = self._recover_fill(trade, sol_usd)
+                    if recovered:
+                        # Re-lê o trade com fill atualizado antes de checar TP/SL
+                        fresh = db.get_trade_by_id(trade["id"])
+                        if fresh:
+                            trade = fresh
+                except Exception as e:
+                    logger.debug("TradeMonitor recover_fill #%s: %s", trade.get("id"), e)
             try:
                 self._check_trade(trade, sol_usd, now)
             except Exception as e:
