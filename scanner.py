@@ -37,6 +37,9 @@ F_LIQ_MIN        = float(os.getenv("FILTER_LIQ_MIN",        "10000"))
 F_FEE_MIN        = float(os.getenv("FILTER_FEE_MIN",        "1.0"))
 MAX_MIG_AGE_SEC  = int(os.getenv(  "MAX_MIG_AGE_SEC",       "600"))
 MIGRATION_SOL_UNITS = float(os.getenv("MIGRATION_SOL_UNITS", "410"))
+# H22: só tokens no pump.fun pAMM têm dados de absorção via Helius.
+# Raydium/Meteora/outros nunca terão absorption_events > 0.
+F_PUMP_ONLY      = os.getenv("FILTER_PUMP_ONLY", "true").lower() == "true"
 
 
 def _passes_filter(token: dict) -> tuple[bool, str]:
@@ -982,8 +985,16 @@ class Scanner:
                     self._seen.discard(mint)
                 return
 
-        mc  = _float(token.get("usd_market_cap")) or _float(token.get("market_cap"))
-        liq = _float(token.get("liquidity")) or 0
+        mc       = _float(token.get("usd_market_cap")) or _float(token.get("market_cap"))
+        liq      = _float(token.get("liquidity")) or 0
+        exchange = (token.get("exchange") or "").lower()
+
+        if F_PUMP_ONLY and "pump" not in exchange:
+            logger.info("Migracao descartada %s (%s): exchange=%s (FILTER_PUMP_ONLY=true)",
+                        token.get("symbol"), mint[:8], exchange or "unknown")
+            with self._lock:
+                self._seen.discard(mint)
+            return
 
         if not mc or mc < F_MC_MIN or mc > F_MC_MAX:
             motivo = (f"mc=${mc:.0f}<${F_MC_MIN:.0f}" if mc and mc < F_MC_MIN
