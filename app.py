@@ -10595,6 +10595,186 @@ def debug_bounce_list():
         return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
+@app.route("/debug/trailing-review")
+def debug_trailing_review():
+    """Lista os trades classificados como 'trailing_falhou' para revisão manual.
+    Mostra mint, timestamps, max_gain_before_exit e links para verificar no chart."""
+    import traceback
+    try:
+        CSS = ("<style>body{background:#0d1117;color:#e6edf3;font:13px/1.6 monospace;padding:20px}"
+               "a{color:#58a6ff;text-decoration:none}table{border-collapse:collapse;width:100%}"
+               "th{background:#161b22;padding:6px 10px;text-align:left;font-size:11px;color:#8b949e}"
+               "td{padding:5px 10px;border-bottom:1px solid #21262d;font-size:12px}"
+               ".green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}.dim{color:#484f58}"
+               "h1{color:#58a6ff;font-size:16px;margin-bottom:4px}"
+               "h2{color:#8b949e;font-size:12px;margin:20px 0 6px}"
+               "tr:hover td{background:#161b22}"
+               ".tag{padding:2px 7px;border-radius:4px;font-size:11px}"
+               ".t-red{background:#3d1a1a;color:#f85149}"
+               ".t-yellow{background:#3d2f0a;color:#e3b341}"
+               ".t-dim{background:#1c2128;color:#8b949e}</style>")
+
+        with db._cursor() as cur:
+            cur.execute("""
+                WITH base AS (
+                    SELECT
+                        t.id,
+                        t.mint,
+                        t.symbol,
+                        t.status,
+                        t.ts_signal,
+                        t.exit_ts,
+                        t.tp_pct,
+                        t.sl_pct,
+                        t.pnl_pct_real,
+                        t.entry_expected,
+                        COALESCE(
+                            CASE WHEN t.entry_price_usd > 0 AND t.tokens_received > 0
+                                 THEN t.entry_price_usd / t.tokens_received * 1e9
+                            END,
+                            t.entry_expected
+                        ) AS entry_mc,
+                        CASE
+                            WHEN t.status IN ('tp','trailing_active')            THEN 'tp'
+                            WHEN t.status IN ('sl')                              THEN 'sl'
+                            WHEN t.status = 'expired' AND t.pnl_pct_real > 0    THEN 'tp'
+                            WHEN t.status = 'expired' AND t.pnl_pct_real <= 0   THEN 'sl'
+                            ELSE NULL
+                        END AS outcome
+                    FROM trades t
+                    WHERE t.status NOT IN ('pending','error','open')
+                ),
+                tick_pre AS (
+                    SELECT
+                        b.id AS trade_id,
+                        COUNT(tt.id) AS pre_tick_count,
+                        MAX(COALESCE(tt.mc_high, tt.mc)) AS max_mc_pre
+                    FROM base b
+                    JOIN token_ticks tt ON tt.mint = b.mint
+                        AND tt.tick_ts >= b.ts_signal
+                        AND tt.tick_ts <= b.exit_ts
+                    WHERE b.exit_ts IS NOT NULL
+                    GROUP BY b.id
+                )
+                SELECT
+                    b.id,
+                    b.mint,
+                    b.symbol,
+                    b.status,
+                    b.outcome,
+                    b.ts_signal  AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo' AS ts_signal_brt,
+                    b.exit_ts    AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo' AS exit_ts_brt,
+                    b.tp_pct,
+                    b.sl_pct,
+                    b.pnl_pct_real,
+                    b.entry_mc,
+                    tp.pre_tick_count,
+                    tp.max_mc_pre,
+                    CASE WHEN b.entry_mc > 0 AND tp.max_mc_pre IS NOT NULL
+                         THEN (tp.max_mc_pre - b.entry_mc) / b.entry_mc END AS max_gain_before_exit
+                FROM base b
+                JOIN tick_pre tp ON tp.trade_id = b.id
+                WHERE b.outcome = 'sl'
+                ORDER BY b.id ASC
+            """)
+            rows = [dict(r) for r in cur.fetchall()]
+
+        # Filtra apenas trailing_falhou
+        trailing_rows = []
+        for r in rows:
+            tp_pct    = r.get("tp_pct") or 0.75
+            pre_gain  = r.get("max_gain_before_exit")
+            pre_ticks = r.get("pre_tick_count") or 0
+            if pre_gain is not None and pre_gain >= tp_pct:
+                r["spike_suspect"] = pre_ticks < 5 and pre_gain > 1.00
+                trailing_rows.append(r)
+
+        def _ts(v):
+            if v is None: return "—"
+            return v.strftime("%m-%d %H:%M:%S") if hasattr(v, "strftime") else str(v)
+
+        def _pct(v):
+            if v is None: return "<span class='dim'>—</span>"
+            c = "#3fb950" if v > 0 else "#f85149"
+            return f"<span style='color:{c}'>{v*100:+.0f}%</span>"
+
+        rows_html = ""
+        for i, r in enumerate(trailing_rows, 1):
+            mint = r.get("mint","")
+            sym  = r.get("symbol","?")
+            spike = r.get("spike_suspect", False)
+            pt   = r.get("pre_tick_count") or 0
+            gain = r.get("max_gain_before_exit")
+            tp_pct = r.get("tp_pct") or 0.75
+
+            # Trailing exit esperado = pico × (1 - drawdown 30%) — estimativa
+            expected_trail_exit = None
+            if gain is not None and r.get("entry_mc"):
+                peak_mc = r["entry_mc"] * (1 + gain)
+                expected_trail_exit = (peak_mc * 0.70 - r["entry_mc"]) / r["entry_mc"]
+
+            spike_badge = " <span class='tag t-red'>SPIKE?</span>" if spike else ""
+            conf_color = "#3fb950" if pt >= 10 else ("#d29922" if pt >= 5 else "#f85149")
+
+            rows_html += (
+                f"<tr>"
+                f"<td class='dim'>{i}</td>"
+                f"<td class='dim'>{r['id']}</td>"
+                f"<td><b>{sym}</b>{spike_badge}</td>"
+                f"<td class='dim' style='font-size:10px'>{mint[:20]}...</td>"
+                f"<td class='dim'>{_ts(r.get('ts_signal_brt'))}</td>"
+                f"<td class='dim'>{_ts(r.get('exit_ts_brt'))}</td>"
+                f"<td style='color:{conf_color}'>{pt}</td>"
+                f"<td>{_pct(gain)}</td>"
+                f"<td>{_pct(expected_trail_exit)}</td>"
+                f"<td class='red'>{_pct(r.get('pnl_pct_real'))}</td>"
+                f"<td>"
+                f"<a href='https://dexscreener.com/solana/{mint}' target='_blank'>DS</a> "
+                f"<a href='https://gmgn.ai/sol/token/{mint}' target='_blank'>GMGN</a>"
+                f"</td>"
+                f"</tr>"
+            )
+
+        n = len(trailing_rows)
+        n_real  = sum(1 for r in trailing_rows if not r.get("spike_suspect"))
+        n_spike = sum(1 for r in trailing_rows if r.get("spike_suspect"))
+
+        html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>Trailing Review</title>{CSS}
+</head><body>
+<h1>Trailing Falhou — {n} casos para revisao manual</h1>
+<p style='color:#8b949e;font-size:12px'>
+  Classificacao: max_gain_before_exit &ge; tp_pct (+75%) enquanto seguravamos, mas exit foi SL.<br>
+  <b style='color:#3fb950'>Trailing REAL</b> (ticks &ge; 5): {n_real} — GMGN genuinamente nao executou trailing<br>
+  <b style='color:#f85149'>SPIKE?</b> (ticks &lt; 5 + gain &gt; 100%): {n_spike} — preco pode nao ter chegado la de verdade (mc_high spike)<br>
+</p>
+<p style='color:#484f58;font-size:11px'>
+  Ticks = numero de token_ticks entre ts_signal e exit_ts. Poucos ticks = baixa confianca no max_gain.<br>
+  Exit esperado = estimativa de onde trailing (30% drawdown do pico) teria saido.<br>
+  Timestamps em BRT (America/Sao_Paulo).
+</p>
+<table>
+  <thead><tr>
+    <th>#</th><th>Trade ID</th><th>Token</th><th>Mint</th>
+    <th>Entrada (BRT)</th><th>Exit (BRT)</th>
+    <th>Ticks</th><th>Max gain</th><th>Exit esperado</th><th>PnL real</th>
+    <th>Links</th>
+  </tr></thead>
+  <tbody>{rows_html if rows_html else "<tr><td colspan='11' class='dim'>Nenhum trailing_falhou encontrado</td></tr>"}</tbody>
+</table>
+<br>
+<p style='color:#484f58;font-size:11px'>
+  Para cada token: verifique no grafico se o preco realmente chegou a +{75}% a partir do fundo.<br>
+  Se sim e o SL bateu = GMGN nao ativou o trailing (bug ou IP da Railway).<br>
+  Se nao = mc_high do kline capturou spike momentaneo, preco real nunca chegou la.
+</p>
+</body></html>"""
+        return html
+
+    except Exception:
+        return f"<pre>{traceback.format_exc()}</pre>", 500
+
+
 @app.route("/debug/absorption")
 def debug_absorption():
     """
