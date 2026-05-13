@@ -121,9 +121,9 @@ Também: separar `sl` de `expired`. `expired` com `pnl_pct_real ≥ 0` não é S
 
 Com 1.7% de cobertura real, snapshots pós-bounce também virão zerados para 98% dos tokens. Implementar depois que cobertura subir para nível útil.
 
-**E — `/analise/h22-correlation`** ← BLOQUEADO (n=9 observações — insuficiente)
+**E — `/analise/h22-correlation`** ← IMPLEMENTAR AGORA (instrumento pronto antes dos dados chegarem)
 
-Gate: n≥30 bounces com `absorption_events > 0`. Hoje: 9. Não implementar até atingir o gate.
+Dashboard mostra correlação H22 → outcome com n atual (hoje=9). Conclusões só valem com n≥30, mas o dashboard fica pronto para quando os dados chegarem. Bot ativo = bounces acumulando = cobertura crescendo. Construir instrumento de medição enquanto dados acumulam é o caminho correto.
 
 ---
 
