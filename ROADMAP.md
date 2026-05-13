@@ -1,7 +1,7 @@
 # NeideBOT — Roadmap
 
-**Atualizado:** 2026-05-12 (sessão 2)
-**Estado:** Bot ativo a $1/trade · WR **~15% (GMGN ground truth)** · filtros A.2/A.3/A.5/A.6/A.7/smart≥3 ativos · H22 em coleta · DB WR inválido — usar apenas GMGN para métricas
+**Atualizado:** 2026-05-13 (sessão 3)
+**Estado:** Bot ativo a $1/trade · WR **~15% (GMGN ground truth, filtros anteriores)** · filtros A.2/A.3/A.5/A.6/A.7/smart≥3/FILTER_PUMP_ONLY ativos · SL=25% em teste · Helius RPC fill ativo · TradeMonitor cego corrigido via get_token_balance() · H22 cobertura 6% (32/552) e crescendo
 
 ---
 
@@ -36,6 +36,14 @@
 | **`/analise/h22-correlation`** | 2026-05-13 | Dashboard H22: 3 tabelas (absorption_events buckets, buy/sell ratio, buy_concentration). Instrumento de medição pronto. Gate: n≥30 com Helius data. |
 | **Fix mc_peak inflado (kline high → close)** | 2026-05-12 | Kline `high` incluía spikes intra-candle de transações em pools com baixa liquidez — um único whale buy pode empurrar o AMM price 200x por <1s. Scanner mostrava ganhos de 5000-25000% (ex: DIAMOND $9M peak mas mc_1h = $39K). Fix: `_precise_bottom_tick()` e `_graduate()` agora usam `close × supply` para mc_peak. `mc_high` nos token_ticks mantido para o backtester. |
 | **`/analise/post-sl-recovery`** | 2026-05-12 | Para cada SL, busca o max MC nos token_ticks após exit_ts. 12% dos SLs (8/64 com dados) teriam atingido o TP depois. 88% são dumps genuínos que continuaram. ⚠️ Número pendente de correção: usa `entry_expected` (mc_bottom × 1.15), não entrada real (`entry_price_usd / tokens_received × 1B`). |
+| **`helius_rpc.py` — fill on-chain + detecção de posição** | 2026-05-13 | Novo módulo. `get_swap_fill(tx_sig, mint)` via `getTransaction` lê fill real da blockchain. `get_token_balance(mint)` via `getTokenAccountsByOwner` detecta posição fechada (balance=0). `extract_tx_signature(query_order_resp)` extrai tx sig de múltiplos campos. Requer `HELIUS_RPC_URL` no Railway. |
+| **TradeMonitor `_check_position_closed()` via Helius** | 2026-05-13 | Resolve cegueira estrutural: quando `not ticks`, chama `get_token_balance()` — balance=0 → GMGN fechou posição → infere TP/SL via ratio da última MC vs thresholds. Elimina trades presos `open` horas após fechar. |
+| **`fill_source` coluna em `trades`** | 2026-05-13 | Rastreia origem do fill data: `gmgn`/`helius`/`helius_recovery`/`gmgn_recovery`. ALTER TABLE IF NOT EXISTS. |
+| **`tp_mc` fallback quando `entry_mc_real=None`** | 2026-05-13 | GMGN nunca retorna `filled_output_amount` → `entry_mc_real=None` → `tp_mc=None` → TP nunca detectado. Fix: `tp_mc = entry_expected × (1+tp_pct)` quando real não disponível. Flag `tp_from_expected` indica quando fallback foi usado. |
+| **`/debug/open-trades` endpoint** | 2026-05-13 | Diagnóstico de trades presos. Mostra entry_expected, entry_mc_real, sl_mc, tp_mc, tick count, min/max, flags hit, raw JSON do query_order ao vivo. Identifica exatamente por que TradeMonitor não detectou saída. |
+| **Fix `/analise/h22-correlation` CTE** | 2026-05-13 | CTE excluía `status='open'` → todos os bounces com trades mostravam `outcome=NULL`. Fix: sem WHERE filter — latest trade por mint independente de status. |
+| **H22 cobertura: 6% (32/552)** | 2026-05-13 | Cresceu de 1.7% (9/529). 100% dos tokens pump.fun novos terão cobertura via FILTER_PUMP_ONLY + Helius WS. Histórico anterior à implementação ficará sem dados. |
+| **`/debug/absorption` — 3 summary boxes H22** | 2026-05-13 | Adicionados boxes: "H22 ticks (holding)", "Trades monitorados", "Mints distintos" — counts da tabela `trade_absorption_ticks`. |
 
 > ⚠️ **Nota sobre WR histórico**: O DB WR (chegou a mostrar 34%) é inválido. TradeMonitor infere TP/SL via token_ticks e gera falsos positivos após GMGN fechar a posição. **GMGN = 15% WR = ground truth.**
 
@@ -43,15 +51,11 @@
 
 ## 🔜 Curto Prazo
 
-### 1. FILTER_SMART_MIN=3 ← **IMEDIATO (env var Railway, zero código)**
+### 1. FILTER_SMART_MIN=3 ← **✅ CONCLUÍDO (2026-05-12)**
 
-**Por quê:** Dado live/GMGN mais limpo disponível. smart=3 → 57% WR vs smart=2 → 20% WR. Discriminação +37pp. Zero linhas de código, efeito imediato, reversível.
+`FILTER_SMART_MIN=3` ativo em Railway. smart=1→0% WR, smart=2→20%, smart=3→57% (dado live GMGN).
 
-**Como:** Railway → FILTER_SMART_MIN=3 (sem redeploy necessário).
-
-**Gate:** Acumular n≥30 trades com smart≥3 antes de qualquer outra mudança de código.
-
-**Tradeoff:** Menor frequência de sinais. Aceitar — a estratégia vive de qualidade, não de volume bruto.
+**Gate ativo:** Acumular n≥30 trades com smart≥3 antes de qualquer outra mudança de filtro.
 
 ---
 
@@ -80,13 +84,13 @@
 
 **Score/grade: deliberadamente removidos.** Construir fórmula sem correlação com outcomes é julgar o peixe por não subir em árvore. Coletar → correlacionar → só então pontuar.
 
-**⚠️ COBERTURA HELIUS — DIAGNÓSTICO (2026-05-13):**
+**⚠️ COBERTURA HELIUS — DIAGNÓSTICO (2026-05-13, fim da sessão 3):**
 ```sql
--- bounce_signals: total=529+, com_helius=23+, sem_helius=~520
--- Cobertura real: ~4.3% e crescendo (era 1.7% no início da sessão 2026-05-13)
+-- bounce_signals: total=552, com_helius=32 (6%), sem_helius=~520
+-- Cresceu de 1.7% (9/529) no início da sessão para 6% (32/552) ao final
 ```
-529+ bounces registrados. **23+ têm `absorption_events > 0`** (cresceu de 9 durante a sessão). Restantes têm NULL.
-Causa provável: Helius subscreve o mint quando o token entra no HotMonitor, mas os BuyEvent/SellEvent do pAMM chegam com baixa taxa para a maioria dos tokens — muitos bounces disparam em janelas onde poucos swaps ocorreram pela subscrição Helius.
+552 bounces registrados. **32 têm `absorption_events > 0`** (6% de cobertura). Restantes têm NULL.
+**Causa confirmada**: 100% dos tokens `exchange='pump'` têm cobertura Helius. Os 520 sem dados são tokens de exchanges anteriores (pré-FILTER_PUMP_ONLY) ou períodos antes da implementação do rolling window (pré-2026-05-12). Com FILTER_PUMP_ONLY ativo, TODOS os novos tokens serão pump.fun pAMM → 100% cobertura futura.
 
 **Implicação direta:** Tarefa B (h22-correlation) é prematura. Com n=9 observações, qualquer correlação é ruído.
 
@@ -285,3 +289,7 @@ Dashboard mostra correlação H22 → outcome com n atual. 3 tabelas: por `absor
 13. **Kline `high` inflava mc_peak com spikes intra-candle**: em pools com 79 SOL de liquidez, um único trade pode temporariamente empurrar o preço AMM 200x. O kline registra isso como o `high` da vela mesmo que o close volte ao normal. Fix: usar `close × supply` para mc_peak (push_mc já usa close implicitamente). `mc_high` mantido nos token_ticks para o backtester (TP detection intra-vela).
 14. **Cobertura de infraestrutura ≠ dados disponíveis**: implementar H22 (coleta de absorção) não significa ter dados. Com 529 bounces e apenas 9 `absorption_events > 0` (1.7%), toda análise de correlação é prematura. Verificar cobertura ANTES de construir dashboard analítico. Pergunta certa: "quantos bounces têm dados reais?" — não "a infraestrutura está implementada?".
 15. **`entry_expected` ≠ entrada real**: o executor calcula `entry_target = mc_bottom × 1.15` antes do swap. A entrada real pode ser 30-50%+ acima por latência e slippage. Qualquer análise de TP/SL threshold que use `entry_expected` pode estar errada para cima ou para baixo. Sempre usar `(entry_price_usd / tokens_received) × 1B` quando disponível — já salvo no banco desde Fase 6.
+16. **GMGN nunca retorna dados de fill no query_order**: `filled_output_amount` e `filled_input_amount` chegam consistentemente como `null` mesmo com `state=confirmed`. Não é bug transitório — é comportamento padrão da GMGN API. Toda a lógica que dependia desses campos estava silenciosamente falhando. Solução: ler fill diretamente da blockchain via Helius `getTransaction`. A blockchain é a única fonte de verdade — qualquer intermediário pode não retornar o que você precisa.
+17. **TradeMonitor era cego após 60min de janela quente**: dependia de `token_ticks` gerados pelo HotMonitor. Quando HotMonitor expira, ticks param → `if not ticks: return` → trade fica `open` para sempre. Trades de menos de $1 fechavam em minutos mas o sistema não sabia. Fix correto: verificar posição on-chain via `get_token_balance()`, não tentar inferir de dados que param de chegar.
+18. **`condition_orders` na query_order é vazia**: GMGN não retorna status das condition_orders (TP/SL) quando se consulta a ordem de compra. `_check_via_gmgn()` que tentava ler esse campo é ineficaz. As condition_orders têm lifecycle independente da ordem de compra — precisariam de uma query separada com order_id do TP/SL (não exposto pela API). Blockchain é o único caminho confiável.
+19. **SL=15% vs volatilidade pAMM**: em pools com liquidez pequena (~79 SOL), uma única transação de venda pode temporariamente empurrar o preço 15-20% abaixo antes do próximo buy reequilibrar. GMGN monitora price com granularidade alta → SL=15% dispara nesses spikes antes de qualquer recuperação. Testando SL=25% como threshold mais robusto a ruído. Aguardar n≥30 trades para validar EV vs SL=15%.
