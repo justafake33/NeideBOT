@@ -339,11 +339,17 @@ class TradeMonitor:
         """Coleta fluxo buy/sell do Helius pAMM enquanto o trade está aberto.
         Dados brutos apenas — zero decisão. Cruzar com outcome (TP/SL) depois.
         Janela rolante de 30s: snapshot do que está acontecendo AGORA no mercado.
+        Não insere se mint não está subscrito no Helius — zeros seriam indistinguíveis
+        de "subscrito mas sem eventos", corrompendo a série temporal.
         """
         if not self._helius:
             return
         mint = trade.get("mint")
         if not mint:
+            return
+        # Só coleta se o mint está sendo monitorado pelo Helius.
+        # Tokens fora da janela quente (>60min) não estão subscritos — sem dados reais.
+        if mint not in getattr(self._helius, "_swap_events", {}):
             return
         trade_id = trade.get("id")
         w = self._helius.get_absorption_window(mint, window_sec=30)

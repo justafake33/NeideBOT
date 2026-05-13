@@ -10510,7 +10510,11 @@ def debug_absorption():
                        b.absorption_events,
                        t.status AS trade_status
                 FROM bounce_signals b
-                LEFT JOIN trades t ON t.mint = b.mint
+                LEFT JOIN LATERAL (
+                    SELECT status FROM trades
+                    WHERE mint = b.mint
+                    ORDER BY created_at DESC LIMIT 1
+                ) t ON true
                 ORDER BY b.ts_signal DESC
                 LIMIT 30
             """)
@@ -10968,7 +10972,9 @@ def analise_h22_correlation():
             all_rows = [dict(r) for r in cur.fetchall()]
 
         # --- Classify outcomes ---
-        TP_STATUS  = {'tp', 'trailing_active'}
+        # trailing_active NÃO é TP confirmado — resultado final ainda desconhecido.
+        # Só status='tp' (detectado pelo _check_trailing_exit) conta como TP real.
+        TP_STATUS  = {'tp'}
         SL_STATUS  = {'sl'}
 
         for r in all_rows:
@@ -10981,7 +10987,7 @@ def analise_h22_correlation():
                 pnl = r.get("pnl_pct_real")
                 r["outcome"] = "tp" if (pnl is not None and pnl > 0) else "sl" if (pnl is not None) else None
             else:
-                r["outcome"] = None  # no trade or pending
+                r["outcome"] = None  # trailing_active, pending, open — resultado pendente
 
             ev = r.get("absorption_events") or 0
             bv = r.get("absorption_buy_vol") or 0.0
