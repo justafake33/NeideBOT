@@ -465,7 +465,14 @@ class TradeMonitor:
         # gerando falsos positivos que mostram +75% quando o real foi -15%.
         sl_ref  = entry_mc_real or entry_mc
         sl_mc   = sl_ref * (1 - sl_pct)
-        tp_mc   = entry_mc_real * (1 + tp_pct) if entry_mc_real else None
+        # tp_mc: usa entry_mc_real se disponível.
+        # Fallback para entry_expected quando fill não foi registrado (GMGN não retorna
+        # filled_output_amount no query_order). entry_expected é conservador (real fill
+        # é igual ou maior), então tp_mc calculado assim é igual ou menor que o real —
+        # detecta TP um pouco cedo, mas sem falso positivo estrutural.
+        # Detectado sem fill → marca trailing_active (não tp direto) para sinalizar incerteza.
+        tp_mc            = entry_mc_real * (1 + tp_pct) if entry_mc_real else entry_mc * (1 + tp_pct)
+        tp_from_expected = entry_mc_real is None  # flag: tp_mc baseado em entry_expected
 
         ticks = db.get_ticks_after(mint, min_ts=ref_ts)
         if not ticks:
@@ -478,10 +485,16 @@ class TradeMonitor:
             low     = float(tick["mc_low"]  or 0)
             tick_ts = tick["tick_ts"]
 
-            # TP/trailing: só detecta se temos o preço real de fill.
-            # Sem entry_mc_real, tp_mc é None e este bloco nunca executa.
             if tp_mc and high >= tp_mc:
-                self._record_exit(trade, "trailing_active", tp_pct, tick_ts, sol_usd)
+                # Fill desconhecido → marca trailing_active (GMGN gerencia saída real).
+                # Fill conhecido → trailing_active para _check_trailing_exit acompanhar.
+                exit_label = "trailing_active"
+                logger.info(
+                    "TradeMonitor #%d %s — TP zone (high=$%.0f tp_mc=$%.0f%s)",
+                    trade_id, symbol, high, tp_mc,
+                    " via entry_expected" if tp_from_expected else "",
+                )
+                self._record_exit(trade, exit_label, tp_pct, tick_ts, sol_usd)
                 return
             if low > 0 and low <= sl_mc:
                 self._record_exit(trade, "sl", -sl_pct, tick_ts, sol_usd)
