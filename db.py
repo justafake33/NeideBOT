@@ -214,6 +214,13 @@ def init_db():
             "ADD COLUMN IF NOT EXISTS absorption_sell_cnt INT",
             "ADD COLUMN IF NOT EXISTS absorption_lrg_buy  FLOAT",
             "ADD COLUMN IF NOT EXISTS absorption_events   INT",
+            # Ajuste 2: snapshots pós-bounce +30s e +60s
+            "ADD COLUMN IF NOT EXISTS p30s_buy_vol   FLOAT",
+            "ADD COLUMN IF NOT EXISTS p30s_sell_vol  FLOAT",
+            "ADD COLUMN IF NOT EXISTS p30s_events    INT",
+            "ADD COLUMN IF NOT EXISTS p60s_buy_vol   FLOAT",
+            "ADD COLUMN IF NOT EXISTS p60s_sell_vol  FLOAT",
+            "ADD COLUMN IF NOT EXISTS p60s_events    INT",
         ]:
             cur.execute(f"ALTER TABLE bounce_signals {col}")
 
@@ -584,6 +591,23 @@ def insert_bounce_signal(data: dict):
             "absorption_lrg_buy":  data.get("absorption_lrg_buy"),
             "absorption_events":   data.get("absorption_events"),
         })
+
+
+def update_bounce_snapshots(mint: str, window_label: str, buy_vol: float, sell_vol: float, events: int):
+    """Atualiza snapshots pós-bounce (+30s ou +60s) num bounce_signal existente.
+    window_label: '30s' ou '60s' — determina quais colunas atualizar.
+    """
+    if window_label == "30s":
+        cols = "p30s_buy_vol = %(bv)s, p30s_sell_vol = %(sv)s, p30s_events = %(ev)s"
+    elif window_label == "60s":
+        cols = "p60s_buy_vol = %(bv)s, p60s_sell_vol = %(sv)s, p60s_events = %(ev)s"
+    else:
+        return
+    with _cursor() as cur:
+        cur.execute(
+            f"UPDATE bounce_signals SET {cols} WHERE mint = %(mint)s",
+            {"bv": buy_vol, "sv": sell_vol, "ev": events, "mint": mint},
+        )
 
 
 def insert_ticks_batch(ticks: list):

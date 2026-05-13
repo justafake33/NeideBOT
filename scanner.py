@@ -37,6 +37,9 @@ F_LIQ_MIN        = float(os.getenv("FILTER_LIQ_MIN",        "10000"))
 F_FEE_MIN        = float(os.getenv("FILTER_FEE_MIN",        "1.0"))
 MAX_MIG_AGE_SEC  = int(os.getenv(  "MAX_MIG_AGE_SEC",       "600"))
 MIGRATION_SOL_UNITS = float(os.getenv("MIGRATION_SOL_UNITS", "410"))
+# H22: só tokens no pump.fun pAMM têm dados de absorção via Helius.
+# Raydium/Meteora/outros nunca terão absorption_events > 0.
+F_PUMP_ONLY      = os.getenv("FILTER_PUMP_ONLY", "true").lower() == "true"
 
 
 def _passes_filter(token: dict) -> tuple[bool, str]:
@@ -303,8 +306,8 @@ class HotMonitor:
                 "mc_at_signal":        mc,
                 "drop_from_mig":       round(drop_from_mig, 4),
                 "bounce_pct":          round(bounce_pct, 4),
-                "absorption_score":    None,   # não calculado — fórmula não validada
-                "absorption_grade":    None,   # idem
+                "absorption_score":    None,
+                "absorption_grade":    None,
                 "absorption_buy_vol":  absorption_window.get("buy_vol_sol"),
                 "absorption_sell_vol": absorption_window.get("sell_vol_sol"),
                 "absorption_buy_cnt":  absorption_window.get("buy_count"),
@@ -314,6 +317,30 @@ class HotMonitor:
             })
         except Exception as e:
             logger.warning("insert_bounce_signal %s: %s", mint[:8], e)
+
+        # Ajuste 2 — Snapshots pós-bounce +30s e +60s (Helius rolling window)
+        # Captura fluxo de ordens APÓS o sinal — complementa a janela pré-bounce.
+        # Ambos os snapshots são capturados num único callback em 65s.
+        if self._helius and self.scheduler:
+            def _post_bounce_snapshots(m=mint):
+                try:
+                    w30 = self._helius.get_absorption_window(m, window_sec=30)
+                    db.update_bounce_snapshots(
+                        m, "30s",
+                        buy_vol=w30.get("buy_vol_sol", 0) or 0,
+                        sell_vol=w30.get("sell_vol_sol", 0) or 0,
+                        events=w30.get("total_events", 0) or 0,
+                    )
+                    w60 = self._helius.get_absorption_window(m, window_sec=60)
+                    db.update_bounce_snapshots(
+                        m, "60s",
+                        buy_vol=w60.get("buy_vol_sol", 0) or 0,
+                        sell_vol=w60.get("sell_vol_sol", 0) or 0,
+                        events=w60.get("total_events", 0) or 0,
+                    )
+                except Exception as ex:
+                    logger.debug("post_bounce_snapshots %s: %s", m[:8], ex)
+            self.scheduler.schedule(65, _post_bounce_snapshots)
 
         msg = (
             f"🔔 BOUNCE {symbol}\n"
@@ -982,8 +1009,16 @@ class Scanner:
                     self._seen.discard(mint)
                 return
 
-        mc  = _float(token.get("usd_market_cap")) or _float(token.get("market_cap"))
-        liq = _float(token.get("liquidity")) or 0
+        mc       = _float(token.get("usd_market_cap")) or _float(token.get("market_cap"))
+        liq      = _float(token.get("liquidity")) or 0
+        exchange = (token.get("exchange") or "").lower()
+
+        if F_PUMP_ONLY and "pump" not in exchange:
+            logger.info("Migracao descartada %s (%s): exchange=%s (FILTER_PUMP_ONLY=true)",
+                        token.get("symbol"), mint[:8], exchange or "unknown")
+            with self._lock:
+                self._seen.discard(mint)
+            return
 
         if not mc or mc < F_MC_MIN or mc > F_MC_MAX:
             motivo = (f"mc=${mc:.0f}<${F_MC_MIN:.0f}" if mc and mc < F_MC_MIN

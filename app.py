@@ -10458,12 +10458,23 @@ def debug_absorption():
                 sell_vol = w.get("sell_vol_sol", 0) or 0
                 buy_cnt  = w.get("buy_count",    0) or 0
                 sell_cnt = w.get("sell_count",   0) or 0
+                lrg_buy  = w.get("largest_buy",  0) or 0
                 ratio    = buy_vol / sell_vol if sell_vol > 0 else None
+                conc     = lrg_buy / buy_vol if buy_vol > 0 else None
                 event_cls = "ok" if total >= 5 else ("warn" if total >= 1 else "bad")
                 ratio_cls = "ok" if (ratio and ratio >= 1.0) else "bad"
                 # H22 só captura pump.fun pAMM — Raydium/Meteora/outros = sem dados
                 is_pump = "pump" in exchange.lower() or exchange == "?"
                 exch_cls = "" if is_pump else "warn"
+
+                if sell_vol == 0 and buy_vol > 0:
+                    ratio_str = "<span class='ok'>∞</span>"
+                elif sell_vol == 0 and buy_vol == 0:
+                    ratio_str = "<span style='color:#484f58'>no flow</span>"
+                else:
+                    ratio_str = f"<span class='{ratio_cls}'>{ratio:.2f}×</span>"
+
+                conc_str = f"{conc:.2f}" if conc is not None else "—"
 
                 elapsed = int((
                     __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
@@ -10476,10 +10487,11 @@ def debug_absorption():
                   <td class='{exch_cls}'>{exchange}</td>
                   <td>{elapsed}min</td>
                   <td class='{event_cls}'>{total} eventos</td>
-                  <td class='ok'>{buy_vol:.3f} SOL ({buy_cnt}x)</td>
-                  <td class='bad'>{sell_vol:.3f} SOL ({sell_cnt}x)</td>
-                  <td class='{ratio_cls}'>{f"{ratio:.2f}x" if ratio is not None else "—"}</td>
-                  <td>lrg_buy={w.get('largest_buy',0):.3f}</td>
+                  <td class='ok'>{buy_vol:.3f} SOL ({buy_cnt}×)</td>
+                  <td class='bad'>{sell_vol:.3f} SOL ({sell_cnt}×)</td>
+                  <td>{ratio_str}</td>
+                  <td>{lrg_buy:.3f} SOL</td>
+                  <td style='color:#8b949e'>{conc_str}</td>
                   <td style='font-size:10px;color:#8b949e'>{mint[:12]}…</td>
                   <td><a href='{dex_url}' target='_blank'>DEX</a></td>
                 </tr>"""
@@ -10493,6 +10505,7 @@ def debug_absorption():
                 SELECT b.mint, b.symbol, b.exchange, b.ts_signal, b.bounce_pct, b.drop_from_mig,
                        b.absorption_buy_vol, b.absorption_sell_vol,
                        b.absorption_buy_cnt, b.absorption_sell_cnt,
+                       b.absorption_lrg_buy,
                        b.absorption_events,
                        t.status AS trade_status
                 FROM bounce_signals b
@@ -10535,20 +10548,27 @@ def debug_absorption():
             sv       = r.get("absorption_sell_vol")
             bc       = r.get("absorption_buy_cnt")
             sc       = r.get("absorption_sell_cnt")
+            lb       = r.get("absorption_lrg_buy")
             outcome  = r.get("trade_status") or "—"
-            ratio    = bv / sv if (bv is not None and sv and sv > 0) else None
+            ratio    = bv / sv if (bv is not None and sv and float(sv) > 0) else None
+            conc     = lb / bv if (lb is not None and bv and float(bv) > 0) else None
 
             ratio_cls = "ok" if (ratio and ratio >= 1.0) else ("bad" if ratio is not None else "")
-            out_cls   = "ok" if outcome == "tp" else ("bad" if outcome == "sl" else "")
+            out_cls   = "ok" if outcome == "tp" else ("bad" if outcome in ("sl","expired") else "")
             is_pump   = "pump" in exchange.lower()
             exch_cls  = "" if is_pump else "warn"
-            # Ratio display: distingue "sem sells" (bullish) de "sem dados"
+
             if bv is not None and sv is not None:
-                ratio_str = (f"<span class='ok'>∞</span>" if sv == 0 and bv > 0
-                             else ("no flow" if sv == 0 and bv == 0
-                                   else f"<span class='{ratio_cls}'>{ratio:.2f}x</span>"))
+                if float(sv) == 0 and float(bv) > 0:
+                    ratio_str = "<span class='ok'>∞</span>"
+                elif float(sv) == 0 and float(bv) == 0:
+                    ratio_str = "<span style='color:#484f58'>no flow</span>"
+                else:
+                    ratio_str = f"<span class='{ratio_cls}'>{ratio:.2f}×</span>"
             else:
                 ratio_str = "—"
+
+            conc_str = f"{conc:.2f}" if conc is not None else "—"
 
             bounce_rows_html += f"""<tr>
               <td>{ts}</td>
@@ -10556,9 +10576,10 @@ def debug_absorption():
               <td class='{exch_cls}'>{exchange}</td>
               <td>{float(r['bounce_pct'])*100:.0f}%</td>
               <td class='{out_cls}'>{outcome}</td>
-              <td>{f"{bv:.3f} SOL ({bc}x)" if bv is not None else "<span style='color:#484f58'>NULL</span>"}</td>
-              <td>{f"{sv:.3f} SOL ({sc}x)" if sv is not None else "<span style='color:#484f58'>NULL</span>"}</td>
+              <td>{f"{bv:.3f} ({bc}×)" if bv is not None else "<span style='color:#484f58'>NULL</span>"}</td>
+              <td>{f"{sv:.3f} ({sc}×)" if sv is not None else "<span style='color:#484f58'>NULL</span>"}</td>
               <td>{ratio_str}</td>
+              <td style='color:#8b949e'>{conc_str}</td>
               <td>{ev if ev is not None else "<span style='color:#f85149'>NULL</span>"}</td>
             </tr>"""
 
@@ -10601,6 +10622,7 @@ def debug_absorption():
 <b>Dados brutos apenas</b> — score/grade removidos. Correlacionar com outcome (TP/SL) após n≥30 bounces com dados.<br>
 ⚠️ <b>H22 só captura pump.fun pAMM.</b> Tokens em Raydium/Meteora/outros sempre terão absorption_events=NULL.</p>
 <div class='nav'>
+  <a href='/analise/h22-correlation'>H22 Correlation</a>
   <a href='/analise/post-sl-recovery'>Post-SL Recovery</a>
   <a href='/debug/bounce-list'>Bounce List</a>
   <a href='/debug/executor-status'>Executor</a>
@@ -10618,8 +10640,8 @@ def debug_absorption():
 <table>
   <thead><tr>
     <th>Token</th><th>Exchange</th><th>Elapsed</th><th>Eventos Helius</th>
-    <th>Buy vol</th><th>Sell vol</th><th>Buy/Sell ratio</th>
-    <th>Largest buy</th><th>Mint</th><th></th>
+    <th>Buy vol</th><th>Sell vol</th><th>Ratio</th>
+    <th>Largest buy</th><th>Conc.</th><th>Mint</th><th></th>
   </tr></thead>
   <tbody>{live_rows_html}</tbody>
 </table>
@@ -10627,13 +10649,14 @@ def debug_absorption():
 <h3>Últimos 30 Bounce Signals — Métricas Brutas H22</h3>
 <p style='color:#8b949e;font-size:11px'>
   NULL em "Eventos" = bounce sem dados Helius (token não é pump.fun pAMM, ou pAMM ainda não teve swaps).<br>
-  <b>∞</b> = buy_vol &gt; 0 e sell_vol = 0 (ninguém vendeu — sinal bullish). <b>no flow</b> = sem eventos de nenhum lado.<br>
+  <b>∞</b> = buy_vol &gt; 0 e sell_vol = 0 (ninguém vendeu — sinal mais bullish). <b>no flow</b> = sem eventos de nenhum lado.<br>
+  <b>Conc.</b> = largest_buy / buy_vol — próximo de 1.0 = 1 whale isolado; &lt; 0.5 = múltiplos compradores reais.<br>
   <b>Exchange em amarelo</b> = não é pump.fun pAMM — H22 nunca terá dados para esse token.
 </p>
 <table>
   <thead><tr>
     <th>Hora</th><th>Token</th><th>Exchange</th><th>Bounce</th><th>Trade</th>
-    <th>Buy vol</th><th>Sell vol</th><th>Ratio</th><th>Eventos</th>
+    <th>Buy SOL</th><th>Sell SOL</th><th>Ratio</th><th>Conc.</th><th>Eventos</th>
   </tr></thead>
   <tbody>{bounce_rows_html}</tbody>
 </table>
@@ -10647,29 +10670,37 @@ def debug_absorption():
 
 @app.route("/analise/post-sl-recovery")
 def analise_post_sl_recovery():
-    """H22 — Para cada SL, o que o token fez depois do nosso stop?
-    Responde: 'Yankee é padrão ou exceção?'
+    """Para cada SL, o que o token fez depois do nosso stop?
+    Responde: 'Continuar dumpando é padrão ou exceção?'
     Usa token_ticks (já coletados) — zero chamadas de API.
+    Ajuste 3: usa entrada real (entry_price_usd / tokens_received × 1B) quando disponível.
+    Ajuste 4: expired com pnl_pct_real >= 0 não é SL real — excluído.
     """
     import traceback
     try:
         with db._cursor() as cur:
-            # Para cada SL com exit_ts, busca max MC nos ticks seguintes
             cur.execute("""
                 WITH sl_trades AS (
                     SELECT id, mint, symbol,
                            entry_expected,
+                           entry_price_usd,
+                           tokens_received,
                            amount_usd,
                            exit_ts,
                            COALESCE(tp_pct, 0.75) AS tp_pct,
                            COALESCE(sl_pct, 0.15) AS sl_pct,
                            pnl_pct_real,
                            ts_signal,
-                           mc_bottom
+                           mc_bottom,
+                           status
                     FROM trades
-                    WHERE status IN ('sl', 'expired')
+                    WHERE (
+                        status = 'sl'
+                        OR (status = 'expired' AND pnl_pct_real < 0)
+                    )
                       AND exit_ts IS NOT NULL
-                      AND entry_expected IS NOT NULL
+                      AND (entry_expected IS NOT NULL
+                           OR (entry_price_usd IS NOT NULL AND tokens_received IS NOT NULL))
                 ),
                 ticks_after AS (
                     SELECT
@@ -10683,12 +10714,13 @@ def analise_post_sl_recovery():
                       AND tt.mc IS NOT NULL
                 )
                 SELECT
-                    s.id, s.mint, s.symbol,
-                    s.entry_expected, s.amount_usd,
+                    s.id, s.mint, s.symbol, s.status,
+                    s.entry_expected,
+                    s.entry_price_usd,
+                    s.tokens_received,
+                    s.amount_usd,
                     s.exit_ts, s.tp_pct, s.sl_pct,
                     s.pnl_pct_real, s.ts_signal, s.mc_bottom,
-                    s.entry_expected * (1 - s.sl_pct) AS sl_mc,
-                    s.entry_expected * (1 + s.tp_pct)  AS tp_mc,
                     MAX(CASE WHEN ta.secs_after <= 300  THEN ta.mc END) AS max_mc_5m,
                     MAX(CASE WHEN ta.secs_after <= 600  THEN ta.mc END) AS max_mc_10m,
                     MAX(CASE WHEN ta.secs_after <= 1200 THEN ta.mc END) AS max_mc_20m,
@@ -10696,18 +10728,37 @@ def analise_post_sl_recovery():
                     COUNT(ta.mc) AS tick_count_after
                 FROM sl_trades s
                 LEFT JOIN ticks_after ta ON ta.trade_id = s.id
-                GROUP BY s.id, s.mint, s.symbol, s.entry_expected, s.amount_usd,
-                         s.exit_ts, s.tp_pct, s.sl_pct, s.pnl_pct_real,
-                         s.ts_signal, s.mc_bottom
+                GROUP BY s.id, s.mint, s.symbol, s.status,
+                         s.entry_expected, s.entry_price_usd, s.tokens_received,
+                         s.amount_usd, s.exit_ts, s.tp_pct, s.sl_pct,
+                         s.pnl_pct_real, s.ts_signal, s.mc_bottom
                 ORDER BY s.exit_ts DESC
             """)
             rows = [dict(r) for r in cur.fetchall()]
 
-        # Enriquece cada linha com métricas derivadas
+        # Ajuste 3: calcula entry_mc_real — entrada real via fill, fallback para expected
         for r in rows:
-            entry   = float(r.get("entry_expected") or 0)
-            sl_mc   = float(r.get("sl_mc") or 0)
-            tp_mc   = float(r.get("tp_mc") or 0)
+            ep  = r.get("entry_price_usd")
+            tok = r.get("tokens_received")
+            if ep and tok and float(tok) > 0:
+                r["entry_mc_real"] = float(ep) / float(tok) * 1_000_000_000
+                r["entry_source"]  = "real"
+            elif r.get("entry_expected"):
+                r["entry_mc_real"] = float(r["entry_expected"])
+                r["entry_source"]  = "expected"
+            else:
+                r["entry_mc_real"] = None
+                r["entry_source"]  = None
+
+        # Enriquece cada linha com métricas derivadas usando entrada real
+        for r in rows:
+            entry  = r["entry_mc_real"] or 0.0
+            tp_pct = float(r.get("tp_pct") or 0.75)
+            sl_pct = float(r.get("sl_pct") or 0.15)
+            sl_mc  = entry * (1 - sl_pct) if entry else 0
+            tp_mc  = entry * (1 + tp_pct)  if entry else 0
+            r["sl_mc"] = sl_mc
+            r["tp_mc"] = tp_mc
 
             for win, key in [("5m","max_mc_5m"),("10m","max_mc_10m"),
                               ("20m","max_mc_20m"),("60m","max_mc_60m")]:
@@ -10727,11 +10778,12 @@ def analise_post_sl_recovery():
 
         # Summary — apenas trades com ticks pós-SL (sem ticks = sem dados suficientes)
         with_ticks = [r for r in rows if (r.get("tick_count_after") or 0) >= 3]
-        n_total    = len(rows)
+        n_total     = len(rows)
         n_with_data = len(with_ticks)
-        n_hit_tp   = sum(1 for r in with_ticks if r.get("hit_tp"))
-        n_hit_75   = sum(1 for r in with_ticks if r.get("hit_75"))
-        n_hit_100  = sum(1 for r in with_ticks if r.get("hit_100"))
+        n_hit_tp    = sum(1 for r in with_ticks if r.get("hit_tp"))
+        n_hit_75    = sum(1 for r in with_ticks if r.get("hit_75"))
+        n_hit_100   = sum(1 for r in with_ticks if r.get("hit_100"))
+        n_real_entry= sum(1 for r in rows if r.get("entry_source") == "real")
 
         def _pct(v):
             if v is None: return "—"
@@ -10765,11 +10817,13 @@ def analise_post_sl_recovery():
         pct_hit_tp  = f"{n_hit_tp/n_with_data*100:.0f}%" if n_with_data else "—"
         pct_hit_75  = f"{n_hit_75/n_with_data*100:.0f}%" if n_with_data else "—"
         pct_hit_100 = f"{n_hit_100/n_with_data*100:.0f}%" if n_with_data else "—"
+        tp_pct_label = f"{rows[0]['tp_pct']*100:.0f}%" if rows else "75%"
 
         summary_html = (
-            _box("SLs totais", n_total) +
+            _box("SLs reais", n_total) +
             _box("Com dados de ticks", n_with_data, "#8b949e") +
-            _box(f"Hit TP ({rows[0]['tp_pct']*100:.0f}%) após SL" if rows else "Hit TP após SL",
+            _box(f"Entrada real (fill)", f"{n_real_entry}/{n_total}", "#58a6ff") +
+            _box(f"Hit TP ({tp_pct_label}) após SL",
                  f"{pct_hit_tp} ({n_hit_tp})", "#3fb950") +
             _box("Hit +75% após SL", f"{pct_hit_75} ({n_hit_75})", "#3fb950") +
             _box("Hit +100% após SL", f"{pct_hit_100} ({n_hit_100})", "#e3b341")
@@ -10782,12 +10836,15 @@ def analise_post_sl_recovery():
             n_ticks = r.get("tick_count_after") or 0
             dex_url = f"https://dexscreener.com/solana/{r['mint']}"
             tp_icon = "✅" if r.get("hit_tp") else ("🟡" if r.get("hit_75") else ("⬜" if n_ticks >= 3 else "❓"))
+            src_badge = ("<span style='color:#3fb950;font-size:10px'>●real</span>"
+                         if r.get("entry_source") == "real"
+                         else "<span style='color:#8b949e;font-size:10px'>●est</span>")
 
             rows_html += f"""<tr>
               <td>{ts}</td>
               <td><b>{symbol}</b></td>
               <td>{_pct(r.get('pnl_pct_real'))}</td>
-              <td>{_mc(r.get('entry_expected'))}</td>
+              <td>{_mc(r.get('entry_mc_real'))} {src_badge}</td>
               <td style='color:#8b949e'>{_mc(r.get('mc_bottom'))}</td>
               <td>{_mc(r.get('max_mc_5m'))}</td>
               <td>{_mc(r.get('max_mc_10m'))}</td>
@@ -10806,12 +10863,16 @@ def analise_post_sl_recovery():
 <p style='color:#8b949e;font-size:11px'>
   H22: se sellers foram absorvidos, token recupera após SL.<br>
   ✅ = teria atingido o TP se não tivéssemos saído &nbsp;|&nbsp;
-  🟡 = subiu ≥75% &nbsp;|&nbsp; ⬜ = sem recuperação relevante &nbsp;|&nbsp; ❓ = sem dados
+  🟡 = subiu ≥75% &nbsp;|&nbsp; ⬜ = sem recuperação relevante &nbsp;|&nbsp; ❓ = sem dados<br>
+  <b>●real</b> = entrada via fill real (entry_price_usd/tokens×1B) &nbsp;|&nbsp;
+  <b>●est</b> = estimada (mc_bottom×1.15) — menos precisa<br>
+  <b>expired excluídos se pnl≥0</b> (trailing exits não são SLs reais).
 </p>
 <div class='nav'>
   <a href='/analise/wr-breakdown'>WR Breakdown</a>
   <a href='/debug/bounce-list'>Bounce List</a>
   <a href='/analise/h9'>H9</a>
+  <a href='/analise/h22-correlation'>H22 Correlation</a>
 </div>
 <br>
 {summary_html}
@@ -10826,7 +10887,311 @@ def analise_post_sl_recovery():
 </table>
 <p style='color:#484f58;font-size:11px;margin-top:12px'>
   Fonte: token_ticks coletados durante os 60min do HotMonitor.<br>
-  Trades sem ticks pós-saída = token saiu da janela quente antes do SL ou pouco depois.
+  Trades sem ticks pós-saída = token saiu da janela quente antes do SL ou pouco depois.<br>
+  expired com pnl≥0 excluídos (são trailing exits não reconciliados, não SLs reais).
+</p>
+</body></html>"""
+        return html
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
+@app.route("/analise/h22-correlation")
+def analise_h22_correlation():
+    """H22 — Correlação entre absorção pós-fundo (Helius) e outcome (TP/SL).
+    Instrumento de medição pronto antes dos dados chegarem.
+    Conclusões estatisticamente válidas só com n≥30 bounces com absorption_events > 0.
+    """
+    import traceback
+    try:
+        CSS = ("<style>body{background:#0d1117;color:#e6edf3;font:13px/1.6 monospace;padding:20px}"
+               "a{color:#58a6ff;text-decoration:none}table{border-collapse:collapse;width:100%}"
+               "th{background:#161b22;padding:6px 10px;text-align:left;font-size:11px;color:#8b949e}"
+               "td{padding:5px 10px;border-bottom:1px solid #21262d;font-size:12px}"
+               ".box{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px 16px;"
+               "margin:8px 4px;display:inline-block;vertical-align:top}"
+               ".lbl{color:#8b949e;font-size:11px}.val{font-size:20px;font-weight:bold}"
+               ".nav a{color:#58a6ff;margin-right:14px;font-size:12px}"
+               ".green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}"
+               ".dim{color:#484f58}.warn{color:#e3b341}"
+               "h2{color:#8b949e;font-size:12px;margin:20px 0 6px}"
+               "h1{color:#58a6ff;font-size:16px;margin-bottom:4px}</style>")
+
+        def _box(label, val, color="#e6edf3"):
+            return f"<div class='box'><div class='lbl'>{label}</div><div class='val' style='color:{color}'>{val}</div></div>"
+
+        with db._cursor() as cur:
+            # --- Cobertura geral ---
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS total_bounces,
+                    COUNT(CASE WHEN absorption_events > 0 THEN 1 END) AS with_helius,
+                    COUNT(CASE WHEN absorption_events IS NULL OR absorption_events = 0 THEN 1 END) AS no_helius
+                FROM bounce_signals
+            """)
+            cov = dict(cur.fetchone())
+
+            # --- Bounce signals com trades associados e outcome GMGN ---
+            # Join por mint — bounce_signals tem UNIQUE(mint), trades pode ter múltiplos por mint
+            # Pega o trade mais recente por mint com outcome definitivo
+            cur.execute("""
+                WITH latest_trade AS (
+                    SELECT DISTINCT ON (mint)
+                        mint,
+                        status,
+                        pnl_pct_real
+                    FROM trades
+                    WHERE status IN ('tp', 'sl', 'trailing_active', 'expired')
+                    ORDER BY mint, created_at DESC
+                )
+                SELECT
+                    b.mint,
+                    b.symbol,
+                    b.exchange,
+                    b.ts_signal,
+                    b.bounce_pct,
+                    b.elapsed_sec,
+                    b.absorption_events,
+                    b.absorption_buy_vol,
+                    b.absorption_sell_vol,
+                    b.absorption_buy_cnt,
+                    b.absorption_sell_cnt,
+                    b.absorption_lrg_buy,
+                    t.status,
+                    t.pnl_pct_real
+                FROM bounce_signals b
+                LEFT JOIN latest_trade t ON t.mint = b.mint
+                ORDER BY b.ts_signal DESC
+            """)
+            all_rows = [dict(r) for r in cur.fetchall()]
+
+        # --- Classify outcomes ---
+        TP_STATUS  = {'tp', 'trailing_active'}
+        SL_STATUS  = {'sl'}
+
+        for r in all_rows:
+            s = r.get("status") or ""
+            if s in TP_STATUS:
+                r["outcome"] = "tp"
+            elif s in SL_STATUS:
+                r["outcome"] = "sl"
+            elif s == "expired":
+                pnl = r.get("pnl_pct_real")
+                r["outcome"] = "tp" if (pnl is not None and pnl > 0) else "sl" if (pnl is not None) else None
+            else:
+                r["outcome"] = None  # no trade or pending
+
+            ev = r.get("absorption_events") or 0
+            bv = r.get("absorption_buy_vol") or 0.0
+            sv = r.get("absorption_sell_vol") or 0.0
+            lb = r.get("absorption_lrg_buy") or 0.0
+            r["has_helius"] = ev > 0
+            r["ratio"] = bv / sv if sv > 0 else (float("inf") if bv > 0 else None)
+            r["concentration"] = lb / bv if bv > 0 else None
+
+        # Rows with Helius data + outcome
+        helius_with_outcome = [r for r in all_rows if r["has_helius"] and r["outcome"] is not None]
+        helius_all          = [r for r in all_rows if r["has_helius"]]
+        traded_rows         = [r for r in all_rows if r["outcome"] is not None]
+
+        n_total    = cov["total_bounces"]
+        n_helius   = cov["with_helius"]
+        n_no_helius= cov["no_helius"]
+        gate_pct   = f"{n_helius/30*100:.0f}%" if n_helius < 30 else "ATINGIDO"
+
+        # --- Bucket helpers ---
+        def _wr_row(label, rows_subset, color_fn=None):
+            n   = len(rows_subset)
+            n_tp= sum(1 for r in rows_subset if r["outcome"] == "tp")
+            n_sl= sum(1 for r in rows_subset if r["outcome"] == "sl")
+            wr  = n_tp / (n_tp + n_sl) if (n_tp + n_sl) > 0 else None
+            wr_str = f"{wr*100:.0f}%" if wr is not None else "—"
+            if wr is None:
+                wr_color = "#484f58"
+            elif wr >= 0.40:
+                wr_color = "#3fb950"
+            elif wr >= 0.25:
+                wr_color = "#d29922"
+            else:
+                wr_color = "#f85149"
+            n_no_out = n - n_tp - n_sl
+            note = f"<span class='dim'>({n_no_out} sem trade)</span>" if n_no_out else ""
+            return (f"<tr><td>{label}</td><td>{n_tp+n_sl}</td>"
+                    f"<td style='color:{wr_color}'>{wr_str}</td>"
+                    f"<td>{n_tp}</td><td>{n_sl}</td>"
+                    f"<td class='dim'>{n}</td>{note}</tr>")
+
+        # --- Table 1: por absorption_events bucket ---
+        buckets_ev = [
+            ("0 (sem dados)",      [r for r in traded_rows if not r["has_helius"]]),
+            ("1–2 eventos",        [r for r in helius_with_outcome if 1 <= (r.get("absorption_events") or 0) <= 2]),
+            ("3–5 eventos",        [r for r in helius_with_outcome if 3 <= (r.get("absorption_events") or 0) <= 5]),
+            ("6–10 eventos",       [r for r in helius_with_outcome if 6 <= (r.get("absorption_events") or 0) <= 10]),
+            ("≥11 eventos",        [r for r in helius_with_outcome if (r.get("absorption_events") or 0) >= 11]),
+        ]
+        ev_rows_html = ""
+        for label, subset in buckets_ev:
+            ev_rows_html += _wr_row(label, subset)
+
+        # --- Table 2: por buy/sell ratio ---
+        def _ratio_rows():
+            no_flow   = [r for r in helius_with_outcome if r["ratio"] is None]
+            inf_ratio = [r for r in helius_with_outcome if r["ratio"] == float("inf")]
+            low       = [r for r in helius_with_outcome if r["ratio"] is not None and r["ratio"] != float("inf") and r["ratio"] < 0.5]
+            mid       = [r for r in helius_with_outcome if r["ratio"] is not None and r["ratio"] != float("inf") and 0.5 <= r["ratio"] < 1.0]
+            bal       = [r for r in helius_with_outcome if r["ratio"] is not None and r["ratio"] != float("inf") and 1.0 <= r["ratio"] < 1.5]
+            high      = [r for r in helius_with_outcome if r["ratio"] is not None and r["ratio"] != float("inf") and 1.5 <= r["ratio"] < 3.0]
+            dom       = [r for r in helius_with_outcome if r["ratio"] is not None and r["ratio"] != float("inf") and r["ratio"] >= 3.0]
+            rows = ""
+            rows += _wr_row("∞ (só compra, sell=0)",  inf_ratio)
+            rows += _wr_row("≥3× (compra domina)",    dom)
+            rows += _wr_row("1.5–3× (ligeira compra)", high)
+            rows += _wr_row("1.0–1.5× (equilibrado)", bal)
+            rows += _wr_row("0.5–1.0× (leve venda)",  mid)
+            rows += _wr_row("<0.5× (venda domina)",   low)
+            rows += _wr_row("no flow (ambos=0)",       no_flow)
+            return rows
+
+        ratio_rows_html = _ratio_rows()
+
+        # --- Table 3: buy_concentration ---
+        def _conc_rows():
+            rows = ""
+            no_conc = [r for r in helius_with_outcome if r["concentration"] is None]
+            high_c  = [r for r in helius_with_outcome if r["concentration"] is not None and r["concentration"] >= 0.8]
+            mid_c   = [r for r in helius_with_outcome if r["concentration"] is not None and 0.5 <= r["concentration"] < 0.8]
+            low_c   = [r for r in helius_with_outcome if r["concentration"] is not None and r["concentration"] < 0.5]
+            rows += _wr_row("≥0.8 (1 whale dominou)",          high_c)
+            rows += _wr_row("0.5–0.8 (whale + suporte)",       mid_c)
+            rows += _wr_row("<0.5 (múltiplos compradores)",     low_c)
+            rows += _wr_row("— (sem buy flow)",                 no_conc)
+            return rows
+
+        conc_rows_html = _conc_rows()
+
+        # --- Recent bounces with Helius data ---
+        def _outcome_badge(r):
+            o = r.get("outcome")
+            if o == "tp":   return "<span class='green'>TP</span>"
+            if o == "sl":   return "<span class='red'>SL</span>"
+            return "<span class='dim'>—</span>"
+
+        def _ratio_fmt(r):
+            v = r["ratio"]
+            if v is None:      return "<span class='dim'>no flow</span>"
+            if v == float("inf"): return "<span class='green'>∞</span>"
+            color = "#3fb950" if v >= 1.5 else ("#d29922" if v >= 1.0 else "#f85149")
+            return f"<span style='color:{color}'>{v:.2f}×</span>"
+
+        detail_rows = ""
+        for r in helius_all[:50]:
+            ev   = r.get("absorption_events") or 0
+            bv   = r.get("absorption_buy_vol") or 0
+            sv   = r.get("absorption_sell_vol") or 0
+            bc   = r.get("absorption_buy_cnt") or 0
+            lb   = r.get("absorption_lrg_buy") or 0
+            conc = f"{lb/bv:.2f}" if bv > 0 else "—"
+            ts   = r.get("ts_signal")
+            ts_str = ts.strftime("%m-%d %H:%M") if ts else "—"
+            detail_rows += (
+                f"<tr>"
+                f"<td>{ts_str}</td>"
+                f"<td>{r.get('symbol','?')}</td>"
+                f"<td>{ev}</td>"
+                f"<td>{bv:.3f}</td>"
+                f"<td>{sv:.3f}</td>"
+                f"<td>{_ratio_fmt(r)}</td>"
+                f"<td>{bc}</td>"
+                f"<td>{conc}</td>"
+                f"<td>{_outcome_badge(r)}</td>"
+                f"</tr>"
+            )
+
+        # --- Gate status ---
+        gate_color = "#3fb950" if n_helius >= 30 else ("#d29922" if n_helius >= 15 else "#f85149")
+        gate_msg   = ("✅ Gate atingido — conclusões válidas" if n_helius >= 30
+                      else f"⏳ {n_helius}/30 — acumulando dados ({gate_pct} do gate)")
+
+        html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>H22 Correlation</title>{CSS}
+</head><body>
+<h1>H22 — Correlação Absorção → Outcome (TP/SL)</h1>
+<p style='color:#8b949e;font-size:11px;margin-bottom:12px'>
+  H22: compra real no fundo (Helius pAMM) discrimina TP vs SL.<br>
+  Só tokens pump.fun pAMM têm cobertura. Conclusões válidas com n≥30 bounces com Helius data.
+</p>
+<div class='nav'>
+  <a href='/debug/absorption'>Absorption Debug</a>
+  <a href='/analise/wr-breakdown'>WR Breakdown</a>
+  <a href='/analise/post-sl-recovery'>Post-SL Recovery</a>
+  <a href='/analise/h9'>H9</a>
+</div>
+<br>
+
+{_box("Total bounces", n_total)}
+{_box("Com Helius", n_helius, gate_color)}
+{_box("Sem Helius", n_no_helius, "#8b949e")}
+{_box("Gate 30", gate_msg, gate_color)}
+{_box("Com trade+outcome", len(helius_with_outcome), "#58a6ff")}
+
+<br><br>
+<p style='color:{gate_color};font-size:12px'>⚠ {gate_msg}</p>
+<br>
+
+<h2>▸ Por volume de eventos Helius (absorption_events)</h2>
+<p style='color:#484f58;font-size:11px'>
+  "0" = sem dados Helius (inclui todos os bounces sem pump.fun pAMM ou anteriores à implementação).
+  Tokens com 0 eventos são ruído de base — comparar com grupos ≥1.
+</p>
+<table>
+  <thead><tr>
+    <th>Bucket</th><th>n (traded)</th><th>Win Rate</th><th>TP</th><th>SL</th><th>Total bounces</th>
+  </tr></thead>
+  <tbody>{ev_rows_html}</tbody>
+</table>
+
+<br>
+<h2>▸ Por ratio buy/sell (volume SOL nos 60s pós-fundo)</h2>
+<p style='color:#484f58;font-size:11px'>
+  ∞ = houve compra mas ZERO venda — sinal mais bullish possível.<br>
+  ≥3× = compradores pagaram 3× mais que vendedores no fundo.
+</p>
+<table>
+  <thead><tr>
+    <th>Ratio bucket</th><th>n (traded)</th><th>Win Rate</th><th>TP</th><th>SL</th><th>Total</th>
+  </tr></thead>
+  <tbody>{ratio_rows_html}</tbody>
+</table>
+
+<br>
+<h2>▸ Por concentração de compra (largest_buy / buy_vol)</h2>
+<p style='color:#484f58;font-size:11px'>
+  Alta concentração = 1 whale isolado. Baixa = múltiplos compradores reais.<br>
+  Hipótese: múltiplos compradores (conc &lt; 0.5) = suporte mais robusto.
+</p>
+<table>
+  <thead><tr>
+    <th>Concentração</th><th>n (traded)</th><th>Win Rate</th><th>TP</th><th>SL</th><th>Total</th>
+  </tr></thead>
+  <tbody>{conc_rows_html}</tbody>
+</table>
+
+<br>
+<h2>▸ Bounces com dados Helius (últimos {len(helius_all)})</h2>
+<table>
+  <thead><tr>
+    <th>Hora</th><th>Token</th><th>Eventos</th><th>Buy SOL</th><th>Sell SOL</th>
+    <th>Ratio</th><th>Buy cnt</th><th>Conc.</th><th>Outcome</th>
+  </tr></thead>
+  <tbody>{detail_rows if detail_rows else "<tr><td colspan='9' class='dim'>Nenhum bounce com dados Helius ainda</td></tr>"}</tbody>
+</table>
+
+<br>
+<p style='color:#484f58;font-size:11px;margin-top:12px'>
+  Janela Helius: 60s antes do bounce.<br>
+  GMGN é ground truth para TP/SL — DB status pode ter falsos positivos (TradeMonitor).<br>
+  Gate para ativar como filtro: n≥30 com absorption_events &gt; 0 + WR ≥15pp maior vs grupo sem dados.
 </p>
 </body></html>"""
         return html
