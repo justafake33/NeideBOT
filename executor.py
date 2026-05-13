@@ -23,6 +23,7 @@ import time
 from datetime import datetime, timezone
 
 import db
+import helius_rpc
 from gmgn_client import GmgnClient, get_sol_usd
 
 logger = logging.getLogger(__name__)
@@ -171,10 +172,15 @@ class TradeExecutor:
             _fail(trade_id, str(e))
             return
 
-        # 2. Poll fill em background — registra dados reais (slippage, fee, tokens, latência)
-        # Timeout de 120s: Solana pode demorar até 60s em congestionamento
+        # 2. Poll fill — registra dados reais (slippage, fee, tokens, latência)
+        # Estratégia em camadas:
+        #   a) GMGN query_order: tenta filled_output_amount (histórico: não retorna)
+        #   b) Helius getTransaction: lê o fill diretamente da blockchain (fonte primária)
+        # Timeout de 120s para GMGN; Helius fica tentando enquanto state=confirmed.
         FILL_TIMEOUT_SEC = int(os.getenv("FILL_TIMEOUT_SEC", "120"))
-        deadline = time.time() + FILL_TIMEOUT_SEC
+        deadline         = time.time() + FILL_TIMEOUT_SEC
+        confirmed_qr     = None  # guarda última resposta query_order confirmada
+
         while time.time() < deadline:
             try:
                 qr    = self.gmgn.query_order(order_id)
@@ -184,32 +190,57 @@ class TradeExecutor:
                 if state in ("failed", "expired"):
                     db.update_trade(trade_id, {"status": "error", "error_msg": f"swap on-chain: {state}"})
                     return
+                # Tenta fill via GMGN (pode não retornar os amounts)
                 out_raw = _safe_float(qd.get("filled_output_amount"))
                 if out_raw and out_raw > 0:
                     in_raw   = _safe_float(qd.get("filled_input_amount"))
-                    # in_raw pode estar em lamports (>1000) ou SOL
                     fill_sol = (in_raw / 1e9 if in_raw and in_raw > 1000 else in_raw) or amount_sol
                     fee_raw  = _safe_float(qd.get("fee"))
                     fee_sol  = (fee_raw / 1e9 if fee_raw and fee_raw > 1000 else fee_raw) or 0.0
-                    # slippage: diferença entre SOL real gasto e SOL intencionado
                     slippage = (fill_sol - amount_sol) / amount_sol if amount_sol else 0.0
                     db.update_trade(trade_id, {
                         "ts_order_confirmed": datetime.now(timezone.utc),
                         "tokens_received":    out_raw,
                         "entry_price_sol":    fill_sol / out_raw,
-                        "entry_price_usd":    fill_sol * sol_usd,  # USD gasto real
+                        "entry_price_usd":    fill_sol * sol_usd,
                         "fee_sol":            fee_sol,
                         "latency_sec":        (datetime.now(timezone.utc) - ts_signal).total_seconds(),
                         "slippage_pct":       slippage,
+                        "fill_source":        "gmgn",
                     })
-                    logger.info("Fill #%d %s — %.0f tokens @ %.10f SOL | slip=%.2f%% fee=%.6f SOL lat=%.1fs",
-                                trade_id, symbol, out_raw, fill_sol / out_raw,
-                                slippage * 100, fee_sol,
-                                (datetime.now(timezone.utc) - ts_signal).total_seconds())
+                    logger.info("Fill(GMGN) #%d %s — %.2f tokens @ %.10f SOL | slip=%.2f%% fee=%.6f SOL",
+                                trade_id, symbol, out_raw, fill_sol / out_raw, slippage * 100, fee_sol)
                     return
+                # GMGN confirmou mas sem amounts — salva resposta e tenta Helius
+                if state in ("processed", "confirmed"):
+                    confirmed_qr = qr
+                    tx_sig = helius_rpc.extract_tx_signature(qr)
+                    if tx_sig and helius_rpc.available():
+                        fill = helius_rpc.get_swap_fill(tx_sig, mint)
+                        if fill:
+                            sol_spent = fill["sol_spent"] or amount_sol
+                            tokens    = fill["tokens_received"]
+                            fee_sol   = fill["fee_sol"]
+                            slippage  = (sol_spent - amount_sol) / amount_sol if amount_sol else 0.0
+                            db.update_trade(trade_id, {
+                                "ts_order_confirmed": datetime.now(timezone.utc),
+                                "tokens_received":    tokens,
+                                "entry_price_sol":    sol_spent / tokens,
+                                "entry_price_usd":    sol_spent * sol_usd,
+                                "fee_sol":            fee_sol,
+                                "latency_sec":        (datetime.now(timezone.utc) - ts_signal).total_seconds(),
+                                "slippage_pct":       slippage,
+                                "fill_source":        "helius",
+                            })
+                            logger.info("Fill(Helius) #%d %s — %.2f tokens @ %.10f SOL | slip=%.2f%% fee=%.6f SOL",
+                                        trade_id, symbol, tokens, sol_spent / tokens, slippage * 100, fee_sol)
+                            return
             except Exception as e:
                 logger.debug("poll fill #%d: %s", trade_id, e)
             time.sleep(2)
+
+        # Timeout — fill não registrado. TradeMonitor vai tentar recuperar via _recover_fill.
+        logger.warning("Fill timeout #%d %s — entry_price_usd ficará NULL. TradeMonitor vai recuperar.", trade_id, symbol)
 
     def _check_persistence(self, mint: str, entry_expected: float, ts_signal) -> bool:
         """
@@ -321,49 +352,84 @@ class TradeMonitor:
             time.sleep(MONITOR_POLL_SEC)
 
     def _recover_fill(self, trade: dict, sol_usd: float) -> bool:
-        """Re-busca fill data do GMGN para trades com entry_price_usd=NULL.
+        """Recupera fill data para trades com entry_price_usd=NULL.
 
-        O loop de fill em _execute() pode expirar antes de GMGN popular
-        filled_output_amount (race condition: state=confirmed mas amounts ainda NULL).
-        Recupera esses dados retroativamente a cada ciclo do TradeMonitor.
-        Retorna True se fill foi recuperado.
+        Estratégia em camadas:
+          1. Helius getTransaction (fonte primária — blockchain direta)
+          2. GMGN query_order filled_output_amount (raramente retorna, mas tentamos)
+
+        O tx signature vem da resposta do query_order (campo confirmation.signature
+        ou similar). Sem HELIUS_RPC_URL configurado, cai no fallback GMGN.
         """
         order_id = trade.get("order_id")
         if not order_id:
             return False
         trade_id   = trade["id"]
+        mint       = trade["mint"]
         amount_sol = trade.get("amount_sol") or 0
-        symbol     = trade.get("symbol", trade["mint"][:8])
+        symbol     = trade.get("symbol", mint[:8])
+
         try:
-            res    = self.gmgn.query_order(order_id)
-            qd     = res.get("data") or res
+            res = self.gmgn.query_order(order_id)
+            qd  = res.get("data") or res
+
+            # --- Camada 1: Helius getTransaction ---
+            tx_sig = helius_rpc.extract_tx_signature(res)
+            if tx_sig and helius_rpc.available():
+                fill = helius_rpc.get_swap_fill(tx_sig, mint)
+                if fill:
+                    sol_spent = fill["sol_spent"] or amount_sol
+                    tokens    = fill["tokens_received"]
+                    fee_sol   = fill["fee_sol"]
+                    slippage  = (sol_spent - amount_sol) / amount_sol if amount_sol else 0.0
+                    db.update_trade(trade_id, {
+                        "tokens_received": tokens,
+                        "entry_price_sol": sol_spent / tokens,
+                        "entry_price_usd": sol_spent * sol_usd,
+                        "fee_sol":         fee_sol,
+                        "slippage_pct":    slippage,
+                        "fill_source":     "helius_recovery",
+                    })
+                    logger.info(
+                        "_recover_fill(Helius) #%d %s — %.2f tokens @ %.10f SOL",
+                        trade_id, symbol, tokens, sol_spent / tokens,
+                    )
+                    return True
+
+            # --- Camada 2: GMGN filled_output_amount ---
             out_raw = _safe_float(qd.get("filled_output_amount"))
-            if not out_raw or out_raw <= 0:
+            if out_raw and out_raw > 0:
+                in_raw   = _safe_float(qd.get("filled_input_amount"))
+                fill_sol = (in_raw / 1e9 if in_raw and in_raw > 1000 else in_raw) or amount_sol
+                fee_raw  = _safe_float(qd.get("fee"))
+                fee_sol  = (fee_raw / 1e9 if fee_raw and fee_raw > 1000 else fee_raw) or 0.0
+                slippage = (fill_sol - amount_sol) / amount_sol if amount_sol else 0.0
+                db.update_trade(trade_id, {
+                    "tokens_received": out_raw,
+                    "entry_price_sol": fill_sol / out_raw,
+                    "entry_price_usd": fill_sol * sol_usd,
+                    "fee_sol":         fee_sol,
+                    "slippage_pct":    slippage,
+                    "fill_source":     "gmgn_recovery",
+                })
                 logger.info(
-                    "_recover_fill #%d %s — filled_output_amount ausente. order_id=%s keys=%s",
-                    trade_id, symbol, order_id[:16], list(qd.keys()),
+                    "_recover_fill(GMGN) #%d %s — %.2f tokens @ %.10f SOL",
+                    trade_id, symbol, out_raw, fill_sol / out_raw,
                 )
-                return False
-            in_raw   = _safe_float(qd.get("filled_input_amount"))
-            fill_sol = (in_raw / 1e9 if in_raw and in_raw > 1000 else in_raw) or amount_sol
-            fee_raw  = _safe_float(qd.get("fee"))
-            fee_sol  = (fee_raw / 1e9 if fee_raw and fee_raw > 1000 else fee_raw) or 0.0
-            slippage = (fill_sol - amount_sol) / amount_sol if amount_sol else 0.0
-            db.update_trade(trade_id, {
-                "tokens_received": out_raw,
-                "entry_price_sol": fill_sol / out_raw,
-                "entry_price_usd": fill_sol * sol_usd,
-                "fee_sol":         fee_sol,
-                "slippage_pct":    slippage,
-            })
+                return True
+
+            # Sem dados de nenhuma fonte — loga para diagnóstico
             logger.info(
-                "TradeMonitor _recover_fill #%d %s — %.0f tokens @ %.10f SOL (fill recuperado retroativamente)",
-                trade_id, symbol, out_raw, fill_sol / out_raw,
+                "_recover_fill #%d %s — sem fill em nenhuma fonte. "
+                "tx_sig=%s helius=%s gmgn_keys=%s",
+                trade_id, symbol,
+                tx_sig[:16] if tx_sig else "None",
+                helius_rpc.available(),
+                list(qd.keys()),
             )
-            return True
         except Exception as e:
             logger.debug("_recover_fill #%d: %s", trade_id, e)
-            return False
+        return False
 
     def _check_all(self):
         sol_usd = get_sol_usd() or 0
@@ -428,6 +494,81 @@ class TradeMonitor:
             "lrg_buy":    w.get("largest_buy",  0) or 0,
         })
 
+    def _check_position_closed(self, trade: dict, sol_usd: float, now: datetime) -> bool:
+        """Verifica via Helius RPC se a posição foi fechada (saldo do token = 0).
+
+        Chamado como fallback quando não há token_ticks disponíveis.
+        Se get_token_balance() retorna 0, o GMGN executou o TP ou SL.
+        Infere qual via comparação do último MC conhecido com os thresholds.
+
+        Retorna True se detectou e registrou o fechamento.
+        """
+        if not helius_rpc.available():
+            return False
+
+        mint     = trade["mint"]
+        trade_id = trade["id"]
+        symbol   = trade.get("symbol", mint[:8])
+
+        balance = helius_rpc.get_token_balance(mint)
+        if balance > 0:
+            return False  # posição ainda aberta
+
+        # Saldo zero — GMGN executou TP ou SL. Inferir qual.
+        entry_price_usd = trade.get("entry_price_usd")
+        tokens_received = trade.get("tokens_received")
+        amount_usd      = trade.get("amount_usd") or 1.0
+        sl_pct          = trade.get("sl_pct") or TRADE_SL_PCT
+        tp_pct          = trade.get("tp_pct") or (TRAILING_ACTIVATION_PCT / 100)
+
+        entry_mc_real = None
+        if entry_price_usd and tokens_received and tokens_received > 0:
+            entry_mc_real = (entry_price_usd / tokens_received) * PUMP_FUN_SUPPLY
+        entry_ref = entry_mc_real or trade.get("entry_expected") or 0
+
+        # Último MC conhecido nos ticks — proxy para o preço de saída
+        last_mc  = None
+        ref_ts   = trade.get("ts_order_sent") or trade.get("ts_signal") or trade.get("created_at")
+        if ref_ts:
+            try:
+                ticks = db.get_ticks_after(mint, min_ts=ref_ts)
+                if ticks:
+                    last_mc = float(ticks[-1].get("mc") or 0) or None
+            except Exception:
+                pass
+
+        # Inferência: se último MC conhecido está abaixo do SL threshold → SL
+        # Se acima do TP threshold → TP/trailing
+        # Se não consegue determinar → "closed_by_gmgn" como tipo de saída
+        if entry_ref and last_mc:
+            ratio = last_mc / entry_ref
+            if ratio <= (1 - sl_pct * 0.9):
+                status, exit_type, pnl = "sl",      "sl",      -sl_pct
+            elif ratio >= (1 + tp_pct * 0.9):
+                status, exit_type, pnl = "tp",      "trailing", ratio - 1
+            else:
+                # MC entre SL e TP — provavelmente trailing disparou em algum ponto
+                # Não conseguimos saber o preço exato de saída, marcamos trailing_active
+                # para o _check_trailing_exit tentar refinar via ticks históricos
+                status, exit_type, pnl = "trailing_active", "trailing", None
+        else:
+            status, exit_type, pnl = "trailing_active", "closed_by_gmgn", None
+
+        db.update_trade(trade_id, {
+            "status":       status,
+            "exit_type":    exit_type,
+            "exit_ts":      now,
+            "pnl_pct_real": pnl,
+        })
+        logger.info(
+            "TradeMonitor Helius-balance #%d %s — saldo=0 → %s | "
+            "last_mc=$%.0f entry_ref=$%.0f pnl=%s",
+            trade_id, symbol, status.upper(),
+            last_mc or 0, entry_ref,
+            f"{pnl*100:.1f}%" if pnl is not None else "?",
+        )
+        return True
+
     def _check_trade(self, trade: dict, sol_usd: float, now: datetime):
         trade_id        = trade["id"]
         mint            = trade["mint"]
@@ -465,12 +606,21 @@ class TradeMonitor:
         # gerando falsos positivos que mostram +75% quando o real foi -15%.
         sl_ref  = entry_mc_real or entry_mc
         sl_mc   = sl_ref * (1 - sl_pct)
-        tp_mc   = entry_mc_real * (1 + tp_pct) if entry_mc_real else None
+        # tp_mc: usa entry_mc_real se disponível.
+        # Fallback para entry_expected quando fill não foi registrado (GMGN não retorna
+        # filled_output_amount no query_order). entry_expected é conservador (real fill
+        # é igual ou maior), então tp_mc calculado assim é igual ou menor que o real —
+        # detecta TP um pouco cedo, mas sem falso positivo estrutural.
+        # Detectado sem fill → marca trailing_active (não tp direto) para sinalizar incerteza.
+        tp_mc            = entry_mc_real * (1 + tp_pct) if entry_mc_real else entry_mc * (1 + tp_pct)
+        tp_from_expected = entry_mc_real is None  # flag: tp_mc baseado em entry_expected
 
         ticks = db.get_ticks_after(mint, min_ts=ref_ts)
         if not ticks:
-            # Sem ticks (token fora da janela quente >60min) — pergunta direto ao GMGN.
-            self._check_via_gmgn(trade, sol_usd, now)
+            # Sem ticks — usa Helius para checar se posição ainda está aberta.
+            # Helius é a fonte primária (blockchain). GMGN condition_orders como fallback.
+            if not self._check_position_closed(trade, sol_usd, now):
+                self._check_via_gmgn(trade, sol_usd, now)
             return
 
         for tick in ticks:
@@ -478,10 +628,16 @@ class TradeMonitor:
             low     = float(tick["mc_low"]  or 0)
             tick_ts = tick["tick_ts"]
 
-            # TP/trailing: só detecta se temos o preço real de fill.
-            # Sem entry_mc_real, tp_mc é None e este bloco nunca executa.
             if tp_mc and high >= tp_mc:
-                self._record_exit(trade, "trailing_active", tp_pct, tick_ts, sol_usd)
+                # Fill desconhecido → marca trailing_active (GMGN gerencia saída real).
+                # Fill conhecido → trailing_active para _check_trailing_exit acompanhar.
+                exit_label = "trailing_active"
+                logger.info(
+                    "TradeMonitor #%d %s — TP zone (high=$%.0f tp_mc=$%.0f%s)",
+                    trade_id, symbol, high, tp_mc,
+                    " via entry_expected" if tp_from_expected else "",
+                )
+                self._record_exit(trade, exit_label, tp_pct, tick_ts, sol_usd)
                 return
             if low > 0 and low <= sl_mc:
                 self._record_exit(trade, "sl", -sl_pct, tick_ts, sol_usd)
@@ -584,7 +740,8 @@ class TradeMonitor:
         ref_ts = trade.get("ts_order_sent") or trade.get("exit_ts") or trade.get("ts_signal")
         ticks  = db.get_ticks_after(mint, min_ts=ref_ts)
         if not ticks:
-            self._check_via_gmgn(trade, sol_usd, now)
+            if not self._check_position_closed(trade, sol_usd, now):
+                self._check_via_gmgn(trade, sol_usd, now)
             return
 
         activation_mc = entry_mc_real * (1 + TRAILING_ACTIVATION_PCT / 100)

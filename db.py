@@ -266,6 +266,14 @@ def init_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_mint   ON trades (mint)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades (status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts     ON trades (created_at DESC)")
+        # Colunas adicionadas progressivamente
+        for col in [
+            "ADD COLUMN IF NOT EXISTS fill_source TEXT",  # gmgn | helius | helius_recovery | gmgn_recovery
+        ]:
+            try:
+                cur.execute(f"ALTER TABLE trades {col}")
+            except Exception:
+                pass
 
         # Série temporal de absorção durante o holding — captação pura, zero decisão.
         # Cruzar com outcome (TP/SL) do trade depois que n for suficiente.
