@@ -10601,6 +10601,7 @@ def debug_absorption():
 <b>Dados brutos apenas</b> — score/grade removidos. Correlacionar com outcome (TP/SL) após n≥30 bounces com dados.<br>
 ⚠️ <b>H22 só captura pump.fun pAMM.</b> Tokens em Raydium/Meteora/outros sempre terão absorption_events=NULL.</p>
 <div class='nav'>
+  <a href='/analise/h22-correlation'>H22 Correlation</a>
   <a href='/analise/post-sl-recovery'>Post-SL Recovery</a>
   <a href='/debug/bounce-list'>Bounce List</a>
   <a href='/debug/executor-status'>Executor</a>
@@ -10827,6 +10828,309 @@ def analise_post_sl_recovery():
 <p style='color:#484f58;font-size:11px;margin-top:12px'>
   Fonte: token_ticks coletados durante os 60min do HotMonitor.<br>
   Trades sem ticks pós-saída = token saiu da janela quente antes do SL ou pouco depois.
+</p>
+</body></html>"""
+        return html
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
+@app.route("/analise/h22-correlation")
+def analise_h22_correlation():
+    """H22 — Correlação entre absorção pós-fundo (Helius) e outcome (TP/SL).
+    Instrumento de medição pronto antes dos dados chegarem.
+    Conclusões estatisticamente válidas só com n≥30 bounces com absorption_events > 0.
+    """
+    import traceback
+    try:
+        CSS = ("<style>body{background:#0d1117;color:#e6edf3;font:13px/1.6 monospace;padding:20px}"
+               "a{color:#58a6ff;text-decoration:none}table{border-collapse:collapse;width:100%}"
+               "th{background:#161b22;padding:6px 10px;text-align:left;font-size:11px;color:#8b949e}"
+               "td{padding:5px 10px;border-bottom:1px solid #21262d;font-size:12px}"
+               ".box{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px 16px;"
+               "margin:8px 4px;display:inline-block;vertical-align:top}"
+               ".lbl{color:#8b949e;font-size:11px}.val{font-size:20px;font-weight:bold}"
+               ".nav a{color:#58a6ff;margin-right:14px;font-size:12px}"
+               ".green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}"
+               ".dim{color:#484f58}.warn{color:#e3b341}"
+               "h2{color:#8b949e;font-size:12px;margin:20px 0 6px}"
+               "h1{color:#58a6ff;font-size:16px;margin-bottom:4px}</style>")
+
+        def _box(label, val, color="#e6edf3"):
+            return f"<div class='box'><div class='lbl'>{label}</div><div class='val' style='color:{color}'>{val}</div></div>"
+
+        with db._cursor() as cur:
+            # --- Cobertura geral ---
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS total_bounces,
+                    COUNT(CASE WHEN absorption_events > 0 THEN 1 END) AS with_helius,
+                    COUNT(CASE WHEN absorption_events IS NULL OR absorption_events = 0 THEN 1 END) AS no_helius
+                FROM bounce_signals
+            """)
+            cov = dict(cur.fetchone())
+
+            # --- Bounce signals com trades associados e outcome GMGN ---
+            # Join por mint — bounce_signals tem UNIQUE(mint), trades pode ter múltiplos por mint
+            # Pega o trade mais recente por mint com outcome definitivo
+            cur.execute("""
+                WITH latest_trade AS (
+                    SELECT DISTINCT ON (mint)
+                        mint,
+                        status,
+                        pnl_pct_real
+                    FROM trades
+                    WHERE status IN ('tp', 'sl', 'trailing_active', 'expired')
+                    ORDER BY mint, created_at DESC
+                )
+                SELECT
+                    b.mint,
+                    b.symbol,
+                    b.exchange,
+                    b.ts_signal,
+                    b.bounce_pct,
+                    b.elapsed_sec,
+                    b.absorption_events,
+                    b.absorption_buy_vol,
+                    b.absorption_sell_vol,
+                    b.absorption_buy_cnt,
+                    b.absorption_sell_cnt,
+                    b.absorption_lrg_buy,
+                    t.status,
+                    t.pnl_pct_real
+                FROM bounce_signals b
+                LEFT JOIN latest_trade t ON t.mint = b.mint
+                ORDER BY b.ts_signal DESC
+            """)
+            all_rows = [dict(r) for r in cur.fetchall()]
+
+        # --- Classify outcomes ---
+        TP_STATUS  = {'tp', 'trailing_active'}
+        SL_STATUS  = {'sl'}
+
+        for r in all_rows:
+            s = r.get("status") or ""
+            if s in TP_STATUS:
+                r["outcome"] = "tp"
+            elif s in SL_STATUS:
+                r["outcome"] = "sl"
+            elif s == "expired":
+                pnl = r.get("pnl_pct_real")
+                r["outcome"] = "tp" if (pnl is not None and pnl > 0) else "sl" if (pnl is not None) else None
+            else:
+                r["outcome"] = None  # no trade or pending
+
+            ev = r.get("absorption_events") or 0
+            bv = r.get("absorption_buy_vol") or 0.0
+            sv = r.get("absorption_sell_vol") or 0.0
+            lb = r.get("absorption_lrg_buy") or 0.0
+            r["has_helius"] = ev > 0
+            r["ratio"] = bv / sv if sv > 0 else (float("inf") if bv > 0 else None)
+            r["concentration"] = lb / bv if bv > 0 else None
+
+        # Rows with Helius data + outcome
+        helius_with_outcome = [r for r in all_rows if r["has_helius"] and r["outcome"] is not None]
+        helius_all          = [r for r in all_rows if r["has_helius"]]
+        traded_rows         = [r for r in all_rows if r["outcome"] is not None]
+
+        n_total    = cov["total_bounces"]
+        n_helius   = cov["with_helius"]
+        n_no_helius= cov["no_helius"]
+        gate_pct   = f"{n_helius/30*100:.0f}%" if n_helius < 30 else "ATINGIDO"
+
+        # --- Bucket helpers ---
+        def _wr_row(label, rows_subset, color_fn=None):
+            n   = len(rows_subset)
+            n_tp= sum(1 for r in rows_subset if r["outcome"] == "tp")
+            n_sl= sum(1 for r in rows_subset if r["outcome"] == "sl")
+            wr  = n_tp / (n_tp + n_sl) if (n_tp + n_sl) > 0 else None
+            wr_str = f"{wr*100:.0f}%" if wr is not None else "—"
+            if wr is None:
+                wr_color = "#484f58"
+            elif wr >= 0.40:
+                wr_color = "#3fb950"
+            elif wr >= 0.25:
+                wr_color = "#d29922"
+            else:
+                wr_color = "#f85149"
+            n_no_out = n - n_tp - n_sl
+            note = f"<span class='dim'>({n_no_out} sem trade)</span>" if n_no_out else ""
+            return (f"<tr><td>{label}</td><td>{n_tp+n_sl}</td>"
+                    f"<td style='color:{wr_color}'>{wr_str}</td>"
+                    f"<td>{n_tp}</td><td>{n_sl}</td>"
+                    f"<td class='dim'>{n}</td>{note}</tr>")
+
+        # --- Table 1: por absorption_events bucket ---
+        buckets_ev = [
+            ("0 (sem dados)",      [r for r in traded_rows if not r["has_helius"]]),
+            ("1–2 eventos",        [r for r in helius_with_outcome if 1 <= (r.get("absorption_events") or 0) <= 2]),
+            ("3–5 eventos",        [r for r in helius_with_outcome if 3 <= (r.get("absorption_events") or 0) <= 5]),
+            ("6–10 eventos",       [r for r in helius_with_outcome if 6 <= (r.get("absorption_events") or 0) <= 10]),
+            ("≥11 eventos",        [r for r in helius_with_outcome if (r.get("absorption_events") or 0) >= 11]),
+        ]
+        ev_rows_html = ""
+        for label, subset in buckets_ev:
+            ev_rows_html += _wr_row(label, subset)
+
+        # --- Table 2: por buy/sell ratio ---
+        def _ratio_rows():
+            no_flow   = [r for r in helius_with_outcome if r["ratio"] is None]
+            inf_ratio = [r for r in helius_with_outcome if r["ratio"] == float("inf")]
+            low       = [r for r in helius_with_outcome if r["ratio"] is not None and r["ratio"] != float("inf") and r["ratio"] < 0.5]
+            mid       = [r for r in helius_with_outcome if r["ratio"] is not None and r["ratio"] != float("inf") and 0.5 <= r["ratio"] < 1.0]
+            bal       = [r for r in helius_with_outcome if r["ratio"] is not None and r["ratio"] != float("inf") and 1.0 <= r["ratio"] < 1.5]
+            high      = [r for r in helius_with_outcome if r["ratio"] is not None and r["ratio"] != float("inf") and 1.5 <= r["ratio"] < 3.0]
+            dom       = [r for r in helius_with_outcome if r["ratio"] is not None and r["ratio"] != float("inf") and r["ratio"] >= 3.0]
+            rows = ""
+            rows += _wr_row("∞ (só compra, sell=0)",  inf_ratio)
+            rows += _wr_row("≥3× (compra domina)",    dom)
+            rows += _wr_row("1.5–3× (ligeira compra)", high)
+            rows += _wr_row("1.0–1.5× (equilibrado)", bal)
+            rows += _wr_row("0.5–1.0× (leve venda)",  mid)
+            rows += _wr_row("<0.5× (venda domina)",   low)
+            rows += _wr_row("no flow (ambos=0)",       no_flow)
+            return rows
+
+        ratio_rows_html = _ratio_rows()
+
+        # --- Table 3: buy_concentration ---
+        def _conc_rows():
+            rows = ""
+            no_conc = [r for r in helius_with_outcome if r["concentration"] is None]
+            high_c  = [r for r in helius_with_outcome if r["concentration"] is not None and r["concentration"] >= 0.8]
+            mid_c   = [r for r in helius_with_outcome if r["concentration"] is not None and 0.5 <= r["concentration"] < 0.8]
+            low_c   = [r for r in helius_with_outcome if r["concentration"] is not None and r["concentration"] < 0.5]
+            rows += _wr_row("≥0.8 (1 whale dominou)",          high_c)
+            rows += _wr_row("0.5–0.8 (whale + suporte)",       mid_c)
+            rows += _wr_row("<0.5 (múltiplos compradores)",     low_c)
+            rows += _wr_row("— (sem buy flow)",                 no_conc)
+            return rows
+
+        conc_rows_html = _conc_rows()
+
+        # --- Recent bounces with Helius data ---
+        def _outcome_badge(r):
+            o = r.get("outcome")
+            if o == "tp":   return "<span class='green'>TP</span>"
+            if o == "sl":   return "<span class='red'>SL</span>"
+            return "<span class='dim'>—</span>"
+
+        def _ratio_fmt(r):
+            v = r["ratio"]
+            if v is None:      return "<span class='dim'>no flow</span>"
+            if v == float("inf"): return "<span class='green'>∞</span>"
+            color = "#3fb950" if v >= 1.5 else ("#d29922" if v >= 1.0 else "#f85149")
+            return f"<span style='color:{color}'>{v:.2f}×</span>"
+
+        detail_rows = ""
+        for r in helius_all[:50]:
+            ev   = r.get("absorption_events") or 0
+            bv   = r.get("absorption_buy_vol") or 0
+            sv   = r.get("absorption_sell_vol") or 0
+            bc   = r.get("absorption_buy_cnt") or 0
+            lb   = r.get("absorption_lrg_buy") or 0
+            conc = f"{lb/bv:.2f}" if bv > 0 else "—"
+            ts   = r.get("ts_signal")
+            ts_str = ts.strftime("%m-%d %H:%M") if ts else "—"
+            detail_rows += (
+                f"<tr>"
+                f"<td>{ts_str}</td>"
+                f"<td>{r.get('symbol','?')}</td>"
+                f"<td>{ev}</td>"
+                f"<td>{bv:.3f}</td>"
+                f"<td>{sv:.3f}</td>"
+                f"<td>{_ratio_fmt(r)}</td>"
+                f"<td>{bc}</td>"
+                f"<td>{conc}</td>"
+                f"<td>{_outcome_badge(r)}</td>"
+                f"</tr>"
+            )
+
+        # --- Gate status ---
+        gate_color = "#3fb950" if n_helius >= 30 else ("#d29922" if n_helius >= 15 else "#f85149")
+        gate_msg   = ("✅ Gate atingido — conclusões válidas" if n_helius >= 30
+                      else f"⏳ {n_helius}/30 — acumulando dados ({gate_pct} do gate)")
+
+        html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>H22 Correlation</title>{CSS}
+</head><body>
+<h1>H22 — Correlação Absorção → Outcome (TP/SL)</h1>
+<p style='color:#8b949e;font-size:11px;margin-bottom:12px'>
+  H22: compra real no fundo (Helius pAMM) discrimina TP vs SL.<br>
+  Só tokens pump.fun pAMM têm cobertura. Conclusões válidas com n≥30 bounces com Helius data.
+</p>
+<div class='nav'>
+  <a href='/debug/absorption'>Absorption Debug</a>
+  <a href='/analise/wr-breakdown'>WR Breakdown</a>
+  <a href='/analise/post-sl-recovery'>Post-SL Recovery</a>
+  <a href='/analise/h9'>H9</a>
+</div>
+<br>
+
+{_box("Total bounces", n_total)}
+{_box("Com Helius", n_helius, gate_color)}
+{_box("Sem Helius", n_no_helius, "#8b949e")}
+{_box("Gate 30", gate_msg, gate_color)}
+{_box("Com trade+outcome", len(helius_with_outcome), "#58a6ff")}
+
+<br><br>
+<p style='color:{gate_color};font-size:12px'>⚠ {gate_msg}</p>
+<br>
+
+<h2>▸ Por volume de eventos Helius (absorption_events)</h2>
+<p style='color:#484f58;font-size:11px'>
+  "0" = sem dados Helius (inclui todos os bounces sem pump.fun pAMM ou anteriores à implementação).
+  Tokens com 0 eventos são ruído de base — comparar com grupos ≥1.
+</p>
+<table>
+  <thead><tr>
+    <th>Bucket</th><th>n (traded)</th><th>Win Rate</th><th>TP</th><th>SL</th><th>Total bounces</th>
+  </tr></thead>
+  <tbody>{ev_rows_html}</tbody>
+</table>
+
+<br>
+<h2>▸ Por ratio buy/sell (volume SOL nos 60s pós-fundo)</h2>
+<p style='color:#484f58;font-size:11px'>
+  ∞ = houve compra mas ZERO venda — sinal mais bullish possível.<br>
+  ≥3× = compradores pagaram 3× mais que vendedores no fundo.
+</p>
+<table>
+  <thead><tr>
+    <th>Ratio bucket</th><th>n (traded)</th><th>Win Rate</th><th>TP</th><th>SL</th><th>Total</th>
+  </tr></thead>
+  <tbody>{ratio_rows_html}</tbody>
+</table>
+
+<br>
+<h2>▸ Por concentração de compra (largest_buy / buy_vol)</h2>
+<p style='color:#484f58;font-size:11px'>
+  Alta concentração = 1 whale isolado. Baixa = múltiplos compradores reais.<br>
+  Hipótese: múltiplos compradores (conc &lt; 0.5) = suporte mais robusto.
+</p>
+<table>
+  <thead><tr>
+    <th>Concentração</th><th>n (traded)</th><th>Win Rate</th><th>TP</th><th>SL</th><th>Total</th>
+  </tr></thead>
+  <tbody>{conc_rows_html}</tbody>
+</table>
+
+<br>
+<h2>▸ Bounces com dados Helius (últimos {len(helius_all)})</h2>
+<table>
+  <thead><tr>
+    <th>Hora</th><th>Token</th><th>Eventos</th><th>Buy SOL</th><th>Sell SOL</th>
+    <th>Ratio</th><th>Buy cnt</th><th>Conc.</th><th>Outcome</th>
+  </tr></thead>
+  <tbody>{detail_rows if detail_rows else "<tr><td colspan='9' class='dim'>Nenhum bounce com dados Helius ainda</td></tr>"}</tbody>
+</table>
+
+<br>
+<p style='color:#484f58;font-size:11px;margin-top:12px'>
+  Janela Helius: 60s antes do bounce.<br>
+  GMGN é ground truth para TP/SL — DB status pode ter falsos positivos (TradeMonitor).<br>
+  Gate para ativar como filtro: n≥30 com absorption_events &gt; 0 + WR ≥15pp maior vs grupo sem dados.
 </p>
 </body></html>"""
         return html

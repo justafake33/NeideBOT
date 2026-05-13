@@ -590,6 +590,7 @@ ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
 | `/debug/bounce-list` | **Lista de bounces** — tokens com bounce ≥ X% nas últimas 48h com links DexScreener/GMGN. `?bounce=0.50&hours=48`. Auto-refresh 30s. |
 | `/debug/absorption` | **H22 Absorption Debug** — janela buy/sell ao vivo por token ativo + últimos 30 bounces com ratio buy/sell e cobertura Helius. Auto-refresh 10s. Score/grade ausentes — coleta bruta apenas. |
 | `/analise/post-sl-recovery` | **Post-SL Recovery** — para cada SL, max MC nos ticks pós-exit. 12% atingiriam TP (8/64). 88% continuaram dumpando. Confirma H21 estruturalmente. |
+| `/analise/h22-correlation` | **H22 Correlation** — correlação entre absorção pós-fundo (Helius) e outcome TP/SL. Tabelas por bucket: absorption_events (0/1-2/3-5/6-10/≥11), buy/sell ratio (∞/≥3×/1.5-3×/etc.), concentração (largest_buy/buy_vol). Instrumento pronto antes dos dados chegarem — n=? cresce com o bot ativo. Gate: n≥30 com Helius. |
 
 ---
 

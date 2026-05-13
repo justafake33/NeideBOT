@@ -32,6 +32,8 @@
 | Análise big player (síntese ChatGPT + sessão) | 2026-05-12 | Identificado detector de absorção pós-fundo como próxima grande alavanca |
 | **H22 — Coleta de absorção implementada** | 2026-05-12 | `helius_ws.py`: deque(maxlen=300) por mint acumula `{ts, side, sol, mc}` de cada BuyEvent/SellEvent do pAMM. `get_absorption_window(mint, 60)` expõe buy_vol, sell_vol, counts, ratio, largest_buy. `bounce_signals` recebe 8 campos de absorção. `/debug/absorption` mostra dados ao vivo + histórico. Score/grade **não calculados** — coleta de métricas brutas apenas. |
 | **H22 — Score removido (dados antes de fórmula)** | 2026-05-12 | `_absorption_score()` deletada do scanner.py. Score não existe sem correlação real com TP/SL. Construir fórmula APÓS n≥30 bounces com `absorption_events > 0` e outcomes GMGN confirmados. |
+| **FILTER_PUMP_ONLY=true** | 2026-05-13 | Scanner rejeita migrações onde `exchange` não contém "pump". Garante que todos os futuros bounces sejam H22-capturáveis via Helius pAMM. `exchange` propagado por HotMonitor → bounce_signals. |
+| **`/analise/h22-correlation`** | 2026-05-13 | Dashboard H22: 3 tabelas (absorption_events buckets, buy/sell ratio, buy_concentration). Instrumento de medição pronto. Gate: n≥30 com Helius data. |
 | **Fix mc_peak inflado (kline high → close)** | 2026-05-12 | Kline `high` incluía spikes intra-candle de transações em pools com baixa liquidez — um único whale buy pode empurrar o AMM price 200x por <1s. Scanner mostrava ganhos de 5000-25000% (ex: DIAMOND $9M peak mas mc_1h = $39K). Fix: `_precise_bottom_tick()` e `_graduate()` agora usam `close × supply` para mc_peak. `mc_high` nos token_ticks mantido para o backtester. |
 | **`/analise/post-sl-recovery`** | 2026-05-12 | Para cada SL, busca o max MC nos token_ticks após exit_ts. 12% dos SLs (8/64 com dados) teriam atingido o TP depois. 88% são dumps genuínos que continuaram. ⚠️ Número pendente de correção: usa `entry_expected` (mc_bottom × 1.15), não entrada real (`entry_price_usd / tokens_received × 1B`). |
 
@@ -80,10 +82,10 @@
 
 **⚠️ COBERTURA HELIUS — DIAGNÓSTICO (2026-05-13):**
 ```sql
--- bounce_signals: total=529, com_helius=9, sem_helius=520
--- Cobertura real: 1.7%
+-- bounce_signals: total=529+, com_helius=23+, sem_helius=~520
+-- Cobertura real: ~4.3% e crescendo (era 1.7% no início da sessão 2026-05-13)
 ```
-529 bounces registrados. Apenas **9 têm `absorption_events > 0`**. 520 têm NULL.
+529+ bounces registrados. **23+ têm `absorption_events > 0`** (cresceu de 9 durante a sessão). Restantes têm NULL.
 Causa provável: Helius subscreve o mint quando o token entra no HotMonitor, mas os BuyEvent/SellEvent do pAMM chegam com baixa taxa para a maioria dos tokens — muitos bounces disparam em janelas onde poucos swaps ocorreram pela subscrição Helius.
 
 **Implicação direta:** Tarefa B (h22-correlation) é prematura. Com n=9 observações, qualquer correlação é ruído.
@@ -121,9 +123,9 @@ Também: separar `sl` de `expired`. `expired` com `pnl_pct_real ≥ 0` não é S
 
 Com 1.7% de cobertura real, snapshots pós-bounce também virão zerados para 98% dos tokens. Implementar depois que cobertura subir para nível útil.
 
-**E — `/analise/h22-correlation`** ← IMPLEMENTAR AGORA (instrumento pronto antes dos dados chegarem)
+**E — `/analise/h22-correlation`** ← ✅ IMPLEMENTADO (2026-05-13)
 
-Dashboard mostra correlação H22 → outcome com n atual (hoje=9). Conclusões só valem com n≥30, mas o dashboard fica pronto para quando os dados chegarem. Bot ativo = bounces acumulando = cobertura crescendo. Construir instrumento de medição enquanto dados acumulam é o caminho correto.
+Dashboard mostra correlação H22 → outcome com n atual. 3 tabelas: por `absorption_events` bucket, por buy/sell ratio, por `buy_concentration` (largest_buy/buy_vol). Detalha últimos bounces com dados Helius. Conclusões só valem com n≥30 — instrumento pronto para o instante que o gate for atingido.
 
 ---
 
