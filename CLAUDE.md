@@ -487,8 +487,9 @@ get_sol_usd() [gmgn_client.py]
 | `migrations` | Uma linha por token migrado — todos os campos de qualidade + checkpoints |
 | `token_ticks` | Série temporal por token. `source='trenches'` (~30s) ou `source='kline'` (60s, com OHLC). |
 | `token_signals` | **Fase 2** — sinais type 12 por token durante janela quente |
-| `bounce_signals` | **Fase 2** — um registro por token quando bounce detector dispara (UNIQUE mint) |
-| `trades` | **Fase 6** — log completo de cada trade live ($1/trade calibração) |
+| `bounce_signals` | **Fase 2** — um registro por token quando bounce detector dispara (UNIQUE mint). Tem 8 colunas H22: `absorption_buy_vol`, `sell_vol`, `buy_cnt`, `sell_cnt`, `lrg_buy`, `events`, `score=NULL`, `grade=NULL`. |
+| `trades` | **Fase 6** — log completo de cada trade live. Coluna `fill_source TEXT` rastreia origem do fill data (`gmgn`/`helius`/`helius_recovery`/`gmgn_recovery`). |
+| `trade_absorption_ticks` | Snapshots contínuos de absorção Helius (+30s/+60s pós-bounce) por trade em monitoramento. |
 
 ### HeapScheduler
 - Thread única com heap de eventos futuros
@@ -549,13 +550,17 @@ BOTTOM_FRESHNESS_SEC=300     # A.6: máx 5min desde o último mc_min (bloqueia s
 TRADING_ENABLED=true         # true para ativar trades reais
 CALIBRATION_AMOUNT_USD=1.0   # tamanho de cada trade em USD
 CALIBRATION_MAX_TRADES=999999 # sem limite prático — executor para apenas manualmente
-TRADE_SL_PCT=0.15            # stop loss fixo (15%)
+TRADE_SL_PCT=0.25            # stop loss (testando 25% — 15% disparava em segundos por volatilidade do pAMM)
 TRAILING_ACTIVATION_PCT=75   # trailing: gain% mínimo para ativar (75% = início conservador)
 TRAILING_DRAWDOWN_PCT=30     # trailing: recuo máximo do pico antes de vender (30%)
 TRADE_SLIPPAGE_BPS=500       # slippage máximo em basis points (5%)
 ORDER_POLL_SEC=2             # intervalo de poll do fill (segundos)
 ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
 # PERSISTENCE_WAIT_SEC e PERSISTENCE_MIN_TICKS REMOVIDOS — A.4 desativado (hardcoded = 0)
+
+# Helius RPC (leitura on-chain direta — preenchimento de fill + detecção de posição fechada)
+HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (diferente do WSS para pAMM events)
+# GMGN_WALLET_ADDRESS já configurado acima — reutilizado por helius_rpc.py como WALLET_ADDRESS
 ```
 
 ---
@@ -591,6 +596,7 @@ ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
 | `/debug/absorption` | **H22 Absorption Debug** — janela buy/sell ao vivo por token ativo + últimos 30 bounces com ratio buy/sell e cobertura Helius. Auto-refresh 10s. Score/grade ausentes — coleta bruta apenas. |
 | `/analise/post-sl-recovery` | **Post-SL Recovery** — para cada SL, max MC nos ticks pós-exit. 12% atingiriam TP (8/64). 88% continuaram dumpando. Confirma H21 estruturalmente. |
 | `/analise/h22-correlation` | **H22 Correlation** — correlação entre absorção pós-fundo (Helius) e outcome TP/SL. Tabelas por bucket: absorption_events (0/1-2/3-5/6-10/≥11), buy/sell ratio (∞/≥3×/1.5-3×/etc.), concentração (largest_buy/buy_vol). Instrumento pronto antes dos dados chegarem — n=? cresce com o bot ativo. Gate: n≥30 com Helius. |
+| `/debug/open-trades` | **Diagnóstico de trades abertos** — por trade `open`/`trailing_active`: entry_expected, entry_mc_real, sl_mc, tp_mc, contagem de ticks, min_low, max_high, flags sl_hit/tp_hit, resposta ao vivo do GMGN `query_order` com raw JSON. Identifica trades presos + por que TradeMonitor não detectou saída. |
 
 ---
 
@@ -697,13 +703,27 @@ ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
 99. **H22 cobertura Helius: 1.7% (2026-05-13)**: `bounce_signals` tem 529 registros. Apenas **9 têm `absorption_events > 0`** (1.7% de cobertura). 520 têm NULL. Bot ativo = cobertura cresce com cada bounce. Conclusões estatísticas aguardam n≥30, mas `/analise/h22-correlation` deve ser construído agora — instrumento de medição pronto antes dos dados chegarem. Causa da baixa cobertura histórica: a maioria dos 529 bounces é anterior à implementação do Helius rolling window (2026-05-12). Os bounces novos (pós-implementação) já chegam com dados.
 100. **`buy_concentration = largest_buy / buy_vol`** (Codex review 2026-05-13): diferencia "um único buyer pumpou o preço" (concentration ≈ 1.0) de "múltiplos compradores absorveram" (concentration << 1.0). `largest_buy` e `buy_vol` já existem em `bounce_signals` e `get_absorption_window()`. Campo derivado, zero schema change. Implementar junto com a correção do `/debug/absorption` (mostrar "∞" para sell_vol=0+buy_vol>0, e "no flow" para ambos=0).
 101. **`/debug/executor-status` usava `db.get_conn()` que não existe** (fix 2026-05-13): o módulo db.py usa contextmanager `_cursor()`, não expõe `get_conn`. Também usava `ORDER BY created_at` mas a coluna se chama `ts_signal`. Ambos os erros eram capturados silenciosamente → "Nenhum no DB" mesmo com bounce_signals populada. Fix: psycopg2.connect(db.DATABASE_URL) direto + ORDER BY ts_signal. Mesmo padrão corrigido em `/debug/wallet-audit`.
+102. **GMGN `query_order` nunca retorna `filled_output_amount`** (confirmado 2026-05-13): campo retorna consistentemente `null` mesmo quando `confirmation.state="confirmed"`. `filled_input_amount` (SOL) também ausente. `_wait_fill()` no executor detectava `state=confirmed` mas saía sem popular `entry_price_usd` → `tokens_received=None` → `tp_mc=None` → TradeMonitor nunca detectava TP. Solução: leitura on-chain via Helius (`helius_rpc.py`).
+103. **`helius_rpc.py` — módulo de leitura on-chain (2026-05-13)**: novo módulo para ler fill data e verificar posições diretamente da blockchain Solana. Três funções principais: `get_swap_fill(tx_sig, token_mint)` via `getTransaction` (jsonParsed) para obter `tokens_received`/`sol_spent`/`fee_sol`; `get_token_balance(token_mint)` via `getTokenAccountsByOwner` para verificar se wallet ainda segura o token; `extract_tx_signature(query_order_response)` para extrair tx sig dos campos do query_order. Requer `HELIUS_RPC_URL` (HTTP JSON-RPC, diferente do WSS do helius_ws.py) e `GMGN_WALLET_ADDRESS`. Degradação graciosa: sem `HELIUS_RPC_URL`, todas as funções retornam `None`/`0`.
+104. **`fill_source` coluna na tabela `trades`** (2026-05-13): rastreia qual fonte forneceu os dados do fill: `'gmgn'` (filled_output_amount retornou — raro), `'helius'` (getTransaction on-chain no fill loop principal), `'helius_recovery'` (Helius em `_recover_fill()` pós-timeout), `'gmgn_recovery'` (filled_output_amount em `_recover_fill()`). Schema: `ALTER TABLE trades ADD COLUMN IF NOT EXISTS fill_source TEXT`.
+105. **TradeMonitor cego sem ticks (problema estrutural, 2026-05-13)**: `_check_trade()` e `_check_trailing_exit()` retornam imediatamente se `not ticks`. Token_ticks são geradas pelo HotMonitor durante a janela de 60min — quando o HotMonitor expira, os ticks param. Trades que ficam abertos mais de 60min pós-migração ficam invisíveis para o TradeMonitor. Fix: se `not ticks`, chamar `_check_position_closed()` (Helius) + `_check_via_gmgn()` como fallback.
+106. **`_check_position_closed()` via Helius (2026-05-13)**: novo método no TradeMonitor. Chama `helius_rpc.get_token_balance(mint)` — se saldo=0, GMGN fechou a posição. Infere TP vs SL via última MC disponível nos ticks vs thresholds: `ratio <= (1 - sl_pct × 0.9)` → `sl`; `ratio >= (1 + tp_pct × 0.9)` → `tp`; entre os dois → `trailing_active` (GMGN gerenciando trailing). Retorna `True` se posição foi detectada como fechada. Chamado na ausência de ticks para trades `open` e `trailing_active`.
+107. **`tp_mc` fallback quando `entry_mc_real=None` (2026-05-13)**: quando `filled_output_amount` não retorna e Helius não está disponível, `entry_mc_real` fica `None` → `tp_mc = entry_mc_real × (1+tp_pct)` falha com TypeError. Fix: `tp_mc = entry_mc_real × (1+tp_pct) if entry_mc_real else entry_expected × (1+tp_pct)`. `tp_from_expected` flag indica quando o fallback foi usado. A entrada real é sempre ≥ `entry_expected` por latência/slippage — o threshold do fallback é conservador (TP detectado um pouco mais tarde do que o real).
+108. **`condition_orders: nenhum` em `query_order` (2026-05-13)**: GMGN não retorna status das condition_orders no endpoint `query_order` do order de compra. `_check_via_gmgn()` que tentava inferir TP/SL a partir da resposta é ineficaz como solução standalone. A abordagem correta é verificar o saldo on-chain via `get_token_balance()`. Lição: tentar inferir estado de ordens derivadas via a ordem de compra original não funciona — elas têm lifecycle independente.
+109. **`/debug/open-trades` endpoint (2026-05-13)**: diagnóstico de trades presos `open`/`trailing_active`. Mostra para cada trade: token, age, entry_expected, entry_mc_real (real fill), sl_mc, tp_mc, tick count após ts_signal, min_low/max_high dos ticks, flags `sl_hit`/`tp_hit` com threshold calculado, raw JSON da resposta ao vivo do GMGN `query_order`. Permite identificar exatamente por que o TradeMonitor não detectou a saída. Essential para debugging sem acesso ao terminal Railway.
+110. **`/analise/h22-correlation` CTE fix (2026-05-13)**: CTE original fazia `WHERE status IN ('tp','sl','trailing_active','expired')` → excluía trades com `status='open'` e `status='error'` do JOIN → todos os bounces com trades mostravam `outcome=NULL`. Fix: remover WHERE filter — buscar latest trade por mint independente de status. Dashboard agora mostra outcomes reais onde disponíveis.
+111. **H22 cobertura 6% (32/552 bounces, 2026-05-13)**: cobertura cresceu de 1.7% (9/529) no início da sessão para 6% (32/552) ao final. 100% dos tokens com `exchange='pump'` têm cobertura Helius (FILTER_PUMP_ONLY garante isso para novos bounces). Os 520+ sem cobertura são históricos anteriores à implementação do Helius rolling window (2026-05-12). Cobertura cresce linearmente com o bot ativo — todos os novos bounces terão dados.
+112. **TRADE_SL_PCT=0.25 em teste (2026-05-13)**: elevado de 0.15 para 0.25 porque SL=15% disparava em segundos após entrada. Causa suspeita: volatilidade intra-candle do pAMM em pools pequenas — uma única ordem de venda pode temporariamente empurrar o preço 15%+ antes de recuperar. Com SL=25%, o threshold é mais tolerante a ruído de mercado sem necessariamente piorar o EV (token que vai -25% dificilmente recupera). Aguardar n≥30 trades para avaliar impacto no WR e EV vs SL=15%.
+113. **FILTER_PUMP_ONLY garante cobertura H22 futura**: scanner rejeita migrações onde `exchange` não contém "pump". Consequência: 100% dos tokens futuros são pump.fun pAMM — Helius WebSocket já subscrito para eles, logo `get_absorption_window()` sempre retorna dados. Eliminará a dicotomia entre bounces com/sem dados Helius após ~30 dias de operação.
 
 ---
 
-## 🔄 Estado Atual: Bot ativo a $1/trade (2026-05-13)
+## 🔄 Estado Atual: Bot ativo a $1/trade (2026-05-13, sessão 3)
 
 ### Pipeline ativo
 `TRADING_ENABLED=true`, `CALIBRATION_AMOUNT_USD=1.0`, `CALIBRATION_MAX_TRADES=999999`.
+`TRADE_SL_PCT=0.25` (testando — 15% disparava em segundos por volatilidade pAMM).
+`HELIUS_RPC_URL` configurado no Railway — `helius_rpc.py` ativo para fill + posição.
 
 **Filtros ativos (ordem de aplicação no _check_bounce):**
 - A.2: bloqueia bounce_pct 20-30% (dead zone histórica — validado live; redundante com A.7 mas mantido como safety net)
@@ -712,15 +732,22 @@ ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
 - A.6: bloqueia fundo estagnado > 5min (BOTTOM_FRESHNESS_SEC — validado live)
 - A.7: bloqueia bounce_pct < 30% (BOUNCE_MIN_PCT=0.30 — validado live, n=11)
 - smart≥3: FILTER_SMART_MIN=3 — smart=1→0% WR (n=6), smart=2→20%, smart=3→57% (dado live GMGN)
+- FILTER_PUMP_ONLY: rejeita migrações sem "pump" no exchange — garante cobertura H22 futura
 
-**H22 cobertura:** 529 bounces registrados, 9 com `absorption_events > 0` (1.7%). Bot ativo = cobertura crescendo a cada bounce. `/analise/h22-correlation` deve ser construído agora — instrumento pronto antes dos dados chegarem. Conclusões com significância estatística aguardam n≥30, mas o dashboard estará pronto no instante que o gate for atingido.
+**TradeMonitor — melhorias (sessão 3):**
+- `_check_position_closed()`: usa `get_token_balance()` via Helius quando não há ticks — detecta GMGN fechar posição
+- `tp_mc` fallback: usa `entry_expected × (1+tp_pct)` quando `entry_mc_real=None` (GMGN nunca retorna fill)
+- `fill_source`: coluna no banco rastreia origem do fill data
+- `_check_via_gmgn()`: tenta condition_orders em query_order — confirmado ineficaz (GMGN retorna vazio)
 
-**Pendências analíticas (Codex review 2026-05-13):**
+**H22 cobertura:** 32/552 bounces (6%, cresceu de 1.7% na sessão anterior). 100% dos tokens pump.fun novos têm cobertura. Históricos sem dados são pré-implementação (2026-05-12). `/analise/h22-correlation` implementado e funcional — fix CTE que excluía trades `open` do JOIN.
+
+**Pendências analíticas:**
 - `/analise/post-sl-recovery` usa `entry_expected` — pendente correção para `entry_mc_real = (entry_price_usd / tokens_received) × 1B`
-- `buy_concentration` não exposto ainda (dados já existem)
+- `buy_concentration` não exposto ainda (dados já existem em bounce_signals)
 - `/debug/absorption` mostra "—" para ambos os casos de sell_vol=0 — pendente fix "∞" vs "no flow"
 
-**WR ground truth (GMGN):** ~15% (filtros anteriores) → esperado ≥30% com smart≥3. DB WR é inválido — não usar para decisões.
+**WR ground truth (GMGN):** ~15% (filtros anteriores) → esperado ≥30% com smart≥3+SL25%. DB WR é inválido — não usar para decisões.
 
 **Regra de ouro para novos filtros:** só implementar com n≥30 trades validados no GMGN. Não usar DB WR como fonte.
 
