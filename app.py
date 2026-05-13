@@ -11207,5 +11207,223 @@ def analise_h22_correlation():
         return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
+@app.route("/analise/sniper-filter")
+def analise_sniper_filter():
+    """Análise do FILTER_SNIPER_MAX — top70_sniper_hold_rate vs recovery e WR live.
+    Responde: o filtro atual (5%) está bloqueando tokens bons ou ruins?
+    Dados: migrations (recovery histórico) + trades (WR live GMGN).
+    """
+    import traceback
+    try:
+        CSS = ("<style>body{background:#0d1117;color:#e6edf3;font:13px/1.6 monospace;padding:20px}"
+               "a{color:#58a6ff;text-decoration:none}table{border-collapse:collapse;width:100%}"
+               "th{background:#161b22;padding:6px 10px;text-align:left;font-size:11px;color:#8b949e}"
+               "td{padding:5px 10px;border-bottom:1px solid #21262d;font-size:12px}"
+               ".box{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px 16px;"
+               "margin:8px 4px;display:inline-block;vertical-align:top}"
+               ".lbl{color:#8b949e;font-size:11px}.val{font-size:20px;font-weight:bold}"
+               ".green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}.dim{color:#484f58}"
+               "h2{color:#8b949e;font-size:12px;margin:20px 0 6px}"
+               "h1{color:#58a6ff;font-size:16px;margin-bottom:4px}</style>")
+
+        def _box(label, val, color="#e6edf3"):
+            return f"<div class='box'><div class='lbl'>{label}</div><div class='val' style='color:{color}'>{val}</div></div>"
+
+        with db._cursor() as cur:
+            # 1. Distribuição de top70_sniper_hold_rate nas migrações com recovery
+            cur.execute("""
+                SELECT
+                    CASE
+                        WHEN top70_sniper_hold_rate IS NULL THEN 'NULL (sem dado)'
+                        WHEN top70_sniper_hold_rate = 0     THEN '0% exato'
+                        WHEN top70_sniper_hold_rate <= 0.05 THEN '0-5%'
+                        WHEN top70_sniper_hold_rate <= 0.10 THEN '5-10%'
+                        WHEN top70_sniper_hold_rate <= 0.20 THEN '10-20%'
+                        WHEN top70_sniper_hold_rate <= 0.30 THEN '20-30%'
+                        ELSE '>30%'
+                    END AS bucket,
+                    COUNT(*) AS n,
+                    COUNT(CASE WHEN recovery = TRUE  THEN 1 END) AS n_rec,
+                    COUNT(CASE WHEN recovery = FALSE THEN 1 END) AS n_norec,
+                    ROUND(AVG(CASE WHEN recovery IS NOT NULL
+                        THEN (CASE WHEN recovery THEN 1.0 ELSE 0.0 END) END)::numeric, 3) AS rec_rate,
+                    ROUND(AVG(top70_sniper_hold_rate)::numeric, 4) AS avg_sniper,
+                    MIN(top70_sniper_hold_rate) AS min_sniper,
+                    MAX(top70_sniper_hold_rate) AS max_sniper
+                FROM migrations
+                WHERE ts_migration IS NOT NULL
+                GROUP BY 1
+                ORDER BY MIN(COALESCE(top70_sniper_hold_rate, -1))
+            """)
+            hist_rows = [dict(r) for r in cur.fetchall()]
+
+            # 2. Impacto do filtro atual — quantos tokens estão sendo bloqueados
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(CASE WHEN top70_sniper_hold_rate > 0.05 THEN 1 END) AS blocked,
+                    COUNT(CASE WHEN top70_sniper_hold_rate <= 0.05 THEN 1 END) AS passed,
+                    COUNT(CASE WHEN top70_sniper_hold_rate IS NULL THEN 1 END) AS no_data,
+                    -- Recovery rate dos bloqueados vs passados
+                    ROUND(AVG(CASE WHEN top70_sniper_hold_rate > 0.05 AND recovery IS NOT NULL
+                        THEN (CASE WHEN recovery THEN 1.0 ELSE 0.0 END) END)::numeric, 3) AS rec_blocked,
+                    ROUND(AVG(CASE WHEN top70_sniper_hold_rate <= 0.05 AND recovery IS NOT NULL
+                        THEN (CASE WHEN recovery THEN 1.0 ELSE 0.0 END) END)::numeric, 3) AS rec_passed
+                FROM migrations
+                WHERE ts_migration IS NOT NULL AND recovery IS NOT NULL
+            """)
+            impact = dict(cur.fetchone())
+
+            # 3. WR live por bucket de sniper (trades com outcome GMGN)
+            cur.execute("""
+                SELECT
+                    CASE
+                        WHEN m.top70_sniper_hold_rate IS NULL THEN 'NULL'
+                        WHEN m.top70_sniper_hold_rate = 0     THEN '0% exato'
+                        WHEN m.top70_sniper_hold_rate <= 0.05 THEN '0-5%'
+                        WHEN m.top70_sniper_hold_rate <= 0.10 THEN '5-10%'
+                        WHEN m.top70_sniper_hold_rate <= 0.20 THEN '10-20%'
+                        ELSE '>20%'
+                    END AS bucket,
+                    COUNT(*) AS n,
+                    COUNT(CASE WHEN t.status = 'tp'
+                        OR (t.status = 'expired' AND t.pnl_pct_real > 0) THEN 1 END) AS n_tp,
+                    COUNT(CASE WHEN t.status = 'sl'
+                        OR (t.status = 'expired' AND t.pnl_pct_real <= 0) THEN 1 END) AS n_sl,
+                    ROUND(AVG(m.top70_sniper_hold_rate)::numeric, 4) AS avg_sniper
+                FROM trades t
+                JOIN migrations m ON m.mint = t.mint
+                WHERE t.status IN ('tp', 'sl', 'expired')
+                  AND t.pnl_pct_real IS NOT NULL
+                GROUP BY 1
+                ORDER BY MIN(COALESCE(m.top70_sniper_hold_rate, -1))
+            """)
+            live_rows = [dict(r) for r in cur.fetchall()]
+
+            # 4. Cobertura — % de migrações que têm top70_sniper_hold_rate preenchido
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(top70_sniper_hold_rate) AS with_data
+                FROM migrations WHERE ts_migration IS NOT NULL
+            """)
+            cov = dict(cur.fetchone())
+
+        # --- Build HTML ---
+        def _wr(n_tp, n_sl):
+            n = (n_tp or 0) + (n_sl or 0)
+            if not n: return "—", "#484f58"
+            wr = (n_tp or 0) / n
+            color = "#3fb950" if wr >= 0.35 else ("#d29922" if wr >= 0.20 else "#f85149")
+            return f"{wr*100:.0f}%", color
+
+        # Tabela histórica
+        hist_html = ""
+        for r in hist_rows:
+            n, n_rec, n_norec = r["n"], r["n_rec"] or 0, r["n_norec"] or 0
+            rr = r["rec_rate"]
+            rr_str = f"{float(rr)*100:.1f}%" if rr is not None else "—"
+            rr_color = "#3fb950" if rr and rr >= 0.35 else ("#d29922" if rr and rr >= 0.20 else "#f85149") if rr else "#484f58"
+            blocked = "⛔ bloqueado" if r["bucket"] not in ("NULL (sem dado)", "0% exato", "0-5%") else "✅ passa"
+            hist_html += (f"<tr><td>{r['bucket']}</td><td>{n}</td>"
+                          f"<td style='color:{rr_color}'>{rr_str}</td>"
+                          f"<td>{n_rec}</td><td>{n_norec}</td>"
+                          f"<td class='dim'>{r['avg_sniper'] or '—'}</td>"
+                          f"<td>{blocked}</td></tr>")
+
+        # Tabela live
+        live_html = ""
+        for r in live_rows:
+            n, n_tp, n_sl = r["n"], r["n_tp"] or 0, r["n_sl"] or 0
+            wr_str, wr_color = _wr(n_tp, n_sl)
+            blocked = "⛔" if r["bucket"] not in ("NULL", "0% exato", "0-5%") else "✅"
+            live_html += (f"<tr><td>{r['bucket']}</td><td>{n}</td>"
+                          f"<td style='color:{wr_color}'>{wr_str}</td>"
+                          f"<td>{n_tp}</td><td>{n_sl}</td>"
+                          f"<td class='dim'>{r['avg_sniper'] or '—'}</td>"
+                          f"<td>{blocked}</td></tr>")
+
+        # Impacto do filtro
+        tot   = impact["total"] or 1
+        bloc  = impact["blocked"] or 0
+        pas   = impact["passed"] or 0
+        nd    = impact["no_data"] or 0
+        rb    = impact["rec_blocked"]
+        rp    = impact["rec_passed"]
+        rb_s  = f"{float(rb)*100:.1f}%" if rb is not None else "—"
+        rp_s  = f"{float(rp)*100:.1f}%" if rp is not None else "—"
+        delta = f"{(float(rb)-float(rp))*100:+.1f}pp" if rb is not None and rp is not None else "—"
+        delta_color = "#3fb950" if rb and rp and float(rb) < float(rp) else "#f85149"
+
+        cov_pct = f"{cov['with_data']/cov['total']*100:.0f}%" if cov['total'] else "—"
+
+        summary = (
+            _box("Cobertura campo", f"{cov['with_data']}/{cov['total']} ({cov_pct})") +
+            _box("Bloqueados pelo filtro >5%", f"{bloc} ({bloc/tot*100:.0f}%)", "#f85149") +
+            _box("Passam pelo filtro ≤5%", f"{pas} ({pas/tot*100:.0f}%)", "#3fb950") +
+            _box("Sem dado (NULL)", f"{nd} ({nd/tot*100:.0f}%)", "#8b949e") +
+            _box("Recovery bloqueados", rb_s, "#f85149") +
+            _box("Recovery passados", rp_s, "#3fb950") +
+            _box("Delta (bloqueado - passado)", delta, delta_color)
+        )
+
+        html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>Sniper Filter Analysis</title>{CSS}
+</head><body>
+<h1>FILTER_SNIPER_MAX — Análise do filtro top70_sniper_hold_rate</h1>
+<p style='color:#8b949e;font-size:11px;margin-bottom:12px'>
+  top70_sniper_hold_rate = % do supply que os 70 maiores snipers ainda seguram.<br>
+  Filtro atual: FILTER_SNIPER_MAX=0.05 (rejeita tokens com sniper hold &gt;5%).<br>
+  H4 (CLAUDE.md): "sniper alto levemente positivo (+0.7pp)" — refutada historicamente.<br>
+  Análise: os dados confirmam ou contradizem o filtro?
+</p>
+<div style='margin-bottom:12px'>
+  <a href='/analise/wr-breakdown' style='color:#58a6ff;margin-right:14px'>WR Breakdown</a>
+  <a href='/analise/h22-correlation' style='color:#58a6ff;margin-right:14px'>H22</a>
+</div>
+
+{summary}
+
+<br><br>
+<h2>▸ Recovery histórico por bucket (migrations, n={cov['total']})</h2>
+<p style='color:#484f58;font-size:11px'>
+  Fonte: migrations.recovery = mc_1h &gt; mc_bottom × 1.3. DB — não usar como decisão final,
+  mas serve para identificar correlação bruta com o campo.
+</p>
+<table>
+  <thead><tr>
+    <th>Bucket sniper</th><th>n</th><th>Recovery rate</th>
+    <th>n_recovery</th><th>n_no_rec</th><th>avg sniper</th><th>Filtro atual</th>
+  </tr></thead>
+  <tbody>{hist_html}</tbody>
+</table>
+
+<br>
+<h2>▸ WR live por bucket (trades com outcome GMGN)</h2>
+<p style='color:#484f58;font-size:11px'>
+  Fonte: trades × migrations JOIN. status='tp'/'sl'/'expired' com pnl_pct_real.<br>
+  GMGN é ground truth. n pequeno — interpretar com cautela.
+</p>
+<table>
+  <thead><tr>
+    <th>Bucket sniper</th><th>n trades</th><th>WR</th>
+    <th>TPs</th><th>SLs</th><th>avg sniper</th><th>Filtro</th>
+  </tr></thead>
+  <tbody>{live_html if live_html else "<tr><td colspan='7' class='dim'>Sem trades com dados de sniper</td></tr>"}</tbody>
+</table>
+
+<br>
+<p style='color:#484f58;font-size:11px'>
+  Decisão: os dados acima mostram se bloqueados têm recovery menor, igual ou maior que passados.<br>
+  Delta negativo (bloqueados com recovery MENOR) = filtro correto.<br>
+  Delta positivo (bloqueados com recovery MAIOR) = filtro está rejeitando tokens bons.
+</p>
+</body></html>"""
+        return html
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
