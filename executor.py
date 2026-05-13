@@ -339,6 +339,10 @@ class TradeMonitor:
             qd     = res.get("data") or res
             out_raw = _safe_float(qd.get("filled_output_amount"))
             if not out_raw or out_raw <= 0:
+                logger.info(
+                    "_recover_fill #%d %s — filled_output_amount ausente. order_id=%s keys=%s",
+                    trade_id, symbol, order_id[:16], list(qd.keys()),
+                )
                 return False
             in_raw   = _safe_float(qd.get("filled_input_amount"))
             fill_sol = (in_raw / 1e9 if in_raw and in_raw > 1000 else in_raw) or amount_sol
