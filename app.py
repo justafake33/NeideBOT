@@ -12284,12 +12284,17 @@ def analise_trade_autopsy():
         # ================================================================
         # SEÇÃO 5 — Velocidade do SL
         # ================================================================
+        # Identifica trades ultra-rápidos (<1min) — candidatos a self-inflicted SL
+        ultra_fast_rows = [r for r in sl_rows if r.get("mins_to_exit") is not None and r["mins_to_exit"] < 1]
+        n_ultra_fast = len(ultra_fast_rows)
+
         sl_speed_buckets = [
-            ("<5min",   [r for r in sl_rows if r.get("mins_to_exit") is not None and r["mins_to_exit"] < 5]),
-            ("5–15min", [r for r in sl_rows if r.get("mins_to_exit") is not None and 5  <= r["mins_to_exit"] < 15]),
-            ("15–30min",[r for r in sl_rows if r.get("mins_to_exit") is not None and 15 <= r["mins_to_exit"] < 30]),
-            (">30min",  [r for r in sl_rows if r.get("mins_to_exit") is not None and r["mins_to_exit"] >= 30]),
-            ("sem dado",[r for r in sl_rows if r.get("mins_to_exit") is None]),
+            ("<1min ⚡",  [r for r in sl_rows if r.get("mins_to_exit") is not None and r["mins_to_exit"] < 1]),
+            ("1–5min",   [r for r in sl_rows if r.get("mins_to_exit") is not None and 1  <= r["mins_to_exit"] < 5]),
+            ("5–15min",  [r for r in sl_rows if r.get("mins_to_exit") is not None and 5  <= r["mins_to_exit"] < 15]),
+            ("15–30min", [r for r in sl_rows if r.get("mins_to_exit") is not None and 15 <= r["mins_to_exit"] < 30]),
+            (">30min",   [r for r in sl_rows if r.get("mins_to_exit") is not None and r["mins_to_exit"] >= 30]),
+            ("sem dado", [r for r in sl_rows if r.get("mins_to_exit") is None]),
         ]
         speed_html = ""
         for label, subset in sl_speed_buckets:
@@ -12301,14 +12306,69 @@ def analise_trade_autopsy():
             pct_had_pos = had_pos / n_s * 100
             avg_max = _avg([r.get("max_gain_pct") for r in subset])
             avg_early = _avg([r.get("early_gain_pct") for r in subset])
+            row_style = " style='background:#2d1a1a'" if "⚡" in label else ""
             speed_html += (
-                f"<tr><td>{label}</td>"
+                f"<tr{row_style}><td>{label}</td>"
                 f"<td>{n_s}</td>"
                 f"<td>{had_pos} <span class='dim'>({pct_had_pos:.0f}%)</span></td>"
                 f"<td>{_pct(avg_early, 0)}</td>"
                 f"<td>{_pct(avg_max, 0)}</td>"
                 f"</tr>"
             )
+
+        # Detalhe dos ultra-fast (<1min) para diagnóstico
+        ultra_fast_detail_html = ""
+        for r in sorted(ultra_fast_rows, key=lambda x: x.get("mins_to_exit") or 0):
+            m = r.get("mins_to_exit")
+            secs = int(m * 60) if m is not None else None
+            ultra_fast_detail_html += (
+                f"<tr>"
+                f"<td><b>{r.get('symbol','?')}</b></td>"
+                f"<td class='red'>{('%ds' % secs) if secs is not None else '—'}</td>"
+                f"<td>{_pct(r.get('early_gain_pct'), 0)}</td>"
+                f"<td>{_pct(r.get('max_gain_pct'),   0)}</td>"
+                f"<td>{_pct(r.get('b_bounce_pct'),    0)}</td>"
+                f"<td>{_pct(r.get('b_drop_pct'),      0)}</td>"
+                f"<td class='dim'>{r.get('smart_wallets') or '—'}</td>"
+                f"<td class='dim'>{r.get('tick_count') or '—'}</td>"
+                f"</tr>"
+            )
+        if not ultra_fast_detail_html:
+            ultra_fast_detail_html = "<tr><td colspan='8' class='dim'>Nenhum SL em &lt;1min</td></tr>"
+
+        if n_ultra_fast > 0:
+            ultra_fast_section_html = (
+                "<br>"
+                "<div style='border:1px solid #f85149;border-radius:6px;padding:12px;background:#1a0d0d;max-width:900px'>"
+                "<b style='color:#f85149'>SLs INSTANTANEOS (&lt;1min) — n=" + str(n_ultra_fast) + " — Diagnostico</b>"
+                "<p style='color:#c9d1d9;font-size:11px;margin:8px 0'>"
+                "<b>O mecanismo:</b> Pool pAMM tem ~79 SOL de liquidez. Nosso buy de $1-10 pode temporariamente"
+                " empurrar o preco 5-15% para cima. Quando a ordem fill confirma, o preco natural reverte."
+                " Com SL=15% (antigo): threshold = entry x 0.85 = mc_bottom x <b>0.9775</b> — praticamente no fundo."
+                " Qualquer ruido revertia ao fundo e trigava o SL em segundos.<br>"
+                " Com SL=25% (atual): threshold = entry x 0.75 = mc_bottom x <b>0.8625</b> — exige queda"
+                " 13.75% abaixo do fundo gravado. Muito mais robusto contra noise.<br><br>"
+                "<b>Dois subtipos distintos:</b><br>"
+                "&bull; <span style='color:#f85149'>Real fast dump</span>: max_gain aprox 0% ou negativo — o token continuou caindo apos o sinal.<br>"
+                "&bull; <span style='color:#d29922'>Spike artifact</span>: max_gain muito alto (&gt;50%) mas mc_high e intra-candle spike —"
+                " um unico comprador movimentou o AMM pontualmente, o <em>kline high</em> registrou, mas o preco real nunca foi la."
+                " mc_high em token_ticks ainda inclui spikes (diferente de mc_peak que foi corrigido para usar close)."
+                "</p>"
+                "<table style='max-width:780px'>"
+                "<thead><tr>"
+                "<th>Token</th><th>Duracao</th><th>Early +2min</th><th>Max gain*</th>"
+                "<th>Bounce%</th><th>Drop%</th><th>Smart</th><th>Ticks</th>"
+                "</tr></thead>"
+                "<tbody>" + ultra_fast_detail_html + "</tbody>"
+                "</table>"
+                "<p style='color:#8b949e;font-size:10px;margin:6px 0 0'>"
+                "*Max gain usa mc_high dos ticks — spikes intra-candle podem inflar este numero."
+                " Tokens com max_gain&gt;50% e ticks=1-2 sao suspeitos de spike artifact, nao bounce real."
+                "</p>"
+                "</div>"
+            )
+        else:
+            ultra_fast_section_html = ""
 
         # ================================================================
         # SEÇÃO 6 — TPs: trajetória e timing
@@ -12457,7 +12517,7 @@ def analise_trade_autopsy():
 <h2>▸ 2. VELOCIDADE DO SL — Quanto tempo durou antes de bater?</h2>
 <p style='color:#484f58;font-size:11px'>
   "Teve pico positivo" = max_gain &gt; 0 antes de bater o SL (bounce existiu mas foi insuficiente).<br>
-  SL em &lt;5min = dump imediato após entrada → provável sinal falso.
+  SL em <b style='color:#f85149'>&lt;1min ⚡</b> = diagnóstico abaixo — pode ser SL auto-infligido pelo próprio impacto de preço da compra.
 </p>
 <table style='max-width:650px'>
   <thead><tr>
@@ -12466,6 +12526,8 @@ def analise_trade_autopsy():
   </tr></thead>
   <tbody>{speed_html}</tbody>
 </table>
+
+{ultra_fast_section_html}
 
 <br>
 <!-- SEÇÃO 3: drop_from_mig vs WR -->
