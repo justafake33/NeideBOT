@@ -11968,5 +11968,599 @@ def analise_sniper_filter():
         return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
+@app.route("/analise/trade-autopsy")
+def analise_trade_autopsy():
+    """Autópsia dos trades reais — O que separa TPs de SLs?
+    Pergunta central: o SL bateu porque o sinal estava errado (dump continuou)
+    ou porque o bounce era real mas fraco demais para o TP de 75%?
+    """
+    import traceback
+    try:
+        CSS = ("<style>body{background:#0d1117;color:#e6edf3;font:13px/1.6 monospace;padding:20px}"
+               "a{color:#58a6ff;text-decoration:none}table{border-collapse:collapse;width:100%}"
+               "th{background:#161b22;padding:6px 10px;text-align:left;font-size:11px;color:#8b949e}"
+               "td{padding:5px 10px;border-bottom:1px solid #21262d;font-size:12px}"
+               ".box{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px 16px;"
+               "margin:8px 4px;display:inline-block;vertical-align:top;min-width:110px}"
+               ".lbl{color:#8b949e;font-size:11px}.val{font-size:22px;font-weight:bold;margin-top:2px}"
+               ".nav a{color:#58a6ff;margin-right:14px;font-size:12px}"
+               ".green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}"
+               ".dim{color:#484f58}.warn{color:#e3b341}"
+               "h2{color:#8b949e;font-size:12px;margin:24px 0 6px;letter-spacing:.5px}"
+               "h1{color:#58a6ff;font-size:16px;margin-bottom:4px}"
+               ".bar{display:inline-block;height:10px;background:#3fb950;border-radius:2px;margin-right:6px;vertical-align:middle}"
+               ".bar-red{background:#f85149}"
+               "tr:hover td{background:#161b22}</style>")
+
+        def _box(label, val, color="#e6edf3", sub=""):
+            return (f"<div class='box'><div class='lbl'>{label}</div>"
+                    f"<div class='val' style='color:{color}'>{val}</div>"
+                    f"{'<div style=color:#484f58;font-size:10px>' + sub + '</div>' if sub else ''}"
+                    f"</div>")
+
+        def _wr_color(wr):
+            if wr is None: return "#484f58"
+            return "#3fb950" if wr >= 0.40 else ("#d29922" if wr >= 0.25 else "#f85149")
+
+        def _pct(v, decimals=0):
+            if v is None: return "<span class='dim'>—</span>"
+            c = "#3fb950" if v > 0 else ("#f85149" if v < 0 else "#8b949e")
+            fmt = f"{{:+.{decimals}f}}%"
+            return f"<span style='color:{c}'>{fmt.format(v * 100)}</span>"
+
+        def _num(v, decimals=1):
+            if v is None: return "<span class='dim'>—</span>"
+            return f"{v:.{decimals}f}"
+
+        with db._cursor() as cur:
+            # ===================================================================
+            # BASE CTE: todos os trades com classificação de outcome + contexto
+            # entry_mc_real calculado de entry_price_usd/tokens_received (preço real)
+            # Fallback para entry_expected quando fill não disponível
+            # ===================================================================
+            cur.execute("""
+                WITH base AS (
+                    SELECT
+                        t.id,
+                        t.mint,
+                        t.symbol,
+                        t.status,
+                        t.ts_signal,
+                        t.exit_ts,
+                        t.pnl_pct_real,
+                        t.entry_price_usd,
+                        t.tokens_received,
+                        t.entry_expected,
+                        t.mc_bottom,
+                        t.mc_migration          AS t_mc_mig,
+                        t.tp_pct,
+                        t.sl_pct,
+                        t.fill_source,
+                        t.amount_usd,
+                        -- Entry MC real: de dados de fill; fallback para expected
+                        COALESCE(
+                            CASE WHEN t.entry_price_usd > 0 AND t.tokens_received > 0
+                                 THEN t.entry_price_usd / t.tokens_received * 1e9
+                            END,
+                            t.entry_expected
+                        ) AS entry_mc,
+                        -- Outcome limpo
+                        CASE
+                            WHEN t.status IN ('tp')                              THEN 'tp'
+                            WHEN t.status = 'trailing_active'                    THEN 'tp'
+                            WHEN t.status = 'expired' AND t.pnl_pct_real > 0    THEN 'tp'
+                            WHEN t.status IN ('sl')                              THEN 'sl'
+                            WHEN t.status = 'expired' AND t.pnl_pct_real <= 0   THEN 'sl'
+                            WHEN t.status = 'expired' AND t.pnl_pct_real IS NULL THEN NULL
+                            ELSE NULL
+                        END AS outcome,
+                        -- bounce_signals
+                        b.mc_min            AS b_mc_bottom,
+                        b.mc_at_signal      AS b_mc_entry,
+                        b.mc_migration      AS b_mc_mig,
+                        b.bounce_pct        AS b_bounce_pct,
+                        b.drop_from_mig     AS b_drop_pct,
+                        b.elapsed_sec / 60.0 AS b_elapsed_min,
+                        b.absorption_events,
+                        -- migrations
+                        m.smart_wallets,
+                        m.renowned_wallets,
+                        m.creator_token_status,
+                        m.top10_holder_rate,
+                        m.time_to_bottom,
+                        -- entry_ratio: onde entramos no range migração→fundo
+                        CASE WHEN b.mc_migration > 0
+                             THEN b.mc_at_signal / b.mc_migration
+                             ELSE NULL END AS entry_ratio,
+                        -- Tempo até exit em minutos
+                        CASE WHEN t.exit_ts IS NOT NULL AND t.ts_signal IS NOT NULL
+                             THEN EXTRACT(EPOCH FROM (t.exit_ts - t.ts_signal)) / 60.0
+                             ELSE NULL END AS mins_to_exit
+                    FROM trades t
+                    LEFT JOIN bounce_signals b ON b.mint = t.mint
+                    LEFT JOIN migrations     m ON m.mint = t.mint
+                    WHERE t.status NOT IN ('pending', 'error', 'open')
+                ),
+                tick_agg AS (
+                    SELECT
+                        b.id AS trade_id,
+                        COUNT(tt.id)                                                           AS tick_count,
+                        MAX(COALESCE(tt.mc_high, tt.mc))                                       AS max_mc_ever,
+                        MIN(COALESCE(tt.mc_low,  tt.mc))                                       AS min_mc_ever,
+                        MAX(CASE WHEN tt.tick_ts <= b.ts_signal + INTERVAL '2 minutes'
+                                 THEN COALESCE(tt.mc_high, tt.mc) END)                         AS max_mc_2min,
+                        MIN(CASE WHEN tt.tick_ts <= b.ts_signal + INTERVAL '2 minutes'
+                                 THEN COALESCE(tt.mc_low,  tt.mc) END)                         AS min_mc_2min,
+                        MAX(CASE WHEN tt.tick_ts <= b.ts_signal + INTERVAL '5 minutes'
+                                 THEN COALESCE(tt.mc_high, tt.mc) END)                         AS max_mc_5min,
+                        MAX(CASE WHEN tt.tick_ts <= b.ts_signal + INTERVAL '10 minutes'
+                                 THEN COALESCE(tt.mc_high, tt.mc) END)                         AS max_mc_10min,
+                        MAX(CASE WHEN tt.tick_ts <= b.ts_signal + INTERVAL '20 minutes'
+                                 THEN COALESCE(tt.mc_high, tt.mc) END)                         AS max_mc_20min
+                    FROM base b
+                    JOIN token_ticks tt ON tt.mint = b.mint
+                        AND tt.tick_ts >= b.ts_signal
+                        AND tt.tick_ts <= b.ts_signal + INTERVAL '30 minutes'
+                    GROUP BY b.id
+                )
+                SELECT
+                    b.*,
+                    ta.tick_count,
+                    ta.max_mc_ever,
+                    ta.min_mc_ever,
+                    ta.max_mc_2min,
+                    ta.min_mc_2min,
+                    ta.max_mc_5min,
+                    ta.max_mc_10min,
+                    ta.max_mc_20min,
+                    -- Gains relativos à entry_mc
+                    CASE WHEN b.entry_mc > 0 AND ta.max_mc_ever  IS NOT NULL
+                         THEN (ta.max_mc_ever  - b.entry_mc) / b.entry_mc END AS max_gain_pct,
+                    CASE WHEN b.entry_mc > 0 AND ta.min_mc_ever  IS NOT NULL
+                         THEN (ta.min_mc_ever  - b.entry_mc) / b.entry_mc END AS min_loss_pct,
+                    CASE WHEN b.entry_mc > 0 AND ta.max_mc_2min  IS NOT NULL
+                         THEN (ta.max_mc_2min  - b.entry_mc) / b.entry_mc END AS early_gain_pct,
+                    CASE WHEN b.entry_mc > 0 AND ta.max_mc_5min  IS NOT NULL
+                         THEN (ta.max_mc_5min  - b.entry_mc) / b.entry_mc END AS gain_5min_pct,
+                    CASE WHEN b.entry_mc > 0 AND ta.max_mc_10min IS NOT NULL
+                         THEN (ta.max_mc_10min - b.entry_mc) / b.entry_mc END AS gain_10min_pct
+                FROM base b
+                LEFT JOIN tick_agg ta ON ta.trade_id = b.id
+                WHERE b.outcome IS NOT NULL
+                ORDER BY b.id ASC
+            """)
+            rows = [dict(r) for r in cur.fetchall()]
+
+        # --- Classificação de causa-raiz por SL ---
+        def _sl_cause(r):
+            if r["outcome"] == "tp":
+                return "tp"
+            tc = r.get("tick_count") or 0
+            if tc < 3:
+                return "sem_ticks"
+            early = r.get("early_gain_pct")
+            max_g = r.get("max_gain_pct")
+            mins  = r.get("mins_to_exit")
+            tp_pct = r.get("tp_pct") or 0.75
+            if early is not None and early < -0.05:
+                return "dead_from_start"       # caiu desde o tick 1 — sinal errado
+            if mins is not None and mins < 5:
+                return "fast_dump"             # SL em <5min — sem chance de setup
+            if max_g is not None and max_g >= tp_pct * 0.7:
+                return "near_tp"               # chegou perto do TP mas não ativou trailing
+            if max_g is not None and max_g >= 0.10:
+                return "bounce_then_fail"      # bounçou +10% mas não segurou
+            return "slow_bleed"                # subida mínima, esgotamento lento
+
+        for r in rows:
+            r["sl_cause"] = _sl_cause(r)
+
+        # --- Métricas de cobertura ---
+        total   = len(rows)
+        n_tp    = sum(1 for r in rows if r["outcome"] == "tp")
+        n_sl    = sum(1 for r in rows if r["outcome"] == "sl")
+        wr_base = n_tp / total if total else 0
+        n_ticks_ok = sum(1 for r in rows if (r.get("tick_count") or 0) >= 10)
+        n_real_fill = sum(1 for r in rows if r.get("fill_source") in ("helius", "gmgn"))
+
+        # --- Helper: tabela de WR por bucket ---
+        def _bucket_table(buckets, has_traj=False):
+            rows_html = ""
+            for label, subset in buckets:
+                n = len(subset)
+                if n == 0:
+                    rows_html += f"<tr><td>{label}</td><td class='dim'>—</td><td class='dim'>—</td><td class='dim'>—</td><td class='dim'>—</td>"
+                    if has_traj: rows_html += "<td class='dim'>—</td><td class='dim'>—</td>"
+                    rows_html += "</tr>"
+                    continue
+                n_tp_s = sum(1 for r in subset if r["outcome"] == "tp")
+                n_sl_s = sum(1 for r in subset if r["outcome"] == "sl")
+                wr = n_tp_s / n if n else 0
+                delta = wr - wr_base
+                delta_str = f"{delta*100:+.0f}pp"
+                delta_col = "#3fb950" if delta > 0.05 else ("#f85149" if delta < -0.05 else "#8b949e")
+                bar_w = int(wr * 80)
+                bar_html = f"<div class='bar' style='width:{bar_w}px'></div>"
+                wr_col = _wr_color(wr)
+                extra = ""
+                if has_traj:
+                    avg_max = _avg([r.get("max_gain_pct") for r in subset])
+                    avg_min = _avg([r.get("min_loss_pct") for r in subset])
+                    extra = f"<td>{_pct(avg_max)}</td><td>{_pct(avg_min)}</td>"
+                rows_html += (
+                    f"<tr><td>{label}</td>"
+                    f"<td>{n}</td>"
+                    f"<td>{bar_html}<b style='color:{wr_col}'>{wr*100:.0f}%</b> "
+                    f"<span style='color:{delta_col};font-size:11px'>({delta_str})</span></td>"
+                    f"<td class='green'>{n_tp_s}</td><td class='red'>{n_sl_s}</td>"
+                    f"{extra}</tr>"
+                )
+            return rows_html
+
+        def _avg(lst):
+            lst2 = [x for x in lst if x is not None]
+            return sum(lst2) / len(lst2) if lst2 else None
+
+        # ================================================================
+        # SEÇÃO 2 — Causa-raiz dos SLs
+        # ================================================================
+        sl_rows = [r for r in rows if r["outcome"] == "sl"]
+        cause_counts = {}
+        for r in sl_rows:
+            cause_counts[r["sl_cause"]] = cause_counts.get(r["sl_cause"], 0) + 1
+
+        cause_labels = {
+            "dead_from_start": ("⬇ Dead from start", "Caiu desde o tick 1 — sinal errado, dump continuou", "#f85149"),
+            "fast_dump":       ("⚡ Fast dump <5min", "SL em <5min — sem chance, entrada prematura",         "#f85149"),
+            "bounce_then_fail":("〜 Bounce → fail",  "Subiu +10% mas não sustentou — comprador fraco",     "#d29922"),
+            "near_tp":         ("🎯 Near TP",         "Chegou perto do TP mas trailing não ativou",         "#e3b341"),
+            "slow_bleed":      ("📉 Slow bleed",      "Subida mínima, esgotamento lento",                   "#8b949e"),
+            "sem_ticks":       ("❓ Sem ticks",        "Poucos ticks — análise inconclusiva",                "#484f58"),
+        }
+
+        cause_summary_html = ""
+        for key, (label, desc, color) in cause_labels.items():
+            n_c = cause_counts.get(key, 0)
+            pct_c = n_c / len(sl_rows) * 100 if sl_rows else 0
+            bar_w = int(pct_c * 1.5)
+            cause_summary_html += (
+                f"<tr>"
+                f"<td style='color:{color}'>{label}</td>"
+                f"<td>{n_c} <span class='dim'>({pct_c:.0f}%)</span></td>"
+                f"<td><div class='bar' style='width:{bar_w}px;background:{color}'></div></td>"
+                f"<td class='dim' style='font-size:11px'>{desc}</td>"
+                f"</tr>"
+            )
+
+        # Tabela individual dos SLs classificados
+        sl_detail_html = ""
+        for r in sl_rows:
+            cause_key = r["sl_cause"]
+            cause_lbl, _, cause_col = cause_labels.get(cause_key, (cause_key, "", "#8b949e"))
+            mins = r.get("mins_to_exit")
+            mins_str = f"{mins:.1f}m" if mins is not None else "—"
+            tc = r.get("tick_count") or 0
+            sl_detail_html += (
+                f"<tr>"
+                f"<td class='dim'>{r['id']}</td>"
+                f"<td><b>{r.get('symbol','?')}</b></td>"
+                f"<td style='color:{cause_col};font-size:11px'>{cause_lbl}</td>"
+                f"<td>{_pct(r.get('early_gain_pct'), 0)}</td>"
+                f"<td>{_pct(r.get('max_gain_pct'),   0)}</td>"
+                f"<td class='dim'>{mins_str}</td>"
+                f"<td class='dim'>{tc}</td>"
+                f"<td>{_pct(r.get('b_drop_pct'), 0)}</td>"
+                f"<td>{_pct(r.get('b_bounce_pct'), 0)}</td>"
+                f"<td class='dim'>{r.get('smart_wallets') or '—'}</td>"
+                f"</tr>"
+            )
+
+        # ================================================================
+        # SEÇÃO 3 — drop_from_mig vs WR
+        # ================================================================
+        drop_buckets = [
+            ("30–50%",  [r for r in rows if r.get("b_drop_pct") is not None and 0.30 <= r["b_drop_pct"] < 0.50]),
+            ("50–70%",  [r for r in rows if r.get("b_drop_pct") is not None and 0.50 <= r["b_drop_pct"] < 0.70]),
+            ("70–85%",  [r for r in rows if r.get("b_drop_pct") is not None and 0.70 <= r["b_drop_pct"] < 0.85]),
+            (">85%",    [r for r in rows if r.get("b_drop_pct") is not None and r["b_drop_pct"] >= 0.85]),
+            ("sem dado",[r for r in rows if r.get("b_drop_pct") is None]),
+        ]
+        drop_html = _bucket_table(drop_buckets, has_traj=True)
+
+        # ================================================================
+        # SEÇÃO 4 — entry_ratio vs WR
+        # ================================================================
+        er_buckets = [
+            ("<25%",   [r for r in rows if r.get("entry_ratio") is not None and r["entry_ratio"] < 0.25]),
+            ("25–35%", [r for r in rows if r.get("entry_ratio") is not None and 0.25 <= r["entry_ratio"] < 0.35]),
+            ("35–45%", [r for r in rows if r.get("entry_ratio") is not None and 0.35 <= r["entry_ratio"] < 0.45]),
+            ("45–55%", [r for r in rows if r.get("entry_ratio") is not None and 0.45 <= r["entry_ratio"] < 0.55]),
+            ("55–65%", [r for r in rows if r.get("entry_ratio") is not None and 0.55 <= r["entry_ratio"] < 0.65]),
+            (">65%",   [r for r in rows if r.get("entry_ratio") is not None and r["entry_ratio"] >= 0.65]),
+            ("sem dado",[r for r in rows if r.get("entry_ratio") is None]),
+        ]
+        er_html = _bucket_table(er_buckets, has_traj=True)
+
+        # ================================================================
+        # SEÇÃO 5 — Velocidade do SL
+        # ================================================================
+        sl_speed_buckets = [
+            ("<5min",   [r for r in sl_rows if r.get("mins_to_exit") is not None and r["mins_to_exit"] < 5]),
+            ("5–15min", [r for r in sl_rows if r.get("mins_to_exit") is not None and 5  <= r["mins_to_exit"] < 15]),
+            ("15–30min",[r for r in sl_rows if r.get("mins_to_exit") is not None and 15 <= r["mins_to_exit"] < 30]),
+            (">30min",  [r for r in sl_rows if r.get("mins_to_exit") is not None and r["mins_to_exit"] >= 30]),
+            ("sem dado",[r for r in sl_rows if r.get("mins_to_exit") is None]),
+        ]
+        speed_html = ""
+        for label, subset in sl_speed_buckets:
+            n_s = len(subset)
+            if n_s == 0:
+                speed_html += f"<tr><td>{label}</td><td class='dim'>—</td><td class='dim'>—</td><td class='dim'>—</td><td class='dim'>—</td></tr>"
+                continue
+            had_pos = sum(1 for r in subset if (r.get("max_gain_pct") or 0) > 0)
+            pct_had_pos = had_pos / n_s * 100
+            avg_max = _avg([r.get("max_gain_pct") for r in subset])
+            avg_early = _avg([r.get("early_gain_pct") for r in subset])
+            speed_html += (
+                f"<tr><td>{label}</td>"
+                f"<td>{n_s}</td>"
+                f"<td>{had_pos} <span class='dim'>({pct_had_pos:.0f}%)</span></td>"
+                f"<td>{_pct(avg_early, 0)}</td>"
+                f"<td>{_pct(avg_max, 0)}</td>"
+                f"</tr>"
+            )
+
+        # ================================================================
+        # SEÇÃO 6 — TPs: trajetória e timing
+        # ================================================================
+        tp_rows = [r for r in rows if r["outcome"] == "tp"]
+        tp_detail_html = ""
+        for r in sorted(tp_rows, key=lambda x: x.get("mins_to_exit") or 999):
+            mins = r.get("mins_to_exit")
+            tp_detail_html += (
+                f"<tr>"
+                f"<td><b class='green'>{r.get('symbol','?')}</b></td>"
+                f"<td>{f'{mins:.1f}m' if mins is not None else '—'}</td>"
+                f"<td>{_pct(r.get('max_gain_pct'), 0)}</td>"
+                f"<td>{_pct(r.get('pnl_pct_real'), 0)}</td>"
+                f"<td>{_pct(r.get('entry_ratio'), 0)}</td>"
+                f"<td>{_pct(r.get('b_drop_pct'), 0)}</td>"
+                f"<td>{_pct(r.get('b_bounce_pct'), 0)}</td>"
+                f"<td class='dim'>{r.get('smart_wallets') or '—'}</td>"
+                f"<td class='dim'>{r.get('tick_count') or '—'}</td>"
+                f"</tr>"
+            )
+        if not tp_detail_html:
+            tp_detail_html = "<tr><td colspan='9' class='dim'>Nenhum TP com dados disponíveis</td></tr>"
+
+        tp_mins = [r["mins_to_exit"] for r in tp_rows if r.get("mins_to_exit")]
+        tp_median = sorted(tp_mins)[len(tp_mins)//2] if tp_mins else None
+        tp_avg    = sum(tp_mins)/len(tp_mins) if tp_mins else None
+
+        # ================================================================
+        # SEÇÃO 7 — Smart wallets vs WR (trades live)
+        # ================================================================
+        smart_buckets = [
+            ("1",   [r for r in rows if r.get("smart_wallets") == 1]),
+            ("2",   [r for r in rows if r.get("smart_wallets") == 2]),
+            ("3",   [r for r in rows if r.get("smart_wallets") == 3]),
+            ("4",   [r for r in rows if r.get("smart_wallets") == 4]),
+            ("5+",  [r for r in rows if (r.get("smart_wallets") or 0) >= 5]),
+            ("NULL",[r for r in rows if r.get("smart_wallets") is None]),
+        ]
+        smart_html = _bucket_table(smart_buckets)
+
+        # ================================================================
+        # SEÇÃO 8 — bounce_pct vs WR (dentro dos trades ≥30%)
+        # ================================================================
+        bp_buckets = [
+            ("30–40%",  [r for r in rows if r.get("b_bounce_pct") is not None and 0.30 <= r["b_bounce_pct"] < 0.40]),
+            ("40–55%",  [r for r in rows if r.get("b_bounce_pct") is not None and 0.40 <= r["b_bounce_pct"] < 0.55]),
+            ("55–70%",  [r for r in rows if r.get("b_bounce_pct") is not None and 0.55 <= r["b_bounce_pct"] < 0.70]),
+            (">70%",    [r for r in rows if r.get("b_bounce_pct") is not None and r["b_bounce_pct"] >= 0.70]),
+            ("sem dado",[r for r in rows if r.get("b_bounce_pct") is None]),
+        ]
+        bp_html = _bucket_table(bp_buckets, has_traj=True)
+
+        # ================================================================
+        # SEÇÃO 9 — Tabela individual completa
+        # ================================================================
+        cause_icon = {
+            "dead_from_start":  "<span style='color:#f85149'>⬇</span>",
+            "fast_dump":        "<span style='color:#f85149'>⚡</span>",
+            "bounce_then_fail": "<span style='color:#d29922'>〜</span>",
+            "near_tp":          "<span style='color:#e3b341'>🎯</span>",
+            "slow_bleed":       "<span style='color:#8b949e'>📉</span>",
+            "sem_ticks":        "<span class='dim'>❓</span>",
+            "tp":               "<span class='green'>✅</span>",
+        }
+        all_detail_html = ""
+        for r in rows:
+            o = r["outcome"]
+            out_str = f"<span class='green'>TP</span>" if o == "tp" else f"<span class='red'>SL</span>"
+            icon = cause_icon.get(r["sl_cause"], "")
+            er = r.get("entry_ratio")
+            er_str = f"{er*100:.0f}%" if er is not None else "<span class='dim'>—</span>"
+            all_detail_html += (
+                f"<tr>"
+                f"<td class='dim'>{r['id']}</td>"
+                f"<td>{r.get('symbol','?')}</td>"
+                f"<td>{out_str} {icon}</td>"
+                f"<td>{_pct(r.get('b_drop_pct'), 0)}</td>"
+                f"<td>{_pct(r.get('b_bounce_pct'), 0)}</td>"
+                f"<td class='dim'>{('%dm' % r['b_elapsed_min']) if r.get('b_elapsed_min') else '—'}</td>"
+                f"<td class='dim'>{er_str}</td>"
+                f"<td class='dim'>{r.get('smart_wallets') or '—'}</td>"
+                f"<td>{_pct(r.get('early_gain_pct'), 0)}</td>"
+                f"<td>{_pct(r.get('max_gain_pct'),   0)}</td>"
+                f"<td class='dim'>{('%dm' % r['mins_to_exit']) if r.get('mins_to_exit') else '—'}</td>"
+                f"<td class='dim'>{r.get('tick_count') or '—'}</td>"
+                f"<td>{_pct(r.get('pnl_pct_real'), 0)}</td>"
+                f"</tr>"
+            )
+
+        # ================================================================
+        # RENDER
+        # ================================================================
+        wr_col = _wr_color(wr_base)
+        html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>Trade Autopsy</title>{CSS}
+</head><body>
+<h1>Trade Autopsy — O que separa TPs de SLs?</h1>
+<p style='color:#8b949e;font-size:11px;margin-bottom:8px'>
+  Pergunta central: o SL bateu porque o <b style='color:#f85149'>sinal estava errado</b> (dump continuou)
+  ou porque o <b style='color:#d29922'>bounce era real mas fraco</b> (não atingiu TP de 75%)?<br>
+  GMGN = ground truth. DB WR pode ter falsos positivos — usar com cautela.
+</p>
+<div class='nav'>
+  <a href='/analise/wr-breakdown'>WR Breakdown</a>
+  <a href='/analise/h22-correlation'>H22</a>
+  <a href='/analise/post-sl-recovery'>Post-SL Recovery</a>
+  <a href='/analise/backtest'>Backtester</a>
+  <a href='/debug/open-trades'>Open Trades</a>
+</div><br>
+
+{_box("Trades analisados", total)}
+{_box("TP", n_tp, "#3fb950")}
+{_box("SL", n_sl, "#f85149")}
+{_box("WR base", f"{wr_base*100:.0f}%", wr_col)}
+{_box("Com ≥10 ticks", n_ticks_ok, "#58a6ff", "análise de trajetória confiável")}
+{_box("Fill real (Helius/GMGN)", n_real_fill, "#8b949e", "entry_mc calculado do fill")}
+
+<br><br>
+
+<!-- SEÇÃO 2: Causa-raiz dos SLs -->
+<h2>▸ 1. CAUSA-RAIZ DOS SLs — O que causou a perda? (n={len(sl_rows)} SLs)</h2>
+<p style='color:#484f58;font-size:11px'>
+  Classifica cada SL com base nos primeiros ticks após a entrada.<br>
+  "Dead from start": early_gain &lt; -5% nos primeiros 2min — token nunca bounçou de verdade.<br>
+  "Near TP": max_gain ≥ 70% do TP_PCT — token bounçou mas trailing não ativou a tempo.
+</p>
+<table style='max-width:700px'>
+  <thead><tr><th>Causa</th><th>n SLs (%)</th><th>Dist.</th><th>Descrição</th></tr></thead>
+  <tbody>{cause_summary_html}</tbody>
+</table>
+
+<br>
+<p style='color:#8b949e;font-size:11px'>Detalhe por SL:</p>
+<table>
+  <thead><tr>
+    <th>#</th><th>Token</th><th>Causa</th>
+    <th>Early +2min</th><th>Max gain</th><th>Duração</th><th>Ticks</th>
+    <th>Drop%</th><th>Bounce%</th><th>Smart</th>
+  </tr></thead>
+  <tbody>{sl_detail_html if sl_detail_html else "<tr><td colspan='10' class='dim'>Sem SLs com dados</td></tr>"}</tbody>
+</table>
+
+<br>
+<!-- SEÇÃO 5: Velocidade do SL -->
+<h2>▸ 2. VELOCIDADE DO SL — Quanto tempo durou antes de bater?</h2>
+<p style='color:#484f58;font-size:11px'>
+  "Teve pico positivo" = max_gain &gt; 0 antes de bater o SL (bounce existiu mas foi insuficiente).<br>
+  SL em &lt;5min = dump imediato após entrada → provável sinal falso.
+</p>
+<table style='max-width:650px'>
+  <thead><tr>
+    <th>Tempo até SL</th><th>n SLs</th><th>Teve pico positivo</th>
+    <th>Early gain +2min</th><th>Max gain</th>
+  </tr></thead>
+  <tbody>{speed_html}</tbody>
+</table>
+
+<br>
+<!-- SEÇÃO 3: drop_from_mig vs WR -->
+<h2>▸ 3. PROFUNDIDADE DO DUMP vs WR — Qual zona de dump gera melhor resultado?</h2>
+<p style='color:#484f58;font-size:11px'>
+  H histórica: dump mais profundo → recovery melhor (dataset de 400+ tokens).<br>
+  Esta seção valida (ou nega) nos ~{total} trades reais executados. delta = vs WR base de {wr_base*100:.0f}%.
+</p>
+<table style='max-width:750px'>
+  <thead><tr>
+    <th>Dump da migração</th><th>n</th><th>Win Rate (delta base)</th><th>TP</th><th>SL</th>
+    <th>Max gain avg</th><th>Min loss avg</th>
+  </tr></thead>
+  <tbody>{drop_html}</tbody>
+</table>
+
+<br>
+<!-- SEÇÃO 4: entry_ratio vs WR -->
+<h2>▸ 4. ENTRY RATIO vs WR — Onde entramos no range migração→fundo?</h2>
+<p style='color:#484f58;font-size:11px'>
+  entry_ratio = mc_at_signal / mc_migration. Ex: 35% = entramos quando o token estava 35% do MC de migração.<br>
+  H15 histórica: zona 50-65% = WR 0%. Validação nos trades live abaixo.
+</p>
+<table style='max-width:750px'>
+  <thead><tr>
+    <th>Entry ratio</th><th>n</th><th>Win Rate (delta base)</th><th>TP</th><th>SL</th>
+    <th>Max gain avg</th><th>Min loss avg</th>
+  </tr></thead>
+  <tbody>{er_html}</tbody>
+</table>
+
+<br>
+<!-- SEÇÃO 6: TPs -->
+<h2>▸ 5. TPs — Perfil dos winners (n={len(tp_rows)})</h2>
+<p style='color:#484f58;font-size:11px'>
+  Mediana tempo até fechar: <b style='color:#3fb950'>{f"{tp_median:.1f}min" if tp_median else "—"}</b> |
+  Média: <b>{f"{tp_avg:.1f}min" if tp_avg else "—"}</b>
+</p>
+<table>
+  <thead><tr>
+    <th>Token</th><th>Duração</th><th>Max gain</th><th>P&L real</th>
+    <th>Entry ratio</th><th>Drop%</th><th>Bounce%</th><th>Smart</th><th>Ticks</th>
+  </tr></thead>
+  <tbody>{tp_detail_html}</tbody>
+</table>
+
+<br>
+<!-- SEÇÃO 7: Smart wallets -->
+<h2>▸ 6. SMART WALLETS vs WR — Confirmação nos trades live</h2>
+<table style='max-width:600px'>
+  <thead><tr><th>Smart count</th><th>n</th><th>Win Rate (delta base)</th><th>TP</th><th>SL</th></tr></thead>
+  <tbody>{smart_html}</tbody>
+</table>
+
+<br>
+<!-- SEÇÃO 8: bounce_pct -->
+<h2>▸ 7. BOUNCE_PCT vs WR — Dentro dos trades ≥30%</h2>
+<p style='color:#484f58;font-size:11px'>
+  Bounce muito alto = entrada tardia? Bounce 30-40% pode ser zona de melhor R:R.
+</p>
+<table style='max-width:750px'>
+  <thead><tr>
+    <th>Bounce no sinal</th><th>n</th><th>Win Rate (delta base)</th><th>TP</th><th>SL</th>
+    <th>Max gain avg</th><th>Min loss avg</th>
+  </tr></thead>
+  <tbody>{bp_html}</tbody>
+</table>
+
+<br>
+<!-- SEÇÃO 9: Tabela completa -->
+<h2>▸ 8. TABELA COMPLETA — Todos os {total} trades</h2>
+<p style='color:#484f58;font-size:11px'>
+  Ícone = causa-raiz do SL. ⬇ dead_from_start · ⚡ fast_dump · 〜 bounce_then_fail · 🎯 near_tp · 📉 slow_bleed
+</p>
+<table>
+  <thead><tr>
+    <th>#</th><th>Token</th><th>Out.</th>
+    <th>Drop%</th><th>Bounce%</th><th>Elapsed</th><th>Entry ratio</th>
+    <th>Smart</th><th>+2min</th><th>Max gain</th><th>Duração</th><th>Ticks</th><th>P&L</th>
+  </tr></thead>
+  <tbody>{all_detail_html}</tbody>
+</table>
+
+<br>
+<p style='color:#484f58;font-size:11px;margin-top:14px'>
+  Gate para cada insight virar filtro: delta WR ≥ +10pp · n_bucket ≥ 10 · mecanismo explicável.<br>
+  entry_mc = calculado de entry_price_usd/tokens_received quando fill disponível; fallback entry_expected.<br>
+  Max gain / Early gain = baseados em mc_high dos token_ticks. Trades sem ticks = análise de trajetória inconclusiva.
+</p>
+</body></html>"""
+        return html
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
