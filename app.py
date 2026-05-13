@@ -11356,9 +11356,11 @@ def analise_sniper_filter():
                 LIMIT 10
             """)
             null_by_exchange = [dict(r) for r in cur.fetchall()]
-            n = (n_tp or 0) + (n_sl or 0)
-            if not n: return "—", "#484f58"
-            wr = (n_tp or 0) / n
+
+        def _wr(tp, sl):
+            total = (tp or 0) + (sl or 0)
+            if not total: return "—", "#484f58"
+            wr = (tp or 0) / total
             color = "#3fb950" if wr >= 0.35 else ("#d29922" if wr >= 0.20 else "#f85149")
             return f"{wr*100:.0f}%", color
 
