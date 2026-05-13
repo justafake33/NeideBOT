@@ -1,7 +1,7 @@
 # NeideBOT — Roadmap
 
-**Atualizado:** 2026-05-13 (sessão 3)
-**Estado:** Bot ativo a $1/trade · WR **~15% (GMGN ground truth, filtros anteriores)** · filtros A.2/A.3/A.5/A.6/A.7/smart≥3/FILTER_PUMP_ONLY ativos · SL=25% em teste · Helius RPC fill ativo · TradeMonitor cego corrigido via get_token_balance() · H22 cobertura 6% (32/552) e crescendo
+**Atualizado:** 2026-05-13 (sessão 4)
+**Estado:** Bot ativo a $1/trade · WR **~32% corrigido (42 TP / ~128 trades, GMGN ground truth)** · filtros A.2/A.3/A.5/A.6/A.7/smart≥3/FILTER_PUMP_ONLY ativos · SL=25% · Helius RPC ativo · GMGN trailing TP confirmado funcionando corretamente
 
 ---
 
@@ -44,12 +44,39 @@
 | **Fix `/analise/h22-correlation` CTE** | 2026-05-13 | CTE excluía `status='open'` → todos os bounces com trades mostravam `outcome=NULL`. Fix: sem WHERE filter — latest trade por mint independente de status. |
 | **H22 cobertura: 6% (32/552)** | 2026-05-13 | Cresceu de 1.7% (9/529). 100% dos tokens pump.fun novos terão cobertura via FILTER_PUMP_ONLY + Helius WS. Histórico anterior à implementação ficará sem dados. |
 | **`/debug/absorption` — 3 summary boxes H22** | 2026-05-13 | Adicionados boxes: "H22 ticks (holding)", "Trades monitorados", "Mints distintos" — counts da tabela `trade_absorption_ticks`. |
+| **Trade Autopsy `/analise/trade-autopsy`** | 2026-05-13 | Dashboard de causa-raiz dos SLs: dead_from_start/fast_dump/bounce_then_fail/near_tp/slow_bleed. Seção pré/pós exit com max_gain_before/after_exit, hit_tp_before/after_exit (boolean), spike_suspect flag. |
+| **Fix mc_high → mc para trajetória** | 2026-05-13 | `tick_pre` e `tick_post` CTEs agora usam `tt.mc` (close), não `mc_high`. mc_high é inflado por spikes intra-candle do pAMM — um único trade em pool pequena pode temporariamente empurrar AMM price 200-300x. Causa confirmada de falsos "trailing_falhou". |
+| **GMGN trailing TP confirmado funcionando** | 2026-05-13 | Verificação manual no gráfico dos 16 casos "trailing_falhou": HUMANITY +56%, Kevin +311%, SLEEP +41%, DrawPoorly +46% foram exits lucrativos reais. Os outros 11 (RSDM, RBC, SPM, TROGE, OARPE, MEMES, LEXAHOUSE, TECH, Talulah, Trending, VIRUS) eram SL corretos — mc_high capturou spikes que nunca existiram como price action real. |
+| **DB fix: 4 trailing TPs corrigidos** | 2026-05-13 | HUMANITY #105, Kevin #153, SLEEP #174, DrawPoorly #157 corrigidos para `status='tp'` com PnL real. TradeMonitor não detectava trailing exit após janela HotMonitor de 60min. WR corrigido: 38→42 TP, 94→90 SL, 29%→32%. |
+| **`/debug/trailing-review`** | 2026-05-13 | Lista todos os "trailing_falhou" com timestamps BRT, ticks (confiança), max_gain_before_exit (close), exit esperado (pico×0.70), links DexScreener+GMGN para verificação manual. |
+| **SL <1min diagnostic no trade-autopsy** | 2026-05-13 | Bucket `<1min` separado na velocidade do SL. Box diagnóstico explica dois subtipos: real fast dump (max_gain≈0%) vs spike artifact (max_gain muito alto, poucos ticks). |
+| **bounce_pct >70% → WR 74% confirmado** | 2026-05-13 | n=23 trades, +45pp vs WR base. Gradiente claro: 30-40%→12%, 40-55%→23%, 55-70%→40%, >70%→74%. Maior discriminador encontrado nos dados live. |
+| **smart_wallets: zero discriminação live** | 2026-05-13 | smart=1→31%, smart=2→32%, smart=3→30%, smart=5+→19%. Flat ou negativo com smart alto. Contradiz análise anterior (n=6 para smart=1). FILTER_SMART_MIN=3 pode ser rebaixado. |
 
-> ⚠️ **Nota sobre WR histórico**: O DB WR (chegou a mostrar 34%) é inválido. TradeMonitor infere TP/SL via token_ticks e gera falsos positivos após GMGN fechar a posição. **GMGN = 15% WR = ground truth.**
+> ⚠️ **WR corrigido (2026-05-13 sessão 4):** 4 trailing TPs (HUMANITY, Kevin, SLEEP, DrawPoorly) estavam como `sl` no DB — TradeMonitor cego após 60min. Após correção: **42 TP / 90 SL / 132 trades = WR 32%** (GMGN ground truth). mc_high nos ticks NÃO pode ser usado para inferir trajectory — usa spikes intra-candle como se fossem price action real.
 
 ---
 
 ## 🔜 Curto Prazo
+
+### 0. BOUNCE_MIN_PCT → 0.50 (ou 0.70) ← PRÓXIMA MUDANÇA DE ENV VAR
+
+**Por quê:** bounce_pct >70% tem WR 74% (n=23, +45pp). Gradiente claro nos dados live.
+Mudança de env var, zero código. Reduz frequência mas aumenta WR drasticamente.
+
+| Threshold | WR | n | Frequência estimada |
+|-----------|-----|---|---------------------|
+| ≥30% (atual) | 29% | 132 | baseline |
+| ≥50% | ~40% | ~46 | ~35% da frequência atual |
+| ≥70% | 74% | ~23 | ~17% da frequência atual |
+
+**Tradeoff:** a $1/trade com WR 74%, EV/trade = +49% vs +4% atual. Mesmo com 1/6 das operações, o resultado financeiro melhora.
+
+**Gate:** Testar BOUNCE_MIN_PCT=0.50 primeiro. Aguardar n≥20 trades para confirmar WR ≥40%. Depois avaliar 0.70.
+
+**Ação:** Mudar Railway env var `BOUNCE_MIN_PCT=0.50` agora. Zero risco de regredir — só reduz frequência.
+
+---
 
 ### 1. FILTER_SMART_MIN=3 ← **✅ CONCLUÍDO (2026-05-12)**
 
@@ -293,3 +320,8 @@ Dashboard mostra correlação H22 → outcome com n atual. 3 tabelas: por `absor
 17. **TradeMonitor era cego após 60min de janela quente**: dependia de `token_ticks` gerados pelo HotMonitor. Quando HotMonitor expira, ticks param → `if not ticks: return` → trade fica `open` para sempre. Trades de menos de $1 fechavam em minutos mas o sistema não sabia. Fix correto: verificar posição on-chain via `get_token_balance()`, não tentar inferir de dados que param de chegar.
 18. **`condition_orders` na query_order é vazia**: GMGN não retorna status das condition_orders (TP/SL) quando se consulta a ordem de compra. `_check_via_gmgn()` que tentava ler esse campo é ineficaz. As condition_orders têm lifecycle independente da ordem de compra — precisariam de uma query separada com order_id do TP/SL (não exposto pela API). Blockchain é o único caminho confiável.
 19. **SL=15% vs volatilidade pAMM**: em pools com liquidez pequena (~79 SOL), uma única transação de venda pode temporariamente empurrar o preço 15-20% abaixo antes do próximo buy reequilibrar. GMGN monitora price com granularidade alta → SL=15% dispara nesses spikes antes de qualquer recuperação. Testando SL=25% como threshold mais robusto a ruído. Aguardar n≥30 trades para validar EV vs SL=15%.
+20. **mc_high em token_ticks não pode ser usado para trajectory analysis**: mesma raiz que o mc_peak inflado (nota 97 do CLAUDE.md). Em pools pAMM com ~79 SOL de liquidez, uma única transação de compra pode empurrar o preço AMM 200-300% por <1 candle antes de reverter. O `kline high` registra esse pico como real. Para análise de "quanto o token subiu enquanto segurava", usar apenas `mc` (close). `mc_high` só é válido para o backtester (detectar se TP foi atingido intra-vela — onde um spike real pode ter trigado a condition_order).
+21. **GMGN trailing TP funciona corretamente**: verificação manual de 16 casos "trailing_falhou" mostrou que todos os casos com price action real (muitos ticks pré-exit) foram ou (a) exits lucrativos reais mal classificados no DB, ou (b) SL corretos onde mc_high estava inflado. Zero casos de falha real do trailing GMGN. O DB é que estava errado — TradeMonitor não capturava trailing exits após o HotMonitor expirar.
+22. **WR corrigido: 32% (42/132)**: 4 trades classificados como `sl` eram na verdade trailing TPs (HUMANITY +56%, Kevin +311%, SLEEP +41%, DrawPoorly +46%). TradeMonitor era cego após 60min porque `if not ticks: return`. Com a correção via `get_token_balance()` os novos trades serão classificados corretamente. Para dados históricos: usar `/debug/fix-trailing-outcomes` + verificação manual.
+23. **smart_wallets não discrimina WR em dados live**: smart=1→31%, smart=3→30%, smart=5+→19% (plano ou negativo). Contradiz análise anterior de n=6. FILTER_SMART_MIN=3 é conservador demais — pode estar rejeitando tokens válidos. Revisar após n≥50 trades com smart≥3 acumulados.
+24. **bounce_pct >70% é o maior discriminador live**: WR 74% (n=23) vs 29% base (+45pp). Gradiente claro e monotônico (12% / 23% / 40% / 74%). Mecanismo plausível: bounce mais forte = mais compradores reais = mais sustentação. BOUNCE_MIN_PCT=0.50 é a mudança de maior impacto disponível sem código.
