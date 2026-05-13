@@ -10543,6 +10543,16 @@ def debug_absorption():
             """)
             exchange_stats = [dict(r) for r in cur.fetchall()]
 
+            # Contagem de trade_absorption_ticks (monitoramento contínuo durante holding)
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS total_ticks,
+                    COUNT(DISTINCT trade_id) AS trades_com_ticks,
+                    COUNT(DISTINCT mint) AS mints_com_ticks
+                FROM trade_absorption_ticks
+            """)
+            tat_stats = dict(cur.fetchone())
+
         bounce_rows_html = ""
         for r in bounces:
             ts       = r["ts_signal"].strftime("%m-%d %H:%M") if r.get("ts_signal") else "—"
@@ -10593,6 +10603,10 @@ def debug_absorption():
         no_data   = stats.get("no_data", 0)
         cov_pct   = f"{with_data/total*100:.0f}%" if total else "—"
 
+        tat_ticks  = tat_stats.get("total_ticks", 0)
+        tat_trades = tat_stats.get("trades_com_ticks", 0)
+        tat_mints  = tat_stats.get("mints_com_ticks", 0)
+
         def _box(label, val, color="#e6edf3"):
             return f"<div class='box'><div class='lbl'>{label}</div><div class='val' style='color:{color}'>{val}</div></div>"
 
@@ -10603,7 +10617,10 @@ def debug_absorption():
             _box("Com dados H22", f"{with_data} ({cov_pct})",
                  "#3fb950" if with_data > 0 else "#f85149") +
             _box("NULL (sem eventos)", no_data,
-                 "#f85149" if no_data > with_data else "#e3b341")
+                 "#f85149" if no_data > with_data else "#e3b341") +
+            _box("H22 ticks (holding)", tat_ticks, "#58a6ff") +
+            _box("Trades monitorados", tat_trades, "#58a6ff") +
+            _box("Mints distintos", tat_mints, "#8b949e")
         )
 
         # Tabela de cobertura por exchange
@@ -10939,7 +10956,7 @@ def analise_h22_correlation():
 
             # --- Bounce signals com trades associados e outcome GMGN ---
             # Join por mint — bounce_signals tem UNIQUE(mint), trades pode ter múltiplos por mint
-            # Pega o trade mais recente por mint com outcome definitivo
+            # Pega o trade mais recente por mint (qualquer status) para não perder trades open/error
             cur.execute("""
                 WITH latest_trade AS (
                     SELECT DISTINCT ON (mint)
@@ -10947,7 +10964,6 @@ def analise_h22_correlation():
                         status,
                         pnl_pct_real
                     FROM trades
-                    WHERE status IN ('tp', 'sl', 'trailing_active', 'expired')
                     ORDER BY mint, created_at DESC
                 )
                 SELECT
