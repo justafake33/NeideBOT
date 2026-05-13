@@ -147,10 +147,18 @@ class TradeExecutor:
             )
             data     = swap_res.get("data") or swap_res
             order_id = data.get("order_id") or data.get("id")
+            # Extrai IDs dos condition_orders (TP/SL) se retornados pelo GMGN.
+            # Formato pode variar — logamos tudo para descobrir a estrutura real.
+            co_list = data.get("condition_orders") or []
+            co_ids  = "|".join(str(co.get("order_id") or co.get("id") or "") for co in co_list if co)
+            strategy_label = f"trailing:ativ{TRAILING_ACTIVATION_PCT:.0f}%|dd{TRAILING_DRAWDOWN_PCT:.0f}%|SL-{TRADE_SL_PCT*100:.0f}%"
+            if co_ids:
+                strategy_label = co_ids  # substitui label por IDs reais se disponíveis
+            logger.debug("Swap #%d condition_orders raw: %s", trade_id, str(co_list)[:500])
             db.update_trade(trade_id, {
                 "ts_order_sent": ts_sent,
                 "order_id":      order_id,
-                "strategy_id":   f"trailing:ativ{TRAILING_ACTIVATION_PCT:.0f}%|dd{TRAILING_DRAWDOWN_PCT:.0f}%|SL-{TRADE_SL_PCT*100:.0f}%",
+                "strategy_id":   strategy_label,
                 "status":        "open",
             })
             logger.info(
@@ -405,6 +413,8 @@ class TradeMonitor:
 
         ticks = db.get_ticks_after(mint, min_ts=ref_ts)
         if not ticks:
+            # Sem ticks (token fora da janela quente >60min) — pergunta direto ao GMGN.
+            self._check_via_gmgn(trade, sol_usd, now)
             return
 
         for tick in ticks:
@@ -420,6 +430,79 @@ class TradeMonitor:
             if low > 0 and low <= sl_mc:
                 self._record_exit(trade, "sl", -sl_pct, tick_ts, sol_usd)
                 return
+
+    def _check_via_gmgn(self, trade: dict, sol_usd: float, now: datetime) -> bool:
+        """Fallback para trades sem token_ticks: consulta query_order direto no GMGN.
+
+        Chama quando não há ticks (token fora da janela quente >60min).
+        Verifica condition_orders do GMGN para detectar se TP/SL executou.
+        Retorna True se atualizou o trade.
+        """
+        order_id = trade.get("order_id")
+        if not order_id:
+            return False
+
+        trade_id   = trade["id"]
+        symbol     = trade.get("symbol", trade["mint"][:8])
+        amount_usd = trade.get("amount_usd") or 1.0
+        fee_sol    = trade.get("fee_sol") or 0.0
+        fill_sol   = trade.get("amount_sol") or 0.0
+        fee_frac   = (fee_sol / fill_sol) if fill_sol > 0 else 0.0
+
+        try:
+            result = self.gmgn.query_order(order_id)
+            data   = result.get("data") or result
+            logger.debug("_check_via_gmgn #%d raw: %s", trade_id, str(data)[:400])
+
+            # Condition orders no response do buy order (formato a confirmar em produção)
+            co_list = data.get("condition_orders") or []
+            for co in co_list:
+                co_status = str(co.get("state") or co.get("status") or "").lower()
+                co_type   = str(co.get("order_type") or co.get("type") or "").lower()
+                if co_status not in ("filled", "completed", "triggered", "executed"):
+                    continue
+
+                is_tp = "profit" in co_type or "trailing" in co_type
+                is_sl = "loss" in co_type or "stop" in co_type
+                if not is_tp and not is_sl:
+                    continue
+
+                exit_type = "trailing" if is_tp else "sl"
+                pnl_guess = TRAILING_ACTIVATION_PCT / 100 if is_tp else -TRADE_SL_PCT
+
+                # Tenta calcular P&L real a partir do fill do condition order
+                exit_raw = _safe_float(co.get("filled_input_amount") or co.get("out_amount"))
+                exit_sol = (exit_raw / 1e9 if exit_raw and exit_raw > 1000 else exit_raw) or 0
+                exit_usd = exit_sol * sol_usd if exit_sol > 0 else amount_usd * (1 + pnl_guess)
+                pnl_real = (exit_usd / amount_usd) - 1 - fee_frac if amount_usd else pnl_guess
+
+                status = "tp" if is_tp else "sl"
+                db.update_trade(trade_id, {
+                    "status":         status,
+                    "exit_type":      exit_type,
+                    "exit_ts":        now,
+                    "exit_price_usd": exit_usd,
+                    "pnl_pct_real":   pnl_real,
+                })
+                logger.info(
+                    "TradeMonitor GMGN-poll #%d %s → %s | type=%s pnl=%.1f%%",
+                    trade_id, symbol, status.upper(), co_type, pnl_real * 100,
+                )
+                return True
+
+            # condition_orders vazio — estrutura desconhecida ou ainda pendentes.
+            # Loga data completo uma vez por hora para diagnóstico.
+            created_at = trade.get("created_at")
+            if created_at:
+                age_min = (now - created_at).total_seconds() / 60
+                if int(age_min) % 60 == 0:
+                    logger.info("_check_via_gmgn #%d sem condition_orders na resposta: %s",
+                                trade_id, str(data)[:300])
+
+        except Exception as e:
+            logger.debug("_check_via_gmgn #%d: %s", trade_id, e)
+
+        return False
 
     def _check_trailing_exit(self, trade: dict, sol_usd: float, now: datetime):
         """
@@ -445,6 +528,7 @@ class TradeMonitor:
         ref_ts = trade.get("ts_order_sent") or trade.get("exit_ts") or trade.get("ts_signal")
         ticks  = db.get_ticks_after(mint, min_ts=ref_ts)
         if not ticks:
+            self._check_via_gmgn(trade, sol_usd, now)
             return
 
         activation_mc = entry_mc_real * (1 + TRAILING_ACTIVATION_PCT / 100)
