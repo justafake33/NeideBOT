@@ -6306,6 +6306,184 @@ def _start_services():
 _start_services()
 
 
+@app.route("/debug/open-trades")
+def debug_open_trades():
+    """Diagnóstico de trades abertos — mostra por que TradeMonitor não detectou saída.
+
+    Para cada trade 'open' ou 'trailing_active':
+    - entry_expected vs entry_mc_real (fill real)
+    - sl_mc e tp_mc calculados
+    - ticks disponíveis: count, fonte, menor low, maior high
+    - query_order GMGN ao vivo: estado atual da ordem
+    """
+    import traceback
+    try:
+        from executor import TRADE_SL_PCT, TRAILING_ACTIVATION_PCT, TRAILING_DRAWDOWN_PCT
+        from gmgn_client import get_sol_usd
+        from datetime import timezone
+
+        CSS = ("<style>body{background:#0d1117;color:#e6edf3;font:12px/1.6 monospace;padding:20px}"
+               "a{color:#58a6ff;text-decoration:none}table{border-collapse:collapse;width:100%}"
+               "th{background:#161b22;padding:6px 10px;text-align:left;font-size:11px;color:#8b949e}"
+               "td{padding:4px 10px;border-bottom:1px solid #21262d;font-size:11px}"
+               ".box{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px 14px;"
+               "margin:6px 4px;display:inline-block;vertical-align:top}"
+               ".lbl{color:#8b949e;font-size:10px}.val{font-size:16px;font-weight:bold}"
+               ".green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}"
+               ".dim{color:#484f58}.warn{color:#e3b341}.nav a{color:#58a6ff;margin-right:14px;font-size:11px}"
+               "pre{background:#161b22;padding:8px;border-radius:4px;font-size:10px;white-space:pre-wrap;word-break:break-all}"
+               "h3{color:#8b949e;font-size:11px;margin:16px 0 6px;border-bottom:1px solid #21262d;padding-bottom:4px}"
+               "</style>")
+
+        sol_usd = get_sol_usd() or 0
+        now = __import__("datetime").datetime.now(timezone.utc)
+
+        open_trades    = db.get_open_trades()
+        trailing_trades = db.get_trailing_active_trades()
+        all_trades = open_trades + trailing_trades
+
+        def _fmt_usd(v):
+            if v is None: return '<span class="dim">—</span>'
+            return f"${v:,.0f}"
+
+        def _fmt_pct(v):
+            if v is None: return '<span class="dim">—</span>'
+            color = "green" if v >= 0 else "red"
+            return f"<span class='{color}'>{v*100:+.1f}%</span>"
+
+        rows_html = ""
+        for t in all_trades:
+            trade_id        = t["id"]
+            mint            = t["mint"]
+            symbol          = t.get("symbol") or mint[:8]
+            status          = t.get("status") or "?"
+            order_id        = t.get("order_id") or ""
+            entry_expected  = t.get("entry_expected") or 0
+            entry_price_usd = t.get("entry_price_usd")
+            tokens_received = t.get("tokens_received")
+            created_at      = t.get("created_at")
+            ref_ts          = t.get("ts_order_sent") or t.get("ts_signal") or created_at
+            sl_pct          = t.get("sl_pct") or TRADE_SL_PCT
+            tp_pct          = t.get("tp_pct") or (TRAILING_ACTIVATION_PCT / 100)
+
+            age_min = (now - created_at).total_seconds() / 60 if created_at else 0
+
+            # entry_mc_real
+            entry_mc_real = None
+            if entry_price_usd and tokens_received and tokens_received > 0:
+                entry_mc_real = (entry_price_usd / tokens_received) * 1_000_000_000
+
+            sl_ref = entry_mc_real or entry_expected or 0
+            sl_mc  = sl_ref * (1 - sl_pct) if sl_ref else None
+            tp_mc  = entry_mc_real * (1 + tp_pct) if entry_mc_real else None
+
+            # Ticks após ref_ts
+            ticks = []
+            try:
+                ticks = db.get_ticks_after(mint, min_ts=ref_ts) if ref_ts else []
+            except Exception:
+                pass
+
+            n_ticks   = len(ticks)
+            min_low   = min((float(tk["mc_low"]) for tk in ticks if tk.get("mc_low")), default=None)
+            max_high  = max((float(tk["mc_high"]) for tk in ticks if tk.get("mc_high")), default=None)
+
+            # Diagnóstico: sl_mc atingido nos ticks?
+            sl_hit_in_ticks = sl_mc and min_low and min_low <= sl_mc
+            tp_hit_in_ticks = tp_mc and max_high and max_high >= tp_mc
+
+            # query_order ao vivo
+            gmgn_raw = {}
+            gmgn_note = '<span class="dim">sem order_id</span>'
+            if order_id:
+                try:
+                    res = gmgn.query_order(order_id)
+                    gmgn_raw = res.get("data") or res
+                    state = str((gmgn_raw.get("confirmation") or {}).get("state") or
+                                gmgn_raw.get("status") or "").lower()
+                    co_list = gmgn_raw.get("condition_orders") or []
+                    co_info = ", ".join(
+                        f"{co.get('order_type','?')}={co.get('state') or co.get('status','?')}"
+                        for co in co_list
+                    ) or "nenhum"
+                    gmgn_note = f"state={state} | condition_orders: {co_info}"
+                except Exception as e:
+                    gmgn_note = f'<span class="warn">erro: {e}</span>'
+
+            # Diagnóstico final
+            diag = []
+            if not entry_price_usd:
+                diag.append('<span class="warn">⚠ fill não registrado (entry_price_usd=NULL)</span>')
+            if not entry_mc_real and entry_expected:
+                diag.append('<span class="warn">⚠ usando entry_expected como ref SL (fill ausente)</span>')
+            if entry_mc_real and entry_expected and entry_mc_real > entry_expected * 1.3:
+                diag.append(f'<span class="warn">⚠ entrada real {entry_mc_real/entry_expected:.1f}× acima do esperado (slippage alto)</span>')
+            if sl_mc and min_low and sl_hit_in_ticks:
+                diag.append('<span class="green">✓ SL atingido em ticks — TradeMonitor deveria ter detectado</span>')
+            elif sl_mc and min_low and not sl_hit_in_ticks:
+                diag.append(f'<span class="red">✗ SL NÃO atingido em ticks (min_low={_fmt_usd(min_low)} > sl_mc={_fmt_usd(sl_mc)})</span>')
+            if n_ticks == 0:
+                diag.append('<span class="red">✗ zero ticks após ref_ts — TradeMonitor cego</span>')
+
+            status_color = "yellow" if status == "open" else "green" if status == "tp" else "red"
+            rows_html += f"""
+<h3>#{trade_id} — <b>{symbol}</b>
+  <span class='{status_color}'>[{status}]</span>
+  <span class='dim'>age={age_min:.0f}min | {mint[:16]}…</span>
+</h3>
+<table>
+  <tr>
+    <th>entry_expected</th><th>entry_mc_real</th><th>sl_mc</th><th>tp_mc</th>
+    <th>ticks</th><th>min_low</th><th>max_high</th><th>sl_hit?</th><th>tp_hit?</th>
+  </tr>
+  <tr>
+    <td>{_fmt_usd(entry_expected)}</td>
+    <td>{_fmt_usd(entry_mc_real)}</td>
+    <td>{_fmt_usd(sl_mc)}</td>
+    <td>{_fmt_usd(tp_mc) if tp_mc else '<span class="dim">—</span>'}</td>
+    <td>{n_ticks}</td>
+    <td>{_fmt_usd(min_low)}</td>
+    <td>{_fmt_usd(max_high)}</td>
+    <td>{"<span class='green'>SIM</span>" if sl_hit_in_ticks else "<span class='dim'>não</span>"}</td>
+    <td>{"<span class='green'>SIM</span>" if tp_hit_in_ticks else "<span class='dim'>não</span>"}</td>
+  </tr>
+</table>
+<p><b>GMGN:</b> {gmgn_note}</p>
+<p>{'<br>'.join(diag) if diag else '<span class="dim">sem diagnóstico específico</span>'}</p>
+<details><summary style='cursor:pointer;color:#58a6ff;font-size:10px'>raw query_order response</summary>
+<pre>{__import__("json").dumps(gmgn_raw, indent=2, default=str)[:1500]}</pre>
+</details>
+"""
+
+        if not all_trades:
+            rows_html = "<p class='dim'>Nenhum trade open/trailing_active no momento.</p>"
+
+        n_open     = len(open_trades)
+        n_trailing = len(trailing_trades)
+
+        return f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>Open Trades Debug</title>{CSS}
+<meta http-equiv='refresh' content='15'>
+</head><body>
+<h1 style='color:#58a6ff;font-size:15px'>Debug — Trades Abertos</h1>
+<p style='color:#8b949e;font-size:10px'>auto-refresh 15s · mostra entry_expected vs entry_mc_real, sl_mc/tp_mc, ticks, query_order GMGN ao vivo</p>
+<div class='nav'>
+  <a href='/debug/executor-status'>Executor Status</a>
+  <a href='/analise/wr-breakdown'>WR Breakdown</a>
+  <a href='/analise/h22-correlation'>H22</a>
+</div>
+<br>
+<div class='box'><div class='lbl'>Open</div><div class='val' style='color:#d29922'>{n_open}</div></div>
+<div class='box'><div class='lbl'>Trailing Active</div><div class='val' style='color:#58a6ff'>{n_trailing}</div></div>
+<div class='box'><div class='lbl'>SOL/USD</div><div class='val'>${sol_usd:.0f}</div></div>
+<br><br>
+{rows_html}
+</body></html>"""
+
+    except Exception as e:
+        return f"<pre>Erro: {e}\n{traceback.format_exc()}</pre>", 500
+
+
 @app.route("/debug/executor-status")
 def debug_executor_status():
     """Diagnóstico completo do pipeline de trading — mostra onde a cadeia pode estar bloqueada."""
