@@ -10956,7 +10956,7 @@ def analise_h22_correlation():
 
             # --- Bounce signals com trades associados e outcome GMGN ---
             # Join por mint — bounce_signals tem UNIQUE(mint), trades pode ter múltiplos por mint
-            # Pega o trade mais recente por mint com outcome definitivo
+            # Pega o trade mais recente por mint (qualquer status) para não perder trades open/error
             cur.execute("""
                 WITH latest_trade AS (
                     SELECT DISTINCT ON (mint)
@@ -10964,7 +10964,6 @@ def analise_h22_correlation():
                         status,
                         pnl_pct_real
                     FROM trades
-                    WHERE status IN ('tp', 'sl', 'trailing_active', 'expired')
                     ORDER BY mint, created_at DESC
                 )
                 SELECT
