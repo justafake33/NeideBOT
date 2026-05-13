@@ -11151,6 +11151,10 @@ def analise_h22_correlation():
                     b.ts_signal,
                     b.bounce_pct,
                     b.elapsed_sec,
+                    b.mc_min,
+                    b.mc_at_signal,
+                    b.mc_migration,
+                    b.drop_from_mig,
                     b.absorption_events,
                     b.absorption_buy_vol,
                     b.absorption_sell_vol,
@@ -11164,6 +11168,61 @@ def analise_h22_correlation():
                 ORDER BY b.ts_signal DESC
             """)
             all_rows = [dict(r) for r in cur.fetchall()]
+
+            # --- Trajetória de preço pós-bounce via token_ticks ---
+            # Para cada bounce com dados Helius, busca o MC em janelas de +5/+10/+20min após ts_signal
+            cur.execute("""
+                WITH latest_trade AS (
+                    SELECT DISTINCT ON (mint)
+                        mint, status, pnl_pct_real
+                    FROM trades
+                    ORDER BY mint, created_at DESC
+                ),
+                bounce_base AS (
+                    SELECT
+                        b.mint, b.symbol, b.ts_signal,
+                        b.mc_at_signal, b.mc_min AS mc_bottom,
+                        b.bounce_pct, b.drop_from_mig,
+                        b.absorption_events,
+                        b.absorption_buy_vol, b.absorption_sell_vol,
+                        b.absorption_buy_cnt, b.absorption_lrg_buy,
+                        t.status, t.pnl_pct_real
+                    FROM bounce_signals b
+                    LEFT JOIN latest_trade t ON t.mint = b.mint
+                    WHERE b.absorption_events > 0 AND b.ts_signal IS NOT NULL
+                ),
+                tick_agg AS (
+                    SELECT
+                        b.mint,
+                        COUNT(tt.id)                                                                           AS tick_count,
+                        MAX(CASE WHEN tt.tick_ts <= b.ts_signal + interval '5 minutes'  THEN COALESCE(tt.mc_high, tt.mc) END) AS mc_max_5min,
+                        MAX(CASE WHEN tt.tick_ts <= b.ts_signal + interval '10 minutes' THEN COALESCE(tt.mc_high, tt.mc) END) AS mc_max_10min,
+                        MAX(CASE WHEN tt.tick_ts <= b.ts_signal + interval '20 minutes' THEN COALESCE(tt.mc_high, tt.mc) END) AS mc_max_20min,
+                        MIN(CASE WHEN tt.tick_ts <= b.ts_signal + interval '20 minutes' THEN COALESCE(tt.mc_low,  tt.mc) END) AS mc_min_20min
+                    FROM bounce_base b
+                    JOIN token_ticks tt ON tt.mint = b.mint
+                        AND tt.tick_ts >  b.ts_signal
+                        AND tt.tick_ts <= b.ts_signal + interval '20 minutes'
+                    GROUP BY b.mint
+                )
+                SELECT
+                    b.*,
+                    ta.tick_count,
+                    ta.mc_max_5min,
+                    ta.mc_max_10min,
+                    ta.mc_max_20min,
+                    ta.mc_min_20min,
+                    CASE WHEN b.mc_at_signal > 0 AND ta.mc_max_20min IS NOT NULL
+                         THEN (ta.mc_max_20min - b.mc_at_signal) / b.mc_at_signal END AS max_gain_pct,
+                    CASE WHEN b.mc_at_signal > 0 AND ta.mc_min_20min IS NOT NULL
+                         THEN (ta.mc_min_20min - b.mc_at_signal) / b.mc_at_signal END AS min_loss_pct,
+                    CASE WHEN b.mc_at_signal > 0 AND ta.mc_max_5min IS NOT NULL
+                         THEN (ta.mc_max_5min - b.mc_at_signal) / b.mc_at_signal END AS gain_5min_pct
+                FROM bounce_base b
+                LEFT JOIN tick_agg ta ON ta.mint = b.mint
+                ORDER BY b.ts_signal DESC
+            """)
+            trajectory_rows = [dict(r) for r in cur.fetchall()]
 
         # --- Classify outcomes ---
         # trailing_active NÃO é TP confirmado — resultado final ainda desconhecido.
@@ -11270,6 +11329,121 @@ def analise_h22_correlation():
             return rows
 
         conc_rows_html = _conc_rows()
+
+        # --- Classify outcomes for trajectory rows ---
+        for r in trajectory_rows:
+            s = r.get("status") or ""
+            if s in TP_STATUS:
+                r["outcome"] = "tp"
+            elif s in SL_STATUS:
+                r["outcome"] = "sl"
+            elif s == "expired":
+                pnl = r.get("pnl_pct_real")
+                r["outcome"] = "tp" if (pnl is not None and pnl > 0) else "sl" if (pnl is not None) else None
+            else:
+                r["outcome"] = None
+            ev = r.get("absorption_events") or 0
+            bv = r.get("absorption_buy_vol") or 0.0
+            sv = r.get("absorption_sell_vol") or 0.0
+            lb = r.get("absorption_lrg_buy") or 0.0
+            r["ratio"] = bv / sv if sv > 0 else (float("inf") if bv > 0 else None)
+            r["concentration"] = lb / bv if bv > 0 else None
+
+        # --- Aggregated: absorção bucket vs retorno médio (price trajectory) ---
+        def _avg(lst):
+            lst2 = [x for x in lst if x is not None]
+            return sum(lst2) / len(lst2) if lst2 else None
+
+        def _pct_fmt(v, suffix=""):
+            if v is None: return "<span class='dim'>—</span>"
+            color = "#3fb950" if v > 0 else ("#f85149" if v < 0 else "#8b949e")
+            return f"<span style='color:{color}'>{v*100:+.1f}%{suffix}</span>"
+
+        def _traj_bucket_row(label, subset):
+            n = len(subset)
+            if n == 0:
+                return f"<tr><td>{label}</td><td class='dim'>—</td><td class='dim'>—</td><td class='dim'>—</td><td class='dim'>—</td><td class='dim'>—</td><td class='dim'>—</td><td class='dim'>—</td></tr>"
+            n_with_ticks = sum(1 for r in subset if r.get("tick_count"))
+            n_tp = sum(1 for r in subset if r.get("outcome") == "tp")
+            n_sl = sum(1 for r in subset if r.get("outcome") == "sl")
+            wr = n_tp / (n_tp + n_sl) if (n_tp + n_sl) > 0 else None
+            wr_str = f"{wr*100:.0f}%" if wr is not None else "—"
+            wr_color = ("#3fb950" if wr and wr >= 0.40 else "#d29922" if wr and wr >= 0.25 else "#f85149") if wr else "#484f58"
+            avg_max = _avg([r.get("max_gain_pct") for r in subset])
+            avg_min = _avg([r.get("min_loss_pct") for r in subset])
+            avg_5   = _avg([r.get("gain_5min_pct") for r in subset])
+            return (f"<tr>"
+                    f"<td>{label}</td>"
+                    f"<td>{n} <span class='dim'>({n_with_ticks} ticks)</span></td>"
+                    f"<td style='color:{wr_color}'>{wr_str} <span class='dim'>({n_tp}T/{n_sl}S)</span></td>"
+                    f"<td>{_pct_fmt(avg_5)}</td>"
+                    f"<td>{_pct_fmt(avg_max)}</td>"
+                    f"<td>{_pct_fmt(avg_min)}</td>"
+                    f"</tr>")
+
+        traj_by_events = [
+            ("1–2 eventos",  [r for r in trajectory_rows if 1 <= (r.get("absorption_events") or 0) <= 2]),
+            ("3–5 eventos",  [r for r in trajectory_rows if 3 <= (r.get("absorption_events") or 0) <= 5]),
+            ("6–10 eventos", [r for r in trajectory_rows if 6 <= (r.get("absorption_events") or 0) <= 10]),
+            ("≥11 eventos",  [r for r in trajectory_rows if (r.get("absorption_events") or 0) >= 11]),
+        ]
+        traj_by_ratio = [
+            ("∞ (só compra)", [r for r in trajectory_rows if r.get("ratio") == float("inf")]),
+            ("≥3×",           [r for r in trajectory_rows if r.get("ratio") is not None and r["ratio"] != float("inf") and r["ratio"] >= 3.0]),
+            ("1.5–3×",        [r for r in trajectory_rows if r.get("ratio") is not None and r["ratio"] != float("inf") and 1.5 <= r["ratio"] < 3.0]),
+            ("1.0–1.5×",      [r for r in trajectory_rows if r.get("ratio") is not None and r["ratio"] != float("inf") and 1.0 <= r["ratio"] < 1.5]),
+            ("<1.0×",         [r for r in trajectory_rows if r.get("ratio") is not None and r["ratio"] != float("inf") and r["ratio"] < 1.0]),
+            ("no flow",       [r for r in trajectory_rows if r.get("ratio") is None]),
+        ]
+
+        traj_ev_html    = "".join(_traj_bucket_row(l, s) for l, s in traj_by_events)
+        traj_ratio_html = "".join(_traj_bucket_row(l, s) for l, s in traj_by_ratio)
+
+        # --- Detail trajectory table ---
+        traj_detail_rows = ""
+        for r in trajectory_rows[:60]:
+            ts = r.get("ts_signal")
+            ts_str = ts.strftime("%m-%d %H:%M") if ts else "—"
+            sym = r.get("symbol") or "?"
+            ev  = r.get("absorption_events") or 0
+            bv  = r.get("absorption_buy_vol") or 0
+            sv  = r.get("absorption_sell_vol") or 0
+            tc  = r.get("tick_count") or 0
+            ratio_v = r.get("ratio")
+            if ratio_v is None:      ratio_str = "<span class='dim'>no flow</span>"
+            elif ratio_v == float("inf"): ratio_str = "<span class='green'>∞</span>"
+            else:
+                rc = "#3fb950" if ratio_v >= 1.5 else ("#d29922" if ratio_v >= 1.0 else "#f85149")
+                ratio_str = f"<span style='color:{rc}'>{ratio_v:.1f}×</span>"
+
+            o = r.get("outcome")
+            if o == "tp":   out_str = "<span class='green'>✅ TP</span>"
+            elif o == "sl": out_str = "<span class='red'>❌ SL</span>"
+            else:           out_str = "<span class='dim'>—</span>"
+
+            mc_sig = r.get("mc_at_signal") or 0
+            def _mc_pct(mc_target):
+                if not mc_sig or not mc_target: return "<span class='dim'>—</span>"
+                pct = (mc_target - mc_sig) / mc_sig
+                c = "#3fb950" if pct > 0.10 else ("#f85149" if pct < -0.10 else "#8b949e")
+                return f"<span style='color:{c}'>{pct*100:+.0f}%</span>"
+
+            traj_detail_rows += (
+                f"<tr>"
+                f"<td>{ts_str}</td>"
+                f"<td><b>{sym}</b></td>"
+                f"<td>{ev} ev / {bv:.3f}◎</td>"
+                f"<td>{ratio_str}</td>"
+                f"<td>{_mc_pct(r.get('mc_max_5min'))}</td>"
+                f"<td>{_mc_pct(r.get('mc_max_10min'))}</td>"
+                f"<td style='font-weight:bold'>{_mc_pct(r.get('mc_max_20min'))}</td>"
+                f"<td>{_mc_pct(r.get('mc_min_20min'))}</td>"
+                f"<td class='dim'>{tc}</td>"
+                f"<td>{out_str}</td>"
+                f"</tr>"
+            )
+        if not traj_detail_rows:
+            traj_detail_rows = "<tr><td colspan='10' class='dim'>Nenhum bounce com dados Helius + ticks ainda</td></tr>"
 
         # --- Recent bounces with Helius data ---
         def _outcome_badge(r):
@@ -11379,18 +11553,74 @@ def analise_h22_correlation():
 </table>
 
 <br>
-<h2>▸ Bounces com dados Helius (últimos {len(helius_all)})</h2>
+<h2>▸ Absorção vs Trajetória de preço (20min pós-bounce) — por volume de eventos</h2>
+<p style='color:#484f58;font-size:11px'>
+  Para cada bounce com dados Helius, busca o máximo/mínimo de MC nos token_ticks nas janelas +5min/+10min/+20min após o sinal.<br>
+  "max gain +20min" = quanto o token subiu no melhor momento dentro de 20min. "min loss" = pior momento.
+</p>
 <table>
   <thead><tr>
-    <th>Hora</th><th>Token</th><th>Eventos</th><th>Buy SOL</th><th>Sell SOL</th>
-    <th>Ratio</th><th>Buy cnt</th><th>Conc.</th><th>Outcome</th>
+    <th>Bucket eventos</th><th>n (com ticks)</th><th>WR carteira</th>
+    <th>Max gain +5min</th><th>Max gain +20min</th><th>Min loss +20min</th>
   </tr></thead>
-  <tbody>{detail_rows if detail_rows else "<tr><td colspan='9' class='dim'>Nenhum bounce com dados Helius ainda</td></tr>"}</tbody>
+  <tbody>{traj_ev_html if traj_ev_html else "<tr><td colspan='6' class='dim'>Sem dados</td></tr>"}</tbody>
+</table>
+
+<br>
+<h2>▸ Absorção vs Trajetória de preço — por ratio buy/sell</h2>
+<table>
+  <thead><tr>
+    <th>Ratio bucket</th><th>n (com ticks)</th><th>WR carteira</th>
+    <th>Max gain +5min</th><th>Max gain +20min</th><th>Min loss +20min</th>
+  </tr></thead>
+  <tbody>{traj_ratio_html if traj_ratio_html else "<tr><td colspan='6' class='dim'>Sem dados</td></tr>"}</tbody>
+</table>
+
+<br>
+<h2>▸ Detalhe: absorção + trajetória de preço por bounce (últimos {len(trajectory_rows)})</h2>
+<p style='color:#484f58;font-size:11px'>
+  Colunas +5/+10/+20min = variação % do MC_at_signal até o máximo registrado em token_ticks nessa janela.<br>
+  "min" = pior MC registrado em 20min. Sem ticks = token saiu do HotMonitor antes dos ticks chegarem.
+</p>
+<table>
+  <thead><tr>
+    <th>Hora</th><th>Token</th><th>Absorção</th><th>Ratio</th>
+    <th>+5min max</th><th>+10min max</th><th>+20min max</th><th>+20min min</th>
+    <th>Ticks</th><th>Outcome</th>
+  </tr></thead>
+  <tbody>{traj_detail_rows}</tbody>
+</table>
+
+<br>
+<h2>▸ Por volume de eventos Helius (resumo WR — para referência)</h2>
+<table>
+  <thead><tr>
+    <th>Bucket</th><th>n (traded)</th><th>Win Rate</th><th>TP</th><th>SL</th><th>Total bounces</th>
+  </tr></thead>
+  <tbody>{ev_rows_html}</tbody>
+</table>
+
+<br>
+<h2>▸ Por ratio buy/sell (resumo WR)</h2>
+<table>
+  <thead><tr>
+    <th>Ratio bucket</th><th>n (traded)</th><th>Win Rate</th><th>TP</th><th>SL</th><th>Total</th>
+  </tr></thead>
+  <tbody>{ratio_rows_html}</tbody>
+</table>
+
+<br>
+<h2>▸ Por concentração de compra (largest_buy / buy_vol)</h2>
+<table>
+  <thead><tr>
+    <th>Concentração</th><th>n (traded)</th><th>Win Rate</th><th>TP</th><th>SL</th><th>Total</th>
+  </tr></thead>
+  <tbody>{conc_rows_html}</tbody>
 </table>
 
 <br>
 <p style='color:#484f58;font-size:11px;margin-top:12px'>
-  Janela Helius: 60s antes do bounce.<br>
+  Janela Helius: 60s antes do bounce. Janela ticks: 20min pós-sinal.<br>
   GMGN é ground truth para TP/SL — DB status pode ter falsos positivos (TradeMonitor).<br>
   Gate para ativar como filtro: n≥30 com absorption_events &gt; 0 + WR ≥15pp maior vs grupo sem dados.
 </p>
