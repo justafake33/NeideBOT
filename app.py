@@ -9671,6 +9671,8 @@ def _wr_breakdown_inner():
                 m.bot_degen_rate,
                 m.rat_trader_rate,
                 m.top10_holder_rate,
+                m.top70_sniper_hold_rate,
+                m.rug_ratio,
                 m.smart_wallets,
                 m.liq_migration,
                 m.has_social,
@@ -9848,6 +9850,43 @@ def _wr_breakdown_inner():
     ]
     sections += bucket_table("Comunidade (social / CTO)", splits_social)
 
+    # 11. top10_holder_rate (FILTER_TOP10_MAX=0.50 atual vs padrão 0.80)
+    splits_top10 = [
+        ("top10 <30%",    [t for t in closed if t["top10_holder_rate"] is not None and t["top10_holder_rate"] < 0.30]),
+        ("top10 30–50%",  [t for t in closed if t["top10_holder_rate"] is not None and 0.30 <= t["top10_holder_rate"] < 0.50]),
+        ("top10 50–65%",  [t for t in closed if t["top10_holder_rate"] is not None and 0.50 <= t["top10_holder_rate"] < 0.65]),
+        ("top10 65–80%",  [t for t in closed if t["top10_holder_rate"] is not None and 0.65 <= t["top10_holder_rate"] < 0.80]),
+        ("top10 ≥80%",    [t for t in closed if t["top10_holder_rate"] is not None and t["top10_holder_rate"] >= 0.80]),
+    ]
+    sections += bucket_table("Top10 holder rate (FILTER_TOP10_MAX=0.50 atual — padrão 0.80)", splits_top10)
+
+    # 12. top70_sniper_hold_rate (FILTER_SNIPER_MAX=0.05 atual — muito restritivo?)
+    splits_sniper = [
+        ("sniper <5%",    [t for t in closed if t["top70_sniper_hold_rate"] is not None and t["top70_sniper_hold_rate"] < 0.05]),
+        ("sniper 5–15%",  [t for t in closed if t["top70_sniper_hold_rate"] is not None and 0.05 <= t["top70_sniper_hold_rate"] < 0.15]),
+        ("sniper 15–30%", [t for t in closed if t["top70_sniper_hold_rate"] is not None and 0.15 <= t["top70_sniper_hold_rate"] < 0.30]),
+        ("sniper ≥30%",   [t for t in closed if t["top70_sniper_hold_rate"] is not None and t["top70_sniper_hold_rate"] >= 0.30]),
+    ]
+    sections += bucket_table("Top70 sniper hold rate (FILTER_SNIPER_MAX=0.05 atual — calibrar?)", splits_sniper)
+
+    # 13. rat_trader_rate (FILTER_RAT_MAX=0.40 atual)
+    splits_rat = [
+        ("rat <10%",    [t for t in closed if t["rat_trader_rate"] is not None and t["rat_trader_rate"] < 0.10]),
+        ("rat 10–20%",  [t for t in closed if t["rat_trader_rate"] is not None and 0.10 <= t["rat_trader_rate"] < 0.20]),
+        ("rat 20–40%",  [t for t in closed if t["rat_trader_rate"] is not None and 0.20 <= t["rat_trader_rate"] < 0.40]),
+        ("rat ≥40%",    [t for t in closed if t["rat_trader_rate"] is not None and t["rat_trader_rate"] >= 0.40]),
+    ]
+    sections += bucket_table("Rat trader rate (FILTER_RAT_MAX=0.40 atual)", splits_rat)
+
+    # 14. rug_ratio (bundler — FILTER_BUNDLER_MAX=0.60 atual)
+    splits_rug = [
+        ("bundler <10%",  [t for t in closed if t["rug_ratio"] is not None and t["rug_ratio"] < 0.10]),
+        ("bundler 10–30%",[t for t in closed if t["rug_ratio"] is not None and 0.10 <= t["rug_ratio"] < 0.30]),
+        ("bundler 30–60%",[t for t in closed if t["rug_ratio"] is not None and 0.30 <= t["rug_ratio"] < 0.60]),
+        ("bundler ≥60%",  [t for t in closed if t["rug_ratio"] is not None and t["rug_ratio"] >= 0.60]),
+    ]
+    sections += bucket_table("Rug ratio / bundler rate (FILTER_BUNDLER_MAX=0.60 atual)", splits_rug)
+
     # ── Tabela individual de todos os trades ──────────────────────────────
     def _fp(v, mult=100): return f"{v*mult:+.1f}%" if v is not None else "—"
     def _fn(v): return f"{v:.0%}" if v is not None else "—"
@@ -9935,6 +9974,12 @@ tr:hover td{background:#161b22}
         ("drop 70-85%",        [t for t in closed if t["b_drop_pct"] and 0.70 <= t["b_drop_pct"] < 0.85]),
         ("tem social",         [t for t in closed if t["has_social"]]),
         ("sem social",         [t for t in closed if not t["has_social"]]),
+        ("top10 <50%",         [t for t in closed if t["top10_holder_rate"] is not None and t["top10_holder_rate"] < 0.50]),
+        ("top10 >=50%",        [t for t in closed if t["top10_holder_rate"] is not None and t["top10_holder_rate"] >= 0.50]),
+        ("sniper <5%",         [t for t in closed if t["top70_sniper_hold_rate"] is not None and t["top70_sniper_hold_rate"] < 0.05]),
+        ("sniper 5-30%",       [t for t in closed if t["top70_sniper_hold_rate"] is not None and 0.05 <= t["top70_sniper_hold_rate"] < 0.30]),
+        ("rat <20%",           [t for t in closed if t["rat_trader_rate"] is not None and t["rat_trader_rate"] < 0.20]),
+        ("rat >=20%",          [t for t in closed if t["rat_trader_rate"] is not None and t["rat_trader_rate"] >= 0.20]),
     ]
     best_label, best_delta, best_wr, best_n = "", 0, 0, 0
     for label, rows in all_splits:
