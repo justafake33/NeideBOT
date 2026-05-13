@@ -11309,8 +11309,53 @@ def analise_sniper_filter():
             """)
             cov = dict(cur.fetchone())
 
-        # --- Build HTML ---
-        def _wr(n_tp, n_sl):
+            # 5. Diagnóstico dos NULLs — de onde vêm?
+            # 5a. Distribuição temporal — NULLs concentrados em época específica?
+            cur.execute("""
+                SELECT
+                    DATE_TRUNC('week', ts_migration) AS semana,
+                    COUNT(*) AS total,
+                    COUNT(top70_sniper_hold_rate) AS com_dado,
+                    COUNT(*) - COUNT(top70_sniper_hold_rate) AS null_count
+                FROM migrations
+                WHERE ts_migration IS NOT NULL
+                GROUP BY 1
+                ORDER BY 1 DESC
+                LIMIT 12
+            """)
+            null_temporal = [dict(r) for r in cur.fetchall()]
+
+            # 5b. NULLs têm sniper_wallets (count) preenchido? Campo diferente do rate.
+            cur.execute("""
+                SELECT
+                    CASE WHEN top70_sniper_hold_rate IS NULL THEN 'NULL rate' ELSE 'tem rate' END AS grupo,
+                    COUNT(*) AS n,
+                    COUNT(sniper_wallets) AS com_sniper_count,
+                    COUNT(ts_detected) AS com_watchlist,
+                    ROUND(AVG(CASE WHEN recovery IS NOT NULL
+                        THEN (CASE WHEN recovery THEN 1.0 ELSE 0.0 END) END)::numeric, 3) AS rec_rate
+                FROM migrations
+                WHERE ts_migration IS NOT NULL
+                GROUP BY 1
+            """)
+            null_vs_has = [dict(r) for r in cur.fetchall()]
+
+            # 5c. NULLs — qual exchange, bc_progress, e se vieram da watchlist
+            cur.execute("""
+                SELECT
+                    COALESCE(exchange, 'unknown') AS exchange,
+                    COUNT(*) AS n,
+                    COUNT(top70_sniper_hold_rate) AS com_rate,
+                    COUNT(*) - COUNT(top70_sniper_hold_rate) AS null_rate,
+                    ROUND(AVG(CASE WHEN recovery IS NOT NULL
+                        THEN (CASE WHEN recovery THEN 1.0 ELSE 0.0 END) END)::numeric, 3) AS rec_rate
+                FROM migrations
+                WHERE ts_migration IS NOT NULL
+                GROUP BY 1
+                ORDER BY n DESC
+                LIMIT 10
+            """)
+            null_by_exchange = [dict(r) for r in cur.fetchall()]
             n = (n_tp or 0) + (n_sl or 0)
             if not n: return "—", "#484f58"
             wr = (n_tp or 0) / n
@@ -11356,6 +11401,48 @@ def analise_sniper_filter():
         delta_color = "#3fb950" if rb and rp and float(rb) < float(rp) else "#f85149"
 
         cov_pct = f"{cov['with_data']/cov['total']*100:.0f}%" if cov['total'] else "—"
+
+        # Tabelas do diagnóstico NULL — construídas fora do f-string (backslash issue)
+        def _rr(v):
+            return f"{float(v)*100:.1f}%" if v is not None else "—"
+
+        null_vs_has_html = ""
+        for r in null_vs_has:
+            n = r["n"] or 1
+            sc_pct = int((r["com_sniper_count"] or 0) / n * 100)
+            wl_pct = int((r["com_watchlist"] or 0) / n * 100)
+            null_vs_has_html += (
+                f"<tr><td>{r['grupo']}</td><td>{r['n']}</td>"
+                f"<td>{r['com_sniper_count']} ({sc_pct}%)</td>"
+                f"<td>{r['com_watchlist']} ({wl_pct}%)</td>"
+                f"<td>{_rr(r['rec_rate'])}</td></tr>"
+            )
+
+        null_by_exch_html = ""
+        for r in null_by_exchange:
+            null_n = r["null_rate"] or 0
+            total_n = r["n"] or 1
+            null_color = "#f85149" if null_n > total_n * 0.5 else "#8b949e"
+            null_by_exch_html += (
+                f"<tr><td>{r['exchange']}</td><td>{r['n']}</td>"
+                f"<td style='color:#3fb950'>{r['com_rate']}</td>"
+                f"<td style='color:{null_color}'>{null_n}</td>"
+                f"<td>{_rr(r['rec_rate'])}</td></tr>"
+            )
+
+        null_temporal_html = ""
+        for r in null_temporal:
+            semana = r["semana"].strftime("%Y-%m-%d") if r["semana"] else "—"
+            total_n = r["total"] or 1
+            null_n = r["null_count"] or 0
+            pct_null = int(null_n / total_n * 100)
+            null_color = "#f85149" if pct_null > 50 else "#8b949e"
+            null_temporal_html += (
+                f"<tr><td>{semana}</td><td>{r['total']}</td>"
+                f"<td style='color:#3fb950'>{r['com_dado']}</td>"
+                f"<td>{null_n}</td>"
+                f"<td style='color:{null_color}'>{pct_null}%</td></tr>"
+            )
 
         summary = (
             _box("Cobertura campo", f"{cov['with_data']}/{cov['total']} ({cov_pct})") +
@@ -11414,10 +11501,40 @@ def analise_sniper_filter():
 
 <br>
 <p style='color:#484f58;font-size:11px'>
-  Decisão: os dados acima mostram se bloqueados têm recovery menor, igual ou maior que passados.<br>
   Delta negativo (bloqueados com recovery MENOR) = filtro correto.<br>
   Delta positivo (bloqueados com recovery MAIOR) = filtro está rejeitando tokens bons.
 </p>
+
+<br>
+<h2>▸ Diagnóstico dos 38% NULL — de onde vêm?</h2>
+<p style='color:#484f58;font-size:11px'>
+  799 tokens passam pelo filtro sem dado de sniper. Recovery deles = 20.3% (pior que os com dado).<br>
+  Perguntas: o NULL é temporal (campo não existia antes)? Vem de exchange específica? Falta watchlist?
+</p>
+
+<b style='color:#8b949e;font-size:11px'>NULL rate vs tem rate — cobertura de campos relacionados</b>
+<table style='width:auto;margin:8px 0 16px'>
+  <thead><tr>
+    <th>Grupo</th><th>n</th><th>tem sniper_count</th><th>tem watchlist</th><th>Recovery rate</th>
+  </tr></thead>
+  <tbody>{null_vs_has_html}</tbody>
+</table>
+
+<b style='color:#8b949e;font-size:11px'>NULL por exchange</b>
+<table style='width:auto;margin:8px 0 16px'>
+  <thead><tr>
+    <th>Exchange</th><th>n total</th><th>com rate</th><th>NULL rate</th><th>Recovery</th>
+  </tr></thead>
+  <tbody>{null_by_exch_html}</tbody>
+</table>
+
+<b style='color:#8b949e;font-size:11px'>Distribuição temporal (últimas 12 semanas)</b>
+<table style='width:auto;margin:8px 0 16px'>
+  <thead><tr>
+    <th>Semana</th><th>Total migrações</th><th>Com rate</th><th>NULL</th><th>% NULL</th>
+  </tr></thead>
+  <tbody>{null_temporal_html}</tbody>
+</table>
 </body></html>"""
         return html
 
