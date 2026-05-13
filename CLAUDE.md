@@ -692,24 +692,32 @@ ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
 95. **H22 — Coleta de absorção implementada (2026-05-12)**: `helius_ws.py` acumula `{ts, side, sol, mc}` por swap em `deque(maxlen=300)` por mint. `get_absorption_window(mint, window_sec=60)` retorna métricas brutas: `buy_vol_sol`, `sell_vol_sol`, `buy_count`, `sell_count`, `largest_buy`, `total_events`. Estas métricas são salvas em `bounce_signals` (8 colunas novas) em cada bounce. `/debug/absorption` exibe ratio buy/sell ao vivo e cobertura histórica. **Score/grade NÃO existem** — removidos deliberadamente. Princípio: coletar métricas brutas primeiro, correlacionar com outcomes GMGN (TP/SL) após n≥30, construir fórmula somente com pesos validados pelos dados. Gate para filtro: n≥30 bounces com absorption_events > 0 + WR ≥15pp maior com absorção.
 96. **Score sem correlação = ilusão de precisão (2026-05-12)**: `_absorption_score()` foi removida. A fórmula era plausível (baseada em lógica de mercado) mas não validada. Calcular um score antes de ver os dados é "julgar o peixe por não subir em árvore" — o critério de avaliação é arbitrário. Só há sentido em pontuar DEPOIS de saber qual métrica discrimina TP vs SL nos dados reais. Este é o princípio central do big player: coletar → analisar → modelar, nunca o inverso.
 97. **Kline `high` inflava mc_peak com spikes intra-candle (2026-05-12 — fix)**: em pools com ~79 SOL de liquidez, um único whale buy pode momentaneamente empurrar o preço AMM 150-200x antes de reverter. O kline registra esse pico como o `high` da vela (correto tecnicamente). O scanner mostrava ganhos absurdos: DIAMOND +23,034% (Pico $9M mas mc_1h = $39K = +0.0%). Fix: `_precise_bottom_tick()` e `_graduate()` agora usam `close × supply` para `mc_peak`. O `close` é o preço sustentado ao final do minuto. `mc_high` nos `token_ticks` mantido para o backtester (TP detection intra-vela continua correto). `push_mc` (trenches `usd_market_cap`) já usava close implicitamente — unificado agora.
-98. **`/analise/post-sl-recovery` — diagnóstico pós-SL (2026-05-12)**: para cada SL com `exit_ts`, busca max MC nos token_ticks após a saída. Resultado: 12% dos SLs (8/64 com dados) teriam atingido o TP pós-saída. 88% continuaram dumpando — confirma H21 (W-bottom refutada): não é má sorte, é estrutural. Winners recuperam rápido (5-10min). A análise mostra que "hold" após SL seria lucrativo apenas em 12% dos casos — não justifica mudar a estratégia de saída.
+98. **`/analise/post-sl-recovery` — diagnóstico pós-SL (2026-05-12)**: para cada SL com `exit_ts`, busca max MC nos token_ticks após a saída. Resultado: 12% dos SLs (8/64 com dados) teriam atingido o TP pós-saída. 88% continuaram dumpando — confirma H21 (W-bottom refutada): não é má sorte, é estrutural. Winners recuperam rápido (5-10min). A análise mostra que "hold" após SL seria lucrativo apenas em 12% dos casos — não justifica mudar a estratégia de saída. ⚠️ **Número suspeito**: usa `entry_expected` (mc_bottom × 1.15) e não entrada real (`entry_price_usd / tokens_received × 1B`). Pendente correção antes de usar o "12%" como base de decisão.
+99. **H22 cobertura Helius: 1.7% (2026-05-13)**: `bounce_signals` tem 529 registros. Apenas **9 têm `absorption_events > 0`** (1.7% de cobertura). 520 têm NULL. Implicação: H22 não tem dados suficientes para qualquer análise de discriminação. Gate de n≥30 está longe. Tarefa B (h22-correlation dashboard) está **bloqueada** até cobertura subir. Causa provável: subscrição Helius por mint captura apenas eventos em tempo real a partir do subscribe — tokens que bounçaram logo após entrar no HotMonitor podem ter tido poucos eventos Helius registrados.
+100. **`buy_concentration = largest_buy / buy_vol`** (Codex review 2026-05-13): diferencia "um único buyer pumpou o preço" (concentration ≈ 1.0) de "múltiplos compradores absorveram" (concentration << 1.0). `largest_buy` e `buy_vol` já existem em `bounce_signals` e `get_absorption_window()`. Campo derivado, zero schema change. Implementar junto com a correção do `/debug/absorption` (mostrar "∞" para sell_vol=0+buy_vol>0, e "no flow" para ambos=0).
+101. **`/debug/executor-status` usava `db.get_conn()` que não existe** (fix 2026-05-13): o módulo db.py usa contextmanager `_cursor()`, não expõe `get_conn`. Também usava `ORDER BY created_at` mas a coluna se chama `ts_signal`. Ambos os erros eram capturados silenciosamente → "Nenhum no DB" mesmo com bounce_signals populada. Fix: psycopg2.connect(db.DATABASE_URL) direto + ORDER BY ts_signal. Mesmo padrão corrigido em `/debug/wallet-audit`.
 
 ---
 
-## 🔄 Estado Atual: Bot ativo a $1/trade (2026-05-12 — sessão 2)
+## 🔄 Estado Atual: Bot ativo a $1/trade (2026-05-13)
 
 ### Pipeline ativo
 `TRADING_ENABLED=true`, `CALIBRATION_AMOUNT_USD=1.0`, `CALIBRATION_MAX_TRADES=999999`.
 
 **Filtros ativos (ordem de aplicação no _check_bounce):**
-- A.2: bloqueia bounce_pct 20-30% (dead zone histórica — validado live)
+- A.2: bloqueia bounce_pct 20-30% (dead zone histórica — validado live; redundante com A.7 mas mantido como safety net)
 - A.3: bloqueia entry 50-65% do mc_migration (zona morta — validado live)
 - A.5: bloqueia elapsed > 20min (BOUNCE_TIME_MAX — validado live)
 - A.6: bloqueia fundo estagnado > 5min (BOTTOM_FRESHNESS_SEC — validado live)
 - A.7: bloqueia bounce_pct < 30% (BOUNCE_MIN_PCT=0.30 — validado live, n=11)
 - smart≥3: FILTER_SMART_MIN=3 — smart=1→0% WR (n=6), smart=2→20%, smart=3→57% (dado live GMGN)
 
-**H22 em coleta:** cada bounce registra buy_vol, sell_vol, ratio, counts, largest_buy via Helius pAMM. Aguardando n≥30 bounces com absorption_events > 0 para análise de discriminação.
+**H22 cobertura CRÍTICA:** 529 bounces registrados, apenas 9 com `absorption_events > 0` (1.7%). Análise de discriminação bloqueada até n≥30. `/debug/absorption` e `/analise/h22-correlation` aguardam cobertura real.
+
+**Pendências analíticas (Codex review 2026-05-13):**
+- `/analise/post-sl-recovery` usa `entry_expected` — pendente correção para `entry_mc_real = (entry_price_usd / tokens_received) × 1B`
+- `buy_concentration` não exposto ainda (dados já existem)
+- `/debug/absorption` mostra "—" para ambos os casos de sell_vol=0 — pendente fix "∞" vs "no flow"
 
 **WR ground truth (GMGN):** ~15% (filtros anteriores) → esperado ≥30% com smart≥3. DB WR é inválido — não usar para decisões.
 
