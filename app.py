@@ -12102,6 +12102,34 @@ def analise_trade_autopsy():
                         AND tt.tick_ts >= b.ts_signal
                         AND tt.tick_ts <= b.ts_signal + INTERVAL '30 minutes'
                     GROUP BY b.id
+                ),
+                -- Pré-exit: ticks entre ts_signal e exit_ts (o que aconteceu ENQUANTO segurávamos)
+                tick_pre AS (
+                    SELECT
+                        b.id AS trade_id,
+                        COUNT(tt.id)                     AS pre_tick_count,
+                        MAX(COALESCE(tt.mc_high, tt.mc)) AS max_mc_pre,
+                        MIN(COALESCE(tt.mc_low,  tt.mc)) AS min_mc_pre
+                    FROM base b
+                    JOIN token_ticks tt ON tt.mint = b.mint
+                        AND tt.tick_ts >= b.ts_signal
+                        AND tt.tick_ts <= b.exit_ts
+                    WHERE b.exit_ts IS NOT NULL
+                    GROUP BY b.id
+                ),
+                -- Pós-exit: ticks nos 30min após exit_ts (o que o token fez DEPOIS de sair)
+                tick_post AS (
+                    SELECT
+                        b.id AS trade_id,
+                        COUNT(tt.id)                     AS post_tick_count,
+                        MAX(COALESCE(tt.mc_high, tt.mc)) AS max_mc_post,
+                        MIN(COALESCE(tt.mc_low,  tt.mc)) AS min_mc_post
+                    FROM base b
+                    JOIN token_ticks tt ON tt.mint = b.mint
+                        AND tt.tick_ts > b.exit_ts
+                        AND tt.tick_ts <= b.exit_ts + INTERVAL '30 minutes'
+                    WHERE b.exit_ts IS NOT NULL
+                    GROUP BY b.id
                 )
                 SELECT
                     b.*,
@@ -12113,7 +12141,7 @@ def analise_trade_autopsy():
                     ta.max_mc_5min,
                     ta.max_mc_10min,
                     ta.max_mc_20min,
-                    -- Gains relativos à entry_mc
+                    -- Gains relativos à entry_mc (janela total)
                     CASE WHEN b.entry_mc > 0 AND ta.max_mc_ever  IS NOT NULL
                          THEN (ta.max_mc_ever  - b.entry_mc) / b.entry_mc END AS max_gain_pct,
                     CASE WHEN b.entry_mc > 0 AND ta.min_mc_ever  IS NOT NULL
@@ -12123,9 +12151,27 @@ def analise_trade_autopsy():
                     CASE WHEN b.entry_mc > 0 AND ta.max_mc_5min  IS NOT NULL
                          THEN (ta.max_mc_5min  - b.entry_mc) / b.entry_mc END AS gain_5min_pct,
                     CASE WHEN b.entry_mc > 0 AND ta.max_mc_10min IS NOT NULL
-                         THEN (ta.max_mc_10min - b.entry_mc) / b.entry_mc END AS gain_10min_pct
+                         THEN (ta.max_mc_10min - b.entry_mc) / b.entry_mc END AS gain_10min_pct,
+                    -- PRÉ-EXIT: ganho máximo enquanto segurávamos
+                    tp.pre_tick_count,
+                    tp.max_mc_pre,
+                    tp.min_mc_pre,
+                    CASE WHEN b.entry_mc > 0 AND tp.max_mc_pre IS NOT NULL
+                         THEN (tp.max_mc_pre - b.entry_mc) / b.entry_mc END AS max_gain_before_exit,
+                    CASE WHEN b.entry_mc > 0 AND tp.min_mc_pre IS NOT NULL
+                         THEN (tp.min_mc_pre - b.entry_mc) / b.entry_mc END AS min_loss_before_exit,
+                    -- PÓS-EXIT: quanto o token subiu DEPOIS de sairmos
+                    tpo.post_tick_count,
+                    tpo.max_mc_post,
+                    tpo.min_mc_post,
+                    CASE WHEN b.entry_mc > 0 AND tpo.max_mc_post IS NOT NULL
+                         THEN (tpo.max_mc_post - b.entry_mc) / b.entry_mc END AS max_gain_after_exit,
+                    CASE WHEN b.entry_mc > 0 AND tpo.min_mc_post IS NOT NULL
+                         THEN (tpo.min_mc_post - b.entry_mc) / b.entry_mc END AS min_loss_after_exit
                 FROM base b
-                LEFT JOIN tick_agg ta ON ta.trade_id = b.id
+                LEFT JOIN tick_agg ta  ON ta.trade_id  = b.id
+                LEFT JOIN tick_pre  tp  ON tp.trade_id  = b.id
+                LEFT JOIN tick_post tpo ON tpo.trade_id = b.id
                 WHERE b.outcome IS NOT NULL
                 ORDER BY b.id ASC
             """)
@@ -12154,6 +12200,33 @@ def analise_trade_autopsy():
 
         for r in rows:
             r["sl_cause"] = _sl_cause(r)
+
+        # --- Classificação de qualidade de exit (pré/pós) ---
+        def _exit_quality(r):
+            """Classifica o exit em 5 categorias baseado no que aconteceu antes e depois."""
+            if r["outcome"] != "sl":
+                return "tp"
+            tp_pct   = r.get("tp_pct") or 0.75
+            pre_gain = r.get("max_gain_before_exit")   # max gain ENQUANTO segurava
+            post_gain= r.get("max_gain_after_exit")    # max gain nos 30min APÓS sair
+            pre_ticks = r.get("pre_tick_count") or 0
+            post_ticks= r.get("post_tick_count") or 0
+            if pre_ticks < 2 and post_ticks < 2:
+                return "sem_dados"
+            # Atingiu TP activation (+75%) antes de sair? → trailing deveria ter capturado
+            hit_tp_before = pre_gain is not None and pre_gain >= tp_pct
+            # Token recuperou ao nível de TP após o SL?
+            hit_tp_after  = post_gain is not None and post_gain >= tp_pct
+            if hit_tp_before:
+                return "trailing_falhou"   # preço passou do TP mas trailing não executou
+            if hit_tp_after:
+                return "sl_prematuro"      # saímos antes, token foi ao TP sem nós
+            if post_gain is not None and post_gain >= 0.20:
+                return "sl_mas_recuperou"  # não chegou ao TP mas subiu 20%+ depois
+            return "sl_correto"            # token caiu ou ficou flat após a saída
+
+        for r in rows:
+            r["exit_quality"] = _exit_quality(r)
 
         # --- Métricas de cobertura ---
         total   = len(rows)
@@ -12371,6 +12444,65 @@ def analise_trade_autopsy():
             ultra_fast_section_html = ""
 
         # ================================================================
+        # SEÇÃO 5b — Qualidade do exit: pré vs pós
+        # ================================================================
+        eq_labels = {
+            "trailing_falhou":  ("Trailing falhou",   "Preco atingiu TP activation (+75%) mas trailing nao executou corretamente", "#f85149"),
+            "sl_prematuro":     ("SL prematuro",      "Saimos antes — token recuperou ao nivel do TP nos 30min seguintes",          "#e3b341"),
+            "sl_mas_recuperou": ("SL mas recuperou",  "Nao chegou ao TP mas subiu 20%+ apos nossa saida",                          "#d29922"),
+            "sl_correto":       ("SL correto",        "Token nao recuperou — saida foi a decisao certa",                           "#3fb950"),
+            "sem_dados":        ("Sem dados",         "Poucos ticks pre ou pos exit — analise inconclusiva",                       "#484f58"),
+            "tp":               ("TP",                "Win",                                                                        "#3fb950"),
+        }
+        eq_counts = {}
+        for r in rows:
+            k = r.get("exit_quality", "sem_dados")
+            eq_counts[k] = eq_counts.get(k, 0) + 1
+
+        eq_summary_html = ""
+        for key, (label, desc, color) in eq_labels.items():
+            n_c = eq_counts.get(key, 0)
+            if n_c == 0:
+                continue
+            pct_c = n_c / total * 100
+            eq_summary_html += (
+                f"<tr><td style='color:{color}'>{label}</td>"
+                f"<td>{n_c} <span class='dim'>({pct_c:.0f}%)</span></td>"
+                f"<td class='dim'>{desc}</td>"
+                f"</tr>"
+            )
+
+        # Detalhe: trailing_falhou + sl_prematuro + sl_mas_recuperou (os evitáveis)
+        evitable = [r for r in rows if r.get("exit_quality") in ("trailing_falhou", "sl_prematuro", "sl_mas_recuperou")]
+        eq_detail_html = ""
+        for r in sorted(evitable, key=lambda x: x.get("exit_quality", "") + (x.get("symbol") or "")):
+            eq = r.get("exit_quality", "")
+            eq_colors = {"trailing_falhou": "#f85149", "sl_prematuro": "#e3b341", "sl_mas_recuperou": "#d29922"}
+            eq_col = eq_colors.get(eq, "#8b949e")
+            mins = r.get("mins_to_exit")
+            eq_detail_html += (
+                f"<tr>"
+                f"<td><b>{r.get('symbol','?')}</b></td>"
+                f"<td style='color:{eq_col}'>{eq.replace('_',' ')}</td>"
+                f"<td>{_pct(r.get('max_gain_before_exit'), 0)}</td>"
+                f"<td>{_pct(r.get('max_gain_after_exit'),  0)}</td>"
+                f"<td>{_pct(r.get('min_loss_before_exit'), 0)}</td>"
+                f"<td>{_pct(r.get('min_loss_after_exit'),  0)}</td>"
+                f"<td class='dim'>{('%dm' % mins) if mins is not None else '—'}</td>"
+                f"<td>{_pct(r.get('b_bounce_pct'), 0)}</td>"
+                f"<td class='dim'>{(r.get('pre_tick_count') or 0)}/{(r.get('post_tick_count') or 0)}</td>"
+                f"</tr>"
+            )
+        if not eq_detail_html:
+            eq_detail_html = "<tr><td colspan='9' class='dim'>Sem SLs evitaveis com dados suficientes</td></tr>"
+
+        n_evitable   = len(evitable)
+        n_trailing_f = sum(1 for r in rows if r.get("exit_quality") == "trailing_falhou")
+        n_sl_prem    = sum(1 for r in rows if r.get("exit_quality") == "sl_prematuro")
+        n_sl_rec     = sum(1 for r in rows if r.get("exit_quality") == "sl_mas_recuperou")
+        n_sl_correct = sum(1 for r in rows if r.get("exit_quality") == "sl_correto")
+
+        # ================================================================
         # SEÇÃO 6 — TPs: trajetória e timing
         # ================================================================
         tp_rows = [r for r in rows if r["outcome"] == "tp"]
@@ -12528,6 +12660,53 @@ def analise_trade_autopsy():
 </table>
 
 {ultra_fast_section_html}
+
+<br>
+<!-- SEÇÃO PRÉ/PÓS EXIT -->
+<h2>&#9658; 2b. PRÉ vs PÓS EXIT — O que o token fez antes e depois de sairmos?</h2>
+<p style='color:#484f58;font-size:11px'>
+  <b>max_gain_before_exit</b> = max MC entre ts_signal e exit_ts (enquanto seguravamos).<br>
+  <b>max_gain_after_exit</b> = max MC nos 30min apos exit_ts (o que deixamos na mesa).<br>
+  Trailing falhou = preco passou de +{int((rows[0].get("tp_pct") or 0.75)*100)}% enquanto seguravamos mas saimos como SL.
+  SL prematuro = token foi ao TP nos 30min seguintes ao nosso SL.
+</p>
+<table style='max-width:600px'>
+  <thead><tr><th>Categoria</th><th>n ({total} trades)</th><th>Descricao</th></tr></thead>
+  <tbody>{eq_summary_html}</tbody>
+</table>
+<br>
+<div style='display:flex;gap:12px;flex-wrap:wrap;margin-bottom:10px'>
+  <div class='box'>
+    <div class='lbl'>Trailing falhou</div>
+    <div class='val' style='color:#f85149'>{n_trailing_f}</div>
+    <div style='color:#484f58;font-size:10px'>Dinheiro deixado na mesa (TP ativado)</div>
+  </div>
+  <div class='box'>
+    <div class='lbl'>SL prematuro</div>
+    <div class='val' style='color:#e3b341'>{n_sl_prem}</div>
+    <div style='color:#484f58;font-size:10px'>Token recuperou ao TP apos nosso SL</div>
+  </div>
+  <div class='box'>
+    <div class='lbl'>SL + recuperou 20%+</div>
+    <div class='val' style='color:#d29922'>{n_sl_rec}</div>
+    <div style='color:#484f58;font-size:10px'>Nao chegou ao TP mas subiu</div>
+  </div>
+  <div class='box'>
+    <div class='lbl'>SL correto</div>
+    <div class='val' style='color:#3fb950'>{n_sl_correct}</div>
+    <div style='color:#484f58;font-size:10px'>Token nao recuperou — saida certa</div>
+  </div>
+</div>
+<p style='color:#8b949e;font-size:11px'>SLs evitaveis (trailing+prematuro+recuperou): <b>{n_evitable}</b> de <b>{n_sl}</b> SLs totais ({int(n_evitable/n_sl*100) if n_sl else 0}%)</p>
+<table>
+  <thead><tr>
+    <th>Token</th><th>Categoria</th>
+    <th>Max pré-exit</th><th>Max pós-exit</th>
+    <th>Min pré-exit</th><th>Min pós-exit</th>
+    <th>Duração</th><th>Bounce%</th><th>Ticks pre/pos</th>
+  </tr></thead>
+  <tbody>{eq_detail_html}</tbody>
+</table>
 
 <br>
 <!-- SEÇÃO 3: drop_from_mig vs WR -->
