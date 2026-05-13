@@ -10446,7 +10446,8 @@ def debug_absorption():
                 active = dict(scanner.hot._tokens)
 
             for mint, state in active.items():
-                symbol = state.get("symbol", mint[:8])
+                symbol   = state.get("symbol", mint[:8])
+                exchange = state.get("exchange") or "?"
                 try:
                     w = scanner.hot._helius.get_absorption_window(mint, window_sec=60)
                 except Exception:
@@ -10460,6 +10461,9 @@ def debug_absorption():
                 ratio    = buy_vol / sell_vol if sell_vol > 0 else None
                 event_cls = "ok" if total >= 5 else ("warn" if total >= 1 else "bad")
                 ratio_cls = "ok" if (ratio and ratio >= 1.0) else "bad"
+                # H22 só captura pump.fun pAMM — Raydium/Meteora/outros = sem dados
+                is_pump = "pump" in exchange.lower() or exchange == "?"
+                exch_cls = "" if is_pump else "warn"
 
                 elapsed = int((
                     __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
@@ -10469,6 +10473,7 @@ def debug_absorption():
                 dex_url = f"https://dexscreener.com/solana/{mint}"
                 live_rows_html += f"""<tr>
                   <td><b>{symbol}</b></td>
+                  <td class='{exch_cls}'>{exchange}</td>
                   <td>{elapsed}min</td>
                   <td class='{event_cls}'>{total} eventos</td>
                   <td class='ok'>{buy_vol:.3f} SOL ({buy_cnt}x)</td>
@@ -10485,7 +10490,7 @@ def debug_absorption():
         # ── 2. Últimos 30 bounce_signals com métricas brutas H22 ──────────────────────
         with db._cursor() as cur:
             cur.execute("""
-                SELECT b.mint, b.symbol, b.ts_signal, b.bounce_pct, b.drop_from_mig,
+                SELECT b.mint, b.symbol, b.exchange, b.ts_signal, b.bounce_pct, b.drop_from_mig,
                        b.absorption_buy_vol, b.absorption_sell_vol,
                        b.absorption_buy_cnt, b.absorption_sell_cnt,
                        b.absorption_events,
@@ -10507,30 +10512,54 @@ def debug_absorption():
             """)
             stats = dict(cur.fetchone())
 
+            # Stats por exchange — quantos bounces por launchpad, cobertura H22
+            cur.execute("""
+                SELECT
+                    COALESCE(exchange, 'unknown') AS exchange,
+                    COUNT(*) AS n,
+                    COUNT(absorption_events) AS with_h22
+                FROM bounce_signals
+                GROUP BY exchange
+                ORDER BY n DESC
+                LIMIT 10
+            """)
+            exchange_stats = [dict(r) for r in cur.fetchall()]
+
         bounce_rows_html = ""
         for r in bounces:
-            ts = r["ts_signal"].strftime("%m-%d %H:%M") if r.get("ts_signal") else "—"
-            symbol = r.get("symbol") or r["mint"][:8]
-            ev     = r.get("absorption_events")
-            bv     = r.get("absorption_buy_vol")
-            sv     = r.get("absorption_sell_vol")
-            bc     = r.get("absorption_buy_cnt")
-            sc     = r.get("absorption_sell_cnt")
-            outcome= r.get("trade_status") or "—"
-            ratio  = bv / sv if (bv is not None and sv and sv > 0) else None
+            ts       = r["ts_signal"].strftime("%m-%d %H:%M") if r.get("ts_signal") else "—"
+            symbol   = r.get("symbol") or r["mint"][:8]
+            exchange = r.get("exchange") or "?"
+            ev       = r.get("absorption_events")
+            bv       = r.get("absorption_buy_vol")
+            sv       = r.get("absorption_sell_vol")
+            bc       = r.get("absorption_buy_cnt")
+            sc       = r.get("absorption_sell_cnt")
+            outcome  = r.get("trade_status") or "—"
+            ratio    = bv / sv if (bv is not None and sv and sv > 0) else None
 
             ratio_cls = "ok" if (ratio and ratio >= 1.0) else ("bad" if ratio is not None else "")
             out_cls   = "ok" if outcome == "tp" else ("bad" if outcome == "sl" else "")
+            is_pump   = "pump" in exchange.lower()
+            exch_cls  = "" if is_pump else "warn"
+            # Ratio display: distingue "sem sells" (bullish) de "sem dados"
+            if bv is not None and sv is not None:
+                ratio_str = (f"<span class='ok'>∞</span>" if sv == 0 and bv > 0
+                             else ("no flow" if sv == 0 and bv == 0
+                                   else f"<span class='{ratio_cls}'>{ratio:.2f}x</span>"))
+            else:
+                ratio_str = "—"
 
             bounce_rows_html += f"""<tr>
               <td>{ts}</td>
               <td><b>{symbol}</b></td>
+              <td class='{exch_cls}'>{exchange}</td>
               <td>{float(r['bounce_pct'])*100:.0f}%</td>
               <td class='{out_cls}'>{outcome}</td>
               <td>{f"{bv:.3f} SOL ({bc}x)" if bv is not None else "<span style='color:#484f58'>NULL</span>"}</td>
               <td>{f"{sv:.3f} SOL ({sc}x)" if sv is not None else "<span style='color:#484f58'>NULL</span>"}</td>
-              <td class='{ratio_cls}'>{f"{ratio:.2f}x" if ratio is not None else "—"}</td>
-              <td>{ev if ev is not None else "<span style='color:#f85149'>NULL ← sem Helius</span>"}</td>
+              <td>{ratio_str}</td>
+              <td>{ev if ev is not None else "<span style='color:#f85149'>NULL</span>"}</td>
             </tr>"""
 
         total     = stats.get("total", 0)
@@ -10551,13 +10580,26 @@ def debug_absorption():
                  "#f85149" if no_data > with_data else "#e3b341")
         )
 
+        # Tabela de cobertura por exchange
+        exch_rows = ""
+        for row in exchange_stats:
+            exch = row["exchange"]
+            n    = row["n"]
+            h22  = row["with_h22"]
+            pct  = f"{h22/n*100:.0f}%" if n else "—"
+            is_pump = "pump" in exch.lower()
+            cls  = "" if is_pump else "warn"
+            note = "✅ H22 captura" if is_pump else "⚠️ sem H22 (não é pump.fun pAMM)"
+            exch_rows += f"<tr><td class='{cls}'>{exch}</td><td>{n}</td><td>{h22} ({pct})</td><td class='{cls}'>{note}</td></tr>"
+
         html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
 <title>Debug Absorption</title>{CSS}
 <meta http-equiv='refresh' content='10'>
 </head><body>
 <h2>H22 — Absorption Debug</h2>
 <p style='color:#8b949e;font-size:11px'>auto-refresh 10s · janela de absorção = 60s · fonte: Helius pAMM (pump.fun)<br>
-<b>Dados brutos apenas</b> — score/grade removidos. Correlacionar com outcome (TP/SL) após n≥30 bounces com dados.</p>
+<b>Dados brutos apenas</b> — score/grade removidos. Correlacionar com outcome (TP/SL) após n≥30 bounces com dados.<br>
+⚠️ <b>H22 só captura pump.fun pAMM.</b> Tokens em Raydium/Meteora/outros sempre terão absorption_events=NULL.</p>
 <div class='nav'>
   <a href='/analise/post-sl-recovery'>Post-SL Recovery</a>
   <a href='/debug/bounce-list'>Bounce List</a>
@@ -10566,10 +10608,16 @@ def debug_absorption():
 <br>
 {summary}
 
+<h3>Cobertura H22 por Exchange/Launchpad</h3>
+<table>
+  <thead><tr><th>Exchange</th><th>Bounces</th><th>Com H22</th><th>Nota</th></tr></thead>
+  <tbody>{exch_rows}</tbody>
+</table>
+
 <h3>Tokens Ativos — Janela de Absorção Ao Vivo (últimos 60s)</h3>
 <table>
   <thead><tr>
-    <th>Token</th><th>Elapsed</th><th>Eventos Helius</th>
+    <th>Token</th><th>Exchange</th><th>Elapsed</th><th>Eventos Helius</th>
     <th>Buy vol</th><th>Sell vol</th><th>Buy/Sell ratio</th>
     <th>Largest buy</th><th>Mint</th><th></th>
   </tr></thead>
@@ -10578,13 +10626,13 @@ def debug_absorption():
 
 <h3>Últimos 30 Bounce Signals — Métricas Brutas H22</h3>
 <p style='color:#8b949e;font-size:11px'>
-  NULL em "Eventos" = bounce disparou mas Helius não tinha eventos na deque para esse mint.<br>
-  Causas: token recém-adicionado ao HotMonitor, WS desconectado, ou token não é pump.fun pAMM.<br>
-  <b>Ratio = buy_vol/sell_vol.</b> Acumular outcome para correlacionar com TP/SL.
+  NULL em "Eventos" = bounce sem dados Helius (token não é pump.fun pAMM, ou pAMM ainda não teve swaps).<br>
+  <b>∞</b> = buy_vol &gt; 0 e sell_vol = 0 (ninguém vendeu — sinal bullish). <b>no flow</b> = sem eventos de nenhum lado.<br>
+  <b>Exchange em amarelo</b> = não é pump.fun pAMM — H22 nunca terá dados para esse token.
 </p>
 <table>
   <thead><tr>
-    <th>Hora</th><th>Token</th><th>Bounce</th><th>Trade</th>
+    <th>Hora</th><th>Token</th><th>Exchange</th><th>Bounce</th><th>Trade</th>
     <th>Buy vol</th><th>Sell vol</th><th>Ratio</th><th>Eventos</th>
   </tr></thead>
   <tbody>{bounce_rows_html}</tbody>

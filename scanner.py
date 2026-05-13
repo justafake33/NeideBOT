@@ -100,7 +100,7 @@ class HotMonitor:
                 logger.warning("HeliusWS não iniciado: %s", e)
 
     def add(self, mint: str, mc_migration: float, ts_migration: datetime,
-            symbol: str, total_supply: float = 1_000_000_000):
+            symbol: str, total_supply: float = 1_000_000_000, exchange: str = None):
         added = False
         with self._lock:
             if mint not in self._tokens and mint not in self._cancelled:
@@ -109,6 +109,7 @@ class HotMonitor:
                     "ts_mig_unix":  int(ts_migration.timestamp()),
                     "ts_migration": ts_migration,
                     "symbol":       symbol,
+                    "exchange":     exchange,
                     "mc_min":       mc_migration,
                     "time_min":     0.0,
                     "ts_min":       ts_migration,   # timestamp quando mc_min foi visto pela última vez
@@ -295,6 +296,7 @@ class HotMonitor:
             db.insert_bounce_signal({
                 "mint":                mint,
                 "symbol":              symbol,
+                "exchange":            state.get("exchange"),
                 "elapsed_sec":         elapsed_sec,
                 "mc_migration":        mc_migration,
                 "mc_min":              mc_min,
@@ -1124,7 +1126,7 @@ class Scanner:
         logger.info("Migracao %s (%s) MC_oficial=$%.0f[%s] MC_obs=$%.0f[%s] liq=$%.0f exch=%s smart=%d%s",
                     symbol, mint[:8], mc_migration, src, mc_observed, src_observed, liq, exch, smart, delay_str)
 
-        self.hot.add(mint, mc_migration, now, symbol, total_supply)
+        self.hot.add(mint, mc_migration, now, symbol, total_supply, exchange=token.get("exchange"))
 
 
 # ==============================================================================

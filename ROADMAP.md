@@ -33,7 +33,7 @@
 | **H22 — Coleta de absorção implementada** | 2026-05-12 | `helius_ws.py`: deque(maxlen=300) por mint acumula `{ts, side, sol, mc}` de cada BuyEvent/SellEvent do pAMM. `get_absorption_window(mint, 60)` expõe buy_vol, sell_vol, counts, ratio, largest_buy. `bounce_signals` recebe 8 campos de absorção. `/debug/absorption` mostra dados ao vivo + histórico. Score/grade **não calculados** — coleta de métricas brutas apenas. |
 | **H22 — Score removido (dados antes de fórmula)** | 2026-05-12 | `_absorption_score()` deletada do scanner.py. Score não existe sem correlação real com TP/SL. Construir fórmula APÓS n≥30 bounces com `absorption_events > 0` e outcomes GMGN confirmados. |
 | **Fix mc_peak inflado (kline high → close)** | 2026-05-12 | Kline `high` incluía spikes intra-candle de transações em pools com baixa liquidez — um único whale buy pode empurrar o AMM price 200x por <1s. Scanner mostrava ganhos de 5000-25000% (ex: DIAMOND $9M peak mas mc_1h = $39K). Fix: `_precise_bottom_tick()` e `_graduate()` agora usam `close × supply` para mc_peak. `mc_high` nos token_ticks mantido para o backtester. |
-| **`/analise/post-sl-recovery`** | 2026-05-12 | Para cada SL, busca o max MC nos token_ticks após exit_ts. 12% dos SLs (8/64 com dados) teriam atingido o TP depois. 88% são dumps genuínos que continuaram. |
+| **`/analise/post-sl-recovery`** | 2026-05-12 | Para cada SL, busca o max MC nos token_ticks após exit_ts. 12% dos SLs (8/64 com dados) teriam atingido o TP depois. 88% são dumps genuínos que continuaram. ⚠️ Número pendente de correção: usa `entry_expected` (mc_bottom × 1.15), não entrada real (`entry_price_usd / tokens_received × 1B`). |
 
 > ⚠️ **Nota sobre WR histórico**: O DB WR (chegou a mostrar 34%) é inválido. TradeMonitor infere TP/SL via token_ticks e gera falsos positivos após GMGN fechar a posição. **GMGN = 15% WR = ground truth.**
 
@@ -78,19 +78,56 @@
 
 **Score/grade: deliberadamente removidos.** Construir fórmula sem correlação com outcomes é julgar o peixe por não subir em árvore. Coletar → correlacionar → só então pontuar.
 
+**⚠️ COBERTURA HELIUS — DIAGNÓSTICO (2026-05-13):**
+```sql
+-- bounce_signals: total=529, com_helius=9, sem_helius=520
+-- Cobertura real: 1.7%
+```
+529 bounces registrados. Apenas **9 têm `absorption_events > 0`**. 520 têm NULL.
+Causa provável: Helius subscreve o mint quando o token entra no HotMonitor, mas os BuyEvent/SellEvent do pAMM chegam com baixa taxa para a maioria dos tokens — muitos bounces disparam em janelas onde poucos swaps ocorreram pela subscrição Helius.
+
+**Implicação direta:** Tarefa B (h22-correlation) é prematura. Com n=9 observações, qualquer correlação é ruído.
+
 **Próximos passos desta hipótese:**
 1. ✅ Acumular eventos por mint (done)
 2. ✅ Salvar métricas brutas por bounce (done)
-3. ⏳ Acumular n≥30 bounces com `absorption_events > 0` + outcomes GMGN confirmados
-4. Análise: qual métrica discrimina TP vs SL? (ratio? total_events? largest_buy?)
-5. Construir score baseado na correlação real encontrada
-6. Ativar como filtro se WR ≥15pp maior com absorção confirmada
+3. ⏳ Diagnósticar por que cobertura é 1.7% — Helius não está chegando para a maioria dos tokens?
+4. ⏳ Acumular n≥30 bounces com `absorption_events > 0` + outcomes GMGN confirmados
+5. Análise: qual métrica discrimina TP vs SL? (ratio? total_events? largest_buy?)
+6. Construir score baseado na correlação real encontrada
+7. Ativar como filtro se WR ≥15pp maior com absorção confirmada
 
 **Gate para virar filtro:** n≥30 bounces com dados Helius + WR ≥15pp maior no grupo com absorção vs sem absorção (GMGN como fonte).
 
 ---
 
-### 4. H9 como tier de confluência (não gate obrigatório)
+### 4. Correções analíticas pendentes (Codex review 2026-05-13)
+
+**A — `/analise/post-sl-recovery`: usar entrada real** ← OBRIGATÓRIO antes de confiar no "12%"
+
+Hoje usa `entry_expected = mc_bottom × 1.15`. Deve usar `(entry_price_usd / tokens_received) × 1B` quando disponível (já salvo no banco). Entrada real pode ser 30-50% acima do esperado por latência e slippage — muda o TP/SL threshold e pode alterar o número de "SLs que teriam TP". Fórmula já existe em `/analise/wbottom`.
+
+Também: separar `sl` de `expired`. `expired` com `pnl_pct_real ≥ 0` não é SL real.
+
+**B — `buy_concentration = largest_buy / buy_vol`** ← Zero custo (dados já existem)
+
+`largest_buy` e `buy_vol` já estão em `bounce_signals`. Expor concentração no `get_absorption_window()` e no `/debug/absorption`. Diferencia "um whale isolado pumpou" de "múltiplos compradores absorveram". Não requer schema change.
+
+**C — Display `/debug/absorption`: "∞" vs "no flow"**
+
+`sell_vol=0` com `buy_vol>0` = sinal mais bullish (ninguém quis vender). Mostrar "—" para os dois casos esconde informação. `buy_vol>0 e sell_vol=0` → "∞". `ambos=0` → "no flow".
+
+**D — Snapshots pós-bounce +30s/+60s** ← BAIXA prioridade até cobertura Helius ser resolvida
+
+Com 1.7% de cobertura real, snapshots pós-bounce também virão zerados para 98% dos tokens. Implementar depois que cobertura subir para nível útil.
+
+**E — `/analise/h22-correlation`** ← IMPLEMENTAR AGORA (instrumento pronto antes dos dados chegarem)
+
+Dashboard mostra correlação H22 → outcome com n atual (hoje=9). Conclusões só valem com n≥30, mas o dashboard fica pronto para quando os dados chegarem. Bot ativo = bounces acumulando = cobertura crescendo. Construir instrumento de medição enquanto dados acumulam é o caminho correto.
+
+---
+
+### 5. H9 como tier de confluência (não gate obrigatório)
 
 **Por quê:** H9 live mostra 75% WR (n=4) em ratio<0.80 — sinal mais forte encontrado. Mas n=4 é insuficiente para bloquear trades sem H9.
 
@@ -244,3 +281,5 @@
 11. **BOTTOM_FRESHNESS_SEC=180 é baixa alavancagem**: live trades já têm ts_min a 0.1-4.5min do sinal. A.6 a 300s já resolve o problema em produção. Não apertar sem evidência de inválidos chegando com gap 3-5min nos logs atuais.
 12. **Score sem dados é ilusão de precisão**: fórmula calculável ≠ fórmula útil. `_absorption_score()` foi removida porque não havia correlação validada com TP/SL. Coletar métricas brutas → analisar discriminação → SÓ ENTÃO construir score com pesos que os dados justificam.
 13. **Kline `high` inflava mc_peak com spikes intra-candle**: em pools com 79 SOL de liquidez, um único trade pode temporariamente empurrar o preço AMM 200x. O kline registra isso como o `high` da vela mesmo que o close volte ao normal. Fix: usar `close × supply` para mc_peak (push_mc já usa close implicitamente). `mc_high` mantido nos token_ticks para o backtester (TP detection intra-vela).
+14. **Cobertura de infraestrutura ≠ dados disponíveis**: implementar H22 (coleta de absorção) não significa ter dados. Com 529 bounces e apenas 9 `absorption_events > 0` (1.7%), toda análise de correlação é prematura. Verificar cobertura ANTES de construir dashboard analítico. Pergunta certa: "quantos bounces têm dados reais?" — não "a infraestrutura está implementada?".
+15. **`entry_expected` ≠ entrada real**: o executor calcula `entry_target = mc_bottom × 1.15` antes do swap. A entrada real pode ser 30-50%+ acima por latência e slippage. Qualquer análise de TP/SL threshold que use `entry_expected` pode estar errada para cima ou para baixo. Sempre usar `(entry_price_usd / tokens_received) × 1B` quando disponível — já salvo no banco desde Fase 6.

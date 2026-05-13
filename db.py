@@ -182,6 +182,7 @@ def init_db():
                 id                   BIGSERIAL PRIMARY KEY,
                 mint                 TEXT      NOT NULL,
                 symbol               TEXT,
+                exchange             TEXT,
                 ts_signal            TIMESTAMPTZ DEFAULT NOW(),
                 elapsed_sec          INT,
                 mc_migration         FLOAT,
@@ -202,8 +203,9 @@ def init_db():
             )
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_bounce_signals_ts ON bounce_signals (ts_signal)")
-        # Migração: adiciona colunas H22 se a tabela já existir
+        # Migração: adiciona colunas se a tabela já existir
         for col in [
+            "ADD COLUMN IF NOT EXISTS exchange           TEXT",
             "ADD COLUMN IF NOT EXISTS absorption_score    FLOAT",
             "ADD COLUMN IF NOT EXISTS absorption_grade    TEXT",
             "ADD COLUMN IF NOT EXISTS absorption_buy_vol  FLOAT",
@@ -547,14 +549,14 @@ def insert_bounce_signal(data: dict):
     with _cursor() as cur:
         cur.execute("""
             INSERT INTO bounce_signals
-                (mint, symbol, elapsed_sec, mc_migration, mc_min,
+                (mint, symbol, exchange, elapsed_sec, mc_migration, mc_min,
                  mc_at_signal, drop_from_mig, bounce_pct,
                  absorption_score, absorption_grade,
                  absorption_buy_vol, absorption_sell_vol,
                  absorption_buy_cnt, absorption_sell_cnt,
                  absorption_lrg_buy, absorption_events)
             VALUES
-                (%(mint)s, %(symbol)s, %(elapsed_sec)s, %(mc_migration)s, %(mc_min)s,
+                (%(mint)s, %(symbol)s, %(exchange)s, %(elapsed_sec)s, %(mc_migration)s, %(mc_min)s,
                  %(mc_at_signal)s, %(drop_from_mig)s, %(bounce_pct)s,
                  %(absorption_score)s, %(absorption_grade)s,
                  %(absorption_buy_vol)s, %(absorption_sell_vol)s,
@@ -572,6 +574,7 @@ def insert_bounce_signal(data: dict):
             WHERE bounce_signals.absorption_events IS NULL
         """, {
             **data,
+            "exchange":            data.get("exchange"),
             "absorption_score":    data.get("absorption_score"),
             "absorption_grade":    data.get("absorption_grade"),
             "absorption_buy_vol":  data.get("absorption_buy_vol"),
