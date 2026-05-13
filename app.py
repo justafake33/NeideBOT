@@ -12227,6 +12227,17 @@ def analise_trade_autopsy():
 
         for r in rows:
             r["exit_quality"] = _exit_quality(r)
+            tp_pct = r.get("tp_pct") or 0.75
+            pre_gain  = r.get("max_gain_before_exit")
+            post_gain = r.get("max_gain_after_exit")
+            pre_ticks = r.get("pre_tick_count") or 0
+            # Boolean flags explícitos para o template
+            r["hit_tp_before_exit"] = pre_gain is not None and pre_gain >= tp_pct
+            r["hit_tp_after_exit"]  = post_gain is not None and post_gain >= tp_pct
+            # Spike suspect: max_gain muito alto mas poucos ticks — provavelmente intra-candle spike
+            # Critério: pre_ticks < 5 E max_gain_before > 100% (improvável sem spike em pool pequena)
+            r["spike_suspect"] = (r["hit_tp_before_exit"] and pre_ticks < 5
+                                  and pre_gain is not None and pre_gain > 1.00)
 
         # --- Métricas de cobertura ---
         total   = len(rows)
@@ -12475,29 +12486,43 @@ def analise_trade_autopsy():
         # Detalhe: trailing_falhou + sl_prematuro + sl_mas_recuperou (os evitáveis)
         evitable = [r for r in rows if r.get("exit_quality") in ("trailing_falhou", "sl_prematuro", "sl_mas_recuperou")]
         eq_detail_html = ""
-        for r in sorted(evitable, key=lambda x: x.get("exit_quality", "") + (x.get("symbol") or "")):
+        for r in sorted(evitable, key=lambda x: (x.get("exit_quality", ""), -(x.get("max_gain_before_exit") or 0))):
             eq = r.get("exit_quality", "")
             eq_colors = {"trailing_falhou": "#f85149", "sl_prematuro": "#e3b341", "sl_mas_recuperou": "#d29922"}
             eq_col = eq_colors.get(eq, "#8b949e")
             mins = r.get("mins_to_exit")
+            pre_ticks  = r.get("pre_tick_count") or 0
+            post_ticks = r.get("post_tick_count") or 0
+            # hit_tp flags como badges
+            hit_pre  = r.get("hit_tp_before_exit", False)
+            hit_post = r.get("hit_tp_after_exit", False)
+            spike    = r.get("spike_suspect", False)
+            flag_pre  = "<span style='color:#3fb950;font-weight:bold'>YES</span>"  if hit_pre  else "<span class='dim'>—</span>"
+            flag_post = "<span style='color:#e3b341;font-weight:bold'>YES</span>"  if hit_post else "<span class='dim'>—</span>"
+            spike_flag = " <span style='color:#f85149;font-size:10px'>[SPIKE?]</span>" if spike else ""
             eq_detail_html += (
                 f"<tr>"
-                f"<td><b>{r.get('symbol','?')}</b></td>"
+                f"<td><b>{r.get('symbol','?')}</b>{spike_flag}</td>"
                 f"<td style='color:{eq_col}'>{eq.replace('_',' ')}</td>"
+                f"<td>{flag_pre}</td>"
+                f"<td>{flag_post}</td>"
                 f"<td>{_pct(r.get('max_gain_before_exit'), 0)}</td>"
                 f"<td>{_pct(r.get('max_gain_after_exit'),  0)}</td>"
                 f"<td>{_pct(r.get('min_loss_before_exit'), 0)}</td>"
                 f"<td>{_pct(r.get('min_loss_after_exit'),  0)}</td>"
                 f"<td class='dim'>{('%dm' % mins) if mins is not None else '—'}</td>"
-                f"<td>{_pct(r.get('b_bounce_pct'), 0)}</td>"
-                f"<td class='dim'>{(r.get('pre_tick_count') or 0)}/{(r.get('post_tick_count') or 0)}</td>"
+                f"<td class='dim'>{pre_ticks}/{post_ticks}</td>"
                 f"</tr>"
             )
         if not eq_detail_html:
-            eq_detail_html = "<tr><td colspan='9' class='dim'>Sem SLs evitaveis com dados suficientes</td></tr>"
+            eq_detail_html = "<tr><td colspan='10' class='dim'>Sem SLs evitaveis com dados suficientes</td></tr>"
 
         n_evitable   = len(evitable)
         n_trailing_f = sum(1 for r in rows if r.get("exit_quality") == "trailing_falhou")
+        n_trailing_real = sum(1 for r in rows if r.get("exit_quality") == "trailing_falhou"
+                              and not r.get("spike_suspect"))
+        n_trailing_spike= sum(1 for r in rows if r.get("exit_quality") == "trailing_falhou"
+                              and r.get("spike_suspect"))
         n_sl_prem    = sum(1 for r in rows if r.get("exit_quality") == "sl_prematuro")
         n_sl_rec     = sum(1 for r in rows if r.get("exit_quality") == "sl_mas_recuperou")
         n_sl_correct = sum(1 for r in rows if r.get("exit_quality") == "sl_correto")
@@ -12667,8 +12692,8 @@ def analise_trade_autopsy():
 <p style='color:#484f58;font-size:11px'>
   <b>max_gain_before_exit</b> = max MC entre ts_signal e exit_ts (enquanto seguravamos).<br>
   <b>max_gain_after_exit</b> = max MC nos 30min apos exit_ts (o que deixamos na mesa).<br>
-  Trailing falhou = preco passou de +{int((rows[0].get("tp_pct") or 0.75)*100)}% enquanto seguravamos mas saimos como SL.
-  SL prematuro = token foi ao TP nos 30min seguintes ao nosso SL.
+  <b>hit_tp_before</b> = preco atingiu threshold de ativacao (+{int((rows[0].get("tp_pct") or 0.75)*100)}%) enquanto seguravamos.<br>
+  <b>[SPIKE?]</b> = max_gain alto mas &lt;5 ticks pre-exit — provavel spike intra-candle, nao price action real.
 </p>
 <table style='max-width:600px'>
   <thead><tr><th>Categoria</th><th>n ({total} trades)</th><th>Descricao</th></tr></thead>
@@ -12677,9 +12702,14 @@ def analise_trade_autopsy():
 <br>
 <div style='display:flex;gap:12px;flex-wrap:wrap;margin-bottom:10px'>
   <div class='box'>
-    <div class='lbl'>Trailing falhou</div>
+    <div class='lbl'>Trailing falhou (total)</div>
     <div class='val' style='color:#f85149'>{n_trailing_f}</div>
-    <div style='color:#484f58;font-size:10px'>Dinheiro deixado na mesa (TP ativado)</div>
+    <div style='color:#484f58;font-size:10px'>{n_trailing_real} reais / {n_trailing_spike} spike suspect</div>
+  </div>
+  <div class='box'>
+    <div class='lbl'>Trailing REAL (≥5 ticks)</div>
+    <div class='val' style='color:#f85149'>{n_trailing_real}</div>
+    <div style='color:#484f58;font-size:10px'>GMGN genuinamente falhou — investigar</div>
   </div>
   <div class='box'>
     <div class='lbl'>SL prematuro</div>
@@ -12701,9 +12731,10 @@ def analise_trade_autopsy():
 <table>
   <thead><tr>
     <th>Token</th><th>Categoria</th>
+    <th>hit_tp_before</th><th>hit_tp_after</th>
     <th>Max pré-exit</th><th>Max pós-exit</th>
     <th>Min pré-exit</th><th>Min pós-exit</th>
-    <th>Duração</th><th>Bounce%</th><th>Ticks pre/pos</th>
+    <th>Duração</th><th>Ticks pre/pos</th>
   </tr></thead>
   <tbody>{eq_detail_html}</tbody>
 </table>
