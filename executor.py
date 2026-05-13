@@ -290,13 +290,19 @@ class TradeMonitor:
     """
 
     def __init__(self):
-        self._stop = threading.Event()
+        self._stop  = threading.Event()
+        self._helius = None  # injetado via set_helius() antes de start()
+
+    def set_helius(self, helius):
+        self._helius = helius
 
     def start(self):
         if not TRADING_ENABLED:
             return
         threading.Thread(target=self._loop, daemon=True, name="trade-monitor").start()
-        logger.info("TradeMonitor iniciado (poll=%ds max_age=%dh)", MONITOR_POLL_SEC, MONITOR_MAX_AGE_H)
+        logger.info("TradeMonitor iniciado (poll=%ds max_age=%dh helius=%s)",
+                    MONITOR_POLL_SEC, MONITOR_MAX_AGE_H,
+                    "ON" if self._helius else "OFF")
 
     def _loop(self):
         while not self._stop.is_set():
@@ -315,11 +321,42 @@ class TradeMonitor:
                 self._check_trade(trade, sol_usd, now)
             except Exception as e:
                 logger.debug("TradeMonitor trade #%s: %s", trade.get("id"), e)
+            try:
+                self._collect_absorption_tick(trade)
+            except Exception as e:
+                logger.debug("TradeMonitor absorption #%s: %s", trade.get("id"), e)
         for trade in db.get_trailing_active_trades():
             try:
                 self._check_trailing_exit(trade, sol_usd, now)
             except Exception as e:
                 logger.debug("TradeMonitor trailing #%s: %s", trade.get("id"), e)
+            try:
+                self._collect_absorption_tick(trade)
+            except Exception as e:
+                logger.debug("TradeMonitor absorption trailing #%s: %s", trade.get("id"), e)
+
+    def _collect_absorption_tick(self, trade: dict):
+        """Coleta fluxo buy/sell do Helius pAMM enquanto o trade está aberto.
+        Dados brutos apenas — zero decisão. Cruzar com outcome (TP/SL) depois.
+        Janela rolante de 30s: snapshot do que está acontecendo AGORA no mercado.
+        """
+        if not self._helius:
+            return
+        mint = trade.get("mint")
+        if not mint:
+            return
+        trade_id = trade.get("id")
+        w = self._helius.get_absorption_window(mint, window_sec=30)
+        db.insert_trade_absorption_tick({
+            "trade_id":   trade_id,
+            "mint":       mint,
+            "buy_vol":    w.get("buy_vol_sol",  0) or 0,
+            "sell_vol":   w.get("sell_vol_sol", 0) or 0,
+            "buy_count":  w.get("buy_count",    0) or 0,
+            "sell_count": w.get("sell_count",   0) or 0,
+            "events":     w.get("total_events", 0) or 0,
+            "lrg_buy":    w.get("largest_buy",  0) or 0,
+        })
 
     def _check_trade(self, trade: dict, sol_usd: float, now: datetime):
         trade_id        = trade["id"]

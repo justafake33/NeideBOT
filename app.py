@@ -6298,6 +6298,7 @@ def _start_services():
     scheduler.start()
     hot.start()
     scanner.start()
+    monitor.set_helius(hot._helius)  # injeta helius para coleta de absorção durante holding
     monitor.start()
     logger.info("Todos os serviços iniciados")
 
