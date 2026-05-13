@@ -10595,6 +10595,62 @@ def debug_bounce_list():
         return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
+@app.route("/debug/fix-trailing-outcomes")
+def debug_fix_trailing_outcomes():
+    """Corrige outcomes dos 4 trades confirmados como trailing TP pelo usuário,
+    e verifica MUSKOSOPHY (não comprado durante manutenção de IP).
+    Acionar UMA VEZ — verifica antes de alterar."""
+    import traceback
+    try:
+        # Confirmações do usuário (2026-05-13):
+        # HUMANITY #105  → trailing TP, lucro +56%
+        # Kevin     #153 → trailing TP, lucro +311%
+        # SLEEP     #174 → trailing TP, lucro +41%
+        # DrawPoorly#157 → trailing TP, lucro +46%
+        # MUSKOSOPHY#13  → NÃO comprado (manutenção IP) — manter como está mas registrar nota
+        CONFIRMED_TPS = [
+            (105, 0.56,  "HUMANITY"),
+            (153, 3.11,  "Kevin"),
+            (174, 0.41,  "SLEEP"),
+            (157, 0.46,  "DrawPoorly"),
+        ]
+        results = []
+        with db._cursor() as cur:
+            for trade_id, pnl, sym in CONFIRMED_TPS:
+                cur.execute("SELECT id, symbol, status, pnl_pct_real FROM trades WHERE id=%s", (trade_id,))
+                row = cur.fetchone()
+                if not row:
+                    results.append(f"AVISO: trade #{trade_id} ({sym}) não encontrado no DB")
+                    continue
+                before = dict(row)
+                cur.execute(
+                    "UPDATE trades SET status='tp', pnl_pct_real=%s WHERE id=%s",
+                    (pnl, trade_id)
+                )
+                results.append(
+                    f"OK #{trade_id} {sym}: {before['status']} {before['pnl_pct_real']} "
+                    f"→ tp / {pnl*100:.0f}%"
+                )
+            # Verifica MUSKOSOPHY #13
+            cur.execute("SELECT id, symbol, status, pnl_pct_real, mint FROM trades WHERE id=13")
+            row = cur.fetchone()
+            if row:
+                r = dict(row)
+                results.append(
+                    f"INFO #13 MUSKOSOPHY: status={r['status']} pnl={r['pnl_pct_real']} "
+                    f"mint={r['mint']} — nao alterado (nao comprado, manter como referencia)"
+                )
+
+        html_rows = "".join(f"<li style='padding:3px 0'>{r}</li>" for r in results)
+        return (f"<html><body style='background:#0d1117;color:#e6edf3;font:13px monospace;padding:20px'>"
+                f"<h2 style='color:#58a6ff'>Fix Trailing Outcomes</h2>"
+                f"<ul>{html_rows}</ul>"
+                f"<p style='color:#8b949e'>Recarregue /analise/trade-autopsy para ver WR atualizado.</p>"
+                f"</body></html>")
+    except Exception:
+        return f"<pre>{traceback.format_exc()}</pre>", 500
+
+
 @app.route("/debug/trailing-review")
 def debug_trailing_review():
     """Lista os trades classificados como 'trailing_falhou' para revisão manual.
@@ -10648,7 +10704,7 @@ def debug_trailing_review():
                     SELECT
                         b.id AS trade_id,
                         COUNT(tt.id) AS pre_tick_count,
-                        MAX(COALESCE(tt.mc_high, tt.mc)) AS max_mc_pre
+                        MAX(tt.mc)   AS max_mc_pre
                     FROM base b
                     JOIN token_ticks tt ON tt.mint = b.mint
                         AND tt.tick_ts >= b.ts_signal
@@ -12284,12 +12340,13 @@ def analise_trade_autopsy():
                     GROUP BY b.id
                 ),
                 -- Pré-exit: ticks entre ts_signal e exit_ts (o que aconteceu ENQUANTO segurávamos)
+                -- IMPORTANTE: usa tt.mc (close), NÃO mc_high — high é inflado por spikes intra-candle do pAMM
                 tick_pre AS (
                     SELECT
                         b.id AS trade_id,
-                        COUNT(tt.id)                     AS pre_tick_count,
-                        MAX(COALESCE(tt.mc_high, tt.mc)) AS max_mc_pre,
-                        MIN(COALESCE(tt.mc_low,  tt.mc)) AS min_mc_pre
+                        COUNT(tt.id) AS pre_tick_count,
+                        MAX(tt.mc)   AS max_mc_pre,
+                        MIN(tt.mc)   AS min_mc_pre
                     FROM base b
                     JOIN token_ticks tt ON tt.mint = b.mint
                         AND tt.tick_ts >= b.ts_signal
@@ -12298,12 +12355,13 @@ def analise_trade_autopsy():
                     GROUP BY b.id
                 ),
                 -- Pós-exit: ticks nos 30min após exit_ts (o que o token fez DEPOIS de sair)
+                -- Idem: usa close para medir nível sustentado, não spike momentâneo
                 tick_post AS (
                     SELECT
                         b.id AS trade_id,
-                        COUNT(tt.id)                     AS post_tick_count,
-                        MAX(COALESCE(tt.mc_high, tt.mc)) AS max_mc_post,
-                        MIN(COALESCE(tt.mc_low,  tt.mc)) AS min_mc_post
+                        COUNT(tt.id) AS post_tick_count,
+                        MAX(tt.mc)   AS max_mc_post,
+                        MIN(tt.mc)   AS min_mc_post
                     FROM base b
                     JOIN token_ticks tt ON tt.mint = b.mint
                         AND tt.tick_ts > b.exit_ts
