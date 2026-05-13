@@ -197,7 +197,7 @@ class HotMonitor:
     # ------------------------------------------------------------------
 
     BOUNCE_MIN_PCT       = float(os.getenv("BOUNCE_MIN_PCT",         "0.30"))  # A.7: bounce mínimo 30% (live WR 9.1% abaixo disso)
-    BOUNCE_MAX_PCT       = float(os.getenv("BOUNCE_MAX_PCT",         "0.55"))  # bounce máximo — bloqueia entradas tardias (55% above bottom)
+    BOUNCE_MAX_PCT       = float(os.getenv("BOUNCE_MAX_PCT",         "9.99"))  # desativado por padrão — sem validação GMGN para threshold máximo (nota 87 CLAUDE.md)
     BOUNCE_DROP_MIN      = float(os.getenv("BOUNCE_DROP_MIN",        "0.30"))  # queda mínima da migração
     BOUNCE_TIME_MAX      = float(os.getenv("BOUNCE_TIME_MAX",        "20.0"))  # A.5: janela 30→20min (100% TPs em ≤20min)
     BOTTOM_FRESHNESS_SEC = int(os.getenv(  "BOTTOM_FRESHNESS_SEC",  "300"))   # A.6: máx 5min desde o último mc_min
@@ -318,29 +318,36 @@ class HotMonitor:
         except Exception as e:
             logger.warning("insert_bounce_signal %s: %s", mint[:8], e)
 
-        # Ajuste 2 — Snapshots pós-bounce +30s e +60s (Helius rolling window)
-        # Captura fluxo de ordens APÓS o sinal — complementa a janela pré-bounce.
-        # Ambos os snapshots são capturados num único callback em 65s.
+        # Snapshots pós-bounce: dois callbacks separados capturando os primeiros
+        # 30s e 60s reais após o sinal (window_sec=30 em t+30 = [t, t+30]).
+        # p30s = fluxo nos primeiros 30s; p60s = fluxo nos primeiros 60s.
         if self._helius and self.scheduler:
-            def _post_bounce_snapshots(m=mint):
+            def _snap30(m=mint):
                 try:
-                    w30 = self._helius.get_absorption_window(m, window_sec=30)
+                    w = self._helius.get_absorption_window(m, window_sec=30)
                     db.update_bounce_snapshots(
                         m, "30s",
-                        buy_vol=w30.get("buy_vol_sol", 0) or 0,
-                        sell_vol=w30.get("sell_vol_sol", 0) or 0,
-                        events=w30.get("total_events", 0) or 0,
-                    )
-                    w60 = self._helius.get_absorption_window(m, window_sec=60)
-                    db.update_bounce_snapshots(
-                        m, "60s",
-                        buy_vol=w60.get("buy_vol_sol", 0) or 0,
-                        sell_vol=w60.get("sell_vol_sol", 0) or 0,
-                        events=w60.get("total_events", 0) or 0,
+                        buy_vol=w.get("buy_vol_sol", 0) or 0,
+                        sell_vol=w.get("sell_vol_sol", 0) or 0,
+                        events=w.get("total_events", 0) or 0,
                     )
                 except Exception as ex:
-                    logger.debug("post_bounce_snapshots %s: %s", m[:8], ex)
-            self.scheduler.schedule(65, _post_bounce_snapshots)
+                    logger.debug("snap30 %s: %s", m[:8], ex)
+
+            def _snap60(m=mint):
+                try:
+                    w = self._helius.get_absorption_window(m, window_sec=60)
+                    db.update_bounce_snapshots(
+                        m, "60s",
+                        buy_vol=w.get("buy_vol_sol", 0) or 0,
+                        sell_vol=w.get("sell_vol_sol", 0) or 0,
+                        events=w.get("total_events", 0) or 0,
+                    )
+                except Exception as ex:
+                    logger.debug("snap60 %s: %s", m[:8], ex)
+
+            self.scheduler.schedule(30, _snap30)
+            self.scheduler.schedule(60, _snap60)
 
         msg = (
             f"🔔 BOUNCE {symbol}\n"
@@ -997,8 +1004,12 @@ class Scanner:
         with self._lock:
             if mint in self._seen:
                 return
-            watchlist_entry = self._watchlist.pop(mint, None)
             self._seen.add(mint)
+
+        # Lê watchlist_entry sem pop — só remove depois de passar todos os filtros,
+        # para não perder dados se o token for rejeitado (ex: FILTER_PUMP_ONLY).
+        with self._lock:
+            watchlist_entry = self._watchlist.get(mint)
 
         if not watchlist_entry:
             ok, motivo = _passes_filter(token)
@@ -1043,6 +1054,10 @@ class Scanner:
             with self._lock:
                 self._seen.discard(mint)
             return
+
+        # Token passou todos os filtros — agora remove da watchlist
+        with self._lock:
+            watchlist_entry = self._watchlist.pop(mint, watchlist_entry)
 
         total_supply      = _float(token.get("total_supply")) or 1_000_000_000
         complete_ts       = int(token.get("complete_timestamp") or 0)

@@ -267,6 +267,25 @@ def init_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades (status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts     ON trades (created_at DESC)")
 
+        # Série temporal de absorção durante o holding — captação pura, zero decisão.
+        # Cruzar com outcome (TP/SL) do trade depois que n for suficiente.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS trade_absorption_ticks (
+                id          BIGSERIAL    PRIMARY KEY,
+                trade_id    BIGINT       NOT NULL,
+                mint        TEXT         NOT NULL,
+                ts          TIMESTAMPTZ  DEFAULT NOW(),
+                buy_vol     FLOAT,
+                sell_vol    FLOAT,
+                buy_count   INT,
+                sell_count  INT,
+                events      INT,
+                lrg_buy     FLOAT
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_tat_trade ON trade_absorption_ticks (trade_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_tat_mint  ON trade_absorption_ticks (mint)")
+
     logger.info("DB inicializado")
 
 
@@ -591,6 +610,20 @@ def insert_bounce_signal(data: dict):
             "absorption_lrg_buy":  data.get("absorption_lrg_buy"),
             "absorption_events":   data.get("absorption_events"),
         })
+
+
+def insert_trade_absorption_tick(data: dict):
+    """Insere 1 tick de fluxo buy/sell durante um trade aberto (janela 30s rolante).
+    Chamado a cada MONITOR_POLL_SEC pelo TradeMonitor enquanto status='open'/'trailing_active'.
+    """
+    with _cursor() as cur:
+        cur.execute("""
+            INSERT INTO trade_absorption_ticks
+                (trade_id, mint, buy_vol, sell_vol, buy_count, sell_count, events, lrg_buy)
+            VALUES
+                (%(trade_id)s, %(mint)s, %(buy_vol)s, %(sell_vol)s,
+                 %(buy_count)s, %(sell_count)s, %(events)s, %(lrg_buy)s)
+        """, data)
 
 
 def update_bounce_snapshots(mint: str, window_label: str, buy_vol: float, sell_vol: float, events: int):
