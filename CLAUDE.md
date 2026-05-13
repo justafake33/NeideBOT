@@ -718,7 +718,7 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 
 ---
 
-## 🔄 Estado Atual: Bot ativo a $1/trade (2026-05-13, sessão 3)
+## 🔄 Estado Atual: Bot ativo a $1/trade (2026-05-13, sessão 4)
 
 ### Pipeline ativo
 `TRADING_ENABLED=true`, `CALIBRATION_AMOUNT_USD=1.0`, `CALIBRATION_MAX_TRADES=999999`.
@@ -726,32 +726,32 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 `HELIUS_RPC_URL` configurado no Railway — `helius_rpc.py` ativo para fill + posição.
 
 **Filtros ativos (ordem de aplicação no _check_bounce):**
-- A.2: bloqueia bounce_pct 20-30% (dead zone histórica — validado live; redundante com A.7 mas mantido como safety net)
-- A.3: bloqueia entry 50-65% do mc_migration (zona morta — validado live)
-- A.5: bloqueia elapsed > 20min (BOUNCE_TIME_MAX — validado live)
-- A.6: bloqueia fundo estagnado > 5min (BOTTOM_FRESHNESS_SEC — validado live)
-- A.7: bloqueia bounce_pct < 30% (BOUNCE_MIN_PCT=0.30 — validado live, n=11)
-- smart≥3: FILTER_SMART_MIN=3 — smart=1→0% WR (n=6), smart=2→20%, smart=3→57% (dado live GMGN)
-- FILTER_PUMP_ONLY: rejeita migrações sem "pump" no exchange — garante cobertura H22 futura
+- A.2: bloqueia bounce_pct 20-30% (redundante com A.7 mas mantido como safety net)
+- A.3: bloqueia entry 50-65% do mc_migration
+- A.5: bloqueia elapsed > 20min
+- A.6: bloqueia fundo estagnado > 5min
+- A.7: bloqueia bounce_pct < 30% (BOUNCE_MIN_PCT=0.30)
+- smart≥3: FILTER_SMART_MIN=3 — **⚠️ discriminação questionável** (live: smart=1→31%, smart=3→30%, flat)
+- FILTER_PUMP_ONLY: garante cobertura H22
 
-**TradeMonitor — melhorias (sessão 3):**
-- `_check_position_closed()`: usa `get_token_balance()` via Helius quando não há ticks — detecta GMGN fechar posição
-- `tp_mc` fallback: usa `entry_expected × (1+tp_pct)` quando `entry_mc_real=None` (GMGN nunca retorna fill)
-- `fill_source`: coluna no banco rastreia origem do fill data
-- `_check_via_gmgn()`: tenta condition_orders em query_order — confirmado ineficaz (GMGN retorna vazio)
+**WR ground truth (GMGN, corrigido 2026-05-13):** **32%** (42 TP / 90 SL / 132 trades).
+4 trailing TPs mal classificados (HUMANITY, Kevin, SLEEP, DrawPoorly) corrigidos via `/debug/fix-trailing-outcomes`.
 
-**H22 cobertura:** 32/552 bounces (6%, cresceu de 1.7% na sessão anterior). 100% dos tokens pump.fun novos têm cobertura. Históricos sem dados são pré-implementação (2026-05-12). `/analise/h22-correlation` implementado e funcional — fix CTE que excluía trades `open` do JOIN.
+**Maior discriminador live encontrado: bounce_pct >70% → WR 74% (n=23, +45pp)**
+Próxima mudança de env var: `BOUNCE_MIN_PCT=0.50` (teste) → `0.70` se confirmado.
 
-**Pendências analíticas:**
-- `/analise/post-sl-recovery` usa `entry_expected` — pendente correção para `entry_mc_real = (entry_price_usd / tokens_received) × 1B`
-- `buy_concentration` não exposto ainda (dados já existem em bounce_signals)
-- `/debug/absorption` mostra "—" para ambos os casos de sell_vol=0 — pendente fix "∞" vs "no flow"
+**Análise trade-autopsy (`/analise/trade-autopsy`):**
+- Seção 2b (pré/pós exit): usa `mc` (close), não `mc_high` — spike intra-candle eliminado
+- `hit_tp_before_exit` / `hit_tp_after_exit`: flags booleanas por trade
+- `spike_suspect`: max_gain alto + <5 pre_ticks = provável spike artifact
+- GMGN trailing TP confirmado funcionando — mc_high era o dado contaminado
 
-**WR ground truth (GMGN):** ~15% (filtros anteriores) → esperado ≥30% com smart≥3+SL25%. DB WR é inválido — não usar para decisões.
+**Pendências:**
+- Mudar `BOUNCE_MIN_PCT=0.50` no Railway (env var, zero código)
+- Verificar discriminação smart_wallets após n≥50 trades com smart≥3
+- H22: aguardando n≥30 bounces com absorption_events > 0
 
 **Regra de ouro para novos filtros:** só implementar com n≥30 trades validados no GMGN. Não usar DB WR como fonte.
-
-**Próxima grande alavanca:** analisar discriminação H22 após n≥30 bounces com dados Helius — ver nota 95 e ROADMAP.md.
 
 **Próximos passos — ver ROADMAP.md**
 
