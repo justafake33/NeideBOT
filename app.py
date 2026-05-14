@@ -13231,7 +13231,7 @@ document.addEventListener('keydown',e=>{{if((e.ctrlKey||e.metaKey)&&e.key==='Ent
             if hasattr(v, "isoformat"): return v.isoformat()
             return v
 
-        rows = [dict(zip(cols, [_serialize(v) for v in r])) for r in raw_rows]
+        rows = [dict(zip(cols, [_serialize(r[k]) for k in cols])) for r in raw_rows]
 
         if fmt == "json":
             return _json.dumps({"n": len(rows), "cols": cols, "rows": rows}, ensure_ascii=False, indent=2), 200, {"Content-Type": "application/json"}
