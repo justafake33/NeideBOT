@@ -5,7 +5,7 @@ from datetime import timezone, timedelta
 
 import csv
 import io
-from flask import Flask, render_template_string, redirect, Response, request
+from flask import Flask, render_template_string, redirect, Response, request, stream_with_context
 
 import db
 from monitoring import init_sentry
@@ -13409,16 +13409,10 @@ td{{padding:4px 8px;border-bottom:1px solid #21262d}}</style></head><body>
 
 @app.route("/debug/sell-recovery")
 def debug_sell_recovery():  # noqa: C901
-    """Recupera saídas reais (TP/SL) para trades sem exit_price_usd via Helius.
+    """Recupera saídas reais (TP/SL) para todos os trades sem exit via Helius.
 
-    Fluxo:
-      1. Busca todas as assinaturas de tx da wallet (até 1000) via Helius
-      2. Para cada tx, chama getTransaction e tenta identificar VENDA de token
-         (SOL aumenta na wallet + token decresce)
-      3. Faz match com trades do DB pelo mint (sem janela temporal rígida —
-         estratégia é "só existe uma posição por mint por vez")
-      4. Calcula P&L real: (sol_received - sol_spent) / sol_spent
-      5. Atualiza status (tp/sl), exit_price_usd, exit_ts, pnl_pct_real
+    Pagina TODAS as txs da wallet desde o trade mais antigo.
+    Usa streaming para não dar timeout. Sem ?limit — processa tudo.
 
     GET /debug/sell-recovery?dry=1  → simula sem salvar
     GET /debug/sell-recovery        → executa e salva
@@ -13427,290 +13421,299 @@ def debug_sell_recovery():  # noqa: C901
     from gmgn_client import get_sol_usd as _get_sol_usd
     import requests as _req
     from collections import defaultdict
-    import datetime as _dt
+    import datetime as _dt, time as _time
 
     dry_run = request.args.get("dry", "0") == "1"
 
     if not _helius.available():
         return "<pre style='color:red'>HELIUS_RPC_URL não configurado.</pre>", 400
-
     wallet = os.getenv("GMGN_WALLET_ADDRESS", "")
     if not wallet:
         return "<pre style='color:red'>GMGN_WALLET_ADDRESS não configurado.</pre>", 400
 
-    import time as _time
+    CSS = """<style>
+body{background:#0d1117;color:#c9d1d9;font-family:monospace;font-size:12px;padding:16px}
+h2{color:#58a6ff;margin-bottom:8px}
+.log{color:#8b949e;font-size:11px;margin:2px 0}
+.stats{display:flex;gap:12px;margin:12px 0;flex-wrap:wrap}
+.stat{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 16px}
+.stat-label{color:#8b949e;font-size:10px;text-transform:uppercase}
+.stat-value{font-size:20px;font-weight:bold;margin-top:2px}
+.green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}.muted{color:#8b949e}
+table{border-collapse:collapse;width:100%;margin-top:12px}
+th{background:#161b22;color:#8b949e;padding:5px 8px;text-align:left;font-size:11px}
+td{padding:4px 8px;border-bottom:1px solid #21262d}
+</style>"""
 
-    # ?limit= controla quantas txs varrer (padrão 150 — ~15s de processamento)
-    scan_limit = int(request.args.get("limit", "150"))
-
-    # Função com retry para getSignaturesForAddress e getTransaction
-    def _rpc_with_retry(method: str, params: list, retries: int = 3):
+    def _rpc(method, params, retries=4):
+        """JSON-RPC com retry + backoff em rate limit."""
         for attempt in range(retries):
-            _body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
             try:
-                _r = _req.post(_helius.HELIUS_RPC_URL, json=_body, timeout=20)
-                data = _r.json()
-            except Exception as _e:
+                r = _req.post(_helius.HELIUS_RPC_URL,
+                              json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                              timeout=20)
+                data = r.json()
+            except Exception as e:
                 if attempt < retries - 1:
                     _time.sleep(2 ** attempt)
                     continue
-                return None, f"HTTP erro: {_e}"
+                return None, str(e)
             if "error" in data:
-                code = data["error"].get("code", 0)
-                if code == -32429 and attempt < retries - 1:  # rate limited
+                if data["error"].get("code") == -32429 and attempt < retries - 1:
                     _time.sleep(2 ** (attempt + 1))
                     continue
                 return None, _json.dumps(data["error"])
             return data.get("result"), None
-        return None, "max retries excedido"
+        return None, "max retries"
 
-    # 1. Busca txs recentes da wallet
-    sigs_result, err = _rpc_with_retry(
-        "getSignaturesForAddress",
-        [wallet, {"limit": min(scan_limit * 4, 1000), "commitment": "confirmed"}]
-    )
-    if err:
-        return f"<pre style='color:red'>getSignaturesForAddress erro: {err}</pre>", 500
+    def generate():
+        yield f"<!DOCTYPE html><html><head><meta charset='utf-8'>{CSS}</head><body>"
+        yield f"<h2>Sell Recovery — {'DRY RUN' if dry_run else 'EXECUTANDO'}</h2>"
+        if dry_run:
+            yield "<p class='yellow'>⚠️ DRY RUN — nada será salvo</p>"
 
-    all_sigs = sorted(
-        [(int(e["blockTime"]), e["signature"]) for e in (sigs_result or [])
-         if e.get("blockTime") and e.get("signature")],
-        key=lambda x: x[0]
-    )
+        # ── 1. Carrega trades que precisam de exit ──────────────────────────
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT id, mint, symbol, created_at,
+                       amount_sol, tp_pct, sl_pct, status
+                FROM trades
+                WHERE order_id IS NOT NULL
+                  AND status NOT IN ('error','pending')
+                  AND (
+                      status IN ('expired','trailing_active','open')
+                      OR (status IN ('tp','sl') AND exit_price_usd IS NULL)
+                  )
+                ORDER BY created_at
+            """)
+            trades = [dict(r) for r in cur.fetchall()]
 
-    # 2. Busca trades que precisam de exit recovery:
-    with db._cursor() as cur:
-        cur.execute("""
-            SELECT id, mint, symbol, created_at, exit_ts,
-                   entry_price_usd, amount_sol, tokens_received,
-                   tp_pct, sl_pct, status
-            FROM trades
-            WHERE order_id IS NOT NULL
-              AND status NOT IN ('error', 'pending')
-              AND (
-                  status IN ('expired', 'trailing_active', 'open')
-                  OR (status IN ('tp', 'sl') AND exit_price_usd IS NULL)
-              )
-            ORDER BY created_at
-        """)
-        trades = [dict(r) for r in cur.fetchall()]
+        if not trades:
+            yield "<p class='green'>Nenhum trade precisa de exit recovery!</p></body></html>"
+            return
 
-    sol_usd = _get_sol_usd() or 150.0
+        # Primeiro trade do bot foi 06/05 — usar como piso absoluto independente do DB.
+        # Toda atividade da carteira desde essa data é do bot (sem trades manuais).
+        MAY_6_TS = _dt.datetime(2026, 5, 6, tzinfo=_dt.timezone.utc).timestamp()
+        oldest_ts_db = min(t["created_at"].timestamp() for t in trades)
+        oldest_ts    = min(oldest_ts_db, MAY_6_TS)  # sempre volta pelo menos até 06/05
 
-    # Conjunto de mints de interesse — só vamos parsear txs que possam ser saídas desses mints
-    mints_needed = {t["mint"] for t in trades}
+        # Para matching: inclui TODOS os mints que já negociamos (não só os sem exit)
+        # pois algumas vendas podem estar em trades com status errado no DB
+        with db._cursor() as cur:
+            cur.execute("SELECT DISTINCT mint FROM trades WHERE order_id IS NOT NULL")
+            mints_needed = {r[0] for r in cur.fetchall()}
 
-    # Função auxiliar: detecta VENDA de token na tx (tokens saem, SOL entra)
-    def _parse_sell_tx(sig: str):
-        """Retorna (mint_sold, sol_received, tokens_sold, block_ts) ou None."""
-        result, err = _rpc_with_retry("getTransaction", [
-            sig,
-            {
-                "encoding": "jsonParsed",
-                "commitment": "confirmed",
-                "maxSupportedTransactionVersion": 0,
-            },
-        ])
-        if err or not result:
+        yield (f"<p class='log'>Trades sem exit: <b>{len(trades)}</b> | "
+               f"Mints únicos (todos): {len(mints_needed)} | "
+               f"Scan desde: {_dt.datetime.fromtimestamp(oldest_ts).strftime('%Y-%m-%d')} (06/05 piso)</p>")
+
+        sol_usd = _get_sol_usd() or 150.0
+
+        # ── 2. Pagina TODAS as assinaturas da wallet desde o trade mais antigo ──
+        yield "<p class='log'>Buscando assinaturas no Helius (paginando)...</p>"
+        all_sigs = []  # lista de (blockTime, signature) em ordem cronológica
+        before_cursor = None
+        page = 0
+        while True:
+            page += 1
+            params_sig = {"limit": 1000, "commitment": "confirmed"}
+            if before_cursor:
+                params_sig["before"] = before_cursor
+            result, err = _rpc("getSignaturesForAddress", [wallet, params_sig])
+            if err:
+                yield f"<p class='red'>Erro getSignaturesForAddress p.{page}: {err}</p>"
+                break
+            if not result:
+                break
+            batch = [(int(e["blockTime"]), e["signature"])
+                     for e in result if e.get("blockTime") and e.get("signature")]
+            all_sigs.extend(batch)
+            yield (f"<p class='log'>  página {page}: +{len(batch)} txs "
+                   f"(total {len(all_sigs)}) | "
+                   f"mais antiga: {_dt.datetime.fromtimestamp(batch[-1][0]).strftime('%m-%d %H:%M') if batch else '?'}</p>")
+            # Para quando chegamos antes do trade mais antigo
+            if batch and batch[-1][0] < oldest_ts - 3600:
+                yield "<p class='log'>  → chegamos antes do primeiro trade, parando paginação.</p>"
+                break
+            if len(result) < 1000:
+                yield "<p class='log'>  → última página (< 1000 resultados).</p>"
+                break
+            before_cursor = result[-1]["signature"]
+            _time.sleep(0.3)  # pausa entre páginas de assinaturas
+
+        # Filtra apenas txs APÓS o trade mais antigo e ordena cronologicamente
+        all_sigs = sorted(
+            [(bt, sig) for bt, sig in all_sigs if bt >= oldest_ts - 300],
+            key=lambda x: x[0]
+        )
+        yield f"<p class='log'><b>Total de txs no período: {len(all_sigs)}</b></p>"
+
+        # ── 3. Função para detectar venda numa tx ──────────────────────────
+        def _parse_sell(sig):
+            result, _ = _rpc("getTransaction", [
+                sig,
+                {"encoding": "jsonParsed", "commitment": "confirmed",
+                 "maxSupportedTransactionVersion": 0},
+            ])
+            if not result:
+                return None
+            meta     = result.get("meta") or {}
+            tx       = result.get("transaction") or {}
+            block_ts = result.get("blockTime")
+            raw_keys = (tx.get("message") or {}).get("accountKeys") or []
+            accs     = [(k.get("pubkey") if isinstance(k, dict) else str(k)) for k in raw_keys]
+            pre_b    = meta.get("preBalances") or []
+            post_b   = meta.get("postBalances") or []
+            widx     = next((i for i, k in enumerate(accs) if k == wallet), None)
+            if widx is None or widx >= len(pre_b) or widx >= len(post_b):
+                return None
+            sol_delta = (post_b[widx] - pre_b[widx]) / 1e9
+            if sol_delta <= 0:
+                return None  # compra ou operação neutra
+            # Verifica se envolve mint de interesse
+            all_mints = {t.get("mint") for t in
+                         (meta.get("preTokenBalances") or []) +
+                         (meta.get("postTokenBalances") or []) if t.get("mint")}
+            if not all_mints & mints_needed:
+                return None
+            pre_tok  = {t["accountIndex"]: t for t in (meta.get("preTokenBalances") or [])}
+            post_tok = {t["accountIndex"]: t for t in (meta.get("postTokenBalances") or [])}
+            for idx, pre in pre_tok.items():
+                if (pre.get("owner") or "") != wallet:
+                    continue
+                mint_addr = pre.get("mint", "")
+                if mint_addr not in mints_needed:
+                    continue
+                pre_ui    = float(pre.get("uiTokenAmount", {}).get("uiAmount") or 0)
+                post_ui   = float((post_tok.get(idx) or {}).get("uiTokenAmount", {}).get("uiAmount") or 0)
+                if pre_ui - post_ui > 0:
+                    return (mint_addr, sol_delta, pre_ui - post_ui, block_ts)
             return None
 
-        meta = result.get("meta") or {}
-        tx   = result.get("transaction") or {}
-        msg  = tx.get("message") or {}
-        block_ts = result.get("blockTime")
+        # ── 4. Varre txs com throttle 150ms (≤6 req/s) ───────────────────
+        yield "<p class='log'>Varrendo transações para vendas...</p>"
+        sells_by_mint = defaultdict(list)
+        scanned = 0
+        sells_found = 0
+        for bt, sig in all_sigs:
+            parsed = _parse_sell(sig)
+            if parsed:
+                mint_sold, sol_recv, tokens_sold, bts = parsed
+                sells_by_mint[mint_sold].append({
+                    "sig": sig, "block_ts": bts,
+                    "sol_received": sol_recv, "tokens_sold": tokens_sold,
+                })
+                sells_found += 1
+            scanned += 1
+            if scanned % 50 == 0:
+                yield (f"<p class='log'>  {scanned}/{len(all_sigs)} txs varridas | "
+                       f"vendas encontradas: {sells_found}</p>")
+            _time.sleep(0.15)
 
-        raw_keys     = msg.get("accountKeys") or []
-        account_keys = [
-            (k.get("pubkey") if isinstance(k, dict) else str(k))
-            for k in raw_keys
-        ]
+        yield (f"<p class='log'><b>Scan completo: {scanned} txs | "
+               f"{sells_found} vendas de mints de interesse</b></p>")
 
-        pre_bals  = meta.get("preBalances")  or []
-        post_bals = meta.get("postBalances") or []
+        # ── 5. Match e cálculo de P&L ──────────────────────────────────────
+        results  = []
+        fixed    = 0
+        no_sell  = 0
 
-        wallet_idx = next((i for i, k in enumerate(account_keys) if k == wallet), None)
-        if wallet_idx is None:
-            return None
+        for trade in trades:
+            tid    = trade["id"]
+            mint   = trade["mint"]
+            symbol = trade["symbol"] or mint[:8]
+            sol_in = trade.get("amount_sol") or 0
+            ts_buy = trade["created_at"].timestamp()
 
-        # SOL delta na carteira: positivo = recebemos SOL (venda de token)
-        if wallet_idx >= len(pre_bals) or wallet_idx >= len(post_bals):
-            return None
-        sol_delta = (post_bals[wallet_idx] - pre_bals[wallet_idx]) / 1e9
-        if sol_delta <= 0:
-            return None  # SOL diminuiu — é compra, não venda
+            sells = [s for s in sells_by_mint.get(mint, [])
+                     if s["block_ts"] and s["block_ts"] >= ts_buy - 60]
+            sells.sort(key=lambda s: s["block_ts"])
+            sell = sells[0] if sells else None
 
-        # Verifica se a tx envolve algum mint de interesse (filtragem rápida)
-        all_token_mints = set()
-        for t in (meta.get("preTokenBalances") or []) + (meta.get("postTokenBalances") or []):
-            if t.get("mint"):
-                all_token_mints.add(t["mint"])
-        if not all_token_mints.intersection(mints_needed):
-            return None  # tx não envolve nenhum token que nos interessa
-
-        # Identifica qual token diminuiu na carteira
-        pre_tok  = {t["accountIndex"]: t for t in (meta.get("preTokenBalances")  or [])}
-        post_tok = {t["accountIndex"]: t for t in (meta.get("postTokenBalances") or [])}
-
-        for idx, pre in pre_tok.items():
-            owner = pre.get("owner") or ""
-            if owner != wallet:
+            if not sell:
+                no_sell += 1
+                results.append({"id": tid, "symbol": symbol, "status": "NO_SELL",
+                                 "old_status": trade["status"], "detail": mint[:16] + "..."})
                 continue
-            mint_addr  = pre.get("mint", "")
-            if mint_addr not in mints_needed:
-                continue
-            pre_ui     = float(pre.get("uiTokenAmount", {}).get("uiAmount") or 0)
-            post_entry = post_tok.get(idx)
-            post_ui    = float((post_entry or {}).get("uiTokenAmount", {}).get("uiAmount") or 0)
-            tokens_sold = pre_ui - post_ui
-            if tokens_sold > 0 and mint_addr:
-                return (mint_addr, sol_delta, tokens_sold, block_ts)
 
-        return None
+            sol_out  = sell["sol_received"]
+            block_ts = sell["block_ts"]
+            pnl      = (sol_out - sol_in) / sol_in if sol_in else 0.0
+            tp_pct   = trade.get("tp_pct") or 0.75
+            new_status = "tp" if pnl >= tp_pct * 0.5 else "sl"
 
-    # 3. Varre txs com throttle — 100ms entre chamadas (≤10 req/s)
-    sells_by_mint = defaultdict(list)
-    to_scan = all_sigs[-scan_limit:]  # txs mais recentes
-    scanned = 0
-    for bt, sig in to_scan:
-        parsed = _parse_sell_tx(sig)
-        if parsed:
-            mint_sold, sol_recv, tokens_sold, block_ts = parsed
-            sells_by_mint[mint_sold].append({
-                "sig": sig, "block_ts": block_ts,
-                "sol_received": sol_recv, "tokens_sold": tokens_sold,
+            exit_ts_dt = _dt.datetime.fromtimestamp(block_ts, tz=_dt.timezone.utc)
+            results.append({
+                "id": tid, "symbol": symbol, "status": "FIXED",
+                "old_status": trade["status"], "new_status": new_status,
+                "sol_in": round(sol_in, 6), "sol_out": round(sol_out, 6),
+                "pnl_pct": round(pnl * 100, 2),
+                "exit_ts": exit_ts_dt.strftime("%m-%d %H:%M"),
+                "sig": sell["sig"][:20] + "...",
             })
-        scanned += 1
-        _time.sleep(0.12)  # 8 req/s — abaixo do limite Helius free tier
 
-    # 4. Faz match e calcula P&L
-    results = []
-    fixed = 0
-    already_ok = 0
-    no_sell = 0
+            if not dry_run:
+                db.update_trade(tid, {
+                    "status":         new_status,
+                    "exit_type":      "helius_sell_recovery",
+                    "exit_price_usd": sol_out * sol_usd,
+                    "exit_ts":        exit_ts_dt,
+                    "pnl_pct_real":   pnl,
+                })
+            fixed += 1
 
-    for trade in trades:
-        tid    = trade["id"]
-        mint   = trade["mint"]
-        symbol = trade["symbol"] or mint[:8]
-        sol_in = trade.get("amount_sol") or 0
+        # ── 6. Relatório final ─────────────────────────────────────────────
+        tp_count = sum(1 for r in results if r.get("new_status") == "tp")
+        sl_count = sum(1 for r in results if r.get("new_status") == "sl")
+        pnls     = [r["pnl_pct"] for r in results if r.get("status") == "FIXED"]
+        avg_pnl  = sum(pnls) / len(pnls) if pnls else 0
 
-        sells = sells_by_mint.get(mint, [])
-
-        # Se mais de uma venda para o mesmo mint, pega a mais próxima
-        # ao created_at do trade (caso haja re-entries futuros)
-        ts_buy = trade["created_at"].timestamp()
-        sells_after = [s for s in sells if s["block_ts"] and s["block_ts"] >= ts_buy - 60]
-        sells_after.sort(key=lambda s: s["block_ts"])
-        sell = sells_after[0] if sells_after else None
-
-        if not sell:
-            no_sell += 1
-            results.append({"id": tid, "symbol": symbol, "status": "NO_SELL",
-                             "detail": f"0 vendas encontradas para {mint[:12]}..."})
-            continue
-
-        sol_out   = sell["sol_received"]
-        tokens_s  = sell["tokens_sold"]
-        block_ts  = sell["block_ts"]
-
-        # P&L real: (sol_recebido - sol_gasto) / sol_gasto
-        pnl = (sol_out - sol_in) / sol_in if sol_in else 0.0
-
-        # Determina status com base no P&L
-        tp_pct = trade.get("tp_pct") or 0.75
-        sl_pct = trade.get("sl_pct") or 0.25
-        if pnl >= tp_pct * 0.5:   # ≥ metade do TP → TP confirmado
-            new_status = "tp"
-        elif pnl <= -sl_pct * 0.5:  # ≤ metade do SL negativo → SL confirmado
-            new_status = "sl"
-        else:
-            new_status = "sl"  # saída no meio-termo = SL (conservador)
-
-        exit_price_usd = sol_out * sol_usd
-        exit_ts_dt     = _dt.datetime.fromtimestamp(block_ts, tz=_dt.timezone.utc)
-
-        results.append({
-            "id": tid, "symbol": symbol, "status": "FIXED",
-            "old_status": trade["status"],
-            "new_status": new_status,
-            "sol_in": round(sol_in, 6),
-            "sol_out": round(sol_out, 6),
-            "pnl_pct": round(pnl * 100, 2),
-            "exit_ts": exit_ts_dt.strftime("%m-%d %H:%M"),
-            "sig": sell["sig"][:20] + "...",
-        })
-
-        if not dry_run:
-            db.update_trade(tid, {
-                "status":          new_status,
-                "exit_type":       "helius_sell_recovery",
-                "exit_price_usd":  exit_price_usd,
-                "exit_ts":         exit_ts_dt,
-                "pnl_pct_real":    pnl,
-                "fill_source":     (trade.get("fill_source") or "") + "|exit_helius",
-            })
-        fixed += 1
-
-    # HTML report
-    mode_label = "DRY RUN" if dry_run else f"EXECUTADO — {fixed} trades corrigidos"
-
-    # Estatísticas
-    tp_count = sum(1 for r in results if r.get("new_status") == "tp")
-    sl_count = sum(1 for r in results if r.get("new_status") == "sl")
-    avg_pnl  = (sum(r["pnl_pct"] for r in results if r.get("status") == "FIXED") / fixed
-                if fixed else 0)
-
-    rows_html = ""
-    for r in results:
-        if r["status"] == "FIXED":
-            color     = "#3fb950" if r["new_status"] == "tp" else "#f85149"
-            status_td = f"<span style='color:{color}'>{r['new_status'].upper()}</span>"
-            detail    = (f"P&L: <b style='color:{color}'>{r['pnl_pct']:+.1f}%</b> | "
-                         f"buy={r['sol_in']} SOL → sell={r['sol_out']} SOL | "
-                         f"exit={r['exit_ts']} | sig={r['sig']}")
-        else:
-            status_td = f"<span style='color:#8b949e'>{r['status']}</span>"
-            detail    = r.get("detail", "")
-
-        rows_html += (f"<tr><td style='color:#8b949e'>{r['id']}</td>"
-                      f"<td><b>{r['symbol']}</b></td>"
-                      f"<td style='color:#8b949e'>{r.get('old_status','')}</td>"
-                      f"<td>{status_td}</td>"
-                      f"<td style='font-size:11px'>{detail}</td></tr>")
-
-    return f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
-<style>
-body{{background:#0d1117;color:#c9d1d9;font-family:monospace;font-size:12px;padding:16px}}
-h2{{color:#58a6ff;margin-bottom:8px}}
-.stats{{display:flex;gap:12px;margin:12px 0;flex-wrap:wrap}}
-.stat{{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 16px}}
-.stat-label{{color:#8b949e;font-size:10px;text-transform:uppercase}}
-.stat-value{{font-size:20px;font-weight:bold;margin-top:2px}}
-.green{{color:#3fb950}}.red{{color:#f85149}}.yellow{{color:#d29922}}
-table{{border-collapse:collapse;width:100%}}
-th{{background:#161b22;color:#8b949e;padding:5px 8px;text-align:left;font-size:11px}}
-td{{padding:4px 8px;border-bottom:1px solid #21262d}}
-</style></head><body>
-<h2>Sell Recovery — {mode_label}</h2>
-<p style='color:#8b949e'>Wallet: {wallet[:20]}... | Txs Helius: {len(all_sigs)} |
-   Scaneadas: {scanned} | Trades sem exit: {len(trades)}</p>
-{'<p style="color:#d29922">⚠️ DRY RUN — acesse sem ?dry=1 para salvar</p>' if dry_run else ''}
+        yield f"""
 <div class='stats'>
   <div class='stat'><div class='stat-label'>Corrigidos</div>
     <div class='stat-value green'>{fixed}</div></div>
-  <div class='stat'><div class='stat-label'>TP confirmados</div>
+  <div class='stat'><div class='stat-label'>TP on-chain</div>
     <div class='stat-value green'>{tp_count}</div></div>
-  <div class='stat'><div class='stat-label'>SL confirmados</div>
+  <div class='stat'><div class='stat-label'>SL on-chain</div>
     <div class='stat-value red'>{sl_count}</div></div>
-  <div class='stat'><div class='stat-label'>Sem venda</div>
+  <div class='stat'><div class='stat-label'>Sem venda (fora janela)</div>
     <div class='stat-value yellow'>{no_sell}</div></div>
-  <div class='stat'><div class='stat-label'>P&L médio (corrigidos)</div>
-    <div class='stat-value {'green' if avg_pnl >= 0 else 'red'}'>{avg_pnl:+.1f}%</div></div>
-</div>
+  <div class='stat'><div class='stat-label'>WR real</div>
+    <div class='stat-value {"green" if tp_count > 0 else "red"}'>
+      {tp_count/(tp_count+sl_count)*100:.0f}%
+    </div></div>
+  <div class='stat'><div class='stat-label'>P&L médio</div>
+    <div class='stat-value {"green" if avg_pnl >= 0 else "red"}'>{avg_pnl:+.1f}%</div></div>
+</div>"""
+
+        rows = ""
+        for r in results:
+            if r["status"] == "FIXED":
+                c = "#3fb950" if r["new_status"] == "tp" else "#f85149"
+                st  = f"<span style='color:{c}'>{r['new_status'].upper()}</span>"
+                det = (f"P&L <b style='color:{c}'>{r['pnl_pct']:+.1f}%</b> | "
+                       f"{r['sol_in']} SOL → {r['sol_out']} SOL | "
+                       f"exit {r['exit_ts']} | {r['sig']}")
+            else:
+                st  = "<span class='muted'>NO_SELL</span>"
+                det = r.get("detail", "")
+            rows += (f"<tr><td class='muted'>{r['id']}</td>"
+                     f"<td><b>{r['symbol']}</b></td>"
+                     f"<td class='muted'>{r.get('old_status','')}</td>"
+                     f"<td>{st}</td>"
+                     f"<td style='font-size:11px'>{det}</td></tr>")
+
+        yield f"""
 <table><thead><tr>
   <th>ID</th><th>Symbol</th><th>Status DB</th><th>Status Real</th><th>Detalhe</th>
-</tr></thead><tbody>{rows_html}</tbody></table>
+</tr></thead><tbody>{rows}</tbody></table>
+<p class='log' style='margin-top:12px'>
+  {'✅ Salvo no banco.' if not dry_run else '⚠️ DRY RUN — rode sem ?dry=1 para salvar.'}
+</p>
 </body></html>"""
+
+    return Response(stream_with_context(generate()), content_type="text/html; charset=utf-8")
 
 
 if __name__ == "__main__":
