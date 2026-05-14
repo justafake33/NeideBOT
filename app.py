@@ -14575,5 +14575,397 @@ def analise_correlacao():
     return "".join(out)
 
 
+@app.route("/analise/sl-otimo")
+def analise_sl_otimo():
+    """Análise quantitativa do SL ótimo.
+    Para cada trade, calcula o drawdown máximo intra-trade via token_ticks.
+    Simula EV em diferentes larguras de SL (-15% a -60%).
+    Responde: a que profundidade o pAMM vai antes de recuperar nos TPs?
+    """
+    import traceback as _tb
+    _f = lambda v: float(v) if v is not None else 0.0
+
+    CSS = """<style>
+    body{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:20px;max-width:1100px;margin:0 auto}
+    h1{color:#58a6ff;border-bottom:1px solid #30363d;padding-bottom:8px}
+    h2{color:#79c0ff;margin-top:28px;margin-bottom:4px}
+    h3{color:#8b949e;margin:14px 0 4px}
+    table{border-collapse:collapse;width:100%;margin-bottom:16px;font-size:13px}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;text-align:left;border:1px solid #30363d}
+    td{padding:5px 10px;border:1px solid #21262d}
+    tr:hover td{background:#1c2128}
+    .tp{color:#3fb950}.sl{color:#f85149}.neu{color:#e3b341}.dim{color:#6e7681}
+    .box{background:#161b22;border:1px solid #30363d;padding:12px 16px;margin:10px 0;border-radius:6px}
+    .best{background:#0f2a1a;border-color:#3fb950}
+    .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:12px 0}
+    .kpi{background:#161b22;border:1px solid #30363d;padding:12px;border-radius:6px;text-align:center}
+    .kpi-val{font-size:20px;font-weight:bold;display:block}
+    .kpi-lbl{font-size:11px;color:#8b949e;margin-top:4px}
+    .bar{display:inline-block;height:10px;background:#3fb950;vertical-align:middle;margin-right:4px}
+    .bar-sl{background:#f85149}
+    a{color:#58a6ff}
+    </style>"""
+
+    NAV = "<p><a href='/analise/big-picture'>Big Picture</a> · <a href='/analise/correlacao'>Correlação</a> · <a href='/analise/sl-otimo'>SL Ótimo</a></p>"
+
+    out = [f"<!DOCTYPE html><html><head><title>SL Ótimo</title>{CSS}</head><body>", NAV,
+           "<h1>⚙️ Análise do SL Ótimo — Drawdown Real vs EV Simulado</h1>"]
+
+    try:
+      with db._cursor() as cur:
+
+        # ── BASE: drawdown máximo intra-trade para cada trade ──────────────
+        # Para TPs: min MC do sinal até o exit (pAMM dip antes do rally)
+        # Para SLs: o que aconteceu DEPOIS da nossa saída
+        cur.execute("""
+            WITH entry_data AS (
+                SELECT
+                    t.id, t.mint, t.symbol, t.status,
+                    t.pnl_pct_real,
+                    t.ts_signal,
+                    t.exit_ts,
+                    COALESCE(t.tp_pct, 0.75) AS tp_pct,
+                    COALESCE(t.sl_pct, 0.25) AS sl_pct_config,
+                    COALESCE(
+                        CASE WHEN t.entry_price_usd > 0 AND t.tokens_received > 0
+                             THEN t.entry_price_usd / t.tokens_received * 1e9 END,
+                        t.entry_expected
+                    ) AS entry_mc
+                FROM trades t
+                WHERE t.exit_type = 'helius_sell_recovery'
+                  AND t.ts_signal IS NOT NULL
+            ),
+            -- Para TPs: drawdown durante o trade (signal → exit)
+            tp_drawdown AS (
+                SELECT
+                    e.id,
+                    MIN(COALESCE(tt.mc_low, tt.mc)) AS min_mc_intra,
+                    MAX(COALESCE(tt.mc_high, tt.mc)) AS max_mc_intra,
+                    COUNT(tt.tick_ts) AS n_ticks,
+                    -- Quando ocorreu o mínimo (relativo ao sinal)
+                    EXTRACT(EPOCH FROM (
+                        (SELECT tt2.tick_ts FROM token_ticks tt2
+                         WHERE tt2.mint = e.mint
+                           AND tt2.tick_ts >= e.ts_signal
+                           AND tt2.tick_ts <= COALESCE(e.exit_ts, e.ts_signal + INTERVAL '60 min')
+                         ORDER BY COALESCE(tt2.mc_low, tt2.mc) ASC LIMIT 1)
+                        - e.ts_signal
+                    )) / 60.0 AS min_at_min
+                FROM entry_data e
+                JOIN token_ticks tt ON tt.mint = e.mint
+                    AND tt.tick_ts >= e.ts_signal
+                    AND tt.tick_ts <= COALESCE(e.exit_ts, e.ts_signal + INTERVAL '60 min')
+                WHERE e.status = 'tp'
+                GROUP BY e.id
+            ),
+            -- Para SLs: quanto o token foi DEPOIS da nossa saída (antes de recuperar ou continuar)
+            sl_post_exit AS (
+                SELECT
+                    e.id,
+                    -- min/max nos 60min pós-saída
+                    MIN(COALESCE(tt.mc_low, tt.mc)) AS min_mc_post,
+                    MAX(COALESCE(tt.mc_high, tt.mc)) AS max_mc_post,
+                    COUNT(tt.tick_ts) AS n_ticks_post,
+                    -- Também pega intra-trade (signal → exit) para o SL
+                    (SELECT MIN(COALESCE(tt2.mc_low, tt2.mc))
+                     FROM token_ticks tt2
+                     WHERE tt2.mint = e.mint
+                       AND tt2.tick_ts >= e.ts_signal
+                       AND tt2.tick_ts <= e.exit_ts) AS min_mc_intra
+                FROM entry_data e
+                JOIN token_ticks tt ON tt.mint = e.mint
+                    AND tt.tick_ts > e.exit_ts
+                    AND tt.tick_ts <= e.exit_ts + INTERVAL '60 min'
+                WHERE e.status = 'sl' AND e.exit_ts IS NOT NULL
+                GROUP BY e.id
+            )
+            SELECT
+                e.*,
+                -- Para TPs
+                td.min_mc_intra AS tp_min_mc_intra,
+                td.max_mc_intra AS tp_max_mc_intra,
+                td.n_ticks       AS tp_n_ticks,
+                td.min_at_min    AS tp_min_at_min,
+                (td.min_mc_intra - e.entry_mc) / NULLIF(e.entry_mc, 0) AS tp_drawdown_pct,
+                -- Para SLs
+                sp.min_mc_intra  AS sl_min_mc_intra,
+                sp.min_mc_post   AS sl_min_mc_post,
+                sp.max_mc_post   AS sl_max_mc_post,
+                sp.n_ticks_post  AS sl_n_ticks_post,
+                -- Drawdown adicional APÓS nossa saída
+                (sp.min_mc_post - e.entry_mc) / NULLIF(e.entry_mc, 0) AS sl_extra_drawdown,
+                -- Máximo que o token atingiu após nossa saída
+                (sp.max_mc_post - e.entry_mc) / NULLIF(e.entry_mc, 0) AS sl_max_recovery,
+                -- Classificação de recuperação
+                CASE
+                    WHEN sp.max_mc_post >= e.entry_mc * (1 + e.tp_pct) THEN 'hit_tp'
+                    WHEN sp.max_mc_post >= e.entry_mc * 1.20 THEN 'parcial_20'
+                    WHEN sp.max_mc_post >= e.entry_mc THEN 'breakeven'
+                    WHEN sp.min_mc_post IS NULL THEN 'sem_dados'
+                    ELSE 'continuou_caindo'
+                END AS recovery_class
+            FROM entry_data e
+            LEFT JOIN tp_drawdown td ON td.id = e.id
+            LEFT JOIN sl_post_exit sp ON sp.id = e.id
+            ORDER BY e.status, e.pnl_pct_real DESC
+        """)
+        rows = cur.fetchall()
+
+        tp_rows = [r for r in rows if r['status'] == 'tp' and r['tp_drawdown_pct'] is not None]
+        sl_rows = [r for r in rows if r['status'] == 'sl']
+        sl_recovered = [r for r in sl_rows if r['recovery_class'] in ('hit_tp', 'parcial_20', 'breakeven')]
+        sl_continued = [r for r in sl_rows if r['recovery_class'] == 'continuou_caindo']
+
+        # ── SEÇÃO 1: Drawdown dos TPs antes de recuperar ──────────────────
+        out.append("<h2>1 — Drawdown dos TPs durante o trade (antes de atingir o TP)</h2>")
+        out.append("<div class='box'>Para cada TP, qual foi o pior MC entre o sinal e a saída? "
+                   "Isso é o quanto o pAMM 'testou para baixo' antes de subir. "
+                   "Se o drawdown foi -18%, um SL de -20% teria sobrevivido.</div>")
+
+        if tp_rows:
+            dds = sorted([_f(r['tp_drawdown_pct']) * 100 for r in tp_rows])
+            buckets_tp = [
+                ('<-30%',  [d for d in dds if d < -30]),
+                ('-20 a -30%', [d for d in dds if -30 <= d < -20]),
+                ('-15 a -20%', [d for d in dds if -20 <= d < -15]),
+                ('-10 a -15%', [d for d in dds if -15 <= d < -10]),
+                ('-5 a -10%',  [d for d in dds if -10 <= d < -5]),
+                ('0 a -5%',    [d for d in dds if -5 <= d <= 0]),
+                ('>0% (tick acima)',   [d for d in dds if d > 0]),
+            ]
+            out.append("<table><tr><th>Faixa de drawdown intra-TP</th><th>n TPs</th><th>% dos TPs</th><th>Interpretação</th></tr>")
+            n_total_tp = len(dds)
+            for label, vals in buckets_tp:
+                if not vals:
+                    continue
+                n = len(vals)
+                pct = round(n / n_total_tp * 100, 1)
+                interp = ""
+                if '>0' in label: interp = "ticks não capturaram o dip real"
+                elif '0 a -5' in label: interp = "SL ≥ -5% teria sobrevivido"
+                elif '-5 a -10' in label: interp = "SL ≥ -10% teria sobrevivido"
+                elif '-10 a -15' in label: interp = "SL ≥ -15% teria sobrevivido"
+                elif '-15 a -20' in label: interp = "SL ≥ -20% teria sobrevivido"
+                elif '-20 a -30' in label: interp = "<span class='sl'>SL ≥ -30% necessário</span>"
+                else: interp = "<span class='sl'>SL &gt; -30% necessário</span>"
+                bar = int(pct / 2)
+                out.append(f"<tr><td class='neu'>{label}</td><td>{n}</td>"
+                           f"<td><span class='bar' style='width:{bar}px'></span>{pct}%</td>"
+                           f"<td>{interp}</td></tr>")
+            out.append("</table>")
+
+            # Momento do mínimo: quando o dip acontece nos TPs?
+            times = [(r['symbol'], _f(r['tp_drawdown_pct'])*100, _f(r['tp_min_at_min'])) for r in tp_rows if r['tp_min_at_min'] is not None]
+            time_buckets = [
+                ('0-2min', [t for t in times if t[2] <= 2]),
+                ('2-5min', [t for t in times if 2 < t[2] <= 5]),
+                ('5-10min', [t for t in times if 5 < t[2] <= 10]),
+                ('10-20min', [t for t in times if 10 < t[2] <= 20]),
+                ('>20min', [t for t in times if t[2] > 20]),
+            ]
+            out.append("<h3>Quando ocorre o dip mínimo nos TPs (relativo ao sinal)?</h3>")
+            out.append("<table><tr><th>Momento do dip</th><th>n TPs</th><th>%</th><th>Avg drawdown</th></tr>")
+            for label, vals in time_buckets:
+                if not vals:
+                    continue
+                n = len(vals)
+                pct = round(n / len(times) * 100, 1) if times else 0
+                avg_dd = round(sum(v[1] for v in vals) / n, 1)
+                out.append(f"<tr><td>{label}</td><td>{n}</td><td>{pct}%</td><td class='neu'>{avg_dd}%</td></tr>")
+            out.append("</table>")
+
+        # ── SEÇÃO 2: Para os SLs que recuperaram — quão fundo foram depois? ──
+        out.append("<h2>2 — Para os SLs que recuperaram: quão fundo foram depois da nossa saída?</h2>")
+        out.append("<div class='box'><b>Pergunta crítica:</b> saímos a -20%. O token foi a -35% antes de subir para +75%? "
+                   "Se sim, precisamos de SL ≥ -35% para capturar esse trade. "
+                   "Se foi só a -22%, SL de -25% já seria suficiente.</div>")
+
+        if sl_recovered:
+            # Para cada recovered SL: qual o drawdown adicional pós-saída?
+            extra_dds = []
+            for r in sl_recovered:
+                exit_pnl = _f(r['pnl_pct_real']) * 100  # nosso exit, ex: -20%
+                extra = _f(r['sl_extra_drawdown']) * 100 if r['sl_extra_drawdown'] is not None else None
+                recovery = _f(r['sl_max_recovery']) * 100 if r['sl_max_recovery'] is not None else None
+                extra_dds.append((r['symbol'], exit_pnl, extra, recovery, r['recovery_class']))
+
+            # Required SL = min(exit_pnl, extra_drawdown)
+            # i.e., para sobreviver, o SL deve ser > max(|exit|, |extra|)
+            required_sls = []
+            for sym, exit_pnl, extra, recovery, cls in extra_dds:
+                if extra is not None:
+                    required_sls.append(max(abs(exit_pnl), abs(extra)))
+                else:
+                    required_sls.append(abs(exit_pnl))
+
+            req_buckets = [
+                ('SL -25% suficiente', [s for s in required_sls if s <= 25]),
+                ('SL -30% suficiente', [s for s in required_sls if 25 < s <= 30]),
+                ('SL -35% suficiente', [s for s in required_sls if 30 < s <= 35]),
+                ('SL -40% suficiente', [s for s in required_sls if 35 < s <= 40]),
+                ('SL -45% suficiente', [s for s in required_sls if 40 < s <= 45]),
+                ('SL > -45% necessário', [s for s in required_sls if s > 45]),
+            ]
+            out.append("<h3>Largura mínima de SL para sobreviver a cada recovered SL</h3>")
+            out.append("<table><tr><th>SL necessário</th><th>n trades</th><th>%</th><th>Cumulativo salvos</th></tr>")
+            total_rec = len(required_sls)
+            cumulative = 0
+            for label, vals in req_buckets:
+                n = len(vals)
+                if not n:
+                    continue
+                pct = round(n / total_rec * 100, 1)
+                cumulative += n
+                cum_pct = round(cumulative / total_rec * 100, 1)
+                bar = int(pct / 2)
+                out.append(f"<tr><td class='tp'>{label}</td><td>{n}</td>"
+                           f"<td><span class='bar' style='width:{bar}px'></span>{pct}%</td>"
+                           f"<td class='tp'>{cumulative}/{total_rec} ({cum_pct}%)</td></tr>")
+            out.append("</table>")
+
+        # ── SEÇÃO 3: SIMULAÇÃO DE SL — GRID DE EV ────────────────────────
+        out.append("<h2>3 — Simulação: EV em diferentes larguras de SL</h2>")
+        out.append("<div class='box'><b>Metodologia:</b> Para cada largura de SL simulada, recalcula o outcome de cada trade:<br>"
+                   "• Se drawdown intra-TP &lt; SL_sim → TP sobrevive (WR +1, P&L = tp_pct)<br>"
+                   "• Se drawdown intra-TP &gt; SL_sim → TP seria cortado (WR -1, P&L = -SL_sim)<br>"
+                   "• Para SLs: P&L real já inclui o SL atual. Simulamos P&L = -SL_sim (se mais largo, mesma saída ou melhor)<br>"
+                   "• Para SLs-recovered: se required_SL &lt;= SL_sim → teria sobrevivido (P&L = +tp_pct estimado)<br>"
+                   "• Para SLs-continued: P&L = -SL_sim (cut happens at the new width)</div>")
+
+        # Para TPs: drawdown intra-trade
+        # Para SLs recovered: required SL para sobreviver
+        # Para SLs continued: saída no novo SL
+        avg_tp_pnl = 0.893  # avg win real
+
+        simulation_results = []
+        for sl_width_pct in [15, 20, 25, 30, 35, 40, 45, 50]:
+            sl_w = sl_width_pct / 100.0
+
+            # TPs: sobrevivem se drawdown < sl_w
+            tp_survived = sum(1 for r in tp_rows
+                              if r['tp_drawdown_pct'] is not None
+                              and abs(_f(r['tp_drawdown_pct'])) < sl_w)
+            tp_cut = sum(1 for r in tp_rows
+                         if r['tp_drawdown_pct'] is not None
+                         and abs(_f(r['tp_drawdown_pct'])) >= sl_w)
+            tp_no_data = len(tp_rows) - tp_survived - tp_cut
+
+            # SLs recovered: salvos se required_SL <= sl_w
+            rec_saved = 0
+            rec_still_cut = 0
+            for r in sl_recovered:
+                exit_pnl = abs(_f(r['pnl_pct_real']))
+                extra = abs(_f(r['sl_extra_drawdown'])) if r['sl_extra_drawdown'] is not None else 0
+                req = max(exit_pnl, extra)
+                if req <= sl_w:
+                    rec_saved += 1
+                else:
+                    rec_still_cut += 1
+
+            # SLs continued: todos saem no novo SL (pior loss = -sl_w)
+            n_continued = len(sl_continued)
+
+            # Trades sem dados (nem TP nem SL recovered)
+            other_sl = len(sl_rows) - len(sl_recovered) - len(sl_continued)
+
+            # Calcular EV
+            # TPs sobrevividos: +avg_tp_pnl
+            # TPs cortados: -sl_w
+            # Recovered salvos: assumimos saem em TP médio (avg_tp_pnl)
+            # Recovered ainda cortados: -sl_w (agora mais largo)
+            # Continued: -sl_w
+            # Other SL: -sl_w
+            total_sim = (tp_survived + tp_cut + len(sl_recovered) + len(sl_continued) + other_sl)
+            gain = (tp_survived + rec_saved) * avg_tp_pnl
+            loss = (tp_cut * sl_w + rec_still_cut * sl_w + n_continued * sl_w + other_sl * sl_w)
+            ev_sim = (gain - loss) / total_sim if total_sim > 0 else 0
+
+            n_wins = tp_survived + rec_saved
+            n_losses = tp_cut + rec_still_cut + n_continued + other_sl
+            wr_sim = round(n_wins / total_sim * 100, 1) if total_sim > 0 else 0
+
+            simulation_results.append({
+                'sl_w': sl_width_pct,
+                'tp_survived': tp_survived,
+                'tp_cut': tp_cut,
+                'rec_saved': rec_saved,
+                'rec_still_cut': rec_still_cut,
+                'n_wins': n_wins,
+                'n_losses': n_losses,
+                'wr_sim': wr_sim,
+                'ev_sim': ev_sim,
+                'total': total_sim,
+            })
+
+        best_ev = max(simulation_results, key=lambda x: x['ev_sim'])
+
+        out.append("<table><tr><th>SL width</th><th>TPs sobrevivem</th><th>TPs cortados</th>"
+                   "<th>Rec. salvos</th><th>Rec. perdidos</th><th>WR sim</th><th>EV sim/trade</th></tr>")
+        for s in simulation_results:
+            ev = s['ev_sim']
+            ev_cls = "tp" if ev > 0 else "sl"
+            best_cls = "best" if s['sl_w'] == best_ev['sl_w'] else ""
+            wr_cls = "tp" if s['wr_sim'] >= 21.4 else "sl"
+            out.append(f"<tr class='{best_cls}'>"
+                       f"<td class='neu'><b>-{s['sl_w']}%</b></td>"
+                       f"<td class='tp'>{s['tp_survived']}</td>"
+                       f"<td class='sl'>{s['tp_cut']}</td>"
+                       f"<td class='tp'>{s['rec_saved']}</td>"
+                       f"<td class='sl'>{s['rec_still_cut']}</td>"
+                       f"<td class='{wr_cls}'>{s['wr_sim']}%</td>"
+                       f"<td class='{ev_cls}'>{ev:+.2%}</td></tr>")
+        out.append("</table>")
+
+        out.append(f"<div class='box best'><b>SL ótimo simulado: -{best_ev['sl_w']}%</b> "
+                   f"→ WR {best_ev['wr_sim']}% · EV {best_ev['ev_sim']:+.2%}/trade · "
+                   f"{best_ev['tp_survived']+best_ev['rec_saved']} wins / {best_ev['total']} trades<br>"
+                   f"<span class='dim'>Nota: EV simulado assume recovered SLs saem no avg_win real ({avg_tp_pnl:.1%}). "
+                   f"Na prática o gain real pode variar.</span></div>")
+
+        # ── SEÇÃO 4: ANATOMIA DO DIP — detalhamento por TP ───────────────
+        out.append("<h2>4 — Detalhamento do dip intra-trade por TP</h2>")
+        out.append("<div class='box'>Para cada TP: drawdown máximo observado nos ticks durante o trade. "
+                   "Drawdown = 0% significa ticks não capturaram dip (pAMM spike sub-30s).</div>")
+        out.append("<table><tr><th>Token</th><th>P&L</th><th>Drawdown intra</th><th>Momento do dip</th><th>SL necessário</th><th>Max gain</th></tr>")
+        for r in sorted(tp_rows, key=lambda x: _f(x['tp_drawdown_pct'])):
+            dd = _f(r['tp_drawdown_pct']) * 100
+            mg = _f(r['tp_max_mc_intra'] - r['entry_mc']) / max(_f(r['entry_mc']), 1) * 100 if r['tp_max_mc_intra'] and r['entry_mc'] else 0
+            t_min = round(_f(r['tp_min_at_min']), 1) if r['tp_min_at_min'] is not None else None
+            pnl = _f(r['pnl_pct_real']) * 100
+            needed = abs(dd) + 1
+            suf = f"-{needed:.0f}%" if dd < -1 else "qualquer SL"
+            dd_cls = "sl" if dd < -20 else ("neu" if dd < -10 else "tp")
+            out.append(f"<tr><td class='tp'>{r['symbol']}</td>"
+                       f"<td class='tp'>{pnl:.1f}%</td>"
+                       f"<td class='{dd_cls}'>{dd:.1f}%</td>"
+                       f"<td class='dim'>{t_min}min</td>"
+                       f"<td class='neu'>{suf}</td>"
+                       f"<td class='tp'>{mg:.0f}%</td></tr>")
+        out.append("</table>")
+
+        # ── SEÇÃO 5: DISTRIBUIÇÃO FINAL — diagnóstico ────────────────────
+        out.append("<h2>5 — Diagnóstico Final</h2>")
+        n_tp_total = len(tp_rows) if tp_rows else 1
+        dd_lt15 = sum(1 for r in tp_rows if abs(_f(r['tp_drawdown_pct'])*100) < 15)
+        dd_lt25 = sum(1 for r in tp_rows if abs(_f(r['tp_drawdown_pct'])*100) < 25)
+        out.append(f"""<div class='box'>
+        <b>Distribuição do drawdown nos {len(tp_rows)} TPs:</b><br>
+        • {dd_lt15}/{len(tp_rows)} TPs ({round(dd_lt15/n_tp_total*100)}%) tiveram drawdown &lt; -15% → SL atual já capturaria<br>
+        • {dd_lt25}/{len(tp_rows)} TPs ({round(dd_lt25/n_tp_total*100)}%) tiveram drawdown &lt; -25% → SL -25% capturaria<br>
+        • {len(tp_rows)-dd_lt25}/{len(tp_rows)} TPs precisariam de SL &gt; -25% para sobreviver<br><br>
+        <b>Dos {len(sl_recovered)} SLs que recuperaram:</b><br>
+        • {sum(1 for r in sl_recovered if abs(_f(r['pnl_pct_real'])*100) <= 25 and (r['sl_extra_drawdown'] is None or abs(_f(r['sl_extra_drawdown'])*100) <= 25))}/{len(sl_recovered)} seriam salvos por SL = -25%<br>
+        • O resto foi mais fundo antes de recuperar<br><br>
+        <b>Conclusão:</b> O problema é duplo — (1) ticks de 30s não capturam todos os dips do pAMM (possível que o drawdown real dos TPs seja maior que o mostrado),
+        e (2) parte dos SLs que recuperaram exigem SL muito largo (&gt;-35%) que piora o EV nos trades que realmente continuam caindo.
+        </div>""")
+
+    except Exception:
+        out.append(f"<pre style='color:#f85149'>{_tb.format_exc()}</pre>")
+
+    out.append("</body></html>")
+    return "".join(out)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
