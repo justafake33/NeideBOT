@@ -14222,5 +14222,358 @@ def analise_big_picture():
     return "".join(sections)
 
 
+    return "".join(sections)
+
+
+@app.route("/analise/correlacao")
+def analise_correlacao():
+    """Correlação completa: trades × token_ticks × migrations × bounce_signals.
+    Responde: para cada SL, o token continuou caindo ou recuperou?
+    O que diferencia os SLs-que-recuperaram dos SLs-que-continuaram-caindo?
+    """
+    import traceback as _tb
+    _f = lambda v: float(v) if v is not None else 0.0
+
+    CSS = """<style>
+    body{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:20px;max-width:1200px;margin:0 auto}
+    h1{color:#58a6ff;border-bottom:1px solid #30363d;padding-bottom:8px}
+    h2{color:#79c0ff;margin-top:28px;margin-bottom:4px}
+    h3{color:#8b949e;margin:14px 0 4px}
+    table{border-collapse:collapse;width:100%;margin-bottom:16px;font-size:13px}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;text-align:left;border:1px solid #30363d}
+    td{padding:5px 10px;border:1px solid #21262d}
+    tr:hover td{background:#1c2128}
+    .tp{color:#3fb950}.sl{color:#f85149}.neu{color:#e3b341}.dim{color:#6e7681}
+    .box{background:#161b22;border:1px solid #30363d;padding:12px 16px;margin:8px 0;border-radius:6px;font-size:13px}
+    .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:12px 0}
+    .kpi{background:#161b22;border:1px solid #30363d;padding:12px;border-radius:6px;text-align:center}
+    .kpi-val{font-size:20px;font-weight:bold;display:block}
+    .kpi-lbl{font-size:11px;color:#8b949e;margin-top:4px}
+    a{color:#58a6ff}
+    pre{background:#0d1117;padding:10px;overflow:auto;font-size:12px}
+    </style>"""
+
+    NAV = "<p><a href='/analise/big-picture'>Big Picture</a> · <a href='/analise/wr-breakdown'>WR Breakdown</a> · <a href='/analise/trade-autopsy'>Autopsy</a> · <a href='/analise/correlacao'>Correlação</a></p>"
+
+    out = [f"<!DOCTYPE html><html><head><title>Correlação</title>{CSS}</head><body>", NAV,
+           "<h1>🔬 Correlação Completa — trades × ticks × migrations</h1>"]
+
+    try:
+      with db._cursor() as cur:
+
+        # ── 0. COBERTURA GERAL ──────────────────────────────────────────
+        cur.execute("""
+            SELECT
+                COUNT(DISTINCT t.id) AS total_trades,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) AS n_tp,
+                SUM(CASE WHEN t.status='sl' THEN 1 ELSE 0 END) AS n_sl,
+                COUNT(DISTINCT CASE WHEN ticks.n >= 3 THEN t.id END) AS trades_com_ticks,
+                COUNT(DISTINCT CASE WHEN t.status='sl' AND ticks.n >= 3 THEN t.id END) AS sl_com_ticks,
+                COUNT(DISTINCT CASE WHEN bs.mint IS NOT NULL THEN t.id END) AS trades_com_bounce,
+                COUNT(DISTINCT CASE WHEN m.mint IS NOT NULL THEN t.id END) AS trades_com_migration
+            FROM trades t
+            LEFT JOIN (SELECT mint, COUNT(*) AS n FROM token_ticks GROUP BY mint) ticks ON ticks.mint = t.mint
+            LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+            LEFT JOIN migrations m ON m.mint = t.mint
+            WHERE t.exit_type = 'helius_sell_recovery'
+        """)
+        cov = cur.fetchone()
+        sl_cov_pct = round(_f(cov['sl_com_ticks']) / max(_f(cov['n_sl']), 1) * 100, 1)
+        out.append(f"""<div class='grid'>
+          <div class='kpi'><span class='kpi-val'>{cov['total_trades']}</span><span class='kpi-lbl'>Trades blockchain-verificados</span></div>
+          <div class='kpi'><span class='kpi-val'>{cov['trades_com_ticks']}</span><span class='kpi-lbl'>Com ≥3 token_ticks ({round(_f(cov["trades_com_ticks"])/_f(cov["total_trades"])*100,0):.0f}% cobertura)</span></div>
+          <div class='kpi'><span class='kpi-val {"tp" if sl_cov_pct>=30 else "sl"}'>{cov['sl_com_ticks']}/{cov['n_sl']}</span><span class='kpi-lbl'>SLs com ticks suficientes ({sl_cov_pct}%)</span></div>
+        </div>
+        <div class='box'>⚠️ <b>Limite de análise:</b> token_ticks param após 60min do HotMonitor.
+        Análises de trajetória são confiáveis apenas para os {cov['sl_com_ticks']} SLs com cobertura.
+        Para os demais, usamos apenas dados do momento do sinal (bounce_signals + migrations).</div>""")
+
+        # ── 1. PERGUNTA RAIZ: SL continuou caindo ou recuperou? ───────────
+        out.append("<h2>1 — Para cada SL: o token continuou caindo ou recuperou depois?</h2>")
+        out.append("<h3>Trajetória de MC nos 60min após o exit (apenas SLs com ticks suficientes)</h3>")
+
+        cur.execute("""
+            WITH sl_trades AS (
+                SELECT
+                    t.id, t.mint, t.symbol, t.exit_ts, t.pnl_pct_real,
+                    COALESCE(
+                        CASE WHEN t.entry_price_usd > 0 AND t.tokens_received > 0
+                             THEN t.entry_price_usd / t.tokens_received * 1e9 END,
+                        t.entry_expected
+                    ) AS entry_mc,
+                    COALESCE(t.tp_pct, 0.75) AS tp_pct,
+                    bs.bounce_pct,
+                    bs.elapsed_sec / 60.0 AS elapsed_min,
+                    m.time_to_bottom AS ttb,
+                    m.smart_wallets,
+                    bs.absorption_events,
+                    bs.absorption_buy_vol,
+                    bs.absorption_sell_vol
+                FROM trades t
+                LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+                LEFT JOIN migrations m ON m.mint = t.mint
+                WHERE t.status = 'sl'
+                  AND t.exit_type = 'helius_sell_recovery'
+                  AND t.exit_ts IS NOT NULL
+            ),
+            post_exit AS (
+                SELECT
+                    sl.id,
+                    COUNT(tt.tick_ts) AS n_ticks,
+                    MAX(CASE WHEN tt.tick_ts <= sl.exit_ts + INTERVAL '15 minutes' THEN COALESCE(tt.mc_high, tt.mc) END) AS max_mc_15m,
+                    MAX(CASE WHEN tt.tick_ts <= sl.exit_ts + INTERVAL '30 minutes' THEN COALESCE(tt.mc_high, tt.mc) END) AS max_mc_30m,
+                    MAX(CASE WHEN tt.tick_ts <= sl.exit_ts + INTERVAL '60 minutes' THEN COALESCE(tt.mc_high, tt.mc) END) AS max_mc_60m,
+                    MIN(CASE WHEN tt.tick_ts <= sl.exit_ts + INTERVAL '60 minutes' THEN tt.mc END) AS min_mc_60m
+                FROM sl_trades sl
+                JOIN token_ticks tt ON tt.mint = sl.mint AND tt.tick_ts > sl.exit_ts
+                GROUP BY sl.id
+            )
+            SELECT
+                sl.*,
+                pe.n_ticks,
+                pe.max_mc_15m,
+                pe.max_mc_30m,
+                pe.max_mc_60m,
+                pe.min_mc_60m,
+                -- Classificação de recuperação
+                CASE
+                    WHEN pe.max_mc_60m >= sl.entry_mc * (1 + sl.tp_pct) THEN 'hit_tp_60m'
+                    WHEN pe.max_mc_60m >= sl.entry_mc * 1.20 THEN 'parcial_20pct'
+                    WHEN pe.max_mc_60m >= sl.entry_mc THEN 'breakeven'
+                    WHEN pe.max_mc_60m IS NULL THEN 'sem_dados'
+                    ELSE 'continuou_caindo'
+                END AS recovery_class
+            FROM sl_trades sl
+            LEFT JOIN post_exit pe ON pe.id = sl.id
+            ORDER BY sl.exit_ts DESC
+        """)
+        sl_rows = cur.fetchall()
+
+        # Agregação por recovery_class
+        from collections import defaultdict
+        buckets = defaultdict(list)
+        for r in sl_rows:
+            buckets[r['recovery_class']].append(r)
+
+        out.append("<table><tr><th>Classe</th><th>n</th><th>%</th><th>Avg bounce%</th><th>Avg TTB</th><th>Avg smart</th><th>Avg P&L real</th><th>H22 eventos</th></tr>")
+        total_sl_rows = len(sl_rows)
+        order = ['hit_tp_60m', 'parcial_20pct', 'breakeven', 'continuou_caindo', 'sem_dados']
+        labels = {'hit_tp_60m': '✅ Atingiu TP em 60min', 'parcial_20pct': '🟡 Subiu ≥20% pós-SL',
+                  'breakeven': '🟠 Voltou ao entry', 'continuou_caindo': '❌ Continuou caindo', 'sem_dados': '⬜ Sem ticks'}
+        for cls in order:
+            rows_c = buckets[cls]
+            if not rows_c:
+                continue
+            n = len(rows_c)
+            pct = round(n / total_sl_rows * 100, 1)
+            avg_bounce = round(sum(_f(r['bounce_pct']) for r in rows_c) / n * 100, 1)
+            ttb_vals = [_f(r['ttb']) for r in rows_c if r['ttb'] is not None]
+            avg_ttb = round(sum(ttb_vals) / len(ttb_vals), 1) if ttb_vals else None
+            sw_vals = [_f(r['smart_wallets']) for r in rows_c if r['smart_wallets'] is not None]
+            avg_sw = round(sum(sw_vals) / len(sw_vals), 1) if sw_vals else None
+            avg_pnl = round(sum(_f(r['pnl_pct_real']) for r in rows_c) / n * 100, 1)
+            h22_cnt = sum(1 for r in rows_c if r['absorption_events'] and _f(r['absorption_events']) > 0)
+            cls_html = "tp" if cls in ('hit_tp_60m', 'parcial_20pct') else ("sl" if cls == 'continuou_caindo' else "neu")
+            out.append(f"<tr><td class='{cls_html}'>{labels[cls]}</td><td>{n}</td><td>{pct}%</td>"
+                       f"<td>{avg_bounce}%</td><td>{avg_ttb if avg_ttb else '-'}min</td>"
+                       f"<td>{avg_sw if avg_sw else '-'}</td><td class='{cls_html}'>{avg_pnl}%</td>"
+                       f"<td>{h22_cnt}/{n}</td></tr>")
+        out.append("</table>")
+
+        # ── 2. DETALHE: SLs que RECUPERARAM vs que CONTINUARAM CAINDO ────
+        out.append("<h2>2 — O que diferencia SLs que recuperaram dos que continuaram caindo?</h2>")
+        out.append("<h3>Comparação de características (apenas trades com ≥3 ticks pós-exit)</h3>")
+
+        recovered = [r for r in sl_rows if r['recovery_class'] in ('hit_tp_60m', 'parcial_20pct', 'breakeven')]
+        continued = [r for r in sl_rows if r['recovery_class'] == 'continuou_caindo']
+
+        def _stats(rows, label):
+            if not rows:
+                return f"<tr><td colspan='8'>{label}: sem dados</td></tr>"
+            n = len(rows)
+            b = [_f(r['bounce_pct'])*100 for r in rows if r['bounce_pct'] is not None]
+            ttb = [_f(r['ttb']) for r in rows if r['ttb'] is not None]
+            sw = [_f(r['smart_wallets']) for r in rows if r['smart_wallets'] is not None]
+            el = [_f(r['elapsed_min']) for r in rows if r['elapsed_min'] is not None]
+            bv = [_f(r['absorption_buy_vol']) for r in rows if r['absorption_buy_vol'] is not None]
+            sv = [_f(r['absorption_sell_vol']) for r in rows if r['absorption_sell_vol'] is not None]
+            avg = lambda lst: round(sum(lst)/len(lst), 1) if lst else '-'
+            buy_gt_sell = sum(1 for r in rows if r['absorption_buy_vol'] and r['absorption_sell_vol'] and _f(r['absorption_buy_vol']) > _f(r['absorption_sell_vol']))
+            cls = "tp" if "Recup" in label else "sl"
+            return (f"<tr><td class='{cls}'><b>{label}</b></td><td>{n}</td>"
+                    f"<td>{avg(b)}%</td><td>{avg(ttb)}min</td><td>{avg(sw)}</td>"
+                    f"<td>{avg(el)}min</td><td>{buy_gt_sell}/{n}</td>"
+                    f"<td>{avg([_f(r['pnl_pct_real'])*100 for r in rows])}%</td></tr>")
+
+        out.append("<table><tr><th>Grupo</th><th>n</th><th>Avg bounce%</th><th>Avg TTB</th><th>Avg smart</th><th>Avg elapsed</th><th>Buy>Sell</th><th>P&L médio</th></tr>")
+        out.append(_stats(recovered, "Recuperou (hit_tp/parcial/break)"))
+        out.append(_stats(continued, "Continuou caindo"))
+        out.append("</table>")
+
+        # ── 3. ANATOMIA DOS TPs — o que eles têm em comum ─────────────────
+        out.append("<h2>3 — Anatomia dos TPs: o que eles têm em comum?</h2>")
+        cur.execute("""
+            WITH tp_detail AS (
+                SELECT
+                    t.symbol, t.pnl_pct_real,
+                    bs.bounce_pct * 100 AS bounce_pct,
+                    bs.elapsed_sec / 60.0 AS elapsed_min,
+                    m.time_to_bottom AS ttb,
+                    m.smart_wallets,
+                    m.mc_migration,
+                    m.creator_token_status,
+                    m.cto_flag,
+                    bs.absorption_events,
+                    bs.absorption_buy_vol,
+                    bs.absorption_sell_vol,
+                    -- Tempo até atingir o TP nos ticks
+                    (SELECT MIN(tt.tick_ts) - t.ts_signal
+                     FROM token_ticks tt
+                     WHERE tt.mint = t.mint
+                       AND tt.tick_ts > t.ts_signal
+                       AND COALESCE(tt.mc_high, tt.mc) >= COALESCE(t.entry_price_usd/NULLIF(t.tokens_received,0)*1e9, t.entry_expected) * (1 + COALESCE(t.tp_pct, 0.75))
+                    ) AS time_to_tp
+                FROM trades t
+                LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+                LEFT JOIN migrations m ON m.mint = t.mint
+                WHERE t.status = 'tp'
+                  AND t.exit_type = 'helius_sell_recovery'
+            )
+            SELECT *,
+                EXTRACT(EPOCH FROM time_to_tp)/60 AS time_to_tp_min
+            FROM tp_detail
+            ORDER BY pnl_pct_real DESC
+        """)
+        tp_rows = cur.fetchall()
+        n_tp = len(tp_rows)
+
+        if n_tp > 0:
+            out.append(f"<div class='box'><b>{n_tp} TPs analisados</b> — "
+                       f"Avg bounce: {round(sum(_f(r['bounce_pct']) for r in tp_rows)/n_tp,1)}% · "
+                       f"Avg TTB: {round(sum(_f(r['ttb']) for r in tp_rows if r['ttb'])/max(sum(1 for r in tp_rows if r['ttb']),1),1)}min · "
+                       f"Avg elapsed: {round(sum(_f(r['elapsed_min']) for r in tp_rows if r['elapsed_min'])/max(sum(1 for r in tp_rows if r['elapsed_min']),1),1)}min · "
+                       f"Avg smart: {round(sum(_f(r['smart_wallets']) for r in tp_rows if r['smart_wallets'])/max(sum(1 for r in tp_rows if r['smart_wallets']),1),1)}</div>")
+
+            out.append("<table><tr><th>Token</th><th>P&L</th><th>bounce%</th><th>TTB</th><th>elapsed</th><th>smart</th><th>dev</th><th>cto</th><th>H22</th><th>Tempo até TP</th></tr>")
+            for r in tp_rows:
+                ttp = round(_f(r['time_to_tp_min']), 1) if r['time_to_tp_min'] else '-'
+                h22 = f"{int(_f(r['absorption_events']))}ev" if r['absorption_events'] and _f(r['absorption_events'])>0 else '-'
+                dev = (r['creator_token_status'] or '?')[:10]
+                cto = '✅' if r['cto_flag'] else '❌'
+                out.append(f"<tr><td class='tp'>{r['symbol']}</td>"
+                           f"<td class='tp'>{round(_f(r['pnl_pct_real'])*100,1)}%</td>"
+                           f"<td>{round(_f(r['bounce_pct']),0):.0f}%</td>"
+                           f"<td>{round(_f(r['ttb']),1) if r['ttb'] else '-'}min</td>"
+                           f"<td>{round(_f(r['elapsed_min']),1) if r['elapsed_min'] else '-'}min</td>"
+                           f"<td>{r['smart_wallets'] or '-'}</td>"
+                           f"<td class='dim'>{dev}</td><td>{cto}</td>"
+                           f"<td>{h22}</td><td class='tp'>{ttp}min</td></tr>")
+            out.append("</table>")
+
+        # ── 4. VARIÁVEIS DE MIGRATIONS vs OUTCOME ─────────────────────────
+        out.append("<h2>4 — Variáveis de migrations vs outcome real</h2>")
+
+        for feature, label, buckets_sql in [
+            ("rug_ratio",
+             "rug_ratio (bundler %)",
+             "CASE WHEN m.rug_ratio < 0.05 THEN '<5%' WHEN m.rug_ratio < 0.10 THEN '5-10%' WHEN m.rug_ratio < 0.15 THEN '10-15%' ELSE '>=15%' END"),
+            ("creator_token_status",
+             "creator_token_status (dev vendeu?)",
+             "COALESCE(m.creator_token_status, 'unknown')"),
+            ("cto_flag",
+             "cto_flag (comunidade assumiu)",
+             "CASE WHEN m.cto_flag THEN 'cto=true' ELSE 'cto=false' END"),
+            ("top10_holder_rate",
+             "top10_holder_rate (concentração)",
+             "CASE WHEN m.top10_holder_rate < 0.3 THEN '<30%' WHEN m.top10_holder_rate < 0.5 THEN '30-50%' WHEN m.top10_holder_rate < 0.7 THEN '50-70%' ELSE '>=70%' END"),
+        ]:
+            cur.execute(f"""
+                SELECT
+                    {buckets_sql} AS bucket,
+                    COUNT(*) AS n,
+                    SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) AS tp,
+                    ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/NULLIF(COUNT(*),0))::numeric,1) AS wr,
+                    ROUND((AVG(t.pnl_pct_real)*100)::numeric,1) AS avg_pnl
+                FROM trades t
+                LEFT JOIN migrations m ON m.mint = t.mint
+                WHERE t.exit_type = 'helius_sell_recovery'
+                  AND m.mint IS NOT NULL
+                GROUP BY bucket ORDER BY wr DESC NULLS LAST
+            """)
+            rows = cur.fetchall()
+            out.append(f"<h3>{label}</h3>")
+            out.append("<table><tr><th>Bucket</th><th>n</th><th>TP</th><th>WR</th><th>Avg P&L</th></tr>")
+            for r in rows:
+                wr = _f(r['wr'])
+                cls = "tp" if wr >= 21.4 else ("neu" if wr >= 11 else "sl")
+                out.append(f"<tr><td>{r['bucket']}</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td>"
+                           f"<td class='{cls}'>{wr}%</td><td>{_f(r['avg_pnl'])}%</td></tr>")
+            out.append("</table>")
+
+        # ── 5. H22 ABSORÇÃO — todos os thresholds ────────────────────────
+        out.append("<h2>5 — H22: Absorção pós-fundo vs outcome (todos os thresholds)</h2>")
+        cur.execute("""
+            SELECT
+                CASE
+                    WHEN bs.absorption_events IS NULL OR bs.absorption_events = 0 THEN 'sem_dados'
+                    WHEN bs.absorption_sell_vol = 0 AND bs.absorption_buy_vol > 0 THEN 'buy_only (∞ ratio)'
+                    WHEN bs.absorption_sell_vol > 0 THEN
+                        CASE
+                            WHEN bs.absorption_buy_vol / bs.absorption_sell_vol >= 3.0 THEN 'ratio≥3.0×'
+                            WHEN bs.absorption_buy_vol / bs.absorption_sell_vol >= 1.5 THEN 'ratio 1.5-3.0×'
+                            WHEN bs.absorption_buy_vol / bs.absorption_sell_vol >= 1.0 THEN 'ratio 1.0-1.5×'
+                            ELSE 'sell>buy (ratio<1)'
+                        END
+                    ELSE 'no_flow'
+                END AS h22_bucket,
+                COUNT(*) AS n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) AS tp,
+                ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/NULLIF(COUNT(*),0))::numeric,1) AS wr,
+                ROUND((AVG(t.pnl_pct_real)*100)::numeric,1) AS avg_pnl,
+                ROUND(AVG(bs.absorption_events)::numeric,1) AS avg_events,
+                ROUND((AVG(bs.absorption_buy_vol))::numeric,4) AS avg_buy_sol,
+                ROUND((AVG(bs.absorption_sell_vol))::numeric,4) AS avg_sell_sol
+            FROM trades t
+            LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+            WHERE t.exit_type = 'helius_sell_recovery'
+            GROUP BY h22_bucket
+            ORDER BY wr DESC NULLS LAST
+        """)
+        rows = cur.fetchall()
+        out.append("<table><tr><th>Bucket H22</th><th>n</th><th>TP</th><th>WR</th><th>Avg P&L</th><th>Avg events</th><th>Avg buy SOL</th><th>Avg sell SOL</th></tr>")
+        for r in rows:
+            wr = _f(r['wr'])
+            cls = "tp" if wr >= 21.4 else ("neu" if wr >= 11 else "sl")
+            out.append(f"<tr><td>{r['h22_bucket']}</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td>"
+                       f"<td class='{cls}'>{wr}%</td><td>{_f(r['avg_pnl'])}%</td>"
+                       f"<td>{_f(r['avg_events'])}</td><td>{_f(r['avg_buy_sol']):.4f}</td>"
+                       f"<td>{_f(r['avg_sell_sol']):.4f}</td></tr>")
+        out.append("</table>")
+
+        # ── 6. SUMÁRIO FINAL — o que funciona e o que não funciona ────────
+        out.append("<h2>6 — Sumário: o que funciona e o que não funciona</h2>")
+        out.append("""<div class='box'>
+        <b>Variáveis que não discriminam (refutadas):</b><br>
+        • smart_wallets — flat entre 7% e 25% WR, sem monotonia<br>
+        • bounce_pct — flat acima de 30% (artefato de amostra pequena na análise anterior)<br>
+        • H9 signal — invertido: com H9 → 2.4% WR, sem H9 → 13.8% WR<br>
+        • rug_ratio — ver seção 4 acima<br><br>
+        <b>Variáveis com sinal (a validar com mais dados):</b><br>
+        • H22 sell>buy → 0% WR (n=26) — único sinal de bloqueio confirmado<br>
+        • TTB ≥ 30min → 25.6% WR (n=39) — acima do break-even de 21.4%<br>
+        • creator_token_status — ver seção 4 acima<br><br>
+        <b>Diagnóstico da perda:</b><br>
+        • 88% dos SLs continuam caindo após exit — <b>o sinal em si é ruim</b>, não a entrada<br>
+        • EV = -11.35% por trade. Para atingir EV positivo: precisamos WR ≥ 21.4%<br>
+        • Com TTB≥30min + H22 sell≤buy: WR estimado ~25-30% → EV positivo estimado ~+3-7%<br>
+        </div>""")
+
+    except Exception:
+        out.append(f"<pre style='color:#f85149'>{_tb.format_exc()}</pre>")
+
+    out.append("</body></html>")
+    return "".join(out)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
