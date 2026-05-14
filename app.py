@@ -13407,5 +13407,280 @@ td{{padding:4px 8px;border-bottom:1px solid #21262d}}</style></head><body>
 </body></html>"""
 
 
+@app.route("/debug/sell-recovery")
+def debug_sell_recovery():  # noqa: C901
+    """Recupera saídas reais (TP/SL) para trades sem exit_price_usd via Helius.
+
+    Fluxo:
+      1. Busca todas as assinaturas de tx da wallet (até 1000) via Helius
+      2. Para cada tx, chama getTransaction e tenta identificar VENDA de token
+         (SOL aumenta na wallet + token decresce)
+      3. Faz match com trades do DB pelo mint (sem janela temporal rígida —
+         estratégia é "só existe uma posição por mint por vez")
+      4. Calcula P&L real: (sol_received - sol_spent) / sol_spent
+      5. Atualiza status (tp/sl), exit_price_usd, exit_ts, pnl_pct_real
+
+    GET /debug/sell-recovery?dry=1  → simula sem salvar
+    GET /debug/sell-recovery        → executa e salva
+    """
+    import json as _json, helius_rpc as _helius
+    from gmgn_client import get_sol_usd as _get_sol_usd
+    import requests as _req
+    from collections import defaultdict
+    import datetime as _dt
+
+    dry_run = request.args.get("dry", "0") == "1"
+
+    if not _helius.available():
+        return "<pre style='color:red'>HELIUS_RPC_URL não configurado.</pre>", 400
+
+    wallet = os.getenv("GMGN_WALLET_ADDRESS", "")
+    if not wallet:
+        return "<pre style='color:red'>GMGN_WALLET_ADDRESS não configurado.</pre>", 400
+
+    # 1. Busca até 1000 txs recentes da wallet
+    _body = {"jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
+             "params": [wallet, {"limit": 1000, "commitment": "confirmed"}]}
+    try:
+        _r = _req.post(_helius.HELIUS_RPC_URL, json=_body, timeout=30)
+        _raw = _r.json()
+    except Exception as _e:
+        return f"<pre style='color:red'>Helius HTTP erro: {_e}</pre>", 500
+
+    if "error" in _raw:
+        return f"<pre style='color:red'>Helius RPC erro:\n{_json.dumps(_raw, indent=2)}</pre>", 500
+
+    sigs_result = _raw.get("result") or []
+
+    # Monta lista de (blockTime, signature) ordenada
+    all_sigs = sorted(
+        [(int(e["blockTime"]), e["signature"]) for e in sigs_result
+         if e.get("blockTime") and e.get("signature")],
+        key=lambda x: x[0]
+    )
+
+    # 2. Busca trades que precisam de exit recovery:
+    #    - status in ('expired', 'trailing_active', 'open') — resultado desconhecido
+    #    - ou status in ('tp','sl') mas exit_price_usd IS NULL — saída inferida, não real
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT id, mint, symbol, created_at, exit_ts,
+                   entry_price_usd, amount_sol, tokens_received,
+                   tp_pct, sl_pct, status
+            FROM trades
+            WHERE order_id IS NOT NULL
+              AND status NOT IN ('error', 'pending')
+              AND (
+                  status IN ('expired', 'trailing_active', 'open')
+                  OR (status IN ('tp', 'sl') AND exit_price_usd IS NULL)
+              )
+            ORDER BY created_at
+        """)
+        trades = [dict(r) for r in cur.fetchall()]
+
+    sol_usd = _get_sol_usd() or 150.0
+
+    # Função auxiliar: detecta VENDA de token na tx (tokens saem, SOL entra)
+    def _parse_sell_tx(sig: str):
+        """Retorna (mint_sold, sol_received, tokens_sold, block_ts) ou None."""
+        result = _helius._rpc("getTransaction", [
+            sig,
+            {
+                "encoding": "jsonParsed",
+                "commitment": "confirmed",
+                "maxSupportedTransactionVersion": 0,
+            },
+        ])
+        if not result:
+            return None
+
+        meta = result.get("meta") or {}
+        tx   = result.get("transaction") or {}
+        msg  = tx.get("message") or {}
+        block_ts = result.get("blockTime")
+
+        raw_keys     = msg.get("accountKeys") or []
+        account_keys = [
+            (k.get("pubkey") if isinstance(k, dict) else str(k))
+            for k in raw_keys
+        ]
+
+        pre_bals  = meta.get("preBalances")  or []
+        post_bals = meta.get("postBalances") or []
+
+        wallet_idx = next((i for i, k in enumerate(account_keys) if k == wallet), None)
+        if wallet_idx is None:
+            return None
+
+        # SOL delta na carteira: positivo = recebemos SOL (venda de token)
+        if wallet_idx >= len(pre_bals) or wallet_idx >= len(post_bals):
+            return None
+        sol_delta = (post_bals[wallet_idx] - pre_bals[wallet_idx]) / 1e9
+        if sol_delta <= 0:
+            return None  # SOL diminuiu — é compra, não venda
+
+        # Identifica qual token diminuiu na carteira
+        pre_tok  = {t["accountIndex"]: t for t in (meta.get("preTokenBalances")  or [])}
+        post_tok = {t["accountIndex"]: t for t in (meta.get("postTokenBalances") or [])}
+
+        for idx, pre in pre_tok.items():
+            owner = pre.get("owner") or ""
+            if owner != wallet:
+                continue
+            mint_addr  = pre.get("mint", "")
+            pre_ui     = float(pre.get("uiTokenAmount", {}).get("uiAmount") or 0)
+            post_entry = post_tok.get(idx)
+            post_ui    = float((post_entry or {}).get("uiTokenAmount", {}).get("uiAmount") or 0)
+            tokens_sold = pre_ui - post_ui
+            if tokens_sold > 0 and mint_addr:
+                return (mint_addr, sol_delta, tokens_sold, block_ts)
+
+        return None
+
+    # 3. Varre txs e constrói índice: mint → lista de sells (block_ts, sig, sol_received, tokens_sold)
+    sells_by_mint = defaultdict(list)
+    sell_scan_limit = min(len(all_sigs), 500)  # limitar para evitar timeout
+    scanned = 0
+    for bt, sig in all_sigs[-sell_scan_limit:]:  # mais recentes primeiro (reversed)
+        parsed = _parse_sell_tx(sig)
+        if parsed:
+            mint_sold, sol_recv, tokens_sold, block_ts = parsed
+            sells_by_mint[mint_sold].append({
+                "sig": sig, "block_ts": block_ts,
+                "sol_received": sol_recv, "tokens_sold": tokens_sold,
+            })
+        scanned += 1
+
+    # 4. Faz match e calcula P&L
+    results = []
+    fixed = 0
+    already_ok = 0
+    no_sell = 0
+
+    for trade in trades:
+        tid    = trade["id"]
+        mint   = trade["mint"]
+        symbol = trade["symbol"] or mint[:8]
+        sol_in = trade.get("amount_sol") or 0
+
+        sells = sells_by_mint.get(mint, [])
+
+        # Se mais de uma venda para o mesmo mint, pega a mais próxima
+        # ao created_at do trade (caso haja re-entries futuros)
+        ts_buy = trade["created_at"].timestamp()
+        sells_after = [s for s in sells if s["block_ts"] and s["block_ts"] >= ts_buy - 60]
+        sells_after.sort(key=lambda s: s["block_ts"])
+        sell = sells_after[0] if sells_after else None
+
+        if not sell:
+            no_sell += 1
+            results.append({"id": tid, "symbol": symbol, "status": "NO_SELL",
+                             "detail": f"0 vendas encontradas para {mint[:12]}..."})
+            continue
+
+        sol_out   = sell["sol_received"]
+        tokens_s  = sell["tokens_sold"]
+        block_ts  = sell["block_ts"]
+
+        # P&L real: (sol_recebido - sol_gasto) / sol_gasto
+        pnl = (sol_out - sol_in) / sol_in if sol_in else 0.0
+
+        # Determina status com base no P&L
+        tp_pct = trade.get("tp_pct") or 0.75
+        sl_pct = trade.get("sl_pct") or 0.25
+        if pnl >= tp_pct * 0.5:   # ≥ metade do TP → TP confirmado
+            new_status = "tp"
+        elif pnl <= -sl_pct * 0.5:  # ≤ metade do SL negativo → SL confirmado
+            new_status = "sl"
+        else:
+            new_status = "sl"  # saída no meio-termo = SL (conservador)
+
+        exit_price_usd = sol_out * sol_usd
+        exit_ts_dt     = _dt.datetime.fromtimestamp(block_ts, tz=_dt.timezone.utc)
+
+        results.append({
+            "id": tid, "symbol": symbol, "status": "FIXED",
+            "old_status": trade["status"],
+            "new_status": new_status,
+            "sol_in": round(sol_in, 6),
+            "sol_out": round(sol_out, 6),
+            "pnl_pct": round(pnl * 100, 2),
+            "exit_ts": exit_ts_dt.strftime("%m-%d %H:%M"),
+            "sig": sell["sig"][:20] + "...",
+        })
+
+        if not dry_run:
+            db.update_trade(tid, {
+                "status":          new_status,
+                "exit_type":       "helius_sell_recovery",
+                "exit_price_usd":  exit_price_usd,
+                "exit_ts":         exit_ts_dt,
+                "pnl_pct_real":    pnl,
+                "fill_source":     (trade.get("fill_source") or "") + "|exit_helius",
+            })
+        fixed += 1
+
+    # HTML report
+    mode_label = "DRY RUN" if dry_run else f"EXECUTADO — {fixed} trades corrigidos"
+
+    # Estatísticas
+    tp_count = sum(1 for r in results if r.get("new_status") == "tp")
+    sl_count = sum(1 for r in results if r.get("new_status") == "sl")
+    avg_pnl  = (sum(r["pnl_pct"] for r in results if r.get("status") == "FIXED") / fixed
+                if fixed else 0)
+
+    rows_html = ""
+    for r in results:
+        if r["status"] == "FIXED":
+            color     = "#3fb950" if r["new_status"] == "tp" else "#f85149"
+            status_td = f"<span style='color:{color}'>{r['new_status'].upper()}</span>"
+            detail    = (f"P&L: <b style='color:{color}'>{r['pnl_pct']:+.1f}%</b> | "
+                         f"buy={r['sol_in']} SOL → sell={r['sol_out']} SOL | "
+                         f"exit={r['exit_ts']} | sig={r['sig']}")
+        else:
+            status_td = f"<span style='color:#8b949e'>{r['status']}</span>"
+            detail    = r.get("detail", "")
+
+        rows_html += (f"<tr><td style='color:#8b949e'>{r['id']}</td>"
+                      f"<td><b>{r['symbol']}</b></td>"
+                      f"<td style='color:#8b949e'>{r.get('old_status','')}</td>"
+                      f"<td>{status_td}</td>"
+                      f"<td style='font-size:11px'>{detail}</td></tr>")
+
+    return f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<style>
+body{{background:#0d1117;color:#c9d1d9;font-family:monospace;font-size:12px;padding:16px}}
+h2{{color:#58a6ff;margin-bottom:8px}}
+.stats{{display:flex;gap:12px;margin:12px 0;flex-wrap:wrap}}
+.stat{{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 16px}}
+.stat-label{{color:#8b949e;font-size:10px;text-transform:uppercase}}
+.stat-value{{font-size:20px;font-weight:bold;margin-top:2px}}
+.green{{color:#3fb950}}.red{{color:#f85149}}.yellow{{color:#d29922}}
+table{{border-collapse:collapse;width:100%}}
+th{{background:#161b22;color:#8b949e;padding:5px 8px;text-align:left;font-size:11px}}
+td{{padding:4px 8px;border-bottom:1px solid #21262d}}
+</style></head><body>
+<h2>Sell Recovery — {mode_label}</h2>
+<p style='color:#8b949e'>Wallet: {wallet[:20]}... | Txs Helius: {len(all_sigs)} |
+   Scaneadas: {scanned} | Trades sem exit: {len(trades)}</p>
+{'<p style="color:#d29922">⚠️ DRY RUN — acesse sem ?dry=1 para salvar</p>' if dry_run else ''}
+<div class='stats'>
+  <div class='stat'><div class='stat-label'>Corrigidos</div>
+    <div class='stat-value green'>{fixed}</div></div>
+  <div class='stat'><div class='stat-label'>TP confirmados</div>
+    <div class='stat-value green'>{tp_count}</div></div>
+  <div class='stat'><div class='stat-label'>SL confirmados</div>
+    <div class='stat-value red'>{sl_count}</div></div>
+  <div class='stat'><div class='stat-label'>Sem venda</div>
+    <div class='stat-value yellow'>{no_sell}</div></div>
+  <div class='stat'><div class='stat-label'>P&L médio (corrigidos)</div>
+    <div class='stat-value {'green' if avg_pnl >= 0 else 'red'}'>{avg_pnl:+.1f}%</div></div>
+</div>
+<table><thead><tr>
+  <th>ID</th><th>Symbol</th><th>Status DB</th><th>Status Real</th><th>Detalhe</th>
+</tr></thead><tbody>{rows_html}</tbody></table>
+</body></html>"""
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
