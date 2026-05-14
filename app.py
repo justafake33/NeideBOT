@@ -13438,30 +13438,47 @@ def debug_sell_recovery():  # noqa: C901
     if not wallet:
         return "<pre style='color:red'>GMGN_WALLET_ADDRESS não configurado.</pre>", 400
 
-    # 1. Busca até 1000 txs recentes da wallet
-    _body = {"jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
-             "params": [wallet, {"limit": 1000, "commitment": "confirmed"}]}
-    try:
-        _r = _req.post(_helius.HELIUS_RPC_URL, json=_body, timeout=30)
-        _raw = _r.json()
-    except Exception as _e:
-        return f"<pre style='color:red'>Helius HTTP erro: {_e}</pre>", 500
+    import time as _time
 
-    if "error" in _raw:
-        return f"<pre style='color:red'>Helius RPC erro:\n{_json.dumps(_raw, indent=2)}</pre>", 500
+    # ?limit= controla quantas txs varrer (padrão 150 — ~15s de processamento)
+    scan_limit = int(request.args.get("limit", "150"))
 
-    sigs_result = _raw.get("result") or []
+    # Função com retry para getSignaturesForAddress e getTransaction
+    def _rpc_with_retry(method: str, params: list, retries: int = 3):
+        for attempt in range(retries):
+            _body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+            try:
+                _r = _req.post(_helius.HELIUS_RPC_URL, json=_body, timeout=20)
+                data = _r.json()
+            except Exception as _e:
+                if attempt < retries - 1:
+                    _time.sleep(2 ** attempt)
+                    continue
+                return None, f"HTTP erro: {_e}"
+            if "error" in data:
+                code = data["error"].get("code", 0)
+                if code == -32429 and attempt < retries - 1:  # rate limited
+                    _time.sleep(2 ** (attempt + 1))
+                    continue
+                return None, _json.dumps(data["error"])
+            return data.get("result"), None
+        return None, "max retries excedido"
 
-    # Monta lista de (blockTime, signature) ordenada
+    # 1. Busca txs recentes da wallet
+    sigs_result, err = _rpc_with_retry(
+        "getSignaturesForAddress",
+        [wallet, {"limit": min(scan_limit * 4, 1000), "commitment": "confirmed"}]
+    )
+    if err:
+        return f"<pre style='color:red'>getSignaturesForAddress erro: {err}</pre>", 500
+
     all_sigs = sorted(
-        [(int(e["blockTime"]), e["signature"]) for e in sigs_result
+        [(int(e["blockTime"]), e["signature"]) for e in (sigs_result or [])
          if e.get("blockTime") and e.get("signature")],
         key=lambda x: x[0]
     )
 
     # 2. Busca trades que precisam de exit recovery:
-    #    - status in ('expired', 'trailing_active', 'open') — resultado desconhecido
-    #    - ou status in ('tp','sl') mas exit_price_usd IS NULL — saída inferida, não real
     with db._cursor() as cur:
         cur.execute("""
             SELECT id, mint, symbol, created_at, exit_ts,
@@ -13480,10 +13497,13 @@ def debug_sell_recovery():  # noqa: C901
 
     sol_usd = _get_sol_usd() or 150.0
 
+    # Conjunto de mints de interesse — só vamos parsear txs que possam ser saídas desses mints
+    mints_needed = {t["mint"] for t in trades}
+
     # Função auxiliar: detecta VENDA de token na tx (tokens saem, SOL entra)
     def _parse_sell_tx(sig: str):
         """Retorna (mint_sold, sol_received, tokens_sold, block_ts) ou None."""
-        result = _helius._rpc("getTransaction", [
+        result, err = _rpc_with_retry("getTransaction", [
             sig,
             {
                 "encoding": "jsonParsed",
@@ -13491,7 +13511,7 @@ def debug_sell_recovery():  # noqa: C901
                 "maxSupportedTransactionVersion": 0,
             },
         ])
-        if not result:
+        if err or not result:
             return None
 
         meta = result.get("meta") or {}
@@ -13519,6 +13539,14 @@ def debug_sell_recovery():  # noqa: C901
         if sol_delta <= 0:
             return None  # SOL diminuiu — é compra, não venda
 
+        # Verifica se a tx envolve algum mint de interesse (filtragem rápida)
+        all_token_mints = set()
+        for t in (meta.get("preTokenBalances") or []) + (meta.get("postTokenBalances") or []):
+            if t.get("mint"):
+                all_token_mints.add(t["mint"])
+        if not all_token_mints.intersection(mints_needed):
+            return None  # tx não envolve nenhum token que nos interessa
+
         # Identifica qual token diminuiu na carteira
         pre_tok  = {t["accountIndex"]: t for t in (meta.get("preTokenBalances")  or [])}
         post_tok = {t["accountIndex"]: t for t in (meta.get("postTokenBalances") or [])}
@@ -13528,6 +13556,8 @@ def debug_sell_recovery():  # noqa: C901
             if owner != wallet:
                 continue
             mint_addr  = pre.get("mint", "")
+            if mint_addr not in mints_needed:
+                continue
             pre_ui     = float(pre.get("uiTokenAmount", {}).get("uiAmount") or 0)
             post_entry = post_tok.get(idx)
             post_ui    = float((post_entry or {}).get("uiTokenAmount", {}).get("uiAmount") or 0)
@@ -13537,11 +13567,11 @@ def debug_sell_recovery():  # noqa: C901
 
         return None
 
-    # 3. Varre txs e constrói índice: mint → lista de sells (block_ts, sig, sol_received, tokens_sold)
+    # 3. Varre txs com throttle — 100ms entre chamadas (≤10 req/s)
     sells_by_mint = defaultdict(list)
-    sell_scan_limit = min(len(all_sigs), 500)  # limitar para evitar timeout
+    to_scan = all_sigs[-scan_limit:]  # txs mais recentes
     scanned = 0
-    for bt, sig in all_sigs[-sell_scan_limit:]:  # mais recentes primeiro (reversed)
+    for bt, sig in to_scan:
         parsed = _parse_sell_tx(sig)
         if parsed:
             mint_sold, sol_recv, tokens_sold, block_ts = parsed
@@ -13550,6 +13580,7 @@ def debug_sell_recovery():  # noqa: C901
                 "sol_received": sol_recv, "tokens_sold": tokens_sold,
             })
         scanned += 1
+        _time.sleep(0.12)  # 8 req/s — abaixo do limite Helius free tier
 
     # 4. Faz match e calcula P&L
     results = []
