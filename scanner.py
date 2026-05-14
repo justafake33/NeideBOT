@@ -247,6 +247,11 @@ class HotMonitor:
             logger.debug("BOUNCE skip %s — dead zone bounce=%.1f%%", mint[:8], bounce_pct * 100)
             return
 
+        # A.8 — Preço acima da migração: sinal é artifact de wick intra-candle, não bounce real.
+        if mc >= mc_migration:
+            logger.debug("BOUNCE skip %s — A.8 mc=$%.0f >= mig=$%.0f", mint[:8], mc, mc_migration)
+            return
+
         # A.3 — Entry ratio 50-65% da migração: WR 0% em 15 tokens. Rejeitar.
         entry_ratio = mc / mc_migration if mc_migration > 0 else 0
         if 0.50 <= entry_ratio <= 0.65:
