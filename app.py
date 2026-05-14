@@ -13892,12 +13892,14 @@ def analise_big_picture():
     """
     NAV = "<p style='margin-bottom:16px'><a href='/analise/wr-breakdown'>WR Breakdown</a> · <a href='/analise/trade-autopsy'>Trade Autopsy</a> · <a href='/analise/h22-correlation'>H22</a> · <a href='/analise/big-picture'>Big Picture</a></p>"
 
+    import traceback as _tb
     sections = []
     sections.append(f"<!DOCTYPE html><html><head><title>Big Picture</title>{CSS}</head><body>")
     sections.append(NAV)
     sections.append("<h1>📊 Big Picture — 139 Trades Blockchain-Verificados</h1>")
 
-    with db._cursor() as cur:
+    try:
+     with db._cursor() as cur:
 
         # ── CAMADA 1: KPIs base ────────────────────────────────────────
         cur.execute("""
@@ -14208,7 +14210,9 @@ def analise_big_picture():
             sections.append(f"<tr><td>{r['smart_tier']}</td><td>{r['bounce_tier']}</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td><td class='{cls}'>{r['wr']}%</td><td>{r['avg_pnl']}%</td></tr>")
         sections.append("</table>")
 
-    sections.append(f"<p style='color:#8b949e;font-size:12px;margin-top:24px'>Break-even calculado com avg_win={k['avg_win']}% / avg_loss={k['avg_loss']}% reais da blockchain · {k['total']} trades · exit_type=helius_sell_recovery</p>")
+     sections.append(f"<p style='color:#8b949e;font-size:12px;margin-top:24px'>Break-even calculado com avg_win={k['avg_win']}% / avg_loss={k['avg_loss']}% reais da blockchain · {k['total']} trades · exit_type=helius_sell_recovery</p>")
+    except Exception:
+        sections.append(f"<pre style='color:#f85149;background:#161b22;padding:12px'>{_tb.format_exc()}</pre>")
     sections.append("</body></html>")
 
     return "".join(sections)
