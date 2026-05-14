@@ -17,13 +17,30 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-HELIUS_RPC_URL = os.getenv("HELIUS_RPC_URL", "")
 WALLET_ADDRESS = os.getenv("GMGN_WALLET_ADDRESS", "")
 _TIMEOUT       = 10  # segundos por request RPC
 
+def _build_rpc_url() -> str:
+    """Constrói URL HTTP do Helius RPC.
+    Aceita HELIUS_RPC_URL (https:// ou wss://) ou HELIUS_API_KEY isolado.
+    wss:// é convertido automaticamente para https://.
+    """
+    url = os.getenv("HELIUS_RPC_URL", "")
+    if url.startswith("wss://"):
+        url = url.replace("wss://", "https://", 1)
+    if url.startswith("https://"):
+        return url
+    # Fallback: constrói a partir da API key
+    key = os.getenv("HELIUS_API_KEY", "")
+    if key:
+        return f"https://mainnet.helius-rpc.com/?api-key={key}"
+    return ""
+
+HELIUS_RPC_URL = _build_rpc_url()
+
 
 def available() -> bool:
-    """True se HELIUS_RPC_URL está configurado."""
+    """True se Helius RPC HTTP está configurado."""
     return bool(HELIUS_RPC_URL)
 
 
