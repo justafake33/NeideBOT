@@ -16501,10 +16501,10 @@ def analise_token_outcome():
                     bs.mc_min AS bs_mc_min,
                     -- H22 Helius absorption
                     bs.absorption_buy_vol,
-                    bs.sell_vol AS absorption_sell_vol,
-                    bs.buy_cnt,
-                    bs.sell_cnt,
-                    bs.lrg_buy,
+                    bs.absorption_sell_vol,
+                    bs.absorption_buy_cnt,
+                    bs.absorption_sell_cnt,
+                    bs.absorption_lrg_buy,
                     bs.absorption_events,
                     -- H9 signal depth
                     (SELECT COUNT(*) FROM token_signals ts2
@@ -16583,6 +16583,8 @@ def analise_token_outcome():
             abs_events = int(_f(r['absorption_events']))
             has_helius = abs_events > 0
             buy_ratio = abs_buy / (abs_buy + abs_sell) if (abs_buy + abs_sell) > 0 else None
+            abs_lrg_buy = _f(r['absorption_lrg_buy'])
+            abs_buy_cnt = _f(r['absorption_buy_cnt'])
 
             # H9 depth
             h9_count = int(_f(r['h9_signal_count']))
@@ -17006,8 +17008,8 @@ def analise_token_outcome():
                 ("buy_ratio > 0.7 (compradores dominam)", lambda r: r['buy_ratio'] is not None and r['buy_ratio'] > 0.7),
                 ("buy_ratio 0.5–0.7 (leve pressão compra)", lambda r: r['buy_ratio'] is not None and 0.5 <= r['buy_ratio'] <= 0.7),
                 ("buy_ratio < 0.5 (vendedores dominam)", lambda r: r['buy_ratio'] is not None and r['buy_ratio'] < 0.5),
-                ("lrg_buy > 0.5 SOL (whale entrada)", lambda r: _f(r['lrg_buy']) > 0.5),
-                ("buy_cnt ≥ 3 (múltiplos compradores)", lambda r: int(_f(r['buy_cnt'])) >= 3),
+                ("lrg_buy > 0.5 SOL (whale entrada)", lambda r: r['abs_lrg_buy'] > 0.5),
+                ("buy_cnt ≥ 3 (múltiplos compradores)", lambda r: r['abs_buy_cnt'] >= 3),
             ]
 
             out.append("<table><tr><th>Sinal Helius</th><th>n</th><th>WR carteira</th><th>Token recovery</th><th>SL+recov</th></tr>")
@@ -17039,8 +17041,8 @@ def analise_token_outcome():
                     pnl = _f(r['pnl_pct_real']) * 100
                     out.append(f"<tr><td><b>{r['symbol']}</b></td><td class='green'>{var_str}</td>"
                                f"<td class='{br_color}'>{br_str}</td>"
-                               f"<td>{int(_f(r['buy_cnt']))}</td>"
-                               f"<td>{_f(r['lrg_buy']):.2f} SOL</td>"
+                               f"<td>{int(r['abs_buy_cnt'])}</td>"
+                               f"<td>{r['abs_lrg_buy']:.2f} SOL</td>"
                                f"<td class='red'>{pnl:+.0f}%</td></tr>")
                 out.append("</table>")
         else:
