@@ -15042,26 +15042,44 @@ def analise_entrada():
             rows = cur.fetchall()
 
         # Calcula ratios para cada trade
+        # Filtro de sanidade: mc_migration válido entre $10k e $300k
+        # (tokens fora dessa faixa têm mc_migration corrompido no banco)
+        MC_MIG_MIN = 10_000
+        MC_MIG_MAX = 300_000
+
         def enrich(r):
             entry_mc = _f(r['entry_mc_real']) or _f(r['entry_expected'])
             mc_mig = _f(r['mc_migration'])
             mc_bot = _f(r['mc_bottom'])
+            valid_mig = MC_MIG_MIN <= mc_mig <= MC_MIG_MAX
+            valid_bot = mc_bot > 1000
+            valid_entry = 1000 < entry_mc < 1_000_000
             # Ratio vs migração (1.0 = exatamente no MC de migração)
-            ratio_vs_mig = entry_mc / mc_mig if mc_mig > 0 else None
-            # Ratio vs fundo (1.0 = exatamente no fundo, 1.15 = 15% acima do fundo)
-            ratio_vs_bot = entry_mc / mc_bot if mc_bot > 0 else None
+            ratio_vs_mig = (entry_mc / mc_mig) if (valid_mig and valid_entry) else None
+            # Ratio vs fundo
+            ratio_vs_bot = (entry_mc / mc_bot) if (valid_bot and valid_entry) else None
             # Drop depth real (mc_bottom / mc_migration)
-            drop_depth = mc_bot / mc_mig if mc_mig > 0 and mc_bot > 0 else None
+            drop_depth = (mc_bot / mc_mig) if (valid_mig and valid_bot) else None
+            # Posição no range bottom→migration (0%=bottom, 100%=migration, >100%=above)
+            range_size = mc_mig - mc_bot
+            position_in_range = ((entry_mc - mc_bot) / range_size * 100) if (valid_mig and valid_bot and range_size > 0 and valid_entry) else None
             return {**dict(r),
                     'entry_mc': entry_mc,
                     'ratio_vs_mig': ratio_vs_mig,
                     'ratio_vs_bot': ratio_vs_bot,
                     'drop_depth': drop_depth,
+                    'position_in_range': position_in_range,
+                    'valid_mig': valid_mig,
                     'has_real_entry': _f(r['entry_mc_real']) > 0}
 
         data = [enrich(r) for r in rows]
-        tp_data = [r for r in data if r['status'] == 'tp']
-        sl_data = [r for r in data if r['status'] == 'sl']
+        # Dados com mc_migration válido
+        clean = [r for r in data if r['valid_mig']]
+        tp_data = [r for r in clean if r['status'] == 'tp']
+        sl_data = [r for r in clean if r['status'] == 'sl']
+
+        n_corrupted = len(data) - len(clean)
+        out.append(f"<p class='dim'>n={len(clean)} trades com mc_migration válido ({MC_MIG_MIN/1000:.0f}k–{MC_MIG_MAX/1000:.0f}k) | {n_corrupted} excluídos por mc_migration corrompido</p>")
 
         # ── Seção 1: Distribuição de entrada vs MC de migração ──
         out.append("<h3>1 — Distribuição: entrada vs MC de Migração</h3>")
@@ -15075,8 +15093,7 @@ def analise_entrada():
             (">120%",  lambda x: x >= 1.20,  "red",   "MUITO ACIMA do MC mig — entrada péssima"),
         ]
 
-        with_mig = [r for r in data if r['ratio_vs_mig'] is not None]
-        out.append(f"<p class='dim'>n={len(with_mig)} trades com mc_migration disponível</p>")
+        with_mig = [r for r in clean if r['ratio_vs_mig'] is not None]
         out.append("<table><tr><th>Entrada / MC Migração</th><th>Total</th><th>%</th><th>TPs</th><th>SLs</th><th>WR</th><th>Interpretação</th></tr>")
 
         for label, cond, color, interp in buckets:
@@ -15089,13 +15106,13 @@ def analise_entrada():
             out.append(f"<tr><td class='{color}'>{label}</td><td>{len(grp)}</td><td>{pct_of_total:.1f}%</td><td class='green'>{len(tps)}</td><td class='red'>{len(sls)}</td><td class='{wr_color}'>{wr:.1f}%</td><td class='dim'>{interp}</td></tr>")
         out.append("</table>")
 
-        # Sumário de entradas acima da migração
         above_mig = [r for r in with_mig if r['ratio_vs_mig'] >= 1.0]
         above_mig_tp = [r for r in above_mig if r['status'] == 'tp']
-        out.append(f"""<div class='card'>
-        <b>Entradas ACIMA do MC de Migração: {len(above_mig)}/{len(with_mig)} ({len(above_mig)/len(with_mig)*100:.1f}%)</b><br>
-        TPs nesse grupo: {len(above_mig_tp)} | SLs: {len(above_mig)-len(above_mig_tp)} | WR: {len(above_mig_tp)/len(above_mig)*100:.1f}% (se n>0)
-        </div>""") if above_mig else None
+        if above_mig:
+            out.append(f"""<div class='card'>
+            <b>Entradas ACIMA do MC de Migração: {len(above_mig)}/{len(with_mig)} ({len(above_mig)/len(with_mig)*100:.1f}%)</b><br>
+            TPs nesse grupo: {len(above_mig_tp)} | SLs: {len(above_mig)-len(above_mig_tp)} | WR: {len(above_mig_tp)/len(above_mig)*100:.1f}%
+            </div>""")
 
         # ── Seção 2: Drop depth — quão fundo o token foi antes de entrarmos ──
         out.append("<h3>2 — Profundidade do dump antes da entrada</h3>")
@@ -15108,7 +15125,7 @@ def analise_entrada():
             ("70-85% (caiu 15-30%)",       lambda x: 0.70 <= x < 0.85, "red"),
             (">85% (caiu <15%)",           lambda x: x >= 0.85, "red"),
         ]
-        with_drop = [r for r in data if r['drop_depth'] is not None]
+        with_drop = [r for r in clean if r['drop_depth'] is not None]
         out.append("<table><tr><th>Profundidade do dump</th><th>Total</th><th>%</th><th>WR</th><th>Avg entry/mig</th></tr>")
         for label, cond, color in drop_buckets:
             grp = [r for r in with_drop if cond(r['drop_depth'])]
@@ -15143,6 +15160,33 @@ def analise_entrada():
 
         out.append(_ratio_dist(tp_with, "TPs", "green"))
         out.append(_ratio_dist(sl_with, "SLs", "red"))
+
+        # ── Seção 3b: Posição no range bottom→migration ──
+        out.append("<h3>3b — Onde no range bottom→migration estamos entrando?</h3>")
+        out.append("""<div class='card'>
+        <b>position_in_range:</b> 0% = entramos no fundo exato | 100% = entramos no MC de migração | >100% = acima da migração.<br>
+        Ideal: entrar a 10-30% do range (logo acima do fundo, bem abaixo da migração).
+        </div>""")
+
+        range_buckets = [
+            ("0-20% do range (fundo+)",       lambda x: x < 20,    "green"),
+            ("20-40% do range",               lambda x: 20 <= x < 40,  "green"),
+            ("40-60% do range (meio)",        lambda x: 40 <= x < 60,  "yellow"),
+            ("60-80% do range",               lambda x: 60 <= x < 80,  "yellow"),
+            ("80-100% do range (≈migração)",  lambda x: 80 <= x < 100, "red"),
+            (">100% (acima da migração)",     lambda x: x >= 100,   "red"),
+        ]
+        with_range = [r for r in clean if r['position_in_range'] is not None]
+        out.append(f"<p class='dim'>n={len(with_range)} trades com position_in_range calculável</p>")
+        out.append("<table><tr><th>Posição no range</th><th>Total</th><th>%</th><th>TPs</th><th>SLs</th><th>WR</th></tr>")
+        for label, cond, color in range_buckets:
+            grp = [r for r in with_range if cond(r['position_in_range'])]
+            tps = [r for r in grp if r['status'] == 'tp']
+            wr = len(tps) / len(grp) * 100 if grp else 0
+            pct = len(grp) / len(with_range) * 100 if with_range else 0
+            wr_color = "green" if wr >= 20 else ("yellow" if wr >= 10 else "red")
+            out.append(f"<tr><td class='{color}'>{label}</td><td>{len(grp)}</td><td>{pct:.1f}%</td><td class='green'>{len(tps)}</td><td class='red'>{len(grp)-len(tps)}</td><td class='{wr_color}'>{wr:.1f}%</td></tr>")
+        out.append("</table>")
 
         # ── Seção 4: Tabela individual de TPs ──
         out.append("<h3>4 — Todos os TPs: onde entramos?</h3>")
@@ -15189,7 +15233,7 @@ def analise_entrada():
             ("70-100%", lambda r: 0.70 <= _f(r['bs_bounce_pct']) < 1.00),
             (">100%",   lambda r: _f(r['bs_bounce_pct']) >= 1.00),
         ]
-        with_bounce = [r for r in data if r['bs_bounce_pct'] is not None and r['ratio_vs_mig'] is not None]
+        with_bounce = [r for r in clean if r['bs_bounce_pct'] is not None and r['ratio_vs_mig'] is not None]
         out.append("<table><tr><th>Bounce pct</th><th>n</th><th>Avg entry/mig</th><th>% acima mig</th><th>WR</th></tr>")
         for label, cond in bounce_buckets:
             grp = [r for r in with_bounce if cond(r)]
