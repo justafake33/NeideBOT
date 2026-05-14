@@ -13893,6 +13893,7 @@ def analise_big_picture():
     NAV = "<p style='margin-bottom:16px'><a href='/analise/wr-breakdown'>WR Breakdown</a> · <a href='/analise/trade-autopsy'>Trade Autopsy</a> · <a href='/analise/h22-correlation'>H22</a> · <a href='/analise/big-picture'>Big Picture</a></p>"
 
     import traceback as _tb
+    _f = lambda v: float(v) if v is not None else 0.0  # Decimal → float
     sections = []
     sections.append(f"<!DOCTYPE html><html><head><title>Big Picture</title>{CSS}</head><body>")
     sections.append(NAV)
@@ -13915,23 +13916,26 @@ def analise_big_picture():
             FROM trades WHERE exit_type='helius_sell_recovery'
         """)
         k = cur.fetchone()
-        ev = round(k['avg_win']/100 * k['wr']/100 + k['avg_loss']/100 * (1 - k['wr']/100), 4)
-        payoff = round(abs((k['avg_win'] or 0) / (k['avg_loss'] or -1)), 2)
-        breakeven = round(abs(k['avg_loss']) / (abs(k['avg_win']) + abs(k['avg_loss'])) * 100, 1) if k['avg_loss'] and k['avg_win'] else 0
+        avg_win  = _f(k['avg_win'])
+        avg_loss = _f(k['avg_loss'])
+        wr_base  = _f(k['wr'])
+        ev = round(avg_win/100 * wr_base/100 + avg_loss/100 * (1 - wr_base/100), 4)
+        payoff = round(abs(avg_win / avg_loss), 2) if avg_loss else 0
+        breakeven = round(abs(avg_loss) / (abs(avg_win) + abs(avg_loss)) * 100, 1) if avg_loss and avg_win else 0
 
         sections.append(f"""
         <h2>Camada 1 — Distribuição Base</h2>
         <div class='grid'>
           <div class='kpi'><span class='kpi-val'>{k['total']}</span><span class='kpi-lbl'>Trades verificados</span></div>
-          <div class='kpi'><span class='kpi-val {"tp" if k["wr"]>=breakeven else "sl"}'>{k['wr']}%</span><span class='kpi-lbl'>WR real (break-even: {breakeven}%)</span></div>
-          <div class='kpi'><span class='kpi-val tp'>{k['avg_win']}%</span><span class='kpi-lbl'>Avg win ({k['n_tp']} TPs)</span></div>
-          <div class='kpi'><span class='kpi-val sl'>{k['avg_loss']}%</span><span class='kpi-lbl'>Avg loss median {k['median_loss']}% ({k['n_sl']} SLs)</span></div>
+          <div class='kpi'><span class='kpi-val {"tp" if wr_base>=breakeven else "sl"}'>{wr_base}%</span><span class='kpi-lbl'>WR real (break-even: {breakeven}%)</span></div>
+          <div class='kpi'><span class='kpi-val tp'>{avg_win}%</span><span class='kpi-lbl'>Avg win ({k['n_tp']} TPs)</span></div>
+          <div class='kpi'><span class='kpi-val sl'>{avg_loss}%</span><span class='kpi-lbl'>Avg loss median {_f(k['median_loss'])}% ({k['n_sl']} SLs)</span></div>
         </div>
         <div class='grid'>
           <div class='kpi'><span class='kpi-val {"tp" if ev>0 else "sl"}'>{ev:+.2%}</span><span class='kpi-lbl'>EV por trade (real)</span></div>
           <div class='kpi'><span class='kpi-val'>{payoff}×</span><span class='kpi-lbl'>Payoff (win/loss)</span></div>
-          <div class='kpi'><span class='kpi-val {"sl" if breakeven>k["wr"] else "tp"}'>{breakeven}%</span><span class='kpi-lbl'>Break-even WR</span></div>
-          <div class='kpi'><span class='kpi-val {"tp" if k["avg_pnl"]>0 else "sl"}'>{k['avg_pnl']:+.1f}%</span><span class='kpi-lbl'>P&L médio por trade</span></div>
+          <div class='kpi'><span class='kpi-val {"sl" if breakeven>wr_base else "tp"}'>{breakeven}%</span><span class='kpi-lbl'>Break-even WR</span></div>
+          <div class='kpi'><span class='kpi-val {"tp" if _f(k["avg_pnl"])>0 else "sl"}'>{_f(k["avg_pnl"]):+.1f}%</span><span class='kpi-lbl'>P&L médio por trade</span></div>
         </div>
         """)
 
@@ -13981,14 +13985,14 @@ def analise_big_picture():
         sections.append("<h2>Camada 2 — bounce_pct vs TP/SL</h2>")
         sections.append("<table><tr><th>Faixa bounce</th><th>n</th><th>TP</th><th>WR</th><th>Avg P&L</th><th>Avg Win</th><th>Avg Loss</th><th>EV estimado</th></tr>")
         for r in rows:
-            wr = r['wr'] or 0
-            aw = r['avg_win'] or 0
-            al = r['avg_loss'] or 0
+            wr = _f(r['wr'])
+            aw = _f(r['avg_win'])
+            al = _f(r['avg_loss'])
             ev_r = round(aw/100 * wr/100 + al/100 * (1-wr/100), 3)
             cls = "tp" if wr >= breakeven else "sl"
             ev_cls = "tp" if ev_r > 0 else "sl"
             bar = int(wr/2)
-            sections.append(f"<tr><td>{int(r['bmin'])}-{int(r['bmin'])+10}%</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td><td class='{cls}'><span class='bar' style='width:{bar}px'></span>{wr}%</td><td class='{ev_cls}'>{r['avg_pnl']}%</td><td class='tp'>{aw}%</td><td class='sl'>{al}%</td><td class='{ev_cls}'>{ev_r:+.2%}</td></tr>")
+            sections.append(f"<tr><td>{int(_f(r['bmin']))}-{int(_f(r['bmin']))+10}%</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td><td class='{cls}'><span class='bar' style='width:{bar}px'></span>{wr}%</td><td class='{ev_cls}'>{_f(r['avg_pnl'])}%</td><td class='tp'>{aw}%</td><td class='sl'>{al}%</td><td class='{ev_cls}'>{ev_r:+.2%}</td></tr>")
         sections.append("</table>")
 
         # ── CAMADA 2b: H10 no live (time_to_bottom) ─────────────────────
@@ -14013,8 +14017,8 @@ def analise_big_picture():
         sections.append("<h3>H10 nos trades live (time_to_bottom)</h3>")
         sections.append("<table><tr><th>TTB</th><th>n</th><th>TP</th><th>WR</th><th>Avg P&L</th></tr>")
         for r in rows:
-            cls = "tp" if (r['wr'] or 0) >= breakeven else "sl"
-            sections.append(f"<tr><td>{r['ttb']}</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td><td class='{cls}'>{r['wr']}%</td><td>{r['avg_pnl']}%</td></tr>")
+            cls = "tp" if _f(r['wr']) >= breakeven else "sl"
+            sections.append(f"<tr><td>{r['ttb']}</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td><td class='{cls}'>{_f(r['wr'])}%</td><td>{_f(r['avg_pnl'])}%</td></tr>")
         sections.append("</table>")
 
         # ── CAMADA 3: H9 SIGNAL presence ─────────────────────────────────
@@ -14041,8 +14045,8 @@ def analise_big_picture():
         sections.append("<h2>Camada 3 — H9 Signal (trigger_mc &lt; 80% mc_migration)</h2>")
         sections.append("<table><tr><th>H9</th><th>n</th><th>TP</th><th>WR</th><th>Avg P&L</th></tr>")
         for r in rows:
-            cls = "tp" if (r['wr'] or 0) >= breakeven else "sl"
-            sections.append(f"<tr><td>{r['h9']}</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td><td class='{cls}'>{r['wr']}%</td><td>{r['avg_pnl']}%</td></tr>")
+            cls = "tp" if _f(r['wr']) >= breakeven else "sl"
+            sections.append(f"<tr><td>{r['h9']}</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td><td class='{cls}'>{_f(r['wr'])}%</td><td>{_f(r['avg_pnl'])}%</td></tr>")
         sections.append("</table>")
 
         # ── CAMADA 3b: H22 Absorption ─────────────────────────────────────
@@ -14069,8 +14073,8 @@ def analise_big_picture():
         sections.append("<h2>Camada 3b — H22 Absorção no momento do bounce</h2>")
         sections.append("<table><tr><th>Absorção</th><th>n</th><th>TP</th><th>WR</th><th>Avg P&L</th><th>Avg Events</th></tr>")
         for r in rows:
-            cls = "tp" if (r['wr'] or 0) >= breakeven else ("sl" if r['wr'] is not None else "neu")
-            sections.append(f"<tr><td>{r['h22']}</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td><td class='{cls}'>{r['wr'] or '-'}%</td><td>{r['avg_pnl']}%</td><td>{r['avg_events'] or '-'}</td></tr>")
+            cls = "tp" if _f(r['wr']) >= breakeven else ("sl" if r['wr'] is not None else "neu")
+            sections.append(f"<tr><td>{r['h22']}</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td><td class='{cls}'>{_f(r['wr']) if r['wr'] else '-'}%</td><td>{_f(r['avg_pnl'])}%</td><td>{_f(r['avg_events']) if r['avg_events'] else '-'}</td></tr>")
         sections.append("</table>")
 
         # ── CAMADA 4: ANATOMIA DOS 14 TPs ─────────────────────────────────
@@ -14156,9 +14160,9 @@ def analise_big_picture():
         sections.append("<h3>WR cumulativo por threshold de bounce_pct (bounce >= X%)</h3>")
         sections.append("<table><tr><th>Bounce ≥</th><th>n</th><th>TP</th><th>WR</th><th>Avg P&L</th><th>EV estimado</th></tr>")
         for r in rows:
-            wr = float(r['wr'] or 0)
-            ap = float(r['avg_pnl'] or 0)
-            ev_r = round(ap/100 * wr/100 + (k['avg_loss'] or 0)/100 * (1-wr/100), 3)
+            wr = _f(r['wr'])
+            ap = _f(r['avg_pnl'])
+            ev_r = round(ap/100 * wr/100 + avg_loss/100 * (1-wr/100), 3)
             cls = "tp" if wr >= breakeven else "sl"
             ev_cls = "tp" if ev_r > 0 else "sl"
             sections.append(f"<tr><td>{r['threshold']}%</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td><td class='{cls}'>{wr}%</td><td class='{ev_cls}'>{ap:+.1f}%</td><td class='{ev_cls}'>{ev_r:+.2%}</td></tr>")
@@ -14182,8 +14186,8 @@ def analise_big_picture():
         sections.append("<h3>WR por smart_wallets</h3>")
         sections.append("<table><tr><th>Smart</th><th>n</th><th>TP</th><th>WR</th><th>Avg P&L</th></tr>")
         for r in rows:
-            cls = "tp" if (r['wr'] or 0) >= breakeven else "sl"
-            sections.append(f"<tr><td>{r['smart_wallets']}</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td><td class='{cls}'>{r['wr']}%</td><td>{r['avg_pnl']}%</td></tr>")
+            cls = "tp" if _f(r['wr']) >= breakeven else "sl"
+            sections.append(f"<tr><td>{r['smart_wallets']}</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td><td class='{cls}'>{_f(r['wr'])}%</td><td>{_f(r['avg_pnl'])}%</td></tr>")
         sections.append("</table>")
 
         # bounce_pct >= 50 + smart breakdown
@@ -14206,11 +14210,11 @@ def analise_big_picture():
         sections.append("<h3>Combinação: bounce ≥ 70% + smart_wallets</h3>")
         sections.append("<table><tr><th>Smart tier</th><th>Bounce tier</th><th>n</th><th>TP</th><th>WR</th><th>Avg P&L</th></tr>")
         for r in rows:
-            cls = "tp" if (r['wr'] or 0) >= breakeven else "sl"
-            sections.append(f"<tr><td>{r['smart_tier']}</td><td>{r['bounce_tier']}</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td><td class='{cls}'>{r['wr']}%</td><td>{r['avg_pnl']}%</td></tr>")
+            cls = "tp" if _f(r['wr']) >= breakeven else "sl"
+            sections.append(f"<tr><td>{r['smart_tier']}</td><td>{r['bounce_tier']}</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td><td class='{cls}'>{_f(r['wr'])}%</td><td>{_f(r['avg_pnl'])}%</td></tr>")
         sections.append("</table>")
 
-     sections.append(f"<p style='color:#8b949e;font-size:12px;margin-top:24px'>Break-even calculado com avg_win={k['avg_win']}% / avg_loss={k['avg_loss']}% reais da blockchain · {k['total']} trades · exit_type=helius_sell_recovery</p>")
+     sections.append(f"<p style='color:#8b949e;font-size:12px;margin-top:24px'>Break-even calculado com avg_win={avg_win}% / avg_loss={avg_loss}% reais da blockchain · {k['total']} trades · exit_type=helius_sell_recovery</p>")
     except Exception:
         sections.append(f"<pre style='color:#f85149;background:#161b22;padding:12px'>{_tb.format_exc()}</pre>")
     sections.append("</body></html>")
