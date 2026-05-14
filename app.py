@@ -13492,11 +13492,21 @@ td{padding:4px 8px;border-bottom:1px solid #21262d}
             yield "<p class='green'>Nenhum trade precisa de exit recovery!</p></body></html>"
             return
 
-        oldest_ts = min(t["created_at"].timestamp() for t in trades)
-        mints_needed = {t["mint"] for t in trades}
+        # Primeiro trade do bot foi 06/05 — usar como piso absoluto independente do DB.
+        # Toda atividade da carteira desde essa data é do bot (sem trades manuais).
+        MAY_6_TS = _dt.datetime(2026, 5, 6, tzinfo=_dt.timezone.utc).timestamp()
+        oldest_ts_db = min(t["created_at"].timestamp() for t in trades)
+        oldest_ts    = min(oldest_ts_db, MAY_6_TS)  # sempre volta pelo menos até 06/05
+
+        # Para matching: inclui TODOS os mints que já negociamos (não só os sem exit)
+        # pois algumas vendas podem estar em trades com status errado no DB
+        with db._cursor() as cur:
+            cur.execute("SELECT DISTINCT mint FROM trades WHERE order_id IS NOT NULL")
+            mints_needed = {r[0] for r in cur.fetchall()}
+
         yield (f"<p class='log'>Trades sem exit: <b>{len(trades)}</b> | "
-               f"Mints únicos: {len(mints_needed)} | "
-               f"Mais antigo: {_dt.datetime.fromtimestamp(oldest_ts).strftime('%Y-%m-%d %H:%M')}</p>")
+               f"Mints únicos (todos): {len(mints_needed)} | "
+               f"Scan desde: {_dt.datetime.fromtimestamp(oldest_ts).strftime('%Y-%m-%d')} (06/05 piso)</p>")
 
         sol_usd = _get_sol_usd() or 150.0
 
