@@ -14677,7 +14677,7 @@ def analise_sl_otimo():
                     AND tt.tick_ts > e.exit_ts
                     AND tt.tick_ts <= e.exit_ts + INTERVAL '60 min'
                 WHERE e.status = 'sl' AND e.exit_ts IS NOT NULL
-                GROUP BY e.id
+                GROUP BY e.id, e.mint, e.ts_signal, e.exit_ts
             )
             SELECT
                 e.*,
