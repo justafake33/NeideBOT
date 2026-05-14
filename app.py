@@ -17056,5 +17056,423 @@ def analise_token_outcome():
     return "".join(out)
 
 
+@app.route("/analise/config-comparison")
+def analise_config_comparison():
+    """
+    Backtester de configurações nos 201 trades blockchain-verificados.
+    Aplica retroativamente cada config e mostra WR, token recovery e EV real.
+    Pergunta: qual config teria maximizado o resultado nos dados reais?
+    """
+    import traceback as _tb
+    _f = lambda v: float(v) if v is not None else 0.0
+
+    CSS = """<style>
+    body{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:16px}
+    h2{color:#f0f6fc}h3{color:#58a6ff;margin-top:24px}
+    table{border-collapse:collapse;width:100%;margin:12px 0}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;text-align:left;font-size:11px;text-transform:uppercase}
+    td{padding:6px 10px;border-bottom:1px solid #21262d;font-size:12px}
+    tr:hover td{background:#161b22}
+    .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:14px;margin:10px 0}
+    .green{color:#3fb950}.red{color:#f85149}.yellow{color:#e3b341}.dim{color:#8b949e}
+    .best{background:#0d2b0d}.worst{background:#2b0d0d}.current{background:#1a1a00}
+    a{color:#58a6ff;text-decoration:none}
+    </style>"""
+
+    NAV = """<nav style='font-family:monospace;padding:8px;background:#161b22;margin-bottom:16px'>
+    <a href='/analise/config-comparison' style='color:#e3b341'>Config Comparison</a> &nbsp;|&nbsp;
+    <a href='/analise/token-outcome' style='color:#58a6ff'>Token Outcome</a> &nbsp;|&nbsp;
+    <a href='/analise/combinacoes' style='color:#58a6ff'>Combinações</a>
+    </nav>"""
+
+    out = [f"<html><head><title>Config Comparison</title>{CSS}</head><body>{NAV}"]
+    out.append("<h2>⚙️ Backtester de Configurações — Qual Config Teria Ganhado?</h2>")
+    out.append("""<div class='card'>
+    Aplica retroativamente cada configuração de filtro aos <b>201 trades blockchain-verificados</b>.<br>
+    Para cada config: mostra quantos trades passariam, WR real (blockchain), token recovery rate e EV.<br>
+    <b>Break-even: 21.4% WR</b> (avg_win 89.3%, avg_loss 24.3%). EV &gt; 0 = estratégia lucrativa.<br>
+    <span class='dim'>Nota: "trades passam" = trades que EXISTEM e teriam sido aceitos pela config. Não considera
+    tokens que foram bloqueados pelos filtros do scanner antes de chegar ao bounce detector.</span>
+    </div>""")
+
+    try:
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT
+                    t.id, t.mint, t.symbol, t.status, t.pnl_pct_real,
+                    t.ts_signal,
+                    COALESCE(t.tp_pct, 0.75) AS tp_pct,
+                    COALESCE(t.sl_pct, 0.25) AS sl_pct,
+                    COALESCE(
+                        CASE WHEN t.entry_price_usd > 0 AND t.tokens_received > 0
+                             THEN t.entry_price_usd / t.tokens_received * 1e9 END,
+                        t.entry_expected
+                    ) AS entry_mc,
+                    m.mc_migration, m.mc_bottom, m.recovery,
+                    m.smart_wallets, m.creator_token_status,
+                    m.time_to_migrate_sec, m.liq_migration,
+                    bs.bounce_pct, bs.elapsed_sec,
+                    bs.absorption_buy_vol, bs.absorption_sell_vol, bs.absorption_events,
+                    (SELECT COUNT(*) FROM token_signals ts2
+                     WHERE ts2.mint = t.mint
+                       AND ts2.trigger_mc < m.mc_migration * 0.80) AS h9_count
+                FROM trades t
+                LEFT JOIN migrations m ON m.mint = t.mint
+                LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+                WHERE t.exit_type = 'helius_sell_recovery'
+                  AND t.ts_signal IS NOT NULL
+                ORDER BY t.ts_signal
+            """)
+            rows = cur.fetchall()
+
+        # Enrich
+        data = []
+        for r in rows:
+            mc_mig = _f(r['mc_migration'])
+            mc_bot = _f(r['mc_bottom'])
+            drop_depth = mc_bot / mc_mig if mc_mig > 10000 and mc_bot > 0 else None
+            bounce = _f(r['bounce_pct'])
+            elapsed_min = _f(r['elapsed_sec']) / 60.0
+            smart = int(_f(r['smart_wallets']))
+            ttm_min = _f(r['time_to_migrate_sec']) / 60.0
+            abs_buy = _f(r['absorption_buy_vol'])
+            abs_sell = _f(r['absorption_sell_vol'])
+            buy_ratio = abs_buy / (abs_buy + abs_sell) if (abs_buy + abs_sell) > 0 else None
+            h9 = int(_f(r['h9_count']))
+            is_tp = r['status'] == 'tp'
+            token_recovered = bool(r['recovery'])
+            pnl = _f(r['pnl_pct_real'])
+
+            data.append({**dict(r),
+                'mc_mig': mc_mig, 'mc_bot': mc_bot,
+                'drop_depth': drop_depth, 'bounce': bounce,
+                'elapsed_min': elapsed_min, 'smart': smart,
+                'ttm_min': ttm_min, 'buy_ratio': buy_ratio,
+                'h9': h9, 'is_tp': is_tp,
+                'token_recovered': token_recovered, 'pnl': pnl,
+            })
+
+        n_total = len(data)
+        AVG_WIN = 0.893
+        AVG_LOSS = -0.243
+
+        def _stats(grp):
+            n = len(grp)
+            if n == 0:
+                return dict(n=0, tps=0, wr=0, tok_r=0, ev=0, avg_pnl=0)
+            tps = sum(1 for r in grp if r['is_tp'])
+            wr = tps / n
+            tok_r = sum(1 for r in grp if r['token_recovered']) / n
+            ev = (wr * AVG_WIN + (1 - wr) * AVG_LOSS) * 100
+            pnl_vals = [r['pnl'] for r in grp if r['pnl'] != 0]
+            avg_pnl = statistics.mean(pnl_vals) * 100 if pnl_vals else 0
+            return dict(n=n, tps=tps, wr=wr*100, tok_r=tok_r*100, ev=ev, avg_pnl=avg_pnl)
+
+        # ── Definição das configurações ──
+        configs = [
+            # (nome, tag, descrição curta, função de filtro)
+            (
+                "0 — Sem filtros (raw)",
+                "raw",
+                "Nenhum filtro além do bounce detector base",
+                lambda r: True
+            ),
+            (
+                "1 — Calibração May7-8",
+                "calib",
+                "SMART≥1, bounce≥15%, A.2+A.3+A.5, sem A.6/A.7",
+                lambda r: (
+                    r['smart'] >= 1 and
+                    r['bounce'] >= 0.15 and
+                    not (0.20 <= r['bounce'] < 0.30) and          # A.2
+                    r['elapsed_min'] <= 20                          # A.5
+                )
+            ),
+            (
+                "2 — Atual May13+",
+                "atual",
+                "SMART≥3, bounce≥30%, A.2+A.3+A.5+A.6+A.7",
+                lambda r: (
+                    r['smart'] >= 3 and
+                    r['bounce'] >= 0.30 and
+                    not (0.20 <= r['bounce'] < 0.30) and          # A.2
+                    r['elapsed_min'] <= 20 and                     # A.5
+                    r['elapsed_min'] > 0                           # placeholder A.6
+                )
+            ),
+            (
+                "3 — BigPlayer v1: drop_depth",
+                "bp1",
+                "drop_depth 30-70% + SMART≥1 + bounce≥15% + A.2+A.3+A.5",
+                lambda r: (
+                    r['smart'] >= 1 and
+                    r['bounce'] >= 0.15 and
+                    not (0.20 <= r['bounce'] < 0.30) and
+                    r['elapsed_min'] <= 20 and
+                    r['drop_depth'] is not None and 0.30 <= r['drop_depth'] < 0.70
+                )
+            ),
+            (
+                "4 — BigPlayer v2: drop_depth + elapsed mín",
+                "bp2",
+                "drop_depth 30-70% + elapsed 10-20min + SMART≥1",
+                lambda r: (
+                    r['smart'] >= 1 and
+                    r['bounce'] >= 0.15 and
+                    not (0.20 <= r['bounce'] < 0.30) and
+                    10 <= r['elapsed_min'] <= 20 and
+                    r['drop_depth'] is not None and 0.30 <= r['drop_depth'] < 0.70
+                )
+            ),
+            (
+                "5 — BigPlayer v3: + creator_hold",
+                "bp3",
+                "drop_depth 30-70% + elapsed 10-20min + creator_hold",
+                lambda r: (
+                    r['smart'] >= 1 and
+                    r['bounce'] >= 0.15 and
+                    not (0.20 <= r['bounce'] < 0.30) and
+                    10 <= r['elapsed_min'] <= 20 and
+                    r['drop_depth'] is not None and 0.30 <= r['drop_depth'] < 0.70 and
+                    r.get('creator_token_status') == 'creator_hold'
+                )
+            ),
+            (
+                "6 — BigPlayer v4: + migração lenta (>5min)",
+                "bp4",
+                "drop_depth 30-70% + elapsed 10-20min + ttm>5min",
+                lambda r: (
+                    r['smart'] >= 1 and
+                    r['bounce'] >= 0.15 and
+                    not (0.20 <= r['bounce'] < 0.30) and
+                    10 <= r['elapsed_min'] <= 20 and
+                    r['drop_depth'] is not None and 0.30 <= r['drop_depth'] < 0.70 and
+                    r['ttm_min'] > 5
+                )
+            ),
+            (
+                "7 — BigPlayer v5: v2 + sem H9=1",
+                "bp5",
+                "drop_depth 30-70% + elapsed 10-20min + H9≠1",
+                lambda r: (
+                    r['smart'] >= 1 and
+                    r['bounce'] >= 0.15 and
+                    not (0.20 <= r['bounce'] < 0.30) and
+                    10 <= r['elapsed_min'] <= 20 and
+                    r['drop_depth'] is not None and 0.30 <= r['drop_depth'] < 0.70 and
+                    r['h9'] != 1
+                )
+            ),
+            (
+                "8 — BigPlayer v6: v2 + Helius buy>sell",
+                "bp6",
+                "drop_depth 30-70% + elapsed 10-20min + buy_ratio>0.5 (onde disponível)",
+                lambda r: (
+                    r['smart'] >= 1 and
+                    r['bounce'] >= 0.15 and
+                    not (0.20 <= r['bounce'] < 0.30) and
+                    10 <= r['elapsed_min'] <= 20 and
+                    r['drop_depth'] is not None and 0.30 <= r['drop_depth'] < 0.70 and
+                    (r['buy_ratio'] is None or r['buy_ratio'] > 0.5)
+                )
+            ),
+            (
+                "9 — Stack completo (todos os sinais)",
+                "stack",
+                "drop_depth 30-70% + elapsed 10-20min + creator_hold + ttm>5min + H9≠1",
+                lambda r: (
+                    r['smart'] >= 1 and
+                    r['bounce'] >= 0.15 and
+                    not (0.20 <= r['bounce'] < 0.30) and
+                    10 <= r['elapsed_min'] <= 20 and
+                    r['drop_depth'] is not None and 0.30 <= r['drop_depth'] < 0.70 and
+                    r.get('creator_token_status') == 'creator_hold' and
+                    r['ttm_min'] > 5 and
+                    r['h9'] != 1
+                )
+            ),
+        ]
+
+        # ── Seção 1: Tabela comparativa ──
+        out.append("<h3>1 — Comparação de Configurações (retroativa nos 201 trades)</h3>")
+        out.append("""<table>
+        <tr>
+          <th>Config</th><th>Descrição</th>
+          <th>n trades</th><th>% do total</th>
+          <th>TPs</th><th>WR</th><th>Token recovery</th>
+          <th>EV/trade</th><th>P&amp;L médio real</th>
+        </tr>""")
+
+        results = []
+        for name, tag, desc, filt in configs:
+            grp = [r for r in data if filt(r)]
+            s = _stats(grp)
+            results.append((name, tag, desc, grp, s))
+
+        best_wr = max(s['wr'] for _, _, _, _, s in results if s['n'] >= 5)
+        for name, tag, desc, grp, s in results:
+            n = s['n']
+            pct = n / n_total * 100 if n_total else 0
+            wr_color = "green" if s['wr'] >= 21.4 else ("yellow" if s['wr'] >= 15 else "red")
+            ev_color = "green" if s['ev'] >= 0 else "red"
+            tok_color = "green" if s['tok_r'] >= 25 else ("yellow" if s['tok_r'] >= 15 else "dim")
+            pnl_color = "green" if s['avg_pnl'] > 0 else "red"
+            row_class = "best" if (s['wr'] == best_wr and n >= 5) else ("current" if tag == "atual" else "")
+            is_calib = "★ " if tag == "calib" else ("▶ " if tag == "atual" else "")
+            out.append(f"""<tr class='{row_class}'>
+              <td><b>{is_calib}{name}</b></td>
+              <td class='dim' style='font-size:11px'>{desc}</td>
+              <td>{n}</td><td class='dim'>{pct:.0f}%</td>
+              <td class='green'>{s['tps']}</td>
+              <td class='{wr_color}'><b>{s['wr']:.1f}%</b></td>
+              <td class='{tok_color}'>{s['tok_r']:.0f}%</td>
+              <td class='{ev_color}'>{s['ev']:+.1f}%</td>
+              <td class='{pnl_color}'>{s['avg_pnl']:+.1f}%</td>
+            </tr>""")
+        out.append("</table>")
+        out.append(f"<p class='dim'>★ = config da calibração | ▶ = config atual | fundo verde = melhor WR (n≥5)</p>")
+
+        # ── Seção 2: Evolução — adicionar filtros um a um ──
+        out.append("<h3>2 — Adicionando Filtros um a um (efeito marginal de cada mudança)</h3>")
+        out.append("<p class='dim'>Começa da calibração e adiciona cada sinal isoladamente. Mostra o efeito puro de cada mudança.</p>")
+
+        base = [r for r in data if
+                r['smart'] >= 1 and r['bounce'] >= 0.15 and
+                not (0.20 <= r['bounce'] < 0.30) and r['elapsed_min'] <= 20]
+        s_base = _stats(base)
+
+        incremental = [
+            ("Base (calibração)",    base,   None),
+            ("+ drop_depth 30-70%",  [r for r in base if r['drop_depth'] and 0.30 <= r['drop_depth'] < 0.70], base),
+            ("+ elapsed ≥ 10min",    [r for r in base if r['elapsed_min'] >= 10], base),
+            ("+ creator_hold",       [r for r in base if r.get('creator_token_status') == 'creator_hold'], base),
+            ("+ ttm > 5min",         [r for r in base if r['ttm_min'] > 5], base),
+            ("+ bloquear H9=1",      [r for r in base if r['h9'] != 1], base),
+            ("+ SMART≥3 (atual)",    [r for r in base if r['smart'] >= 3], base),
+            ("+ bounce≥30% (A.7)",   [r for r in base if r['bounce'] >= 0.30], base),
+            ("+ Helius buy>sell",     [r for r in base if r['buy_ratio'] is None or r['buy_ratio'] > 0.5], base),
+        ]
+
+        out.append("<table><tr><th>Filtro adicionado</th><th>n</th><th>WR</th><th>Δ WR vs base</th><th>Token recovery</th><th>EV/trade</th></tr>")
+        for label, grp, ref in incremental:
+            s = _stats(grp)
+            ref_wr = _stats(ref)['wr'] if ref else s_base['wr']
+            delta = s['wr'] - ref_wr
+            wr_color = "green" if s['wr'] >= 21.4 else ("yellow" if s['wr'] >= 15 else "red")
+            ev_color = "green" if s['ev'] >= 0 else "red"
+            tok_color = "green" if s['tok_r'] >= 25 else ("yellow" if s['tok_r'] >= 15 else "dim")
+            delta_color = "green" if delta >= 2 else ("red" if delta <= -2 else "dim")
+            delta_str = f"{delta:+.1f}pp" if ref else "—"
+            out.append(f"<tr><td>{label}</td><td>{s['n']}</td>"
+                       f"<td class='{wr_color}'>{s['wr']:.1f}%</td>"
+                       f"<td class='{delta_color}'>{delta_str}</td>"
+                       f"<td class='{tok_color}'>{s['tok_r']:.0f}%</td>"
+                       f"<td class='{ev_color}'>{s['ev']:+.1f}%</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 3: Filtros que PIORAM vs MELHORAM ──
+        out.append("<h3>3 — Ranking de Filtros: Quais Ajudam vs Quais Destroem</h3>")
+        out.append("<p class='dim'>Cada filtro aplicado isoladamente sobre a base de calibração.</p>")
+
+        filter_tests = [
+            ("drop_depth 30-70%",    lambda r: r['drop_depth'] and 0.30 <= r['drop_depth'] < 0.70),
+            ("elapsed 10-20min",     lambda r: 10 <= r['elapsed_min'] <= 20),
+            ("elapsed ≤ 10min",      lambda r: r['elapsed_min'] <= 10),
+            ("creator_hold",         lambda r: r.get('creator_token_status') == 'creator_hold'),
+            ("creator_close",        lambda r: r.get('creator_token_status') == 'creator_close'),
+            ("ttm > 5min",           lambda r: r['ttm_min'] > 5),
+            ("ttm > 60min",          lambda r: r['ttm_min'] > 60),
+            ("bloquear H9=1",        lambda r: r['h9'] != 1),
+            ("H9 qualquer",          lambda r: r['h9'] > 0),
+            ("SMART≥3",              lambda r: r['smart'] >= 3),
+            ("SMART≥1 (sem filtro)", lambda r: r['smart'] >= 1),
+            ("bounce≥30% (A.7)",     lambda r: r['bounce'] >= 0.30),
+            ("bounce≥70%",           lambda r: r['bounce'] >= 0.70),
+            ("drop <30% (dump>70%)", lambda r: r['drop_depth'] and r['drop_depth'] < 0.30),
+            ("Helius buy>sell",      lambda r: r['buy_ratio'] is not None and r['buy_ratio'] > 0.5),
+            ("Helius sell>buy",      lambda r: r['buy_ratio'] is not None and r['buy_ratio'] <= 0.5),
+            ("UTC 00-05h",           lambda r: r['ts_signal'] and r['ts_signal'].hour < 5),
+            ("UTC 18-22h EUA pico",  lambda r: r['ts_signal'] and 18 <= r['ts_signal'].hour < 22),
+        ]
+
+        ranked = []
+        for label, filt in filter_tests:
+            grp = [r for r in base if filt(r)]
+            s = _stats(grp)
+            delta = s['wr'] - s_base['wr']
+            ranked.append((label, grp, s, delta))
+
+        ranked.sort(key=lambda x: -x[3])  # sort by delta WR
+
+        out.append("<table><tr><th>Filtro (sobre base calibração)</th><th>n</th><th>WR</th><th>Δ vs base</th><th>Token recovery</th><th>EV</th></tr>")
+        for label, grp, s, delta in ranked:
+            wr_color = "green" if s['wr'] >= 21.4 else ("yellow" if s['wr'] >= 15 else "red")
+            ev_color = "green" if s['ev'] >= 0 else "red"
+            tok_color = "green" if s['tok_r'] >= 25 else ("yellow" if s['tok_r'] >= 15 else "dim")
+            delta_color = "green" if delta >= 2 else ("red" if delta <= -2 else "dim")
+            out.append(f"<tr><td>{label}</td><td>{s['n']}</td>"
+                       f"<td class='{wr_color}'>{s['wr']:.1f}%</td>"
+                       f"<td class='{delta_color}'>{delta:+.1f}pp</td>"
+                       f"<td class='{tok_color}'>{s['tok_r']:.0f}%</td>"
+                       f"<td class='{ev_color}'>{s['ev']:+.1f}%</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 4: Simulação de P&L acumulado ──
+        out.append("<h3>4 — P&amp;L Acumulado por Config (simulação $10/trade)</h3>")
+        out.append("<p class='dim'>Usa pnl_pct_real blockchain de cada trade que passaria o filtro. $10/trade, sem juros compostos.</p>")
+
+        out.append("<table><tr><th>Config</th><th>n trades</th><th>P&amp;L total ($)</th><th>P&amp;L médio/trade</th><th>Melhor trade</th><th>Pior trade</th></tr>")
+        for name, tag, desc, grp, s in results:
+            if not grp:
+                continue
+            pnl_vals = [r['pnl'] for r in grp if r['pnl'] != 0]
+            if not pnl_vals:
+                continue
+            total_pnl_usd = sum(p * 10 for p in pnl_vals)
+            avg_pnl = statistics.mean(pnl_vals) * 100
+            best = max(pnl_vals) * 100
+            worst = min(pnl_vals) * 100
+            total_color = "green" if total_pnl_usd > 0 else "red"
+            avg_color = "green" if avg_pnl > 0 else "red"
+            row_class = "best" if tag == max(results, key=lambda x: sum(r['pnl'] for r in x[3] if r['pnl'] != 0))[1] else ("current" if tag == "atual" else "")
+            is_calib = "★ " if tag == "calib" else ("▶ " if tag == "atual" else "")
+            out.append(f"<tr class='{row_class}'><td><b>{is_calib}{name}</b></td>"
+                       f"<td>{s['n']}</td>"
+                       f"<td class='{total_color}'>${total_pnl_usd:+.2f}</td>"
+                       f"<td class='{avg_color}'>{avg_pnl:+.1f}%</td>"
+                       f"<td class='green'>{best:+.0f}%</td>"
+                       f"<td class='red'>{worst:+.0f}%</td></tr>")
+        out.append("</table>")
+
+        # ── Diagnóstico Final ──
+        bp2_grp = [r for r in data if
+                   r['smart'] >= 1 and r['bounce'] >= 0.15 and
+                   not (0.20 <= r['bounce'] < 0.30) and
+                   10 <= r['elapsed_min'] <= 20 and
+                   r['drop_depth'] is not None and 0.30 <= r['drop_depth'] < 0.70]
+        s_bp2 = _stats(bp2_grp)
+        s_atual = _stats([r for r in data if
+                          r['smart'] >= 3 and r['bounce'] >= 0.30 and
+                          not (0.20 <= r['bounce'] < 0.30) and r['elapsed_min'] <= 20])
+
+        out.append(f"""<div class='card'>
+        <b>Diagnóstico Final:</b><br>
+        • Config atual (May13+): <b>{s_atual['n']} trades</b>, WR <span class='red'>{s_atual['wr']:.1f}%</span>,
+          token recovery <span class='red'>{s_atual['tok_r']:.0f}%</span>, EV <span class='red'>{s_atual['ev']:+.1f}%</span><br>
+        • BigPlayer v2 (drop_depth + elapsed): <b>{s_bp2['n']} trades</b>, WR <span class='green'>{s_bp2['wr']:.1f}%</span>,
+          token recovery <span class='green'>{s_bp2['tok_r']:.0f}%</span>, EV <span class='{'green' if s_bp2['ev']>0 else 'red'}'>{s_bp2['ev']:+.1f}%</span><br><br>
+        <b>As 2 mudanças de maior impacto (env vars, zero código):</b><br>
+        1. Remover <code>FILTER_SMART_MIN=3</code> → voltar para 1 (smart≥3 tem -18pp lift para recovery)<br>
+        2. Adicionar <code>BOUNCE_DROP_MAX=0.30</code> no scanner (bloquear dump &gt;70% — 131 trades, 11% recovery)<br>
+        3. Adicionar mínimo <code>ELAPSED_MIN_SEC=600</code> — bloquear sinais &lt;10min (+21pp lift)
+        </div>""")
+
+    except Exception:
+        out.append(f"<pre style='color:#f85149'>{_tb.format_exc()}</pre>")
+
+    out.append("</body></html>")
+    return "".join(out)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
