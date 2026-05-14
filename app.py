@@ -13117,5 +13117,155 @@ def analise_trade_autopsy():
         return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
+@app.route("/debug/query", methods=["GET", "POST"])
+def debug_query():
+    """Interface SQL read-only. Requer QUERY_SECRET configurado no Railway.
+    GET sem ?sql= → mostra formulário HTML com histórico de queries úteis.
+    GET/POST com sql → executa e retorna tabela HTML ou JSON (?fmt=json).
+    Bloqueia qualquer statement que não seja SELECT/WITH/EXPLAIN.
+    """
+    import json as _json, os as _os
+    secret = _os.getenv("QUERY_SECRET", "")
+
+    _CSS = """<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;font-size:12px;padding:16px}
+h1{color:#58a6ff;font-size:15px;margin-bottom:12px}
+textarea{width:100%;height:100px;background:#161b22;color:#c9d1d9;border:1px solid #30363d;
+  border-radius:4px;padding:8px;font-family:monospace;font-size:12px;resize:vertical}
+input[type=password]{background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;
+  padding:6px 10px;font-size:12px;width:220px}
+button{background:#238636;color:#fff;border:none;border-radius:4px;padding:7px 18px;
+  font-size:12px;cursor:pointer;margin-top:8px}
+button:hover{background:#2ea043}
+.shortcuts{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0}
+.sc{background:#161b22;border:1px solid #30363d;border-radius:4px;padding:4px 10px;
+  font-size:11px;cursor:pointer;color:#58a6ff}
+.sc:hover{background:#21262d}
+table{width:100%;border-collapse:collapse;margin-top:12px;font-size:11px}
+th{background:#161b22;color:#8b949e;padding:5px 8px;text-align:left;border-bottom:1px solid #30363d}
+td{padding:4px 8px;border-bottom:1px solid #21262d;white-space:nowrap;max-width:300px;
+  overflow:hidden;text-overflow:ellipsis}
+tr:hover td{background:#161b22}
+.meta{color:#8b949e;font-size:11px;margin:8px 0}
+.err{color:#f85149;padding:8px;background:#2d1117;border-radius:4px;margin-top:8px}
+.green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}
+label{color:#8b949e;font-size:11px;display:block;margin-bottom:4px}
+.row{display:flex;gap:12px;align-items:flex-end;margin-top:8px}
+</style>"""
+
+    SHORTCUTS = [
+        ("Trades totais", "SELECT status, COUNT(*) as n FROM trades GROUP BY status ORDER BY n DESC"),
+        ("WR por bounce%", "SELECT CASE WHEN b.bounce_pct < 0.55 THEN '<55%' WHEN b.bounce_pct < 0.70 THEN '55-70%' ELSE '>=70%' END as bucket, COUNT(*) as n, SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp, ROUND(AVG(CASE WHEN t.status='tp' THEN 1.0 ELSE 0 END)*100,1) as wr_pct FROM trades t JOIN bounce_signals b ON b.mint=t.mint WHERE t.status IN ('tp','sl') GROUP BY 1 ORDER BY 1"),
+        ("Trades pós 55%", "SELECT t.id, t.symbol, t.status, t.created_at AT TIME ZONE 'America/Sao_Paulo' as ts_brt, b.bounce_pct FROM trades t JOIN bounce_signals b ON b.mint=t.mint WHERE t.created_at > NOW() - INTERVAL '7 days' ORDER BY t.id DESC LIMIT 30"),
+        ("H22 outcomes", "SELECT b.absorption_events, b.absorption_buy_vol, b.absorption_sell_vol, t.status FROM bounce_signals b JOIN trades t ON t.mint=b.mint WHERE b.absorption_events > 0 AND t.status IN ('tp','sl') ORDER BY b.ts_signal DESC"),
+        ("Ghost trades", "SELECT id, symbol, status, created_at AT TIME ZONE 'America/Sao_Paulo' as ts_brt FROM trades WHERE status='expired' AND pnl_pct_real IS NULL ORDER BY id DESC LIMIT 20"),
+        ("Migrations recentes", "SELECT mint, token_nome, exchange, ts_migration AT TIME ZONE 'America/Sao_Paulo' as ts_brt, mc_migration, recovery FROM migrations WHERE ts_migration > NOW() - INTERVAL '24 hours' ORDER BY ts_migration DESC LIMIT 20"),
+        ("Bounce signals hoje", "SELECT symbol, bounce_pct, elapsed_sec/60.0 as elapsed_min, absorption_events, ts_signal AT TIME ZONE 'America/Sao_Paulo' as ts_brt FROM bounce_signals WHERE ts_signal > NOW() - INTERVAL '24 hours' ORDER BY ts_signal DESC LIMIT 30"),
+        ("Top10 vs WR", "SELECT CASE WHEN m.top10_holder_rate < 0.30 THEN '<30%' WHEN m.top10_holder_rate < 0.50 THEN '30-50%' WHEN m.top10_holder_rate < 0.65 THEN '50-65%' ELSE '>=65%' END as bucket, COUNT(*) as n, ROUND(AVG(CASE WHEN t.status='tp' THEN 1.0 ELSE 0 END)*100,1) as wr_pct FROM trades t JOIN migrations m ON m.mint=t.mint WHERE t.status IN ('tp','sl') GROUP BY 1 ORDER BY 1"),
+    ]
+
+    # Auth
+    key_ok = False
+    if secret:
+        key_param = request.args.get("key") or request.form.get("key", "")
+        key_ok = (key_param == secret)
+
+    sql = (request.args.get("sql") or request.form.get("sql", "")).strip()
+    fmt = request.args.get("fmt", "html")
+
+    # Sem secret configurado
+    if not secret:
+        return "<pre style='color:#f85149;background:#0d1117;padding:16px'>QUERY_SECRET não configurado no Railway.</pre>", 403
+
+    # Formulário (GET sem sql)
+    if not sql:
+        sc_html = "".join(
+            f"<span class='sc' onclick=\"document.getElementById('sql').value=`{s[1].replace('`','&grave;')}`\">{s[0]}</span>"
+            for s in SHORTCUTS
+        )
+        return f"""<!DOCTYPE html><html><head><meta charset='utf-8'><title>DB Query</title>{_CSS}</head><body>
+<h1>NeideBOT — SQL Console (read-only)</h1>
+<div class='row'>
+  <div><label>Senha</label><input type='password' id='key' value='' placeholder='QUERY_SECRET'></div>
+</div>
+<label style='margin-top:12px'>Query SQL (apenas SELECT / WITH / EXPLAIN)</label>
+<textarea id='sql' placeholder='SELECT COUNT(*) FROM trades'></textarea>
+<div class='shortcuts'>{sc_html}</div>
+<div class='row'>
+  <button onclick="run()">Executar</button>
+  <button onclick="runJson()" style='background:#1f6feb'>JSON</button>
+</div>
+<div id='result'></div>
+<script>
+function getSql(){{return document.getElementById('sql').value.trim()}}
+function getKey(){{return document.getElementById('key').value.trim()}}
+function run(){{
+  const url='/debug/query?key='+encodeURIComponent(getKey())+'&sql='+encodeURIComponent(getSql());
+  fetch(url).then(r=>r.text()).then(h=>document.getElementById('result').innerHTML=h);
+}}
+function runJson(){{
+  const url='/debug/query?fmt=json&key='+encodeURIComponent(getKey())+'&sql='+encodeURIComponent(getSql());
+  window.open(url,'_blank');
+}}
+document.addEventListener('keydown',e=>{{if((e.ctrlKey||e.metaKey)&&e.key==='Enter')run()}});
+</script>
+</body></html>"""
+
+    # Auth check
+    if not key_ok:
+        if fmt == "json":
+            return _json.dumps({"error": "key inválida"}), 403, {"Content-Type": "application/json"}
+        return f"{_CSS}<div class='err'>Senha incorreta.</div>", 403
+
+    # Valida statement
+    first_word = sql.split()[0].upper() if sql.split() else ""
+    if first_word not in ("SELECT", "WITH", "EXPLAIN"):
+        msg = f"Apenas SELECT/WITH/EXPLAIN permitido. Recebido: {first_word}"
+        if fmt == "json":
+            return _json.dumps({"error": msg}), 403, {"Content-Type": "application/json"}
+        return f"{_CSS}<div class='err'>{msg}</div>", 403
+
+    try:
+        with db._cursor() as cur:
+            cur.execute(sql)
+            cols = [d[0] for d in cur.description] if cur.description else []
+            raw_rows = cur.fetchall()
+
+        def _serialize(v):
+            if v is None: return None
+            if hasattr(v, "isoformat"): return v.isoformat()
+            return v
+
+        rows = [dict(zip(cols, [_serialize(v) for v in r])) for r in raw_rows]
+
+        if fmt == "json":
+            return _json.dumps({"n": len(rows), "cols": cols, "rows": rows}, ensure_ascii=False, indent=2), 200, {"Content-Type": "application/json"}
+
+        # Tabela HTML
+        if not rows:
+            return f"{_CSS}<div class='meta'>0 resultados.</div>"
+
+        th = "".join(f"<th>{c}</th>" for c in cols)
+        tbody = ""
+        for r in rows:
+            cells = ""
+            for c in cols:
+                v = r[c]
+                if v is None: vs, cls = "—", "style='color:#484f58'"
+                elif isinstance(v, float): vs, cls = f"{v:.4g}", ""
+                else: vs, cls = str(v), ""
+                cells += f"<td {cls}>{vs}</td>"
+            tbody += f"<tr>{cells}</tr>"
+
+        return f"""{_CSS}<div class='meta'>{len(rows)} linhas | Ctrl+Enter para executar</div>
+<table><thead><tr>{th}</tr></thead><tbody>{tbody}</tbody></table>"""
+
+    except Exception as e:
+        if fmt == "json":
+            return _json.dumps({"error": str(e)}), 500, {"Content-Type": "application/json"}
+        return f"{_CSS}<div class='err'>Erro: {e}</div>", 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
