@@ -13262,5 +13262,137 @@ document.addEventListener('keydown',e=>{{if((e.ctrlKey||e.metaKey)&&e.key==='Ent
         return _page("", sql_val=sql, msg=f"Erro: {e}")
 
 
+@app.route("/debug/fill-recovery")
+def debug_fill_recovery():
+    """Recupera entry_price_usd real para trades com NULL.
+
+    Fluxo:
+      1. Busca todas as assinaturas de tx da wallet via Helius getSignaturesForAddress
+      2. Para cada trade com entry_price_usd=NULL e order_id preenchido,
+         encontra a tx pelo timestamp (±120s) e token mint via get_swap_fill
+      3. Salva fill real no banco (fill_source='helius_recovery')
+      4. Retorna relatório completo
+
+    GET /debug/fill-recovery?dry=1  → simula sem salvar
+    GET /debug/fill-recovery        → executa e salva
+    """
+    import json as _json
+    dry_run = request.args.get("dry", "0") == "1"
+
+    if not helius_rpc.available():
+        return "<pre style='color:red'>HELIUS_RPC_URL não configurado.</pre>", 400
+
+    wallet = os.getenv("GMGN_WALLET_ADDRESS", "")
+    if not wallet:
+        return "<pre style='color:red'>GMGN_WALLET_ADDRESS não configurado.</pre>", 400
+
+    # 1. Busca até 1000 txs recentes da wallet
+    sigs_result = helius_rpc._rpc("getSignaturesForAddress", [wallet, {"limit": 1000}])
+    if not sigs_result:
+        return "<pre style='color:red'>Helius getSignaturesForAddress falhou.</pre>", 500
+
+    # Monta dict blockTime → lista de signatures
+    from collections import defaultdict
+    sigs_by_time = []  # lista de (blockTime, signature)
+    for entry in sigs_result:
+        sig  = entry.get("signature")
+        bt   = entry.get("blockTime")  # unix timestamp
+        if sig and bt:
+            sigs_by_time.append((int(bt), sig))
+    sigs_by_time.sort(key=lambda x: x[0])
+
+    # 2. Busca trades com entry_price_usd NULL e order_id preenchido
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT id, mint, symbol, amount_sol, amount_usd, created_at, order_id
+            FROM trades
+            WHERE entry_price_usd IS NULL
+              AND order_id IS NOT NULL
+              AND status NOT IN ('error','pending')
+            ORDER BY created_at
+        """)
+        trades = [dict(r) for r in cur.fetchall()]
+
+    sol_usd = gmgn.get_sol_usd() or 150.0
+
+    results  = []
+    fixed    = 0
+    failed   = 0
+    WINDOW   = 120  # segundos de tolerância em torno do created_at
+
+    for trade in trades:
+        ts_trade = trade["created_at"].timestamp()
+        mint     = trade["mint"]
+        tid      = trade["id"]
+        symbol   = trade["symbol"]
+        amt_sol  = trade.get("amount_sol") or 0
+
+        # Candidatos: sigs dentro da janela de ±WINDOW segundos
+        candidates = [(bt, sig) for bt, sig in sigs_by_time
+                      if abs(bt - ts_trade) <= WINDOW]
+
+        found = None
+        for bt, sig in sorted(candidates, key=lambda x: abs(x[0] - ts_trade)):
+            fill = helius_rpc.get_swap_fill(sig, mint)
+            if fill and fill.get("tokens_received", 0) > 0:
+                found = (sig, fill, bt)
+                break
+
+        if found:
+            sig, fill, bt = found
+            sol_spent = fill["sol_spent"] or amt_sol
+            tokens    = fill["tokens_received"]
+            fee_sol   = fill["fee_sol"]
+            slip      = (sol_spent - amt_sol) / amt_sol if amt_sol else 0.0
+
+            results.append({
+                "id": tid, "symbol": symbol, "status": "FIXED",
+                "sig": sig[:20] + "...",
+                "tokens": round(tokens, 2),
+                "sol_spent": round(sol_spent, 6),
+                "entry_usd": round(sol_spent * sol_usd, 4),
+                "slip_pct": round(slip * 100, 2),
+            })
+
+            if not dry_run:
+                db.update_trade(tid, {
+                    "tokens_received":    tokens,
+                    "entry_price_sol":    sol_spent / tokens if tokens else None,
+                    "entry_price_usd":    sol_spent * sol_usd,
+                    "fee_sol":            fee_sol,
+                    "slippage_pct":       slip,
+                    "fill_source":        "helius_recovery",
+                })
+            fixed += 1
+        else:
+            results.append({
+                "id": tid, "symbol": symbol, "status": "NOT_FOUND",
+                "candidates": len(candidates),
+            })
+            failed += 1
+
+    # HTML report
+    mode_label = "DRY RUN (nada salvo)" if dry_run else f"EXECUTADO — {fixed} trades corrigidos"
+    rows_html  = ""
+    for r in results:
+        color  = "#3fb950" if r["status"] == "FIXED" else "#f85149"
+        detail = (f"tokens={r.get('tokens')} sol={r.get('sol_spent')} "
+                  f"entry_usd=${r.get('entry_usd')} slip={r.get('slip_pct')}%"
+                  if r["status"] == "FIXED" else f"candidatos={r.get('candidates')}")
+        rows_html += f"<tr><td style='color:{color}'>{r['id']}</td><td>{r['symbol']}</td><td style='color:{color}'>{r['status']}</td><td>{detail}</td></tr>"
+
+    return f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<style>body{{background:#0d1117;color:#c9d1d9;font-family:monospace;font-size:12px;padding:16px}}
+h2{{color:#58a6ff}}table{{border-collapse:collapse;width:100%}}
+th{{background:#161b22;color:#8b949e;padding:5px 8px;text-align:left}}
+td{{padding:4px 8px;border-bottom:1px solid #21262d}}</style></head><body>
+<h2>Fill Recovery — {mode_label}</h2>
+<p style='color:#8b949e'>Wallet: {wallet[:16]}... | Txs Helius: {len(sigs_by_time)} | Trades NULL: {len(trades)} | Fixed: {fixed} | Not found: {failed}</p>
+{'<p style="color:#d29922">⚠️ DRY RUN — adicione sem ?dry=1 para salvar</p>' if dry_run else ''}
+<table><thead><tr><th>ID</th><th>Symbol</th><th>Status</th><th>Detalhe</th></tr></thead>
+<tbody>{rows_html}</tbody></table>
+</body></html>"""
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
