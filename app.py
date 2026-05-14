@@ -14967,5 +14967,305 @@ def analise_sl_otimo():
     return "".join(out)
 
 
+@app.route("/analise/sl-timing")
+def analise_sl_timing():
+    """
+    Pergunta central: o SL está disparando em spikes passageiros do pAMM?
+    Para cada trade com exit_type='helius_sell_recovery', analisamos:
+    1. Quantos ticks consecutivos ficaram abaixo do threshold SL antes da saída?
+    2. Para TPs que tiveram drawdown profundo: quantos ticks intra-trade cruzaram SL?
+    3. Para SLs-continued vs SLs-recovered: há diferença no padrão de ticks?
+    """
+    import traceback as _tb
+    _f = lambda v: float(v) if v is not None else 0.0
+
+    NAV = """<nav style='font-family:monospace;padding:8px;background:#161b22;margin-bottom:16px'>
+    <a href='/analise/big-picture' style='color:#58a6ff;margin-right:16px'>Big Picture</a>
+    <a href='/analise/correlacao' style='color:#58a6ff;margin-right:16px'>Correlação</a>
+    <a href='/analise/sl-otimo' style='color:#58a6ff;margin-right:16px'>SL Ótimo</a>
+    <a href='/analise/sl-timing' style='color:#58a6ff'>SL Timing</a>
+    </nav>"""
+
+    CSS = """<style>
+    body{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:16px}
+    h2{color:#f0f6fc}h3{color:#58a6ff}
+    table{border-collapse:collapse;width:100%;margin:12px 0}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;text-align:left}
+    td{padding:5px 10px;border-bottom:1px solid #21262d}
+    tr:hover td{background:#161b22}
+    .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:14px;margin:10px 0}
+    .green{color:#3fb950}.red{color:#f85149}.yellow{color:#e3b341}.dim{color:#8b949e}
+    </style>"""
+
+    out = [f"<html><head><title>SL Timing</title>{CSS}</head><body>{NAV}"]
+    out.append("<h2>⏱️ SL Timing — O SL está disparando em spikes passageiros?</h2>")
+
+    try:
+        with db._cursor() as cur:
+
+            # ── Query principal: por trade, contar ticks abaixo do SL threshold ──
+            # Para cada trade verificado na blockchain, olha os token_ticks
+            # e conta quantos ticks consecutivos (a partir do ts_signal) estiveram
+            # abaixo do threshold do SL. O GMGN condition_order executa em segundos —
+            # se o preço ficou <30s abaixo do threshold, foi spike. Se ficou >60s, foi real.
+            cur.execute("""
+                WITH entry_data AS (
+                    SELECT
+                        t.id, t.mint, t.symbol, t.status, t.pnl_pct_real,
+                        t.ts_signal, t.exit_ts,
+                        COALESCE(t.sl_pct, 0.25) AS sl_pct_config,
+                        COALESCE(t.tp_pct, 0.75) AS tp_pct_config,
+                        COALESCE(
+                            CASE WHEN t.entry_price_usd > 0 AND t.tokens_received > 0
+                                 THEN t.entry_price_usd / t.tokens_received * 1e9 END,
+                            t.entry_expected
+                        ) AS entry_mc
+                    FROM trades t
+                    WHERE t.exit_type = 'helius_sell_recovery'
+                      AND t.ts_signal IS NOT NULL
+                ),
+                -- Classificação de recuperação (mesma lógica do correlação)
+                sl_recovery AS (
+                    SELECT
+                        e.id,
+                        MAX(COALESCE(tt.mc_high, tt.mc)) AS max_mc_60m
+                    FROM entry_data e
+                    JOIN token_ticks tt ON tt.mint = e.mint
+                        AND tt.tick_ts > e.exit_ts
+                        AND tt.tick_ts <= e.exit_ts + INTERVAL '60 min'
+                    WHERE e.status = 'sl' AND e.exit_ts IS NOT NULL
+                    GROUP BY e.id
+                ),
+                -- Para cada trade, ticks abaixo do SL threshold
+                ticks_below_sl AS (
+                    SELECT
+                        e.id,
+                        e.entry_mc * (1.0 - e.sl_pct_config) AS sl_threshold,
+                        COUNT(*) FILTER (
+                            WHERE COALESCE(tt.mc_low, tt.mc) < e.entry_mc * (1.0 - e.sl_pct_config)
+                              AND tt.tick_ts >= e.ts_signal
+                              AND tt.tick_ts <= COALESCE(e.exit_ts, e.ts_signal + INTERVAL '60 min')
+                        ) AS n_ticks_below_sl,
+                        COUNT(*) FILTER (
+                            WHERE tt.tick_ts >= e.ts_signal
+                              AND tt.tick_ts <= COALESCE(e.exit_ts, e.ts_signal + INTERVAL '60 min')
+                        ) AS n_ticks_total,
+                        MIN(tt.tick_ts) FILTER (
+                            WHERE COALESCE(tt.mc_low, tt.mc) < e.entry_mc * (1.0 - e.sl_pct_config)
+                              AND tt.tick_ts >= e.ts_signal
+                        ) AS first_tick_below_sl,
+                        MAX(COALESCE(tt.mc_low, tt.mc)) FILTER (
+                            WHERE tt.tick_ts >= e.ts_signal
+                              AND tt.tick_ts <= COALESCE(e.exit_ts, e.ts_signal + INTERVAL '60 min')
+                        ) AS max_mc_intra
+                    FROM entry_data e
+                    JOIN token_ticks tt ON tt.mint = e.mint
+                        AND tt.tick_ts >= e.ts_signal
+                        AND tt.tick_ts <= COALESCE(e.exit_ts, e.ts_signal + INTERVAL '60 min') + INTERVAL '5 min'
+                    GROUP BY e.id, e.entry_mc, e.sl_pct_config, e.ts_signal, e.exit_ts
+                )
+                SELECT
+                    e.*,
+                    tb.n_ticks_below_sl,
+                    tb.n_ticks_total,
+                    tb.sl_threshold,
+                    tb.max_mc_intra,
+                    EXTRACT(EPOCH FROM (tb.first_tick_below_sl - e.ts_signal)) / 60.0 AS min_to_first_breach,
+                    -- Duração estimada abaixo do SL (n_ticks × ~30s)
+                    tb.n_ticks_below_sl * 30 AS estimated_sec_below_sl,
+                    sr.max_mc_60m,
+                    -- Classificação de recuperação para SLs
+                    CASE
+                        WHEN e.status = 'tp' THEN 'tp'
+                        WHEN e.status != 'sl' THEN e.status
+                        WHEN sr.max_mc_60m IS NULL THEN 'sem_dados'
+                        WHEN sr.max_mc_60m >= e.entry_mc * (1 + e.tp_pct_config * 0.9) THEN 'hit_tp'
+                        WHEN sr.max_mc_60m >= e.entry_mc * 1.20 THEN 'parcial_20pct'
+                        WHEN sr.max_mc_60m >= e.entry_mc * 0.97 THEN 'breakeven'
+                        ELSE 'continuou_caindo'
+                    END AS recovery_class
+                FROM entry_data e
+                LEFT JOIN ticks_below_sl tb ON tb.id = e.id
+                LEFT JOIN sl_recovery sr ON sr.id = e.id
+                ORDER BY e.status, e.pnl_pct_real DESC
+            """)
+            rows = cur.fetchall()
+
+        tp_rows = [r for r in rows if r['status'] == 'tp']
+        sl_rows = [r for r in rows if r['status'] == 'sl']
+        sl_recovered = [r for r in sl_rows if r['recovery_class'] in ('hit_tp', 'parcial_20pct', 'breakeven')]
+        sl_continued = [r for r in sl_rows if r['recovery_class'] == 'continuou_caindo']
+
+        # ── Seção 1: Distribuição de ticks abaixo do SL para TPs ──
+        out.append("<h3>1 — TPs: quantos ticks ficaram abaixo do threshold SL?</h3>")
+        out.append("""<div class='card'>
+        <b>Hipótese do spike:</b> se o pAMM criou um spike de -25% que durou <30s,
+        token_ticks (30s) <i>pode</i> capturá-lo como mc_low mas o GMGN condition_order
+        só executa se o preço sustentado cruzou o threshold. Se n_ticks_below_sl = 1,
+        provavelmente foi spike. Se ≥ 2, o preço ficou abaixo por ≥60s — GMGN dispararia.
+        </div>""")
+
+        tp_with_ticks = [r for r in tp_rows if r['n_ticks_total'] is not None and _f(r['n_ticks_total']) > 0]
+        tp_zero_breach = [r for r in tp_with_ticks if _f(r['n_ticks_below_sl']) == 0]
+        tp_one_breach = [r for r in tp_with_ticks if _f(r['n_ticks_below_sl']) == 1]
+        tp_two_breach = [r for r in tp_with_ticks if _f(r['n_ticks_below_sl']) == 2]
+        tp_three_plus = [r for r in tp_with_ticks if _f(r['n_ticks_below_sl']) >= 3]
+
+        out.append("<table><tr><th>Ticks abaixo SL threshold</th><th>n TPs</th><th>%</th><th>Interpretação</th><th>Avg drawdown vs entry</th></tr>")
+        for label, grp, interp in [
+            ("0 ticks (sem breach)", tp_zero_breach, "SL nunca seria disparado por esse threshold"),
+            ("1 tick (~30s de exposição)", tp_one_breach, "⚠️ SPIKE SUSPEITO — talvez GMGN não disparasse"),
+            ("2 ticks (~60s de exposição)", tp_two_breach, "🔴 GMGN provavelmente teria disparado"),
+            ("≥3 ticks (≥90s de exposição)", tp_three_plus, "🔴 GMGN certamente teria disparado"),
+        ]:
+            if not tp_with_ticks:
+                pct = 0
+                avg_dd = 0
+            else:
+                pct = len(grp) / len(tp_with_ticks) * 100
+                dds = []
+                for r in grp:
+                    if r['sl_threshold'] and r['max_mc_intra'] and _f(r['entry_mc']) > 0:
+                        # min intra = sl_threshold seria the binding constraint
+                        pass
+                    if r['pnl_pct_real']:
+                        dds.append(_f(r['pnl_pct_real']))
+                avg_dd = sum(dds) / len(dds) if dds else 0
+            color = "green" if "0 ticks" in label else ("yellow" if "1 tick" in label else "red")
+            out.append(f"<tr><td class='{color}'>{label}</td><td>{len(grp)}</td><td>{pct:.1f}%</td><td>{interp}</td><td>{avg_dd:+.1f}%</td></tr>")
+        out.append("</table>")
+
+        # ── Tabela detalhada dos TPs que tiveram breach ──
+        tp_with_breach = [r for r in tp_with_ticks if _f(r['n_ticks_below_sl']) > 0]
+        if tp_with_breach:
+            out.append("<b>TPs que cruzaram o threshold SL (candidatos a SL widening):</b>")
+            out.append("<table><tr><th>Token</th><th>P&L</th><th>Ticks abaixo SL</th><th>Seg estimados</th><th>Min até 1ª breach</th><th>Conclusão</th></tr>")
+            for r in sorted(tp_with_breach, key=lambda x: -_f(x['n_ticks_below_sl'])):
+                n_below = int(_f(r['n_ticks_below_sl']))
+                est_sec = n_below * 30
+                min_to = _f(r['min_to_first_breach'])
+                pnl = _f(r['pnl_pct_real']) * 100
+                conclusao = "GMGN certamente teria cortado" if n_below >= 3 else ("GMGN provavelmente cortaria" if n_below >= 2 else "⚠️ Possível spike — GMGN pode não ter cortado")
+                color = "red" if n_below >= 2 else "yellow"
+                out.append(f"<tr><td>{r['symbol']}</td><td class='green'>{pnl:+.1f}%</td><td class='{color}'>{n_below}</td><td>{est_sec}s</td><td>{min_to:.1f}min</td><td class='{color}'>{conclusao}</td></tr>")
+            out.append("</table>")
+
+        # ── Seção 2: SLs-recovered — quantos ticks ficaram abaixo? ──
+        out.append("<h3>2 — SLs Recuperados: padrão de ticks vs SLs que continuaram caindo</h3>")
+        out.append("<p class='dim'>Se SLs-recovered tiveram menos ticks abaixo do threshold que SLs-continued, confirma spike hypothesis: GMGN disparou em preço de spike, não em preço sustentado.</p>")
+
+        def _ticks_stats(group):
+            with_data = [r for r in group if r['n_ticks_below_sl'] is not None]
+            if not with_data:
+                return "sem dados"
+            vals = [_f(r['n_ticks_below_sl']) for r in with_data]
+            zero = sum(1 for v in vals if v == 0)
+            one = sum(1 for v in vals if v == 1)
+            two_plus = sum(1 for v in vals if v >= 2)
+            avg = sum(vals) / len(vals)
+            return f"avg={avg:.1f} | 0 ticks={zero} | 1 tick={one} | ≥2={two_plus} (n={len(with_data)})"
+
+        out.append("<table><tr><th>Grupo</th><th>n</th><th>Distribuição ticks abaixo SL</th></tr>")
+        out.append(f"<tr><td class='green'>TPs (referência)</td><td>{len(tp_rows)}</td><td>{_ticks_stats(tp_rows)}</td></tr>")
+        out.append(f"<tr><td class='yellow'>SLs Recuperados</td><td>{len(sl_recovered)}</td><td>{_ticks_stats(sl_recovered)}</td></tr>")
+        out.append(f"<tr><td class='red'>SLs Continuaram</td><td>{len(sl_continued)}</td><td>{_ticks_stats(sl_continued)}</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 3: Simulação de time-gate ──
+        # Se adicionarmos um filtro: "não dispara SL se n_ticks_below_sl < 2",
+        # quantos trades seriam afetados?
+        out.append("<h3>3 — Simulação: Time-Gate no SL (mínimo N ticks abaixo do threshold)</h3>")
+        out.append("""<div class='card'>
+        <b>Ideia:</b> ao invés de disparar SL imediatamente quando o preço cai X%,
+        aguarda N ticks consecutivos abaixo do threshold antes de executar.
+        N ticks × ~30s = janela mínima de confirmação.<br><br>
+        <b>Limitação crítica:</b> GMGN condition_orders executam em segundos via WebSocket —
+        não há como adicionar delay no GMGN. Esta análise é hipotética para Jupiter swap (roadmap).
+        </div>""")
+
+        avg_tp_pnl = 0.893
+        avg_sl_pnl = -0.243  # avg real dos SLs blockchain
+
+        for min_ticks in [1, 2, 3, 4]:
+            # TPs que não seriam cortados (n_ticks_below_sl < min_ticks)
+            tp_saved = [r for r in tp_rows if _f(r['n_ticks_below_sl']) < min_ticks]
+            tp_cut = [r for r in tp_rows if _f(r['n_ticks_below_sl']) >= min_ticks]
+            # SLs que "chegariam" a esses N ticks (provavelmente sim para a maioria)
+            # SLs que não teriam ticks suficientes (raros — esses seriam "salvos" mas provavelmente ruim)
+            sl_not_reached = [r for r in sl_rows if _f(r['n_ticks_below_sl']) < min_ticks]
+            sl_reached = [r for r in sl_rows if _f(r['n_ticks_below_sl']) >= min_ticks]
+
+            n_total = len(rows)
+            # EV hipotético
+            n_tp_s = len(tp_saved)
+            n_tp_c = len(tp_cut)  # estes seriam cortados mesmo
+            n_sl_nr = len(sl_not_reached)  # estes seriam "mantidos" — a maioria continuaria caindo
+            n_sl_r = len(sl_reached)
+
+            # Dos sl_not_reached, quantos são recovered vs continued?
+            sl_nr_rec = [r for r in sl_not_reached if r['recovery_class'] in ('hit_tp', 'parcial_20pct', 'breakeven')]
+            sl_nr_cont = [r for r in sl_not_reached if r['recovery_class'] == 'continuou_caindo']
+
+            est_pnl_tp_s = n_tp_s * avg_tp_pnl * 100
+            est_pnl_tp_c = n_tp_c * avg_sl_pnl * 100  # cortados no SL
+            est_pnl_sl_nr_rec = len(sl_nr_rec) * avg_tp_pnl * 100  # salvos e recuperaram
+            est_pnl_sl_nr_cont = len(sl_nr_cont) * (-0.50) * 100  # continuaram — perda maior
+            est_pnl_sl_r = n_sl_r * avg_sl_pnl * 100  # SLs normais
+
+            total_pnl = est_pnl_tp_s + est_pnl_tp_c + est_pnl_sl_nr_rec + est_pnl_sl_nr_cont + est_pnl_sl_r
+            ev_per_trade = total_pnl / n_total if n_total > 0 else 0
+
+            color = "green" if ev_per_trade > 0 else "red"
+            label = f"≥{min_ticks} tick{'s' if min_ticks > 1 else ''} (~{min_ticks*30}s)"
+            out.append(f"""<div class='card'>
+            <b>Time-gate: {label} abaixo do threshold antes de disparar SL</b><br>
+            TPs salvos: <span class='green'>{n_tp_s}</span> | TPs que seriam cortados: <span class='red'>{n_tp_c}</span><br>
+            SLs sem confirmação suficiente (mantidos): {n_sl_nr} ({len(sl_nr_rec)} recuperaram / {len(sl_nr_cont)} continuaram caindo)<br>
+            SLs normais (confirmados): {n_sl_r}<br>
+            <b>EV estimado/trade: <span class='{color}'>{ev_per_trade:+.2f}%</span></b>
+            </div>""")
+
+        # ── Seção 4: Análise por token — casos extremos ──
+        out.append("<h3>4 — Tabela Completa: Todos os TPs com dados de timing</h3>")
+        out.append("<table><tr><th>Token</th><th>Status</th><th>P&L</th><th>Ticks total</th><th>Ticks abaixo SL</th><th>Seg abaixo SL</th><th>Min até breach</th><th>Spike?</th></tr>")
+        for r in tp_rows:
+            if r['n_ticks_total'] is None:
+                continue
+            n_total_t = int(_f(r['n_ticks_total']))
+            n_below = int(_f(r['n_ticks_below_sl']))
+            est_sec = n_below * 30
+            pnl = _f(r['pnl_pct_real']) * 100
+            min_to = _f(r['min_to_first_breach'])
+            is_spike = "⚠️ possível spike" if n_below == 1 else ("🔴 NÃO spike" if n_below >= 2 else "✅ sem breach")
+            out.append(f"<tr><td>{r['symbol']}</td><td class='green'>{r['status']}</td><td class='green'>{pnl:+.1f}%</td><td>{n_total_t}</td><td>{n_below}</td><td>{est_sec}s</td><td>{min_to:.1f}min</td><td>{is_spike}</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 5: Diagnóstico Final ──
+        out.append("<h3>5 — Diagnóstico Final</h3>")
+        tp_spike_candidates = [r for r in tp_rows if r['n_ticks_total'] is not None and _f(r['n_ticks_below_sl']) == 1]
+        tp_definite_cut = [r for r in tp_rows if r['n_ticks_total'] is not None and _f(r['n_ticks_below_sl']) >= 2]
+        tp_no_breach = [r for r in tp_rows if r['n_ticks_total'] is not None and _f(r['n_ticks_below_sl']) == 0]
+
+        out.append(f"""<div class='card'>
+        <b>Resumo para TPs ({len(tp_rows)} total, {len([r for r in tp_rows if r['n_ticks_total'] is not None])} com dados de ticks):</b><br>
+        • <span class='green'>{len(tp_no_breach)} TPs</span> nunca cruzaram o threshold SL → esses são safe com qualquer SL da largura atual<br>
+        • <span class='yellow'>{len(tp_spike_candidates)} TPs</span> cruzaram apenas 1 tick (~30s) → possíveis spikes do pAMM que reverteram rapidamente<br>
+        • <span class='red'>{len(tp_definite_cut)} TPs</span> cruzaram ≥2 ticks (~60s+) → GMGN <b>provavelmente teria cortado</b> esses como SL antes de atingir TP<br><br>
+
+        <b>Implicação crítica:</b> Se {len(tp_definite_cut)} TPs teriam sido cortados mesmo com SL atual configurado,
+        significa que eles <i>foram</i> cortados como SLs em trades anteriores e não aparecem nesse dataset como TPs.
+        Os {len(tp_rows)} TPs que temos são os que <b>sobreviveram</b> ao threshold — viés de sobrevivência.<br><br>
+
+        <b>Para Jupiter swap (roadmap):</b> time-gate de 2 ticks (~60s) salvaria os {len(tp_spike_candidates)} possíveis spikes
+        sem comprometer muito a proteção. Mas não resolve os {len(sl_continued)} SLs que genuinamente continuaram caindo.
+        </div>""")
+
+    except Exception:
+        out.append(f"<pre style='color:#f85149'>{_tb.format_exc()}</pre>")
+
+    out.append("</body></html>")
+    return "".join(out)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
