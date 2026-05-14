@@ -13490,7 +13490,7 @@ td{padding:4px 8px;border-bottom:1px solid #21262d}
                 """)
                 status_rows = cur.fetchall()
 
-            status_html = " | ".join(f"{r[0]}={r[1]}(sem_exit={r[2]})" for r in status_rows)
+            status_html = " | ".join(f"{r['status']}={r['n']}(sem_exit={r['sem_exit']})" for r in status_rows)
             yield log(f"<b>Estado do banco:</b> {status_html}")
 
             # ── 2. Carrega trades que precisam de exit ──────────────────────
