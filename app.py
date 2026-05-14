@@ -13263,7 +13263,7 @@ document.addEventListener('keydown',e=>{{if((e.ctrlKey||e.metaKey)&&e.key==='Ent
 
 
 @app.route("/debug/fill-recovery")
-def debug_fill_recovery():
+def debug_fill_recovery():  # noqa: C901
     """Recupera entry_price_usd real para trades com NULL.
 
     Fluxo:
@@ -13276,10 +13276,11 @@ def debug_fill_recovery():
     GET /debug/fill-recovery?dry=1  → simula sem salvar
     GET /debug/fill-recovery        → executa e salva
     """
-    import json as _json
+    import json as _json, helius_rpc as _helius
+    from gmgn_client import get_sol_usd as _get_sol_usd
     dry_run = request.args.get("dry", "0") == "1"
 
-    if not helius_rpc.available():
+    if not _helius.available():
         return "<pre style='color:red'>HELIUS_RPC_URL não configurado.</pre>", 400
 
     wallet = os.getenv("GMGN_WALLET_ADDRESS", "")
@@ -13287,7 +13288,7 @@ def debug_fill_recovery():
         return "<pre style='color:red'>GMGN_WALLET_ADDRESS não configurado.</pre>", 400
 
     # 1. Busca até 1000 txs recentes da wallet
-    sigs_result = helius_rpc._rpc("getSignaturesForAddress", [wallet, {"limit": 1000}])
+    sigs_result = _helius._rpc("getSignaturesForAddress", [wallet, {"limit": 1000}])
     if not sigs_result:
         return "<pre style='color:red'>Helius getSignaturesForAddress falhou.</pre>", 500
 
@@ -13313,7 +13314,7 @@ def debug_fill_recovery():
         """)
         trades = [dict(r) for r in cur.fetchall()]
 
-    sol_usd = gmgn.get_sol_usd() or 150.0
+    sol_usd = _get_sol_usd() or 150.0
 
     results  = []
     fixed    = 0
@@ -13333,7 +13334,7 @@ def debug_fill_recovery():
 
         found = None
         for bt, sig in sorted(candidates, key=lambda x: abs(x[0] - ts_trade)):
-            fill = helius_rpc.get_swap_fill(sig, mint)
+            fill = _helius.get_swap_fill(sig, mint)
             if fill and fill.get("tokens_received", 0) > 0:
                 found = (sig, fill, bt)
                 break
