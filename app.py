@@ -16416,5 +16416,392 @@ def analise_sl_timing():
     return "".join(out)
 
 
+@app.route("/analise/token-outcome")
+def analise_token_outcome():
+    """
+    Separa qualidade do SINAL (o que o token realmente fez após migração)
+    da qualidade da EXECUÇÃO (SL/TP configurado).
+
+    Os 201 trades misturam ~10 configurações de estratégia diferentes.
+    Aqui cruzamos cada trade com o outcome real do token nas migrations:
+    - O token recuperou (recovery=TRUE)?
+    - Qual foi o mc_1h vs mc_migration?
+    - Para SLs: o token subiu depois que saímos?
+    - Para TPs: o token foi muito além do nosso TP?
+    """
+    import traceback as _tb
+    _f = lambda v: float(v) if v is not None else 0.0
+
+    CSS = """<style>
+    body{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:16px}
+    h2{color:#f0f6fc}h3{color:#58a6ff;margin-top:24px}
+    table{border-collapse:collapse;width:100%;margin:12px 0}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;text-align:left;font-size:11px;text-transform:uppercase}
+    td{padding:5px 10px;border-bottom:1px solid #21262d;font-size:12px}
+    tr:hover td{background:#161b22}
+    .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:14px;margin:10px 0}
+    .green{color:#3fb950}.red{color:#f85149}.yellow{color:#e3b341}.dim{color:#8b949e}
+    .b-green{background:#0d2b0d}.b-red{background:#2b0d0d}.b-yellow{background:#2b2200}
+    a{color:#58a6ff;text-decoration:none}
+    </style>"""
+
+    NAV = """<nav style='font-family:monospace;padding:8px;background:#161b22;margin-bottom:16px'>
+    <a href='/analise/token-outcome' style='color:#e3b341'>Token Outcome</a> &nbsp;|&nbsp;
+    <a href='/analise/combinacoes' style='color:#58a6ff'>Combinações</a> &nbsp;|&nbsp;
+    <a href='/analise/entrada' style='color:#58a6ff'>Entrada</a>
+    </nav>"""
+
+    out = [f"<html><head><title>Token Outcome</title>{CSS}</head><body>{NAV}"]
+    out.append("<h2>📊 Qualidade do Sinal vs Qualidade da Execução</h2>")
+    out.append("""<div class='card'>
+    <b>Pergunta central:</b> Dos 201 trades, quantos tinham sinal genuíno (token recuperou)?<br>
+    Se o token recuperou mas tomamos SL → problema de <b>execução</b> (SL muito apertado, spike do pAMM).<br>
+    Se o token não recuperou e tomamos SL → sinal ruim, <b>filtros precisam melhorar</b>.<br>
+    Se o token recuperou e batemos TP → execução correta.<br>
+    Se o token não recuperou mas batemos TP → sorte (saímos antes do dump continuar).<br><br>
+    <b>recovery = mc_1h &gt; mc_bottom × 1.3</b> (definição do banco — token subiu 30%+ do fundo em 1h).<br>
+    <b>var_1h</b> = variação do mc em 1h vs mc_migration (resultado real do token após 1h).
+    </div>""")
+
+    try:
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT
+                    t.id, t.mint, t.symbol, t.status, t.pnl_pct_real,
+                    t.ts_signal, t.exit_ts, t.entry_expected,
+                    t.entry_price_usd, t.tokens_received,
+                    COALESCE(t.tp_pct, 0.75) AS tp_pct,
+                    COALESCE(t.sl_pct, 0.25) AS sl_pct,
+                    COALESCE(
+                        CASE WHEN t.entry_price_usd > 0 AND t.tokens_received > 0
+                             THEN t.entry_price_usd / t.tokens_received * 1e9 END,
+                        t.entry_expected
+                    ) AS entry_mc,
+                    -- Token outcome (o que o token realmente fez)
+                    m.mc_migration,
+                    m.mc_bottom,
+                    m.mc_peak,
+                    m.mc_1h,
+                    m.var_1h,
+                    m.recovery,
+                    m.time_to_bottom,
+                    m.time_to_peak,
+                    m.pct_drop,
+                    m.pct_gain AS m_pct_gain,
+                    -- Signals
+                    m.smart_wallets,
+                    m.creator_token_status,
+                    m.exchange,
+                    -- Bounce metadata
+                    bs.bounce_pct,
+                    bs.elapsed_sec,
+                    bs.mc_at_signal,
+                    bs.mc_min AS bs_mc_min
+                FROM trades t
+                LEFT JOIN migrations m ON m.mint = t.mint
+                LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+                WHERE t.exit_type = 'helius_sell_recovery'
+                  AND t.ts_signal IS NOT NULL
+                ORDER BY t.ts_signal
+            """)
+            rows = cur.fetchall()
+
+        n_all = len(rows)
+
+        # Enrich rows
+        enriched = []
+        for r in rows:
+            entry_mc = _f(r['entry_mc'])
+            mc_mig = _f(r['mc_migration'])
+            mc_bot = _f(r['mc_bottom'])
+            mc_1h = _f(r['mc_1h'])
+            mc_peak = _f(r['mc_peak'])
+
+            is_tp = r['status'] == 'tp'
+            token_recovered = bool(r['recovery'])
+
+            # Drop depth: how far the token fell from migration price
+            drop_depth = mc_bot / mc_mig if mc_mig > 10000 and mc_bot > 0 else None
+            # var_1h: token price at 1h vs migration
+            var_1h_pct = ((mc_1h / mc_mig) - 1) * 100 if mc_mig > 10000 and mc_1h > 0 else None
+            # mc_peak as % of migration
+            peak_ratio = mc_peak / mc_mig if mc_mig > 10000 and mc_peak > 0 else None
+
+            # 4 outcome quadrants
+            if is_tp and token_recovered:
+                quadrant = "TP_RECOV"  # TP + token recovered = ideal
+            elif is_tp and not token_recovered:
+                quadrant = "TP_NORECP"  # TP + token didn't recover = lucky exit
+            elif not is_tp and token_recovered:
+                quadrant = "SL_RECOV"   # SL + token recovered = execution failure
+            else:
+                quadrant = "SL_NORECP"  # SL + token didn't recover = bad signal
+
+            ts_signal = r['ts_signal']
+            # Strategy period based on ts_signal date
+            if ts_signal:
+                day = ts_signal.date()
+                from datetime import date as _date
+                if day < _date(2026, 5, 7):
+                    period = "Pre-calibração (<May7)"
+                elif day < _date(2026, 5, 9):
+                    period = "Calibração (May7-8)"
+                elif day < _date(2026, 5, 11):
+                    period = "Pós-calibração (May9-10)"
+                elif day < _date(2026, 5, 13):
+                    period = "Filtros A.6+A.7 (May11-12)"
+                else:
+                    period = "Recente (May13+)"
+            else:
+                period = "Desconhecido"
+
+            enriched.append({**dict(r),
+                'entry_mc': entry_mc, 'mc_mig': mc_mig, 'mc_bot': mc_bot,
+                'mc_1h': mc_1h, 'mc_peak': mc_peak,
+                'is_tp': is_tp, 'token_recovered': token_recovered,
+                'drop_depth': drop_depth, 'var_1h_pct': var_1h_pct,
+                'peak_ratio': peak_ratio, 'quadrant': quadrant,
+                'period': period,
+                'bounce': _f(r['bounce_pct']),
+                'elapsed_min': _f(r['elapsed_sec']) / 60.0,
+                'smart': int(_f(r['smart_wallets'])),
+            })
+
+        has_mig = [r for r in enriched if r['mc_mig'] > 10000]
+        n_mig = len(has_mig)
+        n_recov_tokens = sum(1 for r in has_mig if r['token_recovered'])
+        n_tp = sum(1 for r in enriched if r['is_tp'])
+
+        # ── Seção 1: Os 4 Quadrantes ──
+        out.append("<h3>1 — Os 4 Quadrantes: Sinal × Execução</h3>")
+
+        q_counts = {}
+        for r in has_mig:
+            q = r['quadrant']
+            q_counts[q] = q_counts.get(q, 0) + 1
+
+        q_labels = {
+            "TP_RECOV":  ("✅ TP + Token Recuperou",  "green",   "Sinal bom, execução correta"),
+            "TP_NORECP": ("⚡ TP + Token Não Recuperou", "yellow", "Saímos antes do dump — sorte ou execução rápida"),
+            "SL_RECOV":  ("⚠️ SL + Token Recuperou",  "red",    "EXECUÇÃO FALHOU: SL muito apertado ou spike pAMM"),
+            "SL_NORECP": ("❌ SL + Token Não Recuperou", "dim",  "Sinal ruim — filtros precisam bloquear esse token"),
+        }
+
+        out.append("<table><tr><th>Quadrante</th><th>n</th><th>%</th><th>Interpretação</th></tr>")
+        for q_key in ["TP_RECOV", "TP_NORECP", "SL_RECOV", "SL_NORECP"]:
+            n = q_counts.get(q_key, 0)
+            pct = n / n_mig * 100 if n_mig else 0
+            label, color, interp = q_labels[q_key]
+            out.append(f"<tr><td class='{color}'>{label}</td><td>{n}</td><td>{pct:.0f}%</td><td class='dim'>{interp}</td></tr>")
+        out.append(f"<tr><td class='dim'><i>Sem dados migrations</i></td><td>{n_all - n_mig}</td><td>{(n_all-n_mig)/n_all*100:.0f}%</td><td class='dim'>mint não encontrado nas migrations</td></tr>")
+        out.append("</table>")
+
+        # Key diagnostic
+        sl_recov = [r for r in has_mig if r['quadrant'] == 'SL_RECOV']
+        sl_norecov = [r for r in has_mig if r['quadrant'] == 'SL_NORECP']
+        tp_recov = [r for r in has_mig if r['quadrant'] == 'TP_RECOV']
+        tp_norecov = [r for r in has_mig if r['quadrant'] == 'TP_NORECP']
+
+        pct_sl_recov = len(sl_recov) / n_mig * 100 if n_mig else 0
+        pct_sl_norecov = len(sl_norecov) / n_mig * 100 if n_mig else 0
+        pct_tokens_with_recov = n_recov_tokens / n_mig * 100 if n_mig else 0
+
+        out.append(f"""<div class='card'>
+        <b>Diagnóstico principal ({n_mig} trades com dados de migration):</b><br>
+        • <span class='yellow'>{pct_tokens_with_recov:.0f}%</span> dos tokens negociados <b>realmente recuperaram</b> (recovery=TRUE no banco)<br>
+        • <span class='red'>{pct_sl_recov:.0f}%</span> são <b>falhas de execução</b> (token recuperou mas tomamos SL — problema de SL/spike)<br>
+        • <span class='dim'>{pct_sl_norecov:.0f}%</span> são <b>sinais ruins</b> (token não recuperou → filtros precisam melhorar)<br><br>
+        <b>Implicação:</b> Se {pct_sl_recov:.0f}% são falhas de execução e {pct_sl_norecov:.0f}% são sinais ruins,
+        o maior ganho potencial vem de {'execução (SL/spike)' if pct_sl_recov > pct_sl_norecov else 'filtros de sinal'}.
+        </div>""")
+
+        # ── Seção 2: Por Período de Estratégia ──
+        out.append("<h3>2 — Breakdown por Período de Estratégia</h3>")
+        out.append("""<div class='card'>
+        Os 201 trades foram executados com ~10 configurações diferentes. Para entender se os filtros ajudaram,
+        comparamos o <b>outcome do token</b> (recovery rate) e o <b>outcome da carteira</b> (WR) por período.
+        </div>""")
+
+        periods_order = [
+            "Pre-calibração (<May7)",
+            "Calibração (May7-8)",
+            "Pós-calibração (May9-10)",
+            "Filtros A.6+A.7 (May11-12)",
+            "Recente (May13+)",
+        ]
+        period_data = {}
+        for r in has_mig:
+            p = r['period']
+            if p not in period_data:
+                period_data[p] = []
+            period_data[p].append(r)
+
+        out.append("<table><tr><th>Período</th><th>n trades</th><th>WR carteira</th><th>Token recovery rate</th><th>SL+recov (exec fail)</th><th>SL+no-recov (bad signal)</th><th>Var 1h mediana</th></tr>")
+        for period in periods_order:
+            grp = period_data.get(period, [])
+            if not grp:
+                continue
+            n = len(grp)
+            wr = sum(1 for r in grp if r['is_tp']) / n * 100
+            tok_recov = sum(1 for r in grp if r['token_recovered']) / n * 100
+            sl_r = sum(1 for r in grp if r['quadrant'] == 'SL_RECOV') / n * 100
+            sl_n = sum(1 for r in grp if r['quadrant'] == 'SL_NORECP') / n * 100
+            var1h_vals = [r['var_1h_pct'] for r in grp if r['var_1h_pct'] is not None]
+            var1h_med = statistics.median(var1h_vals) if var1h_vals else None
+            var1h_str = f"{var1h_med:+.0f}%" if var1h_med is not None else "—"
+            wr_color = "green" if wr >= 21.4 else ("yellow" if wr >= 12 else "red")
+            tok_color = "green" if tok_recov >= 30 else ("yellow" if tok_recov >= 20 else "red")
+            out.append(f"<tr><td>{period}</td><td>{n}</td><td class='{wr_color}'>{wr:.0f}%</td><td class='{tok_color}'>{tok_recov:.0f}%</td><td class='red'>{sl_r:.0f}%</td><td class='dim'>{sl_n:.0f}%</td><td>{var1h_str}</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 3: Para tokens que recuperaram — o que diferencia TP vs SL? ──
+        out.append("<h3>3 — Tokens que Recuperaram (n={}) — TP vs SL</h3>".format(n_recov_tokens))
+        out.append("""<div class='card'>
+        Foco: tokens onde o sinal ERA bom (token recuperou). O que diferencia os que batemos TP
+        dos que tomamos SL antes de recuperar? Resposta: pura volatilidade de entrada (spike pAMM)
+        ou há diferença nas métricas?
+        </div>""")
+
+        if sl_recov or tp_recov:
+            metrics = [
+                ("bounce_pct", "bounce", lambda r: r['bounce']),
+                ("elapsed_min", "elapsed_min", lambda r: r['elapsed_min']),
+                ("drop_depth", "drop_depth", lambda r: r['drop_depth']),
+                ("smart_wallets", "smart", lambda r: float(r['smart'])),
+                ("pnl_pct_real (%)", None, lambda r: _f(r['pnl_pct_real']) * 100),
+            ]
+            out.append("<table><tr><th>Métrica</th><th>TP + recov (n={})".format(len(tp_recov)) + "</th><th>SL + recov (n={})".format(len(sl_recov)) + "</th><th>Diferença</th></tr>")
+            for label, _, fn in metrics:
+                tp_vals = [fn(r) for r in tp_recov if fn(r) is not None]
+                sl_vals = [fn(r) for r in sl_recov if fn(r) is not None]
+                tp_avg = statistics.mean(tp_vals) if tp_vals else None
+                sl_avg = statistics.mean(sl_vals) if sl_vals else None
+                if tp_avg is not None and sl_avg is not None:
+                    diff = tp_avg - sl_avg
+                    diff_str = f"{diff:+.2f}"
+                    diff_color = "green" if abs(diff) >= 0.05 else "dim"
+                    out.append(f"<tr><td>{label}</td><td class='green'>{tp_avg:.2f}</td><td class='red'>{sl_avg:.2f}</td><td class='{diff_color}'>{diff_str}</td></tr>")
+            out.append("</table>")
+
+        # ── Seção 4: Var 1h dos tokens por quadrante ──
+        out.append("<h3>4 — Resultado Real do Token por Quadrante</h3>")
+        out.append("<p class='dim'>var_1h = MC do token em 1h vs MC de migração (independente do nosso trade)</p>")
+
+        out.append("<table><tr><th>Quadrante</th><th>n</th><th>Var 1h mediana</th><th>Var 1h média</th><th>% tokens recov</th><th>pnl médio carteira</th></tr>")
+        for q_key in ["TP_RECOV", "TP_NORECP", "SL_RECOV", "SL_NORECP"]:
+            grp = [r for r in has_mig if r['quadrant'] == q_key]
+            if not grp:
+                continue
+            label, color, _ = q_labels[q_key]
+            n = len(grp)
+            var_vals = [r['var_1h_pct'] for r in grp if r['var_1h_pct'] is not None]
+            var_med = statistics.median(var_vals) if var_vals else None
+            var_avg = statistics.mean(var_vals) if var_vals else None
+            tok_r = sum(1 for r in grp if r['token_recovered']) / n * 100
+            pnl_vals = [_f(r['pnl_pct_real']) * 100 for r in grp if r['pnl_pct_real'] is not None]
+            pnl_avg = statistics.mean(pnl_vals) if pnl_vals else None
+            var_med_str = f"{var_med:+.0f}%" if var_med is not None else "—"
+            var_avg_str = f"{var_avg:+.0f}%" if var_avg is not None else "—"
+            pnl_str = f"{pnl_avg:+.1f}%" if pnl_avg is not None else "—"
+            pnl_color = "green" if pnl_avg and pnl_avg > 0 else "red"
+            out.append(f"<tr><td class='{color}'>{label}</td><td>{n}</td><td>{var_med_str}</td><td>{var_avg_str}</td><td>{tok_r:.0f}%</td><td class='{pnl_color}'>{pnl_str}</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 5: Discriminadores de recovery do token (não da carteira) ──
+        out.append("<h3>5 — O Que Discrimina Recovery do Token?</h3>")
+        out.append("""<div class='card'>
+        Comparamos métricas dos tokens que <b>realmente recuperaram</b> vs os que não recuperaram.
+        Isso mostra o que DEVERIA discriminar — independente do SL/TP configurado.
+        </div>""")
+
+        recov_true = [r for r in has_mig if r['token_recovered']]
+        recov_false = [r for r in has_mig if not r['token_recovered']]
+
+        signal_checks = [
+            ("bounce ≥ 70%", lambda r: r['bounce'] >= 0.70),
+            ("bounce ≥ 50%", lambda r: r['bounce'] >= 0.50),
+            ("bounce ≥ 30% <70%", lambda r: 0.30 <= r['bounce'] < 0.70),
+            ("drop_depth 30-70%", lambda r: r['drop_depth'] and 0.30 <= r['drop_depth'] < 0.70),
+            ("drop_depth <30% (dump >70%)", lambda r: r['drop_depth'] and r['drop_depth'] < 0.30),
+            ("elapsed ≤ 10min", lambda r: r['elapsed_min'] <= 10),
+            ("elapsed 10-20min", lambda r: 10 < r['elapsed_min'] <= 20),
+            ("smart ≥ 3", lambda r: r['smart'] >= 3),
+            ("creator_close", lambda r: r.get('creator_token_status') == 'creator_close'),
+        ]
+
+        out.append("<table><tr><th>Sinal</th><th>% recovery=TRUE</th><th>% recovery=FALSE</th><th>Lift (sinal→recov)</th></tr>")
+        for label, cond in signal_checks:
+            rt_pct = sum(1 for r in recov_true if cond(r)) / len(recov_true) * 100 if recov_true else 0
+            rf_pct = sum(1 for r in recov_false if cond(r)) / len(recov_false) * 100 if recov_false else 0
+            lift = rt_pct - rf_pct
+            lift_color = "green" if lift >= 10 else ("yellow" if lift >= 5 else ("red" if lift < -5 else "dim"))
+            out.append(f"<tr><td>{label}</td><td class='green'>{rt_pct:.0f}%</td><td class='red'>{rf_pct:.0f}%</td><td class='{lift_color}'>{lift:+.0f}pp</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 6: Var 1h por faixa de drop_depth ──
+        out.append("<h3>6 — Resultado Real por Profundidade de Dump (drop_depth)</h3>")
+
+        depth_buckets = [
+            ("dump >80% (depth <20%)", lambda r: r['drop_depth'] and r['drop_depth'] < 0.20),
+            ("dump 70-80% (depth 20-30%)", lambda r: r['drop_depth'] and 0.20 <= r['drop_depth'] < 0.30),
+            ("dump 50-70% (depth 30-50%)", lambda r: r['drop_depth'] and 0.30 <= r['drop_depth'] < 0.50),
+            ("dump 30-50% (depth 50-70%)", lambda r: r['drop_depth'] and 0.50 <= r['drop_depth'] < 0.70),
+            ("dump <30% (depth ≥70%)", lambda r: r['drop_depth'] and r['drop_depth'] >= 0.70),
+        ]
+
+        out.append("<table><tr><th>Faixa</th><th>n trades</th><th>WR carteira</th><th>Token recovery rate</th><th>Var 1h mediana</th></tr>")
+        for label, cond in depth_buckets:
+            grp = [r for r in has_mig if cond(r)]
+            if not grp:
+                continue
+            n = len(grp)
+            wr = sum(1 for r in grp if r['is_tp']) / n * 100
+            tok_r = sum(1 for r in grp if r['token_recovered']) / n * 100
+            var_vals = [r['var_1h_pct'] for r in grp if r['var_1h_pct'] is not None]
+            var_med = statistics.median(var_vals) if var_vals else None
+            wr_color = "green" if wr >= 21.4 else ("yellow" if wr >= 12 else "red")
+            tok_color = "green" if tok_r >= 30 else ("yellow" if tok_r >= 20 else "red")
+            var_str = f"{var_med:+.0f}%" if var_med is not None else "—"
+            out.append(f"<tr><td>{label}</td><td>{n}</td><td class='{wr_color}'>{wr:.0f}%</td><td class='{tok_color}'>{tok_r:.0f}%</td><td>{var_str}</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 7: Tabela individual dos SL onde o token recuperou ──
+        out.append(f"<h3>7 — SLs onde o Token Recuperou ({len(sl_recov)} trades — falhas de execução)</h3>")
+        out.append("<p class='dim'>Esses tokens tinham sinal genuíno. Fomos parados por spike do pAMM ou SL muito apertado.</p>")
+
+        if sl_recov:
+            out.append("<table><tr><th>Trade#</th><th>Token</th><th>Data</th><th>pnl real</th><th>var_1h token</th><th>bounce</th><th>drop_depth</th><th>sl_pct</th></tr>")
+            for r in sorted(sl_recov, key=lambda x: x['var_1h_pct'] or 0, reverse=True)[:40]:
+                pnl = _f(r['pnl_pct_real']) * 100
+                var = r['var_1h_pct']
+                var_str = f"{var:+.0f}%" if var is not None else "—"
+                dd_str = f"{r['drop_depth']:.0%}" if r['drop_depth'] else "—"
+                ts = r['ts_signal'].strftime('%m-%d %H:%M') if r['ts_signal'] else "—"
+                out.append(f"<tr class='b-yellow'><td>{r['id']}</td><td><b>{r['symbol']}</b></td><td class='dim'>{ts}</td>"
+                           f"<td class='red'>{pnl:+.0f}%</td><td class='green'>{var_str}</td>"
+                           f"<td>{r['bounce']:.0%}</td><td>{dd_str}</td>"
+                           f"<td class='dim'>{_f(r['sl_pct']):.0%}</td></tr>")
+            out.append("</table>")
+        else:
+            out.append("<p class='dim'>Nenhum.</p>")
+
+        out.append(f"""<div class='card'>
+        <b>Resumo executivo:</b><br>
+        • {n_mig} trades com dados de migration | {n_tp} TPs | WR carteira: {n_tp/n_mig*100:.1f}%<br>
+        • {n_recov_tokens} tokens realmente recuperaram ({n_recov_tokens/n_mig*100:.0f}%) — esse é o universo de sinais potencialmente bons<br>
+        • {len(sl_recov)} foram falhas de execução (SL + recov) = {len(sl_recov)/n_mig*100:.0f}% dos trades<br>
+        • {len(sl_norecov)} foram sinais ruins (SL + no-recov) = {len(sl_norecov)/n_mig*100:.0f}% dos trades<br>
+        • {len(tp_norecov)} TPs em tokens que não recuperaram = {len(tp_norecov)/n_mig*100:.0f}% (saídas de sorte/timing)<br><br>
+        <b>Conclusão:</b> Se as falhas de execução dominam os sinais ruins, prioridade = ampliar SL ou time-gate de spike.
+        Se os sinais ruins dominam, prioridade = filtros mais restritivos.
+        </div>""")
+
+    except Exception:
+        out.append(f"<pre style='color:#f85149'>{_tb.format_exc()}</pre>")
+
+    out.append("</body></html>")
+    return "".join(out)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
