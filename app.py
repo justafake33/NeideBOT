@@ -15026,7 +15026,7 @@ def analise_entrada():
                     m.time_to_peak,
                     m.pct_drop,
                     m.smart_wallets,
-                    m.bounce_pct AS m_bounce_pct,
+                    m.pct_gain AS m_bounce_pct,
                     -- Dados do bounce signal
                     bs.bounce_pct AS bs_bounce_pct,
                     bs.elapsed_sec,
