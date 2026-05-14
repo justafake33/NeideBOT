@@ -756,7 +756,7 @@ Próxima mudança de env var: `BOUNCE_MIN_PCT=0.50` (teste) → `0.70` se confir
 - GMGN trailing TP confirmado funcionando — mc_high era o dado contaminado
 
 **Pendências críticas (sessão 5):**
-- **Executar `/debug/sell-recovery` sem `?dry=1`** — persistir 139 correções blockchain no banco
+- ✅ **`/debug/sell-recovery` executado** — 139 correções blockchain persistidas. Banco 100% verificado on-chain.
 - Mudar `BOUNCE_MIN_PCT=0.50` no Railway (env var, zero código)
 - Verificar discriminação smart_wallets após n≥50 trades com smart≥3
 - H22: aguardando n≥30 bounces com absorption_events > 0

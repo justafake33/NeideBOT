@@ -62,15 +62,9 @@
 
 ## 🔜 Curto Prazo
 
-### 0. EXECUTAR `/debug/sell-recovery` (sem ?dry=1) ← PRIMEIRA AÇÃO
+### 0. ✅ `/debug/sell-recovery` EXECUTADO — Banco 100% verificado on-chain
 
-**Por quê:** DRY RUN da sessão 5 confirmou 139 correções blockchain prontas para salvar. Banco atual ainda tem dados fictícios — nenhuma análise de WR é válida até a execução.
-
-**O que faz:** atualiza `status`, `exit_type='helius_sell_recovery'`, `exit_price_usd`, `exit_ts`, `pnl_pct_real` para 139 trades. ~86 segundos de execução via streaming.
-
-**URL:** `https://web-production-c4ba7.up.railway.app/debug/sell-recovery` (sem `?dry=1`)
-
-**Após execução:** WR real no banco = 10.1% (14 TP / 125 SL). Todas as análises históricas ficam válidas.
+139 trades corrigidos. WR real no banco = **10.1%** (14 TP / 125 SL). `exit_type='helius_sell_recovery'` em todos os registros. Análises históricas agora são válidas.
 
 ---
 
