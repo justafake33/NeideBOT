@@ -13287,10 +13287,22 @@ def debug_fill_recovery():  # noqa: C901
     if not wallet:
         return "<pre style='color:red'>GMGN_WALLET_ADDRESS não configurado.</pre>", 400
 
-    # 1. Busca até 1000 txs recentes da wallet
-    sigs_result = _helius._rpc("getSignaturesForAddress", [wallet, {"limit": 1000}])
+    # 1. Busca até 1000 txs recentes da wallet — com diagnóstico de erro
+    import requests as _req
+    _body = {"jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
+             "params": [wallet, {"limit": 1000, "commitment": "confirmed"}]}
+    try:
+        _r = _req.post(_helius.HELIUS_RPC_URL, json=_body, timeout=30)
+        _raw = _r.json()
+    except Exception as _e:
+        return f"<pre style='color:red'>Helius HTTP erro: {_e}\nURL: {_helius.HELIUS_RPC_URL[:60]}</pre>", 500
+
+    if "error" in _raw:
+        return f"<pre style='color:red'>Helius RPC erro:\n{_json.dumps(_raw, indent=2)}</pre>", 500
+
+    sigs_result = _raw.get("result")
     if not sigs_result:
-        return "<pre style='color:red'>Helius getSignaturesForAddress falhou.</pre>", 500
+        return f"<pre style='color:red'>Helius retornou result vazio.\nResposta:\n{_json.dumps(_raw, indent=2)}</pre>", 500
 
     # Monta dict blockTime → lista de signatures
     from collections import defaultdict
