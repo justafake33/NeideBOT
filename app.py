@@ -14656,7 +14656,7 @@ def analise_sl_otimo():
                     AND tt.tick_ts >= e.ts_signal
                     AND tt.tick_ts <= COALESCE(e.exit_ts, e.ts_signal + INTERVAL '60 min')
                 WHERE e.status = 'tp'
-                GROUP BY e.id
+                GROUP BY e.id, e.mint, e.ts_signal, e.exit_ts
             ),
             -- Para SLs: quanto o token foi DEPOIS da nossa saída (antes de recuperar ou continuar)
             sl_post_exit AS (
