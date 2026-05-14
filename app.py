@@ -14967,6 +14967,250 @@ def analise_sl_otimo():
     return "".join(out)
 
 
+@app.route("/analise/entrada")
+def analise_entrada():
+    """
+    Qualidade da entrada: onde estamos comprando em relação ao MC de migração e ao fundo?
+    Pergunta principal: quantos trades entram ACIMA do MC de migração?
+    """
+    import traceback as _tb
+    _f = lambda v: float(v) if v is not None else 0.0
+
+    NAV = """<nav style='font-family:monospace;padding:8px;background:#161b22;margin-bottom:16px'>
+    <a href='/analise/big-picture' style='color:#58a6ff;margin-right:16px'>Big Picture</a>
+    <a href='/analise/correlacao' style='color:#58a6ff;margin-right:16px'>Correlação</a>
+    <a href='/analise/entrada' style='color:#e3b341'>Entrada</a>
+    </nav>"""
+    CSS = """<style>
+    body{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:16px}
+    h2{color:#f0f6fc}h3{color:#58a6ff}
+    table{border-collapse:collapse;width:100%;margin:12px 0}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;text-align:left}
+    td{padding:5px 10px;border-bottom:1px solid #21262d}
+    tr:hover td{background:#161b22}
+    .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:14px;margin:10px 0}
+    .green{color:#3fb950}.red{color:#f85149}.yellow{color:#e3b341}.dim{color:#8b949e}
+    </style>"""
+
+    out = [f"<html><head><title>Qualidade da Entrada</title>{CSS}</head><body>{NAV}"]
+    out.append("<h2>🎯 Qualidade da Entrada — Onde estamos comprando?</h2>")
+    out.append("""<div class='card'>
+    <b>Referência central:</b> mc_migration = preço quando o token migrou do Pump.fun para Raydium/Meteora.<br>
+    Entrada abaixo de mc_migration = comprando o dip (correto).<br>
+    Entrada acima de mc_migration = comprando acima do preço de abertura do mercado secundário (errado).<br><br>
+    <b>entry_mc_real</b> = fill real da blockchain (entry_price_usd / tokens_received × 1e9).<br>
+    <b>entry_expected</b> = mc_bottom × 1.15 (estimativa teórica do bounce detector).
+    </div>""")
+
+    try:
+        with db._cursor() as cur:
+            # Busca trades com mc_migration do banco de migrações
+            cur.execute("""
+                SELECT
+                    t.id, t.mint, t.symbol, t.status, t.pnl_pct_real,
+                    t.ts_signal, t.exit_ts,
+                    t.entry_expected,
+                    t.entry_price_usd,
+                    t.tokens_received,
+                    COALESCE(t.tp_pct, 0.75) AS tp_pct,
+                    COALESCE(t.sl_pct, 0.25) AS sl_pct,
+                    -- Entry real da blockchain
+                    CASE WHEN t.entry_price_usd > 0 AND t.tokens_received > 0
+                         THEN t.entry_price_usd / t.tokens_received * 1e9
+                    END AS entry_mc_real,
+                    -- Dados da migração
+                    m.mc_migration,
+                    m.mc_bottom,
+                    m.mc_peak,
+                    m.time_to_bottom,
+                    m.time_to_peak,
+                    m.pct_drop,
+                    m.smart_wallets,
+                    m.bounce_pct AS m_bounce_pct,
+                    -- Dados do bounce signal
+                    bs.bounce_pct AS bs_bounce_pct,
+                    bs.elapsed_sec,
+                    bs.mc_at_signal,
+                    bs.mc_min AS bs_mc_min
+                FROM trades t
+                LEFT JOIN migrations m ON m.mint = t.mint
+                LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+                WHERE t.exit_type = 'helius_sell_recovery'
+                  AND t.ts_signal IS NOT NULL
+                ORDER BY t.ts_signal DESC
+            """)
+            rows = cur.fetchall()
+
+        # Calcula ratios para cada trade
+        def enrich(r):
+            entry_mc = _f(r['entry_mc_real']) or _f(r['entry_expected'])
+            mc_mig = _f(r['mc_migration'])
+            mc_bot = _f(r['mc_bottom'])
+            # Ratio vs migração (1.0 = exatamente no MC de migração)
+            ratio_vs_mig = entry_mc / mc_mig if mc_mig > 0 else None
+            # Ratio vs fundo (1.0 = exatamente no fundo, 1.15 = 15% acima do fundo)
+            ratio_vs_bot = entry_mc / mc_bot if mc_bot > 0 else None
+            # Drop depth real (mc_bottom / mc_migration)
+            drop_depth = mc_bot / mc_mig if mc_mig > 0 and mc_bot > 0 else None
+            return {**dict(r),
+                    'entry_mc': entry_mc,
+                    'ratio_vs_mig': ratio_vs_mig,
+                    'ratio_vs_bot': ratio_vs_bot,
+                    'drop_depth': drop_depth,
+                    'has_real_entry': _f(r['entry_mc_real']) > 0}
+
+        data = [enrich(r) for r in rows]
+        tp_data = [r for r in data if r['status'] == 'tp']
+        sl_data = [r for r in data if r['status'] == 'sl']
+
+        # ── Seção 1: Distribuição de entrada vs MC de migração ──
+        out.append("<h3>1 — Distribuição: entrada vs MC de Migração</h3>")
+
+        buckets = [
+            ("<50%",   lambda x: x < 0.50,  "green",  "Muito abaixo — excelente entrada"),
+            ("50-70%", lambda x: 0.50 <= x < 0.70, "green", "Abaixo — boa entrada"),
+            ("70-85%", lambda x: 0.70 <= x < 0.85, "green", "Ligeiramente abaixo — ok"),
+            ("85-100%",lambda x: 0.85 <= x < 1.00, "yellow","Próximo ao MC mig — zona de risco"),
+            ("100-120%",lambda x: 1.00 <= x < 1.20,"red",   "ACIMA do MC mig — entrada ruim"),
+            (">120%",  lambda x: x >= 1.20,  "red",   "MUITO ACIMA do MC mig — entrada péssima"),
+        ]
+
+        with_mig = [r for r in data if r['ratio_vs_mig'] is not None]
+        out.append(f"<p class='dim'>n={len(with_mig)} trades com mc_migration disponível</p>")
+        out.append("<table><tr><th>Entrada / MC Migração</th><th>Total</th><th>%</th><th>TPs</th><th>SLs</th><th>WR</th><th>Interpretação</th></tr>")
+
+        for label, cond, color, interp in buckets:
+            grp = [r for r in with_mig if cond(r['ratio_vs_mig'])]
+            tps = [r for r in grp if r['status'] == 'tp']
+            sls = [r for r in grp if r['status'] == 'sl']
+            wr = len(tps) / len(grp) * 100 if grp else 0
+            pct_of_total = len(grp) / len(with_mig) * 100 if with_mig else 0
+            wr_color = "green" if wr >= 20 else ("yellow" if wr >= 10 else "red")
+            out.append(f"<tr><td class='{color}'>{label}</td><td>{len(grp)}</td><td>{pct_of_total:.1f}%</td><td class='green'>{len(tps)}</td><td class='red'>{len(sls)}</td><td class='{wr_color}'>{wr:.1f}%</td><td class='dim'>{interp}</td></tr>")
+        out.append("</table>")
+
+        # Sumário de entradas acima da migração
+        above_mig = [r for r in with_mig if r['ratio_vs_mig'] >= 1.0]
+        above_mig_tp = [r for r in above_mig if r['status'] == 'tp']
+        out.append(f"""<div class='card'>
+        <b>Entradas ACIMA do MC de Migração: {len(above_mig)}/{len(with_mig)} ({len(above_mig)/len(with_mig)*100:.1f}%)</b><br>
+        TPs nesse grupo: {len(above_mig_tp)} | SLs: {len(above_mig)-len(above_mig_tp)} | WR: {len(above_mig_tp)/len(above_mig)*100:.1f}% (se n>0)
+        </div>""") if above_mig else None
+
+        # ── Seção 2: Drop depth — quão fundo o token foi antes de entrarmos ──
+        out.append("<h3>2 — Profundidade do dump antes da entrada</h3>")
+        out.append("<p class='dim'>drop_depth = mc_bottom / mc_migration. 0.30 = caiu 70% da migração antes do fundo. Quanto mais fundo, melhor o R:R.</p>")
+
+        drop_buckets = [
+            ("<30% do MC mig (caiu >70%)", lambda x: x < 0.30, "green"),
+            ("30-50% (caiu 50-70%)",       lambda x: 0.30 <= x < 0.50, "green"),
+            ("50-70% (caiu 30-50%)",       lambda x: 0.50 <= x < 0.70, "yellow"),
+            ("70-85% (caiu 15-30%)",       lambda x: 0.70 <= x < 0.85, "red"),
+            (">85% (caiu <15%)",           lambda x: x >= 0.85, "red"),
+        ]
+        with_drop = [r for r in data if r['drop_depth'] is not None]
+        out.append("<table><tr><th>Profundidade do dump</th><th>Total</th><th>%</th><th>WR</th><th>Avg entry/mig</th></tr>")
+        for label, cond, color in drop_buckets:
+            grp = [r for r in with_drop if cond(r['drop_depth'])]
+            tps = [r for r in grp if r['status'] == 'tp']
+            wr = len(tps) / len(grp) * 100 if grp else 0
+            avg_ratio = sum(r['ratio_vs_mig'] for r in grp if r['ratio_vs_mig']) / len([r for r in grp if r['ratio_vs_mig']]) if any(r['ratio_vs_mig'] for r in grp) else 0
+            wr_color = "green" if wr >= 20 else ("yellow" if wr >= 10 else "red")
+            pct = len(grp) / len(with_drop) * 100 if with_drop else 0
+            out.append(f"<tr><td class='{color}'>{label}</td><td>{len(grp)}</td><td>{pct:.1f}%</td><td class='{wr_color}'>{wr:.1f}%</td><td>{avg_ratio:.2f}x</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 3: TPs vs SLs — onde cada grupo entrou ──
+        out.append("<h3>3 — TPs vs SLs: distribuição de entrada</h3>")
+        tp_with = [r for r in tp_data if r['ratio_vs_mig'] is not None]
+        sl_with = [r for r in sl_data if r['ratio_vs_mig'] is not None]
+
+        def _ratio_dist(grp, label, color):
+            if not grp:
+                return f"<div class='card'>{label}: sem dados</div>"
+            ratios = [r['ratio_vs_mig'] for r in grp]
+            avg = sum(ratios) / len(ratios)
+            above = sum(1 for x in ratios if x >= 1.0)
+            below = sum(1 for x in ratios if x < 1.0)
+            lt70 = sum(1 for x in ratios if x < 0.70)
+            lt85 = sum(1 for x in ratios if x < 0.85)
+            return f"""<div class='card'>
+            <b><span class='{color}'>{label}</span> (n={len(grp)})</b><br>
+            Avg entrada: <b>{avg:.2f}x</b> do MC de migração<br>
+            Abaixo da migração: {below} ({below/len(grp)*100:.0f}%) | Acima: <span class='red'>{above} ({above/len(grp)*100:.0f}%)</span><br>
+            Entradas &lt;70% da migração: {lt70} ({lt70/len(grp)*100:.0f}%) | &lt;85%: {lt85} ({lt85/len(grp)*100:.0f}%)
+            </div>"""
+
+        out.append(_ratio_dist(tp_with, "TPs", "green"))
+        out.append(_ratio_dist(sl_with, "SLs", "red"))
+
+        # ── Seção 4: Tabela individual de TPs ──
+        out.append("<h3>4 — Todos os TPs: onde entramos?</h3>")
+        out.append("<table><tr><th>Token</th><th>P&L</th><th>Entry/Migração</th><th>Drop depth</th><th>Entry MC</th><th>MC Migração</th><th>MC Bottom</th></tr>")
+        for r in sorted(tp_with, key=lambda x: x['ratio_vs_mig']):
+            ratio = r['ratio_vs_mig']
+            color = "green" if ratio < 0.85 else ("yellow" if ratio < 1.0 else "red")
+            dd = r['drop_depth']
+            dd_str = f"{dd:.2f}" if dd else "-"
+            pnl = _f(r['pnl_pct_real']) * 100
+            em = r['entry_mc']
+            mm = _f(r['mc_migration'])
+            mb = _f(r['mc_bottom'])
+            out.append(f"<tr><td>{r['symbol']}</td><td class='green'>{pnl:+.1f}%</td>"
+                       f"<td class='{color}'>{ratio:.2f}x</td><td>{dd_str}</td>"
+                       f"<td>${em/1000:.1f}k</td><td>${mm/1000:.1f}k</td><td>${mb/1000:.1f}k</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 5: Top 20 piores SLs — onde entramos? ──
+        out.append("<h3>5 — Top 20 piores SLs: onde entramos?</h3>")
+        worst_sl = sorted([r for r in sl_with], key=lambda x: _f(x['pnl_pct_real']))[:20]
+        out.append("<table><tr><th>Token</th><th>P&L</th><th>Entry/Migração</th><th>Drop depth</th><th>Entry MC</th><th>MC Migração</th><th>bounce_pct</th></tr>")
+        for r in worst_sl:
+            ratio = r['ratio_vs_mig']
+            color = "green" if ratio < 0.85 else ("yellow" if ratio < 1.0 else "red")
+            dd = r['drop_depth']
+            dd_str = f"{dd:.2f}" if dd else "-"
+            pnl = _f(r['pnl_pct_real']) * 100
+            em = r['entry_mc']
+            mm = _f(r['mc_migration'])
+            bp = _f(r['bs_bounce_pct']) * 100 if r['bs_bounce_pct'] else 0
+            out.append(f"<tr><td>{r['symbol']}</td><td class='red'>{pnl:+.1f}%</td>"
+                       f"<td class='{color}'>{ratio:.2f}x</td><td>{dd_str}</td>"
+                       f"<td>${em/1000:.1f}k</td><td>${mm/1000:.1f}k</td><td>{bp:.0f}%</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 6: Correlação bounce_pct × ratio de entrada ──
+        out.append("<h3>6 — bounce_pct vs ratio de entrada</h3>")
+        out.append("<p class='dim'>Bounce maior = entramos mais alto? Ou bounce maior correlaciona com boa entrada (dump profundo que recupera)?</p>")
+
+        bounce_buckets = [
+            ("30-50%",  lambda r: 0.30 <= _f(r['bs_bounce_pct']) < 0.50),
+            ("50-70%",  lambda r: 0.50 <= _f(r['bs_bounce_pct']) < 0.70),
+            ("70-100%", lambda r: 0.70 <= _f(r['bs_bounce_pct']) < 1.00),
+            (">100%",   lambda r: _f(r['bs_bounce_pct']) >= 1.00),
+        ]
+        with_bounce = [r for r in data if r['bs_bounce_pct'] is not None and r['ratio_vs_mig'] is not None]
+        out.append("<table><tr><th>Bounce pct</th><th>n</th><th>Avg entry/mig</th><th>% acima mig</th><th>WR</th></tr>")
+        for label, cond in bounce_buckets:
+            grp = [r for r in with_bounce if cond(r)]
+            if not grp:
+                continue
+            tps = [r for r in grp if r['status'] == 'tp']
+            avg_ratio = sum(r['ratio_vs_mig'] for r in grp) / len(grp)
+            pct_above = sum(1 for r in grp if r['ratio_vs_mig'] >= 1.0) / len(grp) * 100
+            wr = len(tps) / len(grp) * 100
+            wr_color = "green" if wr >= 20 else ("yellow" if wr >= 10 else "red")
+            above_color = "red" if pct_above >= 30 else ("yellow" if pct_above >= 15 else "green")
+            out.append(f"<tr><td>{label}</td><td>{len(grp)}</td><td>{avg_ratio:.2f}x</td><td class='{above_color}'>{pct_above:.0f}%</td><td class='{wr_color}'>{wr:.1f}%</td></tr>")
+        out.append("</table>")
+
+    except Exception:
+        out.append(f"<pre style='color:#f85149'>{_tb.format_exc()}</pre>")
+
+    out.append("</body></html>")
+    return "".join(out)
+
+
 @app.route("/analise/sl-spike")
 def analise_sl_spike():
     """
