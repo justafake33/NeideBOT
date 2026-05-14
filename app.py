@@ -13522,7 +13522,7 @@ td{padding:4px 8px;border-bottom:1px solid #21262d}
 
             with db._cursor() as cur:
                 cur.execute("SELECT DISTINCT mint FROM trades WHERE order_id IS NOT NULL")
-                mints_needed = {r[0] for r in cur.fetchall()}
+                mints_needed = {r['mint'] for r in cur.fetchall()}
 
             yield log(f"Mints únicos: {len(mints_needed)} | "
                       f"Scan desde: {_dt.datetime.fromtimestamp(oldest_ts).strftime('%Y-%m-%d')}")
