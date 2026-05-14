@@ -715,10 +715,17 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 111. **H22 cobertura 6% (32/552 bounces, 2026-05-13)**: cobertura cresceu de 1.7% (9/529) no início da sessão para 6% (32/552) ao final. 100% dos tokens com `exchange='pump'` têm cobertura Helius (FILTER_PUMP_ONLY garante isso para novos bounces). Os 520+ sem cobertura são históricos anteriores à implementação do Helius rolling window (2026-05-12). Cobertura cresce linearmente com o bot ativo — todos os novos bounces terão dados.
 112. **TRADE_SL_PCT=0.25 em teste (2026-05-13)**: elevado de 0.15 para 0.25 porque SL=15% disparava em segundos após entrada. Causa suspeita: volatilidade intra-candle do pAMM em pools pequenas — uma única ordem de venda pode temporariamente empurrar o preço 15%+ antes de recuperar. Com SL=25%, o threshold é mais tolerante a ruído de mercado sem necessariamente piorar o EV (token que vai -25% dificilmente recupera). Aguardar n≥30 trades para avaliar impacto no WR e EV vs SL=15%.
 113. **FILTER_PUMP_ONLY garante cobertura H22 futura**: scanner rejeita migrações onde `exchange` não contém "pump". Consequência: 100% dos tokens futuros são pump.fun pAMM — Helius WebSocket já subscrito para eles, logo `get_absorption_window()` sempre retorna dados. Eliminará a dicotomia entre bounces com/sem dados Helius após ~30 dias de operação.
+114. **Problema de dados fictícios — TradeMonitor inferindo saídas (identificado 2026-05-14, sessão 5)**: o TradeMonitor calculava TP/SL usando `entry_expected = mc_bottom × 1.15` (nunca a entrada real) e `token_ticks` (snapshots MC a ~30s). Após o HotMonitor expirar (60min), os ticks paravam → trades ficavam `open`/`trailing_active` e eram marcados `expired` com `pnl_pct_real = +75%` (threshold do trailing, não lucro real). Resultado: SLs reais apareciam no banco como TP(+75%) e TPs reais apareciam como SL(-15%). O banco era ficção matemática, não realidade on-chain. WR DB inflado: ~32%. WR real blockchain-verificado: **10.1%** (14 TP / 125 SL / 139 trades auditados na sessão 5).
+115. **`/debug/sell-recovery` — recuperação de saídas reais via blockchain (2026-05-14, sessão 5)**: endpoint que pagina TODAS as transações da wallet desde 2026-05-06 via Helius `getSignaturesForAddress` (cursor `before` para paginação completa, sem limite fixo), detecta sells reais (SOL delta > 0 AND token delta < 0 para o mint do trade), faz match trade ↔ sell por mint + timestamp, e atualiza `status`, `exit_type='helius_sell_recovery'`, `exit_price_usd`, `exit_ts`, `pnl_pct_real`. Resultados do DRY RUN: 573 txs escaneadas, 201 sells encontrados, 139 trades corrigidos, 0 não encontrados (cobertura 100%). `exit_type='helius_sell_recovery'` é o único campo que prova que a saída tem dado blockchain real. Streaming via `stream_with_context` + `PAD=" "*2048` para evitar timeout do Railway (run ~86s).
+116. **Resultado da auditoria blockchain (DRY RUN 2026-05-14)**: WR real = **10.1%** (14 TP / 125 SL). P&L médio = **-11.4%**. 41 mudanças de status (DB errado em ~30% dos trades). 121 correções de P&L. Correções notáveis: Kevin #153 DB=SL(-25%) → Real=TP(+335.6%); Goblin #85 DB=SL(-15%) → Real=TP(+100%); HUMANITY #105 DB=SL(-15%) → Real=TP(+63%); SLEEP #174 DB=SL(-25%) → Real=TP(+49.2%); Viltrumite #308 DB=trailing_active → Real=TP(+88.6%); YILONG #232 DB=expired → Real=TP(+54.8%). Sentido oposto: SNDK, soothsayer, GOBOLINI marcados como TP(+75%) no DB eram SL reais (-20% a -30%).
+117. **WR real 10.1% está abaixo do break-even de ~11% a $1/trade**: estratégia está perdendo dinheiro. SLs reais variam de -20% a -40%, mais profundos que o SL configurado (15-25%). Causas possíveis: (a) GMGN executa o SL na price action real que é mais rápida que token_ticks de 30s; (b) volatilidade do pAMM em pools pequenas empurra o preço além do threshold antes de recovery; (c) slippage no sell adiciona perda além do threshold configurado. Executar `/debug/sell-recovery` (sem `?dry=1`) para confirmar dados no banco antes de tomar decisões de calibração.
+118. **Paginação completa com cursor `before` é obrigatória para auditoria histórica**: abordagem inicial `?limit=150` mostrava contagens diferentes a cada run porque a janela de transações mais recentes variava. Fix: loop `getSignaturesForAddress` com cursor `before` no último sig processado, parando quando `block_time < MAY_6_TS - 3600`. Piso hard-coded `MAY_6_TS = datetime(2026, 5, 6, tzinfo=timezone.utc).timestamp()`. Garante cobertura total desde o primeiro trade.
+119. **`db._cursor()` retorna `RealDictCursor` — rows são dicts, não tuplas**: indexar com `r[0]` falha com `KeyError: 0`. Sempre usar nomes de coluna: `r['status']`, `r['mint']`, etc. Especialmente insidioso em code inline onde o erro é silenciado pelo `try/except` do generator. Padrão correto: `{r['coluna'] for r in cur.fetchall()}`, não `{r[0] for r in cur.fetchall()}`.
+120. **Streaming com `stream_with_context` + padding para Railway**: endpoints de longa duração (sell-recovery escaneia 573 txs em ~86s) precisam de streaming para evitar timeout. Usar `Response(stream_with_context(generate()), content_type="text/html")`. Cada `yield` deve incluir `PAD = " " * 2048` para forçar flush em proxies. Sem padding, o browser acumula buffer e não mostra nada até o generator completar — parece timeout para o usuário.
 
 ---
 
-## 🔄 Estado Atual: Bot ativo a $1/trade (2026-05-13, sessão 4)
+## 🔄 Estado Atual: Bot ativo a $1/trade (2026-05-14, sessão 5)
 
 ### Pipeline ativo
 `TRADING_ENABLED=true`, `CALIBRATION_AMOUNT_USD=1.0`, `CALIBRATION_MAX_TRADES=999999`.
@@ -734,8 +741,10 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 - smart≥3: FILTER_SMART_MIN=3 — **⚠️ discriminação questionável** (live: smart=1→31%, smart=3→30%, flat)
 - FILTER_PUMP_ONLY: garante cobertura H22
 
-**WR ground truth (GMGN, corrigido 2026-05-13):** **32%** (42 TP / 90 SL / 132 trades).
-4 trailing TPs mal classificados (HUMANITY, Kevin, SLEEP, DrawPoorly) corrigidos via `/debug/fix-trailing-outcomes`.
+**⚠️ WR REAL CORRIGIDO (blockchain, sessão 5 2026-05-14): 10.1%** (14 TP / 125 SL / 139 trades).
+WR anterior de 32% era fictício — baseado em TradeMonitor que inferia saídas de token_ticks, nunca da blockchain.
+DRY RUN do `/debug/sell-recovery`: 573 txs escaneadas, 201 sells, 139 corrigidos, 0 não encontrados.
+Executar sem `?dry=1` para persistir no banco.
 
 **Maior discriminador live encontrado: bounce_pct >70% → WR 74% (n=23, +45pp)**
 Próxima mudança de env var: `BOUNCE_MIN_PCT=0.50` (teste) → `0.70` se confirmado.
@@ -746,12 +755,13 @@ Próxima mudança de env var: `BOUNCE_MIN_PCT=0.50` (teste) → `0.70` se confir
 - `spike_suspect`: max_gain alto + <5 pre_ticks = provável spike artifact
 - GMGN trailing TP confirmado funcionando — mc_high era o dado contaminado
 
-**Pendências:**
+**Pendências críticas (sessão 5):**
+- ✅ **`/debug/sell-recovery` executado** — 139 correções blockchain persistidas. Banco 100% verificado on-chain.
 - Mudar `BOUNCE_MIN_PCT=0.50` no Railway (env var, zero código)
 - Verificar discriminação smart_wallets após n≥50 trades com smart≥3
 - H22: aguardando n≥30 bounces com absorption_events > 0
 
-**Regra de ouro para novos filtros:** só implementar com n≥30 trades validados no GMGN. Não usar DB WR como fonte.
+**Regra de ouro para novos filtros:** só implementar com n≥30 trades validados no GMGN. **Nunca usar DB WR como fonte — banco estava completamente errado antes da correção blockchain da sessão 5.**
 
 **Próximos passos — ver ROADMAP.md**
 

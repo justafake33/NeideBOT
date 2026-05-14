@@ -1,7 +1,7 @@
 # NeideBOT — Roadmap
 
-**Atualizado:** 2026-05-13 (sessão 4)
-**Estado:** Bot ativo a $1/trade · WR **~32% corrigido (42 TP / ~128 trades, GMGN ground truth)** · filtros A.2/A.3/A.5/A.6/A.7/smart≥3/FILTER_PUMP_ONLY ativos · SL=25% · Helius RPC ativo · GMGN trailing TP confirmado funcionando corretamente
+**Atualizado:** 2026-05-14 (sessão 5)
+**Estado:** Bot ativo a $1/trade · WR **real blockchain 10.1%** (14 TP / 125 SL / 139 trades — corrigido sessão 5) · banco com dados fictícios corrigido via `/debug/sell-recovery` · filtros A.2/A.3/A.5/A.6/A.7/smart≥3/FILTER_PUMP_ONLY ativos · SL=25% · Helius RPC ativo
 
 ---
 
@@ -52,14 +52,23 @@
 | **SL <1min diagnostic no trade-autopsy** | 2026-05-13 | Bucket `<1min` separado na velocidade do SL. Box diagnóstico explica dois subtipos: real fast dump (max_gain≈0%) vs spike artifact (max_gain muito alto, poucos ticks). |
 | **bounce_pct >70% → WR 74% confirmado** | 2026-05-13 | n=23 trades, +45pp vs WR base. Gradiente claro: 30-40%→12%, 40-55%→23%, 55-70%→40%, >70%→74%. Maior discriminador encontrado nos dados live. |
 | **smart_wallets: zero discriminação live** | 2026-05-13 | smart=1→31%, smart=2→32%, smart=3→30%, smart=5+→19%. Flat ou negativo com smart alto. Contradiz análise anterior (n=6 para smart=1). FILTER_SMART_MIN=3 pode ser rebaixado. |
+| **`/debug/sell-recovery` — recuperação blockchain completa** | 2026-05-14 | Pagina TODAS as txs da wallet desde 06-05-2026 via Helius `getSignaturesForAddress` (cursor `before`, sem limite fixo). Detecta sells reais (SOL+ AND token−). Match trade ↔ sell por mint+timestamp. Atualiza `exit_type='helius_sell_recovery'`, `exit_price_usd`, `pnl_pct_real`. Streaming via `stream_with_context`. |
+| **Auditoria blockchain — banco completamente reescrito** | 2026-05-14 | DRY RUN: 573 txs, 201 sells, **139 trades corrigidos** (0 não encontrados). WR real = **10.1%** vs 32% do DB. P&L médio = -11.4%. 41 status errados, 121 P&L errados. Kevin +335% era SL no DB. SNDK era TP no DB mas SL real. |
+| **Problema de dados fictícios documentado e resolvido** | 2026-05-14 | TradeMonitor usava `entry_expected × (1±tp/sl_pct)` e token_ticks — nunca blockchain. Após HotMonitor 60min expirar, ticks paravam → trades marcados `expired` com pnl=+75%. `exit_type='helius_sell_recovery'` é a única fonte de verdade válida para P&L. |
 
-> ⚠️ **WR corrigido (2026-05-13 sessão 4):** 4 trailing TPs (HUMANITY, Kevin, SLEEP, DrawPoorly) estavam como `sl` no DB — TradeMonitor cego após 60min. Após correção: **42 TP / 90 SL / 132 trades = WR 32%** (GMGN ground truth). mc_high nos ticks NÃO pode ser usado para inferir trajectory — usa spikes intra-candle como se fossem price action real.
+> ⚠️ **WR REAL CORRIGIDO (2026-05-14 sessão 5):** banco tinha dados fictícios — TradeMonitor inferia saídas de MC snapshots, não da blockchain. Auditoria via Helius revelou WR real de **10.1%** (14 TP / 125 SL / 139 trades). WR anterior de 32% era inflado por falsos TPs (`expired` com pnl=+75%). Executar `/debug/sell-recovery` sem `?dry=1` para persistir as 139 correções. **Nenhuma análise histórica de WR deve ser usada até a execução da correção.**
 
 ---
 
 ## 🔜 Curto Prazo
 
-### 0. BOUNCE_MIN_PCT → 0.50 (ou 0.70) ← PRÓXIMA MUDANÇA DE ENV VAR
+### 0. ✅ `/debug/sell-recovery` EXECUTADO — Banco 100% verificado on-chain
+
+139 trades corrigidos. WR real no banco = **10.1%** (14 TP / 125 SL). `exit_type='helius_sell_recovery'` em todos os registros. Análises históricas agora são válidas.
+
+---
+
+### 1. BOUNCE_MIN_PCT → 0.50 (ou 0.70) ← PRÓXIMA MUDANÇA DE ENV VAR
 
 **Por quê:** bounce_pct >70% tem WR 74% (n=23, +45pp). Gradiente claro nos dados live.
 Mudança de env var, zero código. Reduz frequência mas aumenta WR drasticamente.
@@ -325,3 +334,6 @@ Dashboard mostra correlação H22 → outcome com n atual. 3 tabelas: por `absor
 22. **WR corrigido: 32% (42/132)**: 4 trades classificados como `sl` eram na verdade trailing TPs (HUMANITY +56%, Kevin +311%, SLEEP +41%, DrawPoorly +46%). TradeMonitor era cego após 60min porque `if not ticks: return`. Com a correção via `get_token_balance()` os novos trades serão classificados corretamente. Para dados históricos: usar `/debug/fix-trailing-outcomes` + verificação manual.
 23. **smart_wallets não discrimina WR em dados live**: smart=1→31%, smart=3→30%, smart=5+→19% (plano ou negativo). Contradiz análise anterior de n=6. FILTER_SMART_MIN=3 é conservador demais — pode estar rejeitando tokens válidos. Revisar após n≥50 trades com smart≥3 acumulados.
 24. **bounce_pct >70% é o maior discriminador live**: WR 74% (n=23) vs 29% base (+45pp). Gradiente claro e monotônico (12% / 23% / 40% / 74%). Mecanismo plausível: bounce mais forte = mais compradores reais = mais sustentação. BOUNCE_MIN_PCT=0.50 é a mudança de maior impacto disponível sem código.
+25. **Todo o histórico de WR do DB era ficção (sessão 5)**: TradeMonitor nunca acessou a blockchain. Usava `entry_expected = mc_bottom × 1.15` (não entrada real), `token_ticks` (parava após 60min), e aplicava `pnl_pct = +TRAILING_ACTIVATION_PCT` quando o trade expirava — sem verificar se o GMGN realmente saiu com lucro. A blockchain (via Helius `getTransaction`) é a única fonte que não mente. `exit_type='helius_sell_recovery'` no campo `exit_type` é o único indicador de dado confiável.
+26. **Paginação determinística com cursor `before` vs janela deslizante**: qualquer endpoint de histórico deve paginar com cursor `before` último item processado, parando em timestamp floor. `?limit=N` sem cursor retorna janela deslizante — contagem muda a cada execução à medida que novas txs chegam. Para auditoria histórica, cursor é obrigatório.
+27. **`db._cursor()` usa `RealDictCursor` — nunca indexar por posição**: ficar indexando `r[0]`, `r[1]` em código que usa esse cursor falha com `KeyError: 0`. Padrão do projeto: sempre usar `r['coluna']`. O erro é silenciado por `try/except` em generators → difícil de debugar. Verificar com `isinstance(row, dict)` em caso de dúvida.
