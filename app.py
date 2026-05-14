@@ -13907,11 +13907,11 @@ def analise_big_picture():
                 COUNT(*) as total,
                 SUM(CASE WHEN status='tp' THEN 1 ELSE 0 END) as n_tp,
                 SUM(CASE WHEN status='sl' THEN 1 ELSE 0 END) as n_sl,
-                ROUND(100.0*SUM(CASE WHEN status='tp' THEN 1 ELSE 0 END)/COUNT(*),1) as wr,
-                ROUND(AVG(CASE WHEN status='tp' THEN pnl_pct_real END)*100,1) as avg_win,
-                ROUND(AVG(CASE WHEN status='sl' THEN pnl_pct_real END)*100,1) as avg_loss,
-                ROUND(AVG(pnl_pct_real)*100,2) as avg_pnl,
-                ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY CASE WHEN status='sl' THEN pnl_pct_real END)*100,1) as median_loss
+                ROUND((100.0*SUM(CASE WHEN status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1) as wr,
+                ROUND((AVG(CASE WHEN status='tp' THEN pnl_pct_real END)*100)::numeric,1) as avg_win,
+                ROUND((AVG(CASE WHEN status='sl' THEN pnl_pct_real END)*100)::numeric,1) as avg_loss,
+                ROUND((AVG(pnl_pct_real)*100)::numeric,2) as avg_pnl,
+                ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY CASE WHEN status='sl' THEN pnl_pct_real END)*100)::numeric,1) as median_loss
             FROM trades WHERE exit_type='helius_sell_recovery'
         """)
         k = cur.fetchone()
@@ -13947,7 +13947,7 @@ def analise_big_picture():
                     ELSE '<-50%'
                 END as faixa,
                 COUNT(*) as n,
-                ROUND(AVG(pnl_pct_real)*100,1) as avg_pnl
+                ROUND((AVG(pnl_pct_real)*100)::numeric,1) as avg_pnl
             FROM trades
             WHERE exit_type='helius_sell_recovery' AND status='sl'
             GROUP BY faixa
@@ -13969,9 +13969,9 @@ def analise_big_picture():
                 COUNT(*) as n,
                 SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
                 ROUND(100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/NULLIF(COUNT(*),0),1) as wr,
-                ROUND(AVG(t.pnl_pct_real)*100,1) as avg_pnl,
-                ROUND(AVG(CASE WHEN t.status='tp' THEN t.pnl_pct_real END)*100,1) as avg_win,
-                ROUND(AVG(CASE WHEN t.status='sl' THEN t.pnl_pct_real END)*100,1) as avg_loss
+                ROUND((AVG(t.pnl_pct_real)*100)::numeric,1) as avg_pnl,
+                ROUND((AVG(CASE WHEN t.status='tp' THEN t.pnl_pct_real END)*100)::numeric,1) as avg_win,
+                ROUND((AVG(CASE WHEN t.status='sl' THEN t.pnl_pct_real END)*100)::numeric,1) as avg_loss
             FROM trades t
             JOIN bounce_signals bs ON bs.mint = t.mint
             WHERE t.exit_type='helius_sell_recovery' AND bs.bounce_pct IS NOT NULL
@@ -14003,7 +14003,7 @@ def analise_big_picture():
                 COUNT(*) as n,
                 SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
                 ROUND(100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/NULLIF(COUNT(*),0),1) as wr,
-                ROUND(AVG(t.pnl_pct_real)*100,1) as avg_pnl
+                ROUND((AVG(t.pnl_pct_real)*100)::numeric,1) as avg_pnl
             FROM trades t
             JOIN migrations m ON m.mint = t.mint
             WHERE t.exit_type='helius_sell_recovery' AND m.time_to_bottom IS NOT NULL
@@ -14031,7 +14031,7 @@ def analise_big_picture():
                 COUNT(*) as n,
                 SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
                 ROUND(100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/NULLIF(COUNT(*),0),1) as wr,
-                ROUND(AVG(t.pnl_pct_real)*100,1) as avg_pnl
+                ROUND((AVG(t.pnl_pct_real)*100)::numeric,1) as avg_pnl
             FROM trades t
             LEFT JOIN h9_mints h ON h.mint = t.mint
             WHERE t.exit_type='helius_sell_recovery'
@@ -14057,8 +14057,8 @@ def analise_big_picture():
                 COUNT(*) as n,
                 SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
                 ROUND(100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/NULLIF(COUNT(*),0),1) as wr,
-                ROUND(AVG(t.pnl_pct_real)*100,1) as avg_pnl,
-                ROUND(AVG(bs.absorption_events),1) as avg_events
+                ROUND((AVG(t.pnl_pct_real)*100)::numeric,1) as avg_pnl,
+                ROUND((AVG(bs.absorption_events))::numeric,1) as avg_events
             FROM trades t
             LEFT JOIN bounce_signals bs ON bs.mint = t.mint
             WHERE t.exit_type='helius_sell_recovery'
@@ -14084,9 +14084,9 @@ def analise_big_picture():
             )
             SELECT
                 t.mint, t.symbol,
-                ROUND(t.pnl_pct_real*100,1) as pnl,
-                ROUND(bs.bounce_pct*100,0) as bounce_pct,
-                ROUND(m.time_to_bottom,1) as ttb,
+                ROUND((t.pnl_pct_real*100)::numeric,1) as pnl,
+                ROUND((bs.bounce_pct*100)::numeric,0) as bounce_pct,
+                ROUND((m.time_to_bottom)::numeric,1) as ttb,
                 m.smart_wallets,
                 ROUND(m.mc_migration) as mc_mig,
                 CASE WHEN h.mint IS NOT NULL THEN 'sim' ELSE 'não' END as h9,
@@ -14111,9 +14111,9 @@ def analise_big_picture():
         cur.execute("""
             SELECT
                 t.symbol,
-                ROUND(t.pnl_pct_real*100,1) as pnl,
-                ROUND(bs.bounce_pct*100,0) as bounce_pct,
-                ROUND(m.time_to_bottom,1) as ttb,
+                ROUND((t.pnl_pct_real*100)::numeric,1) as pnl,
+                ROUND((bs.bounce_pct*100)::numeric,0) as bounce_pct,
+                ROUND((m.time_to_bottom)::numeric,1) as ttb,
                 m.smart_wallets,
                 CASE WHEN (bs.absorption_events IS NOT NULL AND bs.absorption_events > 0) THEN bs.absorption_events::text ELSE '-' END as h22_ev
             FROM trades t
@@ -14136,8 +14136,8 @@ def analise_big_picture():
         # bounce_pct > X threshold grid
         cur.execute("""
             SELECT threshold, n, tp,
-                ROUND(100.0*tp/NULLIF(n,0),1) as wr,
-                ROUND(avg_pnl*100,1) as avg_pnl
+                ROUND((100.0*tp/NULLIF(n,0))::numeric,1) as wr,
+                ROUND((avg_pnl*100)::numeric,1) as avg_pnl
             FROM (
                 SELECT unnest(ARRAY[30,40,50,60,70,80,90]) as threshold
             ) thresholds
@@ -14171,7 +14171,7 @@ def analise_big_picture():
                 COUNT(*) as n,
                 SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
                 ROUND(100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/NULLIF(COUNT(*),0),1) as wr,
-                ROUND(AVG(t.pnl_pct_real)*100,1) as avg_pnl
+                ROUND((AVG(t.pnl_pct_real)*100)::numeric,1) as avg_pnl
             FROM trades t
             JOIN migrations m ON m.mint = t.mint
             WHERE t.exit_type='helius_sell_recovery' AND m.smart_wallets IS NOT NULL
@@ -14194,7 +14194,7 @@ def analise_big_picture():
                 COUNT(*) as n,
                 SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
                 ROUND(100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/NULLIF(COUNT(*),0),1) as wr,
-                ROUND(AVG(t.pnl_pct_real)*100,1) as avg_pnl
+                ROUND((AVG(t.pnl_pct_real)*100)::numeric,1) as avg_pnl
             FROM trades t
             JOIN migrations m ON m.mint = t.mint
             JOIN bounce_signals bs ON bs.mint = t.mint
