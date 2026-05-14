@@ -13117,5 +13117,43 @@ def analise_trade_autopsy():
         return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
+@app.route("/debug/query")
+def debug_query():
+    """Endpoint read-only para queries SQL diretas. Requer ?key=QUERY_SECRET.
+    Bloqueia qualquer statement que não seja SELECT/WITH/EXPLAIN.
+    Uso: /debug/query?sql=SELECT COUNT(*) FROM trades&key=SENHA
+    """
+    import re, json as _json, os as _os
+    secret = _os.getenv("QUERY_SECRET", "")
+    if not secret:
+        return _json.dumps({"error": "QUERY_SECRET não configurado no Railway"}), 403, {"Content-Type": "application/json"}
+    if request.args.get("key", "") != secret:
+        return _json.dumps({"error": "key inválida"}), 403, {"Content-Type": "application/json"}
+
+    sql = request.args.get("sql", "").strip()
+    if not sql:
+        return _json.dumps({"error": "parâmetro sql ausente"}), 400, {"Content-Type": "application/json"}
+
+    # Bloqueia qualquer coisa que não seja leitura
+    first_word = sql.split()[0].upper() if sql.split() else ""
+    if first_word not in ("SELECT", "WITH", "EXPLAIN"):
+        return _json.dumps({"error": f"apenas SELECT/WITH/EXPLAIN permitido, recebeu: {first_word}"}), 403, {"Content-Type": "application/json"}
+
+    try:
+        with db._cursor() as cur:
+            cur.execute(sql)
+            cols = [d[0] for d in cur.description] if cur.description else []
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+            # Converte tipos não-serializáveis
+            def _serialize(v):
+                if hasattr(v, "isoformat"):
+                    return v.isoformat()
+                return v
+            rows = [{k: _serialize(v) for k, v in r.items()} for r in rows]
+        return _json.dumps({"n": len(rows), "cols": cols, "rows": rows}, ensure_ascii=False, indent=2), 200, {"Content-Type": "application/json"}
+    except Exception as e:
+        return _json.dumps({"error": str(e)}), 500, {"Content-Type": "application/json"}
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
