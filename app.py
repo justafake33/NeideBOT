@@ -14967,6 +14967,305 @@ def analise_sl_otimo():
     return "".join(out)
 
 
+@app.route("/analise/combinacoes")
+def analise_combinacoes():
+    """
+    Teste sistemático de combinações de filtros nos 201 trades blockchain-verificados.
+    Pergunta: chegamos no teto de WR ou há combinação não testada acima de 21%?
+    """
+    import traceback as _tb
+    _f = lambda v: float(v) if v is not None else 0.0
+
+    NAV = """<nav style='font-family:monospace;padding:8px;background:#161b22;margin-bottom:16px'>
+    <a href='/analise/big-picture' style='color:#58a6ff;margin-right:16px'>Big Picture</a>
+    <a href='/analise/correlacao' style='color:#58a6ff;margin-right:16px'>Correlação</a>
+    <a href='/analise/combinacoes' style='color:#e3b341'>Combinações</a>
+    </nav>"""
+    CSS = """<style>
+    body{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:16px}
+    h2{color:#f0f6fc}h3{color:#58a6ff}
+    table{border-collapse:collapse;width:100%;margin:12px 0}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;text-align:left}
+    td{padding:5px 10px;border-bottom:1px solid #21262d}
+    tr:hover td{background:#161b22}
+    .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:14px;margin:10px 0}
+    .green{color:#3fb950}.red{color:#f85149}.yellow{color:#e3b341}.dim{color:#8b949e}
+    .hit{background:#0d2b0d}.miss{background:#2b0d0d}
+    </style>"""
+
+    out = [f"<html><head><title>Combinações</title>{CSS}</head><body>{NAV}"]
+    out.append("<h2>🔬 Combinações de Filtros — Chegamos no Teto?</h2>")
+    out.append("""<div class='card'>
+    <b>Pergunta honesta:</b> analisamos sinais individuais (máximo ~23% WR). Mas combinações não foram testadas sistematicamente.<br>
+    Este endpoint testa todas as combinações relevantes nos 201 trades blockchain-verificados.<br>
+    <b>Break-even: 21.4% WR</b> (avg_win 89.3%, avg_loss 24.3%).<br>
+    Qualquer combinação acima de 21.4% com n≥15 é candidata a filtro.
+    </div>""")
+
+    try:
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT
+                    t.id, t.mint, t.symbol, t.status, t.pnl_pct_real,
+                    t.ts_signal,
+                    COALESCE(t.tp_pct, 0.75) AS tp_pct,
+                    COALESCE(t.sl_pct, 0.25) AS sl_pct,
+                    COALESCE(
+                        CASE WHEN t.entry_price_usd > 0 AND t.tokens_received > 0
+                             THEN t.entry_price_usd / t.tokens_received * 1e9 END,
+                        t.entry_expected
+                    ) AS entry_mc,
+                    -- Migrations
+                    m.mc_migration,
+                    m.mc_bottom,
+                    m.mc_migration_bc_ref,
+                    m.time_to_bottom,
+                    m.smart_wallets,
+                    m.renowned_wallets,
+                    m.rug_ratio,
+                    m.top10_holder_rate,
+                    m.creator_token_status,
+                    m.cto_flag,
+                    m.has_social,
+                    m.x_follower_count,
+                    m.rat_trader_rate,
+                    m.bot_degen_rate,
+                    m.suspected_insider_rate,
+                    m.bc_progress_at_detection,
+                    m.exchange,
+                    -- Bounce signal
+                    bs.bounce_pct,
+                    bs.elapsed_sec,
+                    bs.mc_at_signal,
+                    bs.mc_min AS bs_mc_min,
+                    -- H9: tem sinal type 12 com trigger < 80% da migração?
+                    EXISTS(
+                        SELECT 1 FROM token_signals ts2
+                        WHERE ts2.mint = t.mint
+                          AND ts2.trigger_mc < m.mc_migration * 0.80
+                    ) AS has_h9
+                FROM trades t
+                LEFT JOIN migrations m ON m.mint = t.mint
+                LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+                WHERE t.exit_type = 'helius_sell_recovery'
+                  AND t.ts_signal IS NOT NULL
+                ORDER BY t.ts_signal
+            """)
+            rows = cur.fetchall()
+
+        _f = lambda v: float(v) if v is not None else 0.0
+
+        def enrich(r):
+            entry_mc = _f(r['entry_mc'])
+            mc_mig = _f(r['mc_migration'])
+            mc_bot = _f(r['mc_bottom'])
+            mc_mig_ref = _f(r['mc_migration_bc_ref'])
+
+            drop_depth = mc_bot / mc_mig if mc_mig > 10000 else None
+            ratio_vs_mig = entry_mc / mc_mig if mc_mig > 10000 and entry_mc > 0 else None
+            bounce = _f(r['bounce_pct'])
+            elapsed_min = _f(r['elapsed_sec']) / 60.0
+            smart = int(_f(r['smart_wallets']))
+            ttb = _f(r['time_to_bottom'])
+            creator_close = r['creator_token_status'] == 'creator_close'
+            is_tp = r['status'] == 'tp'
+
+            return {**dict(r),
+                    'entry_mc': entry_mc, 'mc_mig': mc_mig, 'mc_bot': mc_bot,
+                    'drop_depth': drop_depth, 'ratio_vs_mig': ratio_vs_mig,
+                    'bounce': bounce, 'elapsed_min': elapsed_min,
+                    'smart': smart, 'ttb': ttb,
+                    'creator_close': creator_close, 'is_tp': is_tp}
+
+        data = [enrich(r) for r in rows]
+        n_total = len(data)
+        n_tp_total = sum(1 for r in data if r['is_tp'])
+        wr_base = n_tp_total / n_total * 100 if n_total else 0
+
+        out.append(f"<p class='dim'>Base: {n_total} trades | {n_tp_total} TPs | WR baseline: {wr_base:.1f}%</p>")
+
+        # ── Seção 1: Sinais individuais (referência) ──
+        out.append("<h3>1 — Sinais Individuais (referência)</h3>")
+        out.append("<table><tr><th>Filtro</th><th>n passa</th><th>% do total</th><th>TPs</th><th>WR</th><th>vs base</th><th>EV/trade</th></tr>")
+
+        AVG_WIN = 0.893
+        AVG_LOSS = -0.243
+
+        def _ev(wr):
+            return wr * AVG_WIN + (1 - wr) * AVG_LOSS
+
+        def _row(label, grp):
+            n = len(grp)
+            tps = sum(1 for r in grp if r['is_tp'])
+            wr = tps / n if n > 0 else 0
+            ev = _ev(wr) * 100
+            delta = (wr - wr_base/100) * 100
+            pct = n / n_total * 100
+            wr_color = "green" if wr*100 >= 21.4 else ("yellow" if wr*100 >= 15 else "red")
+            ev_color = "green" if ev >= 0 else "red"
+            delta_str = f"+{delta:.1f}pp" if delta >= 0 else f"{delta:.1f}pp"
+            return f"<tr><td>{label}</td><td>{n}</td><td>{pct:.0f}%</td><td class='green'>{tps}</td><td class='{wr_color}'>{wr*100:.1f}%</td><td class='dim'>{delta_str}</td><td class='{ev_color}'>{ev:+.1f}%</td></tr>"
+
+        individual_filters = [
+            ("Todos (baseline)", data),
+            ("bounce ≥ 70%", [r for r in data if r['bounce'] >= 0.70]),
+            ("bounce ≥ 50%", [r for r in data if r['bounce'] >= 0.50]),
+            ("bounce ≥ 30% e <70%", [r for r in data if 0.30 <= r['bounce'] < 0.70]),
+            ("drop_depth 30-70%", [r for r in data if r['drop_depth'] and 0.30 <= r['drop_depth'] < 0.70]),
+            ("drop_depth < 30% (dump >70%)", [r for r in data if r['drop_depth'] and r['drop_depth'] < 0.30]),
+            ("creator_close", [r for r in data if r['creator_close']]),
+            ("smart ≥ 3", [r for r in data if r['smart'] >= 3]),
+            ("smart ≥ 5", [r for r in data if r['smart'] >= 5]),
+            ("elapsed ≤ 10min", [r for r in data if r['elapsed_min'] <= 10]),
+            ("elapsed 10-20min", [r for r in data if 10 < r['elapsed_min'] <= 20]),
+            ("H9 confirmado", [r for r in data if r['has_h9']]),
+            ("SEM H9", [r for r in data if not r['has_h9']]),
+            ("entry < 70% mc_mig", [r for r in data if r['ratio_vs_mig'] and r['ratio_vs_mig'] < 0.70]),
+            ("entry 70-100% mc_mig", [r for r in data if r['ratio_vs_mig'] and 0.70 <= r['ratio_vs_mig'] < 1.0]),
+        ]
+        for label, grp in individual_filters:
+            out.append(_row(label, grp))
+        out.append("</table>")
+
+        # ── Seção 2: Combinações de 2 filtros ──
+        out.append("<h3>2 — Combinações de 2 Filtros</h3>")
+        out.append("<table><tr><th>Combinação</th><th>n</th><th>%</th><th>TPs</th><th>WR</th><th>vs base</th><th>EV/trade</th></tr>")
+
+        combos_2 = [
+            ("bounce ≥ 70% + creator_close",
+             [r for r in data if r['bounce'] >= 0.70 and r['creator_close']]),
+            ("bounce ≥ 70% + smart ≥ 3",
+             [r for r in data if r['bounce'] >= 0.70 and r['smart'] >= 3]),
+            ("bounce ≥ 70% + drop 30-70%",
+             [r for r in data if r['bounce'] >= 0.70 and r['drop_depth'] and 0.30 <= r['drop_depth'] < 0.70]),
+            ("bounce ≥ 50% + creator_close",
+             [r for r in data if r['bounce'] >= 0.50 and r['creator_close']]),
+            ("bounce ≥ 50% + smart ≥ 3",
+             [r for r in data if r['bounce'] >= 0.50 and r['smart'] >= 3]),
+            ("bounce ≥ 50% + drop 30-70%",
+             [r for r in data if r['bounce'] >= 0.50 and r['drop_depth'] and 0.30 <= r['drop_depth'] < 0.70]),
+            ("creator_close + smart ≥ 3",
+             [r for r in data if r['creator_close'] and r['smart'] >= 3]),
+            ("creator_close + drop 30-70%",
+             [r for r in data if r['creator_close'] and r['drop_depth'] and 0.30 <= r['drop_depth'] < 0.70]),
+            ("creator_close + elapsed ≤ 10min",
+             [r for r in data if r['creator_close'] and r['elapsed_min'] <= 10]),
+            ("drop 30-70% + smart ≥ 3",
+             [r for r in data if r['drop_depth'] and 0.30 <= r['drop_depth'] < 0.70 and r['smart'] >= 3]),
+            ("drop 30-70% + elapsed ≤ 10min",
+             [r for r in data if r['drop_depth'] and 0.30 <= r['drop_depth'] < 0.70 and r['elapsed_min'] <= 10]),
+            ("smart ≥ 3 + elapsed ≤ 10min",
+             [r for r in data if r['smart'] >= 3 and r['elapsed_min'] <= 10]),
+            ("H9 + bounce ≥ 50%",
+             [r for r in data if r['has_h9'] and r['bounce'] >= 0.50]),
+            ("H9 + creator_close",
+             [r for r in data if r['has_h9'] and r['creator_close']]),
+            ("H9 + smart ≥ 3",
+             [r for r in data if r['has_h9'] and r['smart'] >= 3]),
+            ("entry < 70% + bounce ≥ 50%",
+             [r for r in data if r['ratio_vs_mig'] and r['ratio_vs_mig'] < 0.70 and r['bounce'] >= 0.50]),
+            ("entry < 70% + creator_close",
+             [r for r in data if r['ratio_vs_mig'] and r['ratio_vs_mig'] < 0.70 and r['creator_close']]),
+        ]
+
+        combo_results = []
+        for label, grp in combos_2:
+            n = len(grp)
+            tps = sum(1 for r in grp if r['is_tp'])
+            wr = tps / n if n > 0 else 0
+            ev = _ev(wr) * 100
+            combo_results.append((label, grp, n, tps, wr, ev))
+
+        # Ordenar por WR decrescente
+        for label, grp, n, tps, wr, ev in sorted(combo_results, key=lambda x: -x[4]):
+            delta = (wr - wr_base/100) * 100
+            pct = n / n_total * 100
+            wr_color = "green" if wr*100 >= 21.4 else ("yellow" if wr*100 >= 15 else "red")
+            ev_color = "green" if ev >= 0 else "red"
+            delta_str = f"+{delta:.1f}pp" if delta >= 0 else f"{delta:.1f}pp"
+            row_class = "hit" if wr*100 >= 21.4 and n >= 10 else ""
+            out.append(f"<tr class='{row_class}'><td>{label}</td><td>{n}</td><td>{pct:.0f}%</td><td class='green'>{tps}</td><td class='{wr_color}'>{wr*100:.1f}%</td><td class='dim'>{delta_str}</td><td class='{ev_color}'>{ev:+.1f}%</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 3: Combinações de 3 filtros (só as mais promissoras) ──
+        out.append("<h3>3 — Combinações de 3 Filtros (top candidatos)</h3>")
+        out.append("<table><tr><th>Combinação</th><th>n</th><th>%</th><th>TPs</th><th>WR</th><th>EV/trade</th></tr>")
+
+        combos_3 = [
+            ("bounce ≥ 50% + creator_close + smart ≥ 3",
+             [r for r in data if r['bounce'] >= 0.50 and r['creator_close'] and r['smart'] >= 3]),
+            ("bounce ≥ 70% + creator_close + smart ≥ 3",
+             [r for r in data if r['bounce'] >= 0.70 and r['creator_close'] and r['smart'] >= 3]),
+            ("bounce ≥ 50% + creator_close + drop 30-70%",
+             [r for r in data if r['bounce'] >= 0.50 and r['creator_close'] and r['drop_depth'] and 0.30 <= r['drop_depth'] < 0.70]),
+            ("bounce ≥ 50% + creator_close + elapsed ≤ 10min",
+             [r for r in data if r['bounce'] >= 0.50 and r['creator_close'] and r['elapsed_min'] <= 10]),
+            ("bounce ≥ 50% + smart ≥ 3 + drop 30-70%",
+             [r for r in data if r['bounce'] >= 0.50 and r['smart'] >= 3 and r['drop_depth'] and 0.30 <= r['drop_depth'] < 0.70]),
+            ("creator_close + smart ≥ 3 + drop 30-70%",
+             [r for r in data if r['creator_close'] and r['smart'] >= 3 and r['drop_depth'] and 0.30 <= r['drop_depth'] < 0.70]),
+            ("creator_close + smart ≥ 3 + elapsed ≤ 10min",
+             [r for r in data if r['creator_close'] and r['smart'] >= 3 and r['elapsed_min'] <= 10]),
+            ("H9 + bounce ≥ 50% + creator_close",
+             [r for r in data if r['has_h9'] and r['bounce'] >= 0.50 and r['creator_close']]),
+            ("H9 + creator_close + smart ≥ 3",
+             [r for r in data if r['has_h9'] and r['creator_close'] and r['smart'] >= 3]),
+            ("bounce ≥ 30% + creator_close + smart ≥ 3 + elapsed ≤ 10min",
+             [r for r in data if r['bounce'] >= 0.30 and r['creator_close'] and r['smart'] >= 3 and r['elapsed_min'] <= 10]),
+        ]
+
+        for label, grp in sorted(combos_3, key=lambda x: -(sum(1 for r in x[1] if r['is_tp']) / len(x[1]) if x[1] else 0)):
+            n = len(grp)
+            tps = sum(1 for r in grp if r['is_tp'])
+            wr = tps / n if n > 0 else 0
+            ev = _ev(wr) * 100
+            pct = n / n_total * 100
+            wr_color = "green" if wr*100 >= 21.4 else ("yellow" if wr*100 >= 15 else "red")
+            ev_color = "green" if ev >= 0 else "red"
+            row_class = "hit" if wr*100 >= 21.4 and n >= 8 else ""
+            out.append(f"<tr class='{row_class}'><td>{label}</td><td>{n}</td><td>{pct:.0f}%</td><td class='green'>{tps}</td><td class='{wr_color}'>{wr*100:.1f}%</td><td class='{ev_color}'>{ev:+.1f}%</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 4: Os TPs — o que tinham em comum? ──
+        out.append("<h3>4 — Os 23 TPs: presença de cada sinal</h3>")
+        tp_rows = [r for r in data if r['is_tp']]
+        sl_rows = [r for r in data if not r['is_tp']]
+
+        checks = [
+            ("bounce ≥ 50%", lambda r: r['bounce'] >= 0.50),
+            ("bounce ≥ 70%", lambda r: r['bounce'] >= 0.70),
+            ("creator_close", lambda r: r['creator_close']),
+            ("smart ≥ 3", lambda r: r['smart'] >= 3),
+            ("smart ≥ 5", lambda r: r['smart'] >= 5),
+            ("drop_depth 30-70%", lambda r: r['drop_depth'] and 0.30 <= r['drop_depth'] < 0.70),
+            ("elapsed ≤ 10min", lambda r: r['elapsed_min'] <= 10),
+            ("elapsed ≤ 5min", lambda r: r['elapsed_min'] <= 5),
+            ("entry < 70% mc_mig", lambda r: r['ratio_vs_mig'] and r['ratio_vs_mig'] < 0.70),
+            ("H9 confirmado", lambda r: r['has_h9']),
+        ]
+
+        out.append("<table><tr><th>Sinal</th><th>% TPs com sinal</th><th>% SLs com sinal</th><th>Lift</th></tr>")
+        for label, cond in checks:
+            tp_pct = sum(1 for r in tp_rows if cond(r)) / len(tp_rows) * 100 if tp_rows else 0
+            sl_pct = sum(1 for r in sl_rows if cond(r)) / len(sl_rows) * 100 if sl_rows else 0
+            lift = tp_pct - sl_pct
+            lift_color = "green" if lift >= 10 else ("yellow" if lift >= 5 else ("red" if lift < 0 else "dim"))
+            out.append(f"<tr><td>{label}</td><td class='green'>{tp_pct:.0f}%</td><td class='red'>{sl_pct:.0f}%</td><td class='{lift_color}'>{lift:+.0f}pp</td></tr>")
+        out.append("</table>")
+
+        out.append("""<div class='card'>
+        <b>Interpretação:</b> Lift = %TPs com sinal − %SLs com sinal.<br>
+        Lift &gt;10pp = sinal genuíno. Lift &lt;0 = sinal que PIORA a seleção.<br>
+        Um bom filtro tem lift alto E é presente em muitos TPs (não apenas em 3 casos raros).
+        </div>""")
+
+    except Exception:
+        out.append(f"<pre style='color:#f85149'>{_tb.format_exc()}</pre>")
+
+    out.append("</body></html>")
+    return "".join(out)
+
+
 @app.route("/analise/bonding-curve")
 def analise_bonding_curve():
     """
