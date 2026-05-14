@@ -13866,5 +13866,353 @@ pre.errbox{color:#f85149;background:#1a0000;padding:14px;border-radius:6px;
     )
 
 
+@app.route("/analise/big-picture")
+def analise_big_picture():
+    CSS = """
+    <style>
+    body{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:20px;max-width:1100px;margin:0 auto}
+    h1{color:#58a6ff;border-bottom:1px solid #30363d;padding-bottom:8px}
+    h2{color:#79c0ff;margin-top:28px;margin-bottom:6px}
+    h3{color:#8b949e;margin:14px 0 4px}
+    table{border-collapse:collapse;width:100%;margin-bottom:16px}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;text-align:left;border:1px solid #30363d;font-size:12px}
+    td{padding:5px 10px;border:1px solid #21262d;font-size:13px}
+    tr:hover td{background:#1c2128}
+    .tp{color:#3fb950}.sl{color:#f85149}.neu{color:#e3b341}
+    .bar{display:inline-block;height:12px;background:#3fb950;vertical-align:middle;margin-right:6px}
+    .bar-sl{background:#f85149}
+    .box{background:#161b22;border:1px solid #30363d;padding:12px 16px;margin:8px 0;border-radius:6px}
+    .big{font-size:28px;font-weight:bold}
+    .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}
+    .kpi{background:#161b22;border:1px solid #30363d;padding:12px;border-radius:6px;text-align:center}
+    .kpi-val{font-size:22px;font-weight:bold;display:block}
+    .kpi-lbl{font-size:11px;color:#8b949e;margin-top:4px}
+    a{color:#58a6ff}
+    </style>
+    """
+    NAV = "<p style='margin-bottom:16px'><a href='/analise/wr-breakdown'>WR Breakdown</a> · <a href='/analise/trade-autopsy'>Trade Autopsy</a> · <a href='/analise/h22-correlation'>H22</a> · <a href='/analise/big-picture'>Big Picture</a></p>"
+
+    sections = []
+    sections.append(f"<!DOCTYPE html><html><head><title>Big Picture</title>{CSS}</head><body>")
+    sections.append(NAV)
+    sections.append("<h1>📊 Big Picture — 139 Trades Blockchain-Verificados</h1>")
+
+    with db._cursor() as cur:
+
+        # ── CAMADA 1: KPIs base ────────────────────────────────────────
+        cur.execute("""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN status='tp' THEN 1 ELSE 0 END) as n_tp,
+                SUM(CASE WHEN status='sl' THEN 1 ELSE 0 END) as n_sl,
+                ROUND(100.0*SUM(CASE WHEN status='tp' THEN 1 ELSE 0 END)/COUNT(*),1) as wr,
+                ROUND(AVG(CASE WHEN status='tp' THEN pnl_pct_real END)*100,1) as avg_win,
+                ROUND(AVG(CASE WHEN status='sl' THEN pnl_pct_real END)*100,1) as avg_loss,
+                ROUND(AVG(pnl_pct_real)*100,2) as avg_pnl,
+                ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY CASE WHEN status='sl' THEN pnl_pct_real END)*100,1) as median_loss
+            FROM trades WHERE exit_type='helius_sell_recovery'
+        """)
+        k = cur.fetchone()
+        ev = round(k['avg_win']/100 * k['wr']/100 + k['avg_loss']/100 * (1 - k['wr']/100), 4)
+        payoff = round(abs((k['avg_win'] or 0) / (k['avg_loss'] or -1)), 2)
+        breakeven = round(abs(k['avg_loss']) / (abs(k['avg_win']) + abs(k['avg_loss'])) * 100, 1) if k['avg_loss'] and k['avg_win'] else 0
+
+        sections.append(f"""
+        <h2>Camada 1 — Distribuição Base</h2>
+        <div class='grid'>
+          <div class='kpi'><span class='kpi-val'>{k['total']}</span><span class='kpi-lbl'>Trades verificados</span></div>
+          <div class='kpi'><span class='kpi-val {"tp" if k["wr"]>=breakeven else "sl"}'>{k['wr']}%</span><span class='kpi-lbl'>WR real (break-even: {breakeven}%)</span></div>
+          <div class='kpi'><span class='kpi-val tp'>{k['avg_win']}%</span><span class='kpi-lbl'>Avg win ({k['n_tp']} TPs)</span></div>
+          <div class='kpi'><span class='kpi-val sl'>{k['avg_loss']}%</span><span class='kpi-lbl'>Avg loss median {k['median_loss']}% ({k['n_sl']} SLs)</span></div>
+        </div>
+        <div class='grid'>
+          <div class='kpi'><span class='kpi-val {"tp" if ev>0 else "sl"}'>{ev:+.2%}</span><span class='kpi-lbl'>EV por trade (real)</span></div>
+          <div class='kpi'><span class='kpi-val'>{payoff}×</span><span class='kpi-lbl'>Payoff (win/loss)</span></div>
+          <div class='kpi'><span class='kpi-val {"sl" if breakeven>k["wr"] else "tp"}'>{breakeven}%</span><span class='kpi-lbl'>Break-even WR</span></div>
+          <div class='kpi'><span class='kpi-val {"tp" if k["avg_pnl"]>0 else "sl"}'>{k['avg_pnl']:+.1f}%</span><span class='kpi-lbl'>P&L médio por trade</span></div>
+        </div>
+        """)
+
+        # Distribuição do P&L dos SLs (profundidade real)
+        cur.execute("""
+            SELECT
+                CASE
+                    WHEN pnl_pct_real >= -0.10 THEN '0 a -10%'
+                    WHEN pnl_pct_real >= -0.20 THEN '-10 a -20%'
+                    WHEN pnl_pct_real >= -0.30 THEN '-20 a -30%'
+                    WHEN pnl_pct_real >= -0.40 THEN '-30 a -40%'
+                    WHEN pnl_pct_real >= -0.50 THEN '-40 a -50%'
+                    ELSE '<-50%'
+                END as faixa,
+                COUNT(*) as n,
+                ROUND(AVG(pnl_pct_real)*100,1) as avg_pnl
+            FROM trades
+            WHERE exit_type='helius_sell_recovery' AND status='sl'
+            GROUP BY faixa
+            ORDER BY MIN(pnl_pct_real) DESC
+        """)
+        rows = cur.fetchall()
+        total_sl = sum(r['n'] for r in rows)
+        sections.append("<h3>Profundidade real dos SLs</h3><table><tr><th>Faixa de P&L</th><th>n</th><th>%</th><th>Avg P&L</th></tr>")
+        for r in rows:
+            pct = round(r['n']/total_sl*100, 1)
+            bar = int(pct/2)
+            sections.append(f"<tr><td class='sl'>{r['faixa']}</td><td>{r['n']}</td><td><span class='bar bar-sl' style='width:{bar}px'></span>{pct}%</td><td>{r['avg_pnl']}%</td></tr>")
+        sections.append("</table>")
+
+        # ── CAMADA 2: BOUNCE_PCT vs TP/SL ────────────────────────────────
+        cur.execute("""
+            SELECT
+                FLOOR(bs.bounce_pct*100/10)*10 as bmin,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND(100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/NULLIF(COUNT(*),0),1) as wr,
+                ROUND(AVG(t.pnl_pct_real)*100,1) as avg_pnl,
+                ROUND(AVG(CASE WHEN t.status='tp' THEN t.pnl_pct_real END)*100,1) as avg_win,
+                ROUND(AVG(CASE WHEN t.status='sl' THEN t.pnl_pct_real END)*100,1) as avg_loss
+            FROM trades t
+            JOIN bounce_signals bs ON bs.mint = t.mint
+            WHERE t.exit_type='helius_sell_recovery' AND bs.bounce_pct IS NOT NULL
+            GROUP BY bmin ORDER BY bmin
+        """)
+        rows = cur.fetchall()
+        sections.append("<h2>Camada 2 — bounce_pct vs TP/SL</h2>")
+        sections.append("<table><tr><th>Faixa bounce</th><th>n</th><th>TP</th><th>WR</th><th>Avg P&L</th><th>Avg Win</th><th>Avg Loss</th><th>EV estimado</th></tr>")
+        for r in rows:
+            wr = r['wr'] or 0
+            aw = r['avg_win'] or 0
+            al = r['avg_loss'] or 0
+            ev_r = round(aw/100 * wr/100 + al/100 * (1-wr/100), 3)
+            cls = "tp" if wr >= breakeven else "sl"
+            ev_cls = "tp" if ev_r > 0 else "sl"
+            bar = int(wr/2)
+            sections.append(f"<tr><td>{int(r['bmin'])}-{int(r['bmin'])+10}%</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td><td class='{cls}'><span class='bar' style='width:{bar}px'></span>{wr}%</td><td class='{ev_cls}'>{r['avg_pnl']}%</td><td class='tp'>{aw}%</td><td class='sl'>{al}%</td><td class='{ev_cls}'>{ev_r:+.2%}</td></tr>")
+        sections.append("</table>")
+
+        # ── CAMADA 2b: H10 no live (time_to_bottom) ─────────────────────
+        cur.execute("""
+            SELECT
+                CASE
+                    WHEN m.time_to_bottom < 10 THEN '< 10min'
+                    WHEN m.time_to_bottom < 20 THEN '10-20min'
+                    WHEN m.time_to_bottom < 30 THEN '20-30min'
+                    ELSE '>= 30min'
+                END as ttb,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND(100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/NULLIF(COUNT(*),0),1) as wr,
+                ROUND(AVG(t.pnl_pct_real)*100,1) as avg_pnl
+            FROM trades t
+            JOIN migrations m ON m.mint = t.mint
+            WHERE t.exit_type='helius_sell_recovery' AND m.time_to_bottom IS NOT NULL
+            GROUP BY ttb ORDER BY MIN(m.time_to_bottom)
+        """)
+        rows = cur.fetchall()
+        sections.append("<h3>H10 nos trades live (time_to_bottom)</h3>")
+        sections.append("<table><tr><th>TTB</th><th>n</th><th>TP</th><th>WR</th><th>Avg P&L</th></tr>")
+        for r in rows:
+            cls = "tp" if (r['wr'] or 0) >= breakeven else "sl"
+            sections.append(f"<tr><td>{r['ttb']}</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td><td class='{cls}'>{r['wr']}%</td><td>{r['avg_pnl']}%</td></tr>")
+        sections.append("</table>")
+
+        # ── CAMADA 3: H9 SIGNAL presence ─────────────────────────────────
+        cur.execute("""
+            WITH h9_mints AS (
+                SELECT DISTINCT ts.mint
+                FROM token_signals ts
+                JOIN migrations m ON m.mint = ts.mint
+                WHERE ts.trigger_mc < m.mc_migration * 0.80
+                  AND m.mc_migration IS NOT NULL
+            )
+            SELECT
+                CASE WHEN h.mint IS NOT NULL THEN 'Com H9 (<80% mig)' ELSE 'Sem H9' END as h9,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND(100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/NULLIF(COUNT(*),0),1) as wr,
+                ROUND(AVG(t.pnl_pct_real)*100,1) as avg_pnl
+            FROM trades t
+            LEFT JOIN h9_mints h ON h.mint = t.mint
+            WHERE t.exit_type='helius_sell_recovery'
+            GROUP BY h9
+        """)
+        rows = cur.fetchall()
+        sections.append("<h2>Camada 3 — H9 Signal (trigger_mc &lt; 80% mc_migration)</h2>")
+        sections.append("<table><tr><th>H9</th><th>n</th><th>TP</th><th>WR</th><th>Avg P&L</th></tr>")
+        for r in rows:
+            cls = "tp" if (r['wr'] or 0) >= breakeven else "sl"
+            sections.append(f"<tr><td>{r['h9']}</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td><td class='{cls}'>{r['wr']}%</td><td>{r['avg_pnl']}%</td></tr>")
+        sections.append("</table>")
+
+        # ── CAMADA 3b: H22 Absorption ─────────────────────────────────────
+        cur.execute("""
+            SELECT
+                CASE
+                    WHEN bs.absorption_events IS NULL OR bs.absorption_events = 0 THEN 'Sem dados Helius'
+                    WHEN bs.absorption_buy_vol > bs.absorption_sell_vol THEN 'Buy > Sell'
+                    WHEN bs.absorption_buy_vol = bs.absorption_sell_vol THEN 'Buy = Sell'
+                    ELSE 'Sell > Buy'
+                END as h22,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND(100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/NULLIF(COUNT(*),0),1) as wr,
+                ROUND(AVG(t.pnl_pct_real)*100,1) as avg_pnl,
+                ROUND(AVG(bs.absorption_events),1) as avg_events
+            FROM trades t
+            LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+            WHERE t.exit_type='helius_sell_recovery'
+            GROUP BY h22
+            ORDER BY wr DESC NULLS LAST
+        """)
+        rows = cur.fetchall()
+        sections.append("<h2>Camada 3b — H22 Absorção no momento do bounce</h2>")
+        sections.append("<table><tr><th>Absorção</th><th>n</th><th>TP</th><th>WR</th><th>Avg P&L</th><th>Avg Events</th></tr>")
+        for r in rows:
+            cls = "tp" if (r['wr'] or 0) >= breakeven else ("sl" if r['wr'] is not None else "neu")
+            sections.append(f"<tr><td>{r['h22']}</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td><td class='{cls}'>{r['wr'] or '-'}%</td><td>{r['avg_pnl']}%</td><td>{r['avg_events'] or '-'}</td></tr>")
+        sections.append("</table>")
+
+        # ── CAMADA 4: ANATOMIA DOS 14 TPs ─────────────────────────────────
+        cur.execute("""
+            WITH h9_mints AS (
+                SELECT DISTINCT ts.mint
+                FROM token_signals ts
+                JOIN migrations m ON m.mint = ts.mint
+                WHERE ts.trigger_mc < m.mc_migration * 0.80
+                  AND m.mc_migration IS NOT NULL
+            )
+            SELECT
+                t.mint, t.symbol,
+                ROUND(t.pnl_pct_real*100,1) as pnl,
+                ROUND(bs.bounce_pct*100,0) as bounce_pct,
+                ROUND(m.time_to_bottom,1) as ttb,
+                m.smart_wallets,
+                ROUND(m.mc_migration) as mc_mig,
+                CASE WHEN h.mint IS NOT NULL THEN 'sim' ELSE 'não' END as h9,
+                CASE WHEN (bs.absorption_events IS NOT NULL AND bs.absorption_events > 0) THEN bs.absorption_events::text ELSE '-' END as h22_ev,
+                t.created_at::date as data
+            FROM trades t
+            LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+            LEFT JOIN migrations m ON m.mint = t.mint
+            LEFT JOIN h9_mints h ON h.mint = t.mint
+            WHERE t.exit_type='helius_sell_recovery' AND t.status='tp'
+            ORDER BY t.pnl_pct_real DESC
+        """)
+        rows = cur.fetchall()
+
+        sections.append("<h2>Camada 4 — Anatomia dos TPs</h2>")
+        sections.append("<table><tr><th>Token</th><th>P&L</th><th>bounce%</th><th>TTB</th><th>smart</th><th>MC mig</th><th>H22 ev</th><th>Data</th></tr>")
+        for r in rows:
+            sections.append(f"<tr><td class='tp'>{r['symbol'] or r['mint'][:8]}</td><td class='tp'>{r['pnl']}%</td><td>{r['bounce_pct'] or '-'}%</td><td>{r['ttb'] or '-'}min</td><td>{r['smart_wallets'] or '-'}</td><td>${int(r['mc_mig'] or 0):,}</td><td>{r['h22_ev']}</td><td>{r['data']}</td></tr>")
+        sections.append("</table>")
+
+        # ── CAMADA 4b: ANATOMIA DOS SLs (top 20 piores) ───────────────────
+        cur.execute("""
+            SELECT
+                t.symbol,
+                ROUND(t.pnl_pct_real*100,1) as pnl,
+                ROUND(bs.bounce_pct*100,0) as bounce_pct,
+                ROUND(m.time_to_bottom,1) as ttb,
+                m.smart_wallets,
+                CASE WHEN (bs.absorption_events IS NOT NULL AND bs.absorption_events > 0) THEN bs.absorption_events::text ELSE '-' END as h22_ev
+            FROM trades t
+            LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+            LEFT JOIN migrations m ON m.mint = t.mint
+            WHERE t.exit_type='helius_sell_recovery' AND t.status='sl'
+            ORDER BY t.pnl_pct_real ASC
+            LIMIT 20
+        """)
+        rows = cur.fetchall()
+        sections.append("<h3>Top 20 piores SLs</h3>")
+        sections.append("<table><tr><th>Token</th><th>P&L</th><th>bounce%</th><th>TTB</th><th>smart</th><th>H22</th></tr>")
+        for r in rows:
+            sections.append(f"<tr><td class='sl'>{r['symbol'] or '?'}</td><td class='sl'>{r['pnl']}%</td><td>{r['bounce_pct'] or '-'}%</td><td>{r['ttb'] or '-'}min</td><td>{r['smart_wallets'] or '-'}</td><td>{r['h22_ev']}</td></tr>")
+        sections.append("</table>")
+
+        # ── CAMADA 5: COMBINAÇÕES ─────────────────────────────────────────
+        sections.append("<h2>Camada 5 — Combinações (o diamante)</h2>")
+
+        # bounce_pct > X threshold grid
+        cur.execute("""
+            SELECT threshold, n, tp,
+                ROUND(100.0*tp/NULLIF(n,0),1) as wr,
+                ROUND(avg_pnl*100,1) as avg_pnl
+            FROM (
+                SELECT unnest(ARRAY[30,40,50,60,70,80,90]) as threshold
+            ) thresholds
+            CROSS JOIN LATERAL (
+                SELECT COUNT(*) as n,
+                    SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                    AVG(t.pnl_pct_real) as avg_pnl
+                FROM trades t
+                JOIN bounce_signals bs ON bs.mint = t.mint
+                WHERE t.exit_type='helius_sell_recovery'
+                  AND bs.bounce_pct*100 >= threshold
+            ) sub
+            ORDER BY threshold
+        """)
+        rows = cur.fetchall()
+        sections.append("<h3>WR cumulativo por threshold de bounce_pct (bounce >= X%)</h3>")
+        sections.append("<table><tr><th>Bounce ≥</th><th>n</th><th>TP</th><th>WR</th><th>Avg P&L</th><th>EV estimado</th></tr>")
+        for r in rows:
+            wr = float(r['wr'] or 0)
+            ap = float(r['avg_pnl'] or 0)
+            ev_r = round(ap/100 * wr/100 + (k['avg_loss'] or 0)/100 * (1-wr/100), 3)
+            cls = "tp" if wr >= breakeven else "sl"
+            ev_cls = "tp" if ev_r > 0 else "sl"
+            sections.append(f"<tr><td>{r['threshold']}%</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td><td class='{cls}'>{wr}%</td><td class='{ev_cls}'>{ap:+.1f}%</td><td class='{ev_cls}'>{ev_r:+.2%}</td></tr>")
+        sections.append("</table>")
+
+        # smart_wallets grid
+        cur.execute("""
+            SELECT
+                m.smart_wallets,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND(100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/NULLIF(COUNT(*),0),1) as wr,
+                ROUND(AVG(t.pnl_pct_real)*100,1) as avg_pnl
+            FROM trades t
+            JOIN migrations m ON m.mint = t.mint
+            WHERE t.exit_type='helius_sell_recovery' AND m.smart_wallets IS NOT NULL
+            GROUP BY m.smart_wallets
+            ORDER BY m.smart_wallets
+        """)
+        rows = cur.fetchall()
+        sections.append("<h3>WR por smart_wallets</h3>")
+        sections.append("<table><tr><th>Smart</th><th>n</th><th>TP</th><th>WR</th><th>Avg P&L</th></tr>")
+        for r in rows:
+            cls = "tp" if (r['wr'] or 0) >= breakeven else "sl"
+            sections.append(f"<tr><td>{r['smart_wallets']}</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td><td class='{cls}'>{r['wr']}%</td><td>{r['avg_pnl']}%</td></tr>")
+        sections.append("</table>")
+
+        # bounce_pct >= 50 + smart breakdown
+        cur.execute("""
+            SELECT
+                CASE WHEN m.smart_wallets >= 3 THEN 'smart>=3' ELSE 'smart<3' END as smart_tier,
+                CASE WHEN bs.bounce_pct*100 >= 70 THEN 'bounce>=70' ELSE 'bounce<70' END as bounce_tier,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND(100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/NULLIF(COUNT(*),0),1) as wr,
+                ROUND(AVG(t.pnl_pct_real)*100,1) as avg_pnl
+            FROM trades t
+            JOIN migrations m ON m.mint = t.mint
+            JOIN bounce_signals bs ON bs.mint = t.mint
+            WHERE t.exit_type='helius_sell_recovery' AND bs.bounce_pct IS NOT NULL
+            GROUP BY smart_tier, bounce_tier
+            ORDER BY bounce_tier DESC, smart_tier
+        """)
+        rows = cur.fetchall()
+        sections.append("<h3>Combinação: bounce ≥ 70% + smart_wallets</h3>")
+        sections.append("<table><tr><th>Smart tier</th><th>Bounce tier</th><th>n</th><th>TP</th><th>WR</th><th>Avg P&L</th></tr>")
+        for r in rows:
+            cls = "tp" if (r['wr'] or 0) >= breakeven else "sl"
+            sections.append(f"<tr><td>{r['smart_tier']}</td><td>{r['bounce_tier']}</td><td>{r['n']}</td><td class='tp'>{r['tp']}</td><td class='{cls}'>{r['wr']}%</td><td>{r['avg_pnl']}%</td></tr>")
+        sections.append("</table>")
+
+    sections.append(f"<p style='color:#8b949e;font-size:12px;margin-top:24px'>Break-even calculado com avg_win={k['avg_win']}% / avg_loss={k['avg_loss']}% reais da blockchain · {k['total']} trades · exit_type=helius_sell_recovery</p>")
+    sections.append("</body></html>")
+
+    return "".join(sections)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
