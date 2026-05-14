@@ -16605,6 +16605,7 @@ def analise_token_outcome():
                 'abs_buy': abs_buy, 'abs_sell': abs_sell,
                 'abs_events': abs_events, 'has_helius': has_helius,
                 'buy_ratio': buy_ratio,
+                'abs_lrg_buy': abs_lrg_buy, 'abs_buy_cnt': abs_buy_cnt,
                 'h9_count': h9_count,
             })
 
