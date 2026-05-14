@@ -16492,11 +16492,24 @@ def analise_token_outcome():
                     m.smart_wallets,
                     m.creator_token_status,
                     m.exchange,
+                    m.liq_migration,
+                    m.time_to_migrate_sec,
                     -- Bounce metadata
                     bs.bounce_pct,
                     bs.elapsed_sec,
                     bs.mc_at_signal,
-                    bs.mc_min AS bs_mc_min
+                    bs.mc_min AS bs_mc_min,
+                    -- H22 Helius absorption
+                    bs.absorption_buy_vol,
+                    bs.sell_vol AS absorption_sell_vol,
+                    bs.buy_cnt,
+                    bs.sell_cnt,
+                    bs.lrg_buy,
+                    bs.absorption_events,
+                    -- H9 signal depth
+                    (SELECT COUNT(*) FROM token_signals ts2
+                     WHERE ts2.mint = t.mint
+                       AND ts2.trigger_mc < m.mc_migration * 0.80) AS h9_signal_count
                 FROM trades t
                 LEFT JOIN migrations m ON m.mint = t.mint
                 LEFT JOIN bounce_signals bs ON bs.mint = t.mint
@@ -16555,6 +16568,25 @@ def analise_token_outcome():
             else:
                 period = "Desconhecido"
 
+            # UTC hour of signal
+            utc_hour = ts_signal.hour if ts_signal else None
+
+            # time_to_migrate in minutes
+            ttm_min = _f(r['time_to_migrate_sec']) / 60.0 if r['time_to_migrate_sec'] else None
+
+            # pool liquidity
+            liq = _f(r['liq_migration'])
+
+            # Helius absorption
+            abs_buy = _f(r['absorption_buy_vol'])
+            abs_sell = _f(r['absorption_sell_vol'])
+            abs_events = int(_f(r['absorption_events']))
+            has_helius = abs_events > 0
+            buy_ratio = abs_buy / (abs_buy + abs_sell) if (abs_buy + abs_sell) > 0 else None
+
+            # H9 depth
+            h9_count = int(_f(r['h9_signal_count']))
+
             enriched.append({**dict(r),
                 'entry_mc': entry_mc, 'mc_mig': mc_mig, 'mc_bot': mc_bot,
                 'mc_1h': mc_1h, 'mc_peak': mc_peak,
@@ -16565,6 +16597,13 @@ def analise_token_outcome():
                 'bounce': _f(r['bounce_pct']),
                 'elapsed_min': _f(r['elapsed_sec']) / 60.0,
                 'smart': int(_f(r['smart_wallets'])),
+                'utc_hour': utc_hour,
+                'ttm_min': ttm_min,
+                'liq': liq,
+                'abs_buy': abs_buy, 'abs_sell': abs_sell,
+                'abs_events': abs_events, 'has_helius': has_helius,
+                'buy_ratio': buy_ratio,
+                'h9_count': h9_count,
             })
 
         has_mig = [r for r in enriched if r['mc_mig'] > 10000]
@@ -16795,6 +16834,217 @@ def analise_token_outcome():
         <b>Conclusão:</b> Se as falhas de execução dominam os sinais ruins, prioridade = ampliar SL ou time-gate de spike.
         Se os sinais ruins dominam, prioridade = filtros mais restritivos.
         </div>""")
+
+        # ── Seção 8: Liquidez do pool (liq_migration) ──
+        out.append("<h3>8 — Liquidez do Pool × Recovery (spike pAMM)</h3>")
+        out.append("""<div class='card'>
+        Pool com pouca liquidez → uma única venda de 5 SOL move o preço -25% instantaneamente → SL falso.<br>
+        <b>Hipótese:</b> pools com liquidez baixa geram mais falhas de execução (SL + recov).
+        </div>""")
+
+        liq_buckets = [
+            ("< $5K",   lambda r: r['liq'] > 0 and r['liq'] < 5_000),
+            ("$5K–$10K", lambda r: 5_000 <= r['liq'] < 10_000),
+            ("$10K–$20K", lambda r: 10_000 <= r['liq'] < 20_000),
+            ("$20K–$50K", lambda r: 20_000 <= r['liq'] < 50_000),
+            ("≥ $50K",  lambda r: r['liq'] >= 50_000),
+        ]
+
+        out.append("<table><tr><th>Liquidez pool</th><th>n</th><th>WR carteira</th><th>Token recovery</th><th>SL+recov (exec fail)</th><th>Liq média</th></tr>")
+        for label, cond in liq_buckets:
+            grp = [r for r in has_mig if cond(r)]
+            if not grp:
+                continue
+            n = len(grp)
+            wr = sum(1 for r in grp if r['is_tp']) / n * 100
+            tok_r = sum(1 for r in grp if r['token_recovered']) / n * 100
+            sl_r = sum(1 for r in grp if r['quadrant'] == 'SL_RECOV') / n * 100
+            avg_liq = statistics.mean(r['liq'] for r in grp)
+            wr_color = "green" if wr >= 21.4 else ("yellow" if wr >= 12 else "red")
+            tok_color = "green" if tok_r >= 25 else ("yellow" if tok_r >= 15 else "red")
+            out.append(f"<tr><td>{label}</td><td>{n}</td><td class='{wr_color}'>{wr:.0f}%</td>"
+                       f"<td class='{tok_color}'>{tok_r:.0f}%</td><td class='red'>{sl_r:.0f}%</td>"
+                       f"<td class='dim'>${avg_liq:,.0f}</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 9: Velocidade de migração (time_to_migrate_sec) ──
+        out.append("<h3>9 — Velocidade de Migração × Recovery</h3>")
+        out.append("""<div class='card'>
+        Token que completou bonding curve em &lt;2min = launch provavelmente coordenado (bundlers).<br>
+        Token com 10min+ de migração = demanda mais orgânica.<br>
+        <b>Hipótese:</b> migrações mais lentas têm recovery rate maior.
+        </div>""")
+
+        ttm_buckets = [
+            ("> 0 min (todos)",  lambda r: r['ttm_min'] is not None and r['ttm_min'] > 0),
+            ("> 2 min",          lambda r: r['ttm_min'] is not None and r['ttm_min'] > 2),
+            ("> 5 min",          lambda r: r['ttm_min'] is not None and r['ttm_min'] > 5),
+            ("> 10 min",         lambda r: r['ttm_min'] is not None and r['ttm_min'] > 10),
+            ("> 20 min",         lambda r: r['ttm_min'] is not None and r['ttm_min'] > 20),
+            ("> 60 min",         lambda r: r['ttm_min'] is not None and r['ttm_min'] > 60),
+            ("> 120 min",        lambda r: r['ttm_min'] is not None and r['ttm_min'] > 120),
+        ]
+
+        out.append("<table><tr><th>Tempo até migrar</th><th>n</th><th>% do total</th><th>WR carteira</th><th>Token recovery</th><th>Mediana ttm</th></tr>")
+        for label, cond in ttm_buckets:
+            grp = [r for r in has_mig if cond(r)]
+            if not grp:
+                continue
+            n = len(grp)
+            pct = n / n_mig * 100
+            wr = sum(1 for r in grp if r['is_tp']) / n * 100
+            tok_r = sum(1 for r in grp if r['token_recovered']) / n * 100
+            med_ttm = statistics.median(r['ttm_min'] for r in grp if r['ttm_min'])
+            wr_color = "green" if wr >= 21.4 else ("yellow" if wr >= 12 else "red")
+            tok_color = "green" if tok_r >= 25 else ("yellow" if tok_r >= 15 else "red")
+            out.append(f"<tr><td>{label}</td><td>{n}</td><td class='dim'>{pct:.0f}%</td>"
+                       f"<td class='{wr_color}'>{wr:.0f}%</td><td class='{tok_color}'>{tok_r:.0f}%</td>"
+                       f"<td class='dim'>{med_ttm:.0f}min</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 10: Hora UTC do sinal ──
+        out.append("<h3>10 — Hora UTC do Sinal × Recovery</h3>")
+        out.append("""<div class='card'>
+        Sessões de mercado: <b>05–10h UTC</b> = madrugada americana (liquidez fina) | <b>13–22h UTC</b> = tarde americana (mercado ativo).<br>
+        Memecoins em book fino têm recovery estruturalmente diferente.
+        </div>""")
+
+        session_buckets = [
+            ("00–05h UTC (Ásia/madrugada)",  lambda r: r['utc_hour'] is not None and 0 <= r['utc_hour'] < 5),
+            ("05–10h UTC (madrugada EUA)",    lambda r: r['utc_hour'] is not None and 5 <= r['utc_hour'] < 10),
+            ("10–13h UTC (manhã EUA)",        lambda r: r['utc_hour'] is not None and 10 <= r['utc_hour'] < 13),
+            ("13–18h UTC (tarde EUA início)", lambda r: r['utc_hour'] is not None and 13 <= r['utc_hour'] < 18),
+            ("18–22h UTC (tarde EUA pico)",   lambda r: r['utc_hour'] is not None and 18 <= r['utc_hour'] < 22),
+            ("22–24h UTC (noite EUA)",        lambda r: r['utc_hour'] is not None and 22 <= r['utc_hour'] < 24),
+        ]
+
+        out.append("<table><tr><th>Sessão</th><th>n</th><th>WR carteira</th><th>Token recovery</th><th>Var 1h mediana</th></tr>")
+        for label, cond in session_buckets:
+            grp = [r for r in has_mig if cond(r)]
+            if not grp:
+                continue
+            n = len(grp)
+            wr = sum(1 for r in grp if r['is_tp']) / n * 100
+            tok_r = sum(1 for r in grp if r['token_recovered']) / n * 100
+            var_vals = [r['var_1h_pct'] for r in grp if r['var_1h_pct'] is not None]
+            var_med = statistics.median(var_vals) if var_vals else None
+            wr_color = "green" if wr >= 21.4 else ("yellow" if wr >= 12 else "red")
+            tok_color = "green" if tok_r >= 25 else ("yellow" if tok_r >= 15 else "red")
+            var_str = f"{var_med:+.0f}%" if var_med is not None else "—"
+            out.append(f"<tr><td>{label}</td><td>{n}</td><td class='{wr_color}'>{wr:.0f}%</td>"
+                       f"<td class='{tok_color}'>{tok_r:.0f}%</td><td>{var_str}</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 11: creator_token_status × elapsed ──
+        out.append("<h3>11 — Creator Status × Elapsed (interação não testada)</h3>")
+        out.append("<p class='dim'>Dev ainda segura + timing 10-20min = setup de maior confiança potencial?</p>")
+
+        creator_elapsed_buckets = [
+            ("creator_hold + elapsed ≤ 10min",
+             lambda r: r.get('creator_token_status') == 'creator_hold' and r['elapsed_min'] <= 10),
+            ("creator_hold + elapsed 10-20min",
+             lambda r: r.get('creator_token_status') == 'creator_hold' and 10 < r['elapsed_min'] <= 20),
+            ("creator_close + elapsed ≤ 10min",
+             lambda r: r.get('creator_token_status') == 'creator_close' and r['elapsed_min'] <= 10),
+            ("creator_close + elapsed 10-20min",
+             lambda r: r.get('creator_token_status') == 'creator_close' and 10 < r['elapsed_min'] <= 20),
+        ]
+
+        out.append("<table><tr><th>Combinação</th><th>n</th><th>WR carteira</th><th>Token recovery</th></tr>")
+        for label, cond in creator_elapsed_buckets:
+            grp = [r for r in has_mig if cond(r)]
+            if not grp:
+                out.append(f"<tr><td>{label}</td><td>0</td><td>—</td><td>—</td></tr>")
+                continue
+            n = len(grp)
+            wr = sum(1 for r in grp if r['is_tp']) / n * 100
+            tok_r = sum(1 for r in grp if r['token_recovered']) / n * 100
+            wr_color = "green" if wr >= 21.4 else ("yellow" if wr >= 12 else "red")
+            tok_color = "green" if tok_r >= 25 else ("yellow" if tok_r >= 15 else "red")
+            out.append(f"<tr><td>{label}</td><td>{n}</td>"
+                       f"<td class='{wr_color}'>{wr:.0f}%</td><td class='{tok_color}'>{tok_r:.0f}%</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 12: H9 profundidade (signal_times) ──
+        out.append("<h3>12 — H9 Profundidade: Quantos Sinais Smart Money durante o Dump?</h3>")
+        out.append("<p class='dim'>1 sinal isolado vs 3+ sinais = smart wallets comprando sequencialmente durante o dump.</p>")
+
+        h9_buckets = [
+            ("Sem H9 (0 sinais)",  lambda r: r['h9_count'] == 0),
+            ("1 sinal",            lambda r: r['h9_count'] == 1),
+            ("2 sinais",           lambda r: r['h9_count'] == 2),
+            ("3+ sinais",          lambda r: r['h9_count'] >= 3),
+        ]
+
+        out.append("<table><tr><th>H9 sinais &lt;80% migração</th><th>n</th><th>WR carteira</th><th>Token recovery</th></tr>")
+        for label, cond in h9_buckets:
+            grp = [r for r in has_mig if cond(r)]
+            if not grp:
+                continue
+            n = len(grp)
+            wr = sum(1 for r in grp if r['is_tp']) / n * 100
+            tok_r = sum(1 for r in grp if r['token_recovered']) / n * 100
+            wr_color = "green" if wr >= 21.4 else ("yellow" if wr >= 12 else "red")
+            tok_color = "green" if tok_r >= 25 else ("yellow" if tok_r >= 15 else "dim")
+            out.append(f"<tr><td>{label}</td><td>{n}</td>"
+                       f"<td class='{wr_color}'>{wr:.0f}%</td><td class='{tok_color}'>{tok_r:.0f}%</td></tr>")
+        out.append("</table>")
+
+        # ── Seção 13: Helius Absorption (H22) ──
+        out.append("<h3>13 — Helius Absorption: Havia Comprador Real no Fundo?</h3>")
+
+        helius_grp = [r for r in has_mig if r['has_helius']]
+        n_helius = len(helius_grp)
+
+        out.append(f"""<div class='card'>
+        Cobertura Helius: <b>{n_helius}/{n_mig} trades</b> ({n_helius/n_mig*100:.0f}%) têm dados de absorção ao vivo.<br>
+        buy_vol e sell_vol = SOL negociado nos 60s antes do sinal. <b>buy_ratio &gt; 0.5</b> = compradores dominando.
+        </div>""")
+
+        if n_helius >= 5:
+            abs_buckets = [
+                ("buy_ratio > 0.7 (compradores dominam)", lambda r: r['buy_ratio'] is not None and r['buy_ratio'] > 0.7),
+                ("buy_ratio 0.5–0.7 (leve pressão compra)", lambda r: r['buy_ratio'] is not None and 0.5 <= r['buy_ratio'] <= 0.7),
+                ("buy_ratio < 0.5 (vendedores dominam)", lambda r: r['buy_ratio'] is not None and r['buy_ratio'] < 0.5),
+                ("lrg_buy > 0.5 SOL (whale entrada)", lambda r: _f(r['lrg_buy']) > 0.5),
+                ("buy_cnt ≥ 3 (múltiplos compradores)", lambda r: int(_f(r['buy_cnt'])) >= 3),
+            ]
+
+            out.append("<table><tr><th>Sinal Helius</th><th>n</th><th>WR carteira</th><th>Token recovery</th><th>SL+recov</th></tr>")
+            for label, cond in abs_buckets:
+                grp = [r for r in helius_grp if cond(r)]
+                if not grp:
+                    continue
+                n = len(grp)
+                wr = sum(1 for r in grp if r['is_tp']) / n * 100
+                tok_r = sum(1 for r in grp if r['token_recovered']) / n * 100
+                sl_r = sum(1 for r in grp if r['quadrant'] == 'SL_RECOV') / n * 100
+                wr_color = "green" if wr >= 21.4 else ("yellow" if wr >= 12 else "red")
+                tok_color = "green" if tok_r >= 25 else ("yellow" if tok_r >= 15 else "dim")
+                out.append(f"<tr><td>{label}</td><td>{n}</td>"
+                           f"<td class='{wr_color}'>{wr:.0f}%</td>"
+                           f"<td class='{tok_color}'>{tok_r:.0f}%</td>"
+                           f"<td class='red'>{sl_r:.0f}%</td></tr>")
+            out.append("</table>")
+
+            # Para os SLs onde o token recuperou — tinham absorção positiva?
+            sl_recov_helius = [r for r in sl_recov if r['has_helius']]
+            if sl_recov_helius:
+                out.append(f"<p><b>Das {len(sl_recov)} falhas de execução, {len(sl_recov_helius)} têm dados Helius:</b></p>")
+                out.append("<table><tr><th>Token</th><th>var_1h</th><th>buy_ratio</th><th>buy_cnt</th><th>lrg_buy</th><th>pnl real</th></tr>")
+                for r in sorted(sl_recov_helius, key=lambda x: x['var_1h_pct'] or 0, reverse=True):
+                    var_str = f"{r['var_1h_pct']:+.0f}%" if r['var_1h_pct'] is not None else "—"
+                    br_str = f"{r['buy_ratio']:.0%}" if r['buy_ratio'] is not None else "—"
+                    br_color = "green" if (r['buy_ratio'] or 0) > 0.5 else "red"
+                    pnl = _f(r['pnl_pct_real']) * 100
+                    out.append(f"<tr><td><b>{r['symbol']}</b></td><td class='green'>{var_str}</td>"
+                               f"<td class='{br_color}'>{br_str}</td>"
+                               f"<td>{int(_f(r['buy_cnt']))}</td>"
+                               f"<td>{_f(r['lrg_buy']):.2f} SOL</td>"
+                               f"<td class='red'>{pnl:+.0f}%</td></tr>")
+                out.append("</table>")
+        else:
+            out.append(f"<p class='dim'>Cobertura ainda baixa ({n_helius} trades). Dados crescem com o bot ativo. Gate: n≥15 para conclusões.</p>")
 
     except Exception:
         out.append(f"<pre style='color:#f85149'>{_tb.format_exc()}</pre>")
