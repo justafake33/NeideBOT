@@ -1000,6 +1000,24 @@ def get_ticks_after(mint: str, min_ts) -> list:
         return [dict(row) for row in cur.fetchall()]
 
 
+def get_trades_missing_fill() -> list:
+    """Trades com order_id mas sem fill — independente do status.
+    Usado pelo TradeMonitor para recuperar fill data em qualquer estado do trade.
+    Limita a trades das últimas 24h para não sobrecarregar o GMGN com ordens antigas.
+    """
+    with _cursor() as cur:
+        cur.execute("""
+            SELECT * FROM trades
+            WHERE order_id IS NOT NULL
+              AND entry_price_usd IS NULL
+              AND status NOT IN ('error', 'cancelled', 'pending')
+              AND created_at > NOW() - INTERVAL '24 hours'
+            ORDER BY created_at DESC
+            LIMIT 50
+        """)
+        return [dict(row) for row in cur.fetchall()]
+
+
 def get_trades_without_strategy() -> list:
     """Trades com order_id mas sem strategy_id — candidatos a recuperação de TP/SL."""
     with _cursor() as cur:

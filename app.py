@@ -22192,8 +22192,413 @@ LIMIT 50;
 
 
 # ==============================================================================
-# /debug/price-chain  — decompõe desvio sinal→ordem→fill
+# /debug/fill-pipeline  — investiga por que fill não está sendo salvo
 # ==============================================================================
+
+@app.route("/debug/fill-pipeline")
+def debug_fill_pipeline():
+    import psycopg2
+    import psycopg2.extras
+    import time
+    import requests as _req
+
+    GMGN_HOST    = os.getenv("GMGN_HOST", "https://openapi.gmgn.ai")
+    GMGN_API_KEY = os.getenv("GMGN_API_KEY", "")
+    WALLET       = os.getenv("GMGN_WALLET_ADDRESS", "")
+    HELIUS_URL   = os.getenv("HELIUS_RPC_URL", "")
+    if HELIUS_URL.startswith("wss://"):
+        HELIUS_URL = HELIUS_URL.replace("wss://", "https://", 1)
+
+    def gmgn_query_order(order_id: str):
+        ts = int(time.time() * 1000)
+        try:
+            r = _req.get(
+                f"{GMGN_HOST}/v1/trade/query_order",
+                params={"order_id": order_id, "timestamp": ts, "client_id": WALLET},
+                headers={"X-APIKEY": GMGN_API_KEY},
+                timeout=10,
+            )
+            return r.status_code, r.text, r.json() if r.ok else {}
+        except Exception as e:
+            return 0, str(e), {}
+
+    def helius_rpc_call(method: str, params: list):
+        if not HELIUS_URL:
+            return None, "HELIUS_RPC_URL não configurado"
+        try:
+            r = _req.post(
+                HELIUS_URL,
+                json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                timeout=15,
+            )
+            data = r.json()
+            if "error" in data:
+                return None, str(data["error"])
+            return data.get("result"), None
+        except Exception as e:
+            return None, str(e)
+
+    def extract_tx_sig_extended(qr: dict) -> tuple[str | None, str]:
+        """Retorna (sig, campo_onde_achou) ou (None, motivo)."""
+        if not qr:
+            return None, "response vazio"
+        data = qr.get("data") or qr
+        conf = data.get("confirmation") or {}
+
+        # Todos os campos candidatos, com nome para debug
+        candidates = [
+            ("confirmation.signature",    conf.get("signature")),
+            ("confirmation.tx_hash",      conf.get("tx_hash")),
+            ("confirmation.hash",         conf.get("hash")),
+            ("confirmation.tx_signature", conf.get("tx_signature")),
+            ("data.signature",            data.get("signature")),
+            ("data.tx_hash",              data.get("tx_hash")),
+            ("data.tx_signature",         data.get("tx_signature")),
+            ("data.hash",                 data.get("hash")),
+        ]
+        # Busca recursiva em strings longas (tx sig = 88 chars base58)
+        import json as _json
+        raw_str = _json.dumps(qr)
+        import re as _re
+        b58_pattern = _re.findall(r'[1-9A-HJ-NP-Za-km-z]{87,90}', raw_str)
+
+        for field, val in candidates:
+            if val and isinstance(val, str) and len(val) >= 44:
+                return val, field
+        if b58_pattern:
+            # Filtra apenas strings que não são mints/wallets conhecidos
+            non_wallet = [s for s in b58_pattern if s != WALLET]
+            if non_wallet:
+                return non_wallet[0], f"regex_scan (found {len(b58_pattern)} candidates)"
+        return None, f"nenhum campo com sig ≥44 chars. Keys em data: {list(data.keys())} | Keys em confirmation: {list(conf.keys())}"
+
+    H = """<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>fill-pipeline</title>
+<style>
+body{font-family:monospace;font-size:12px;background:#0e0e0e;color:#ddd;padding:16px}
+h2{color:#f90}h3{color:#8cf;margin-top:20px}h4{color:#fc8;margin-top:12px}
+table{border-collapse:collapse;margin-bottom:16px}
+th{background:#222;color:#aaa;padding:3px 8px;border:1px solid #333;white-space:nowrap}
+td{padding:2px 8px;border:1px solid #1a1a1a;white-space:nowrap;vertical-align:top}
+tr:nth-child(even){background:#111}
+.ok{color:#4f4}.warn{color:#fa0}.err{color:#f44}.null{color:#555}
+pre{background:#111;padding:8px;border-radius:4px;overflow-x:auto;font-size:11px;color:#cfc;white-space:pre-wrap;word-break:break-all}
+.box{background:#111;border:1px solid #333;padding:10px;margin:8px 0;border-radius:4px}
+.step{margin:4px 0;padding:3px 8px;border-left:3px solid #444}
+.step.ok{border-color:#4f4}.step.warn{border-color:#fa0}.step.err{border-color:#f44}
+</style></head><body>"""
+
+    H += "<h2>🔬 Fill Pipeline Investigator</h2>"
+    H += f"<p>WALLET={WALLET or '<span class=err>NOT SET</span>'} | "
+    H += f"HELIUS={('<span class=ok>✅</span>' if HELIUS_URL else '<span class=err>❌ NOT SET</span>')} | "
+    H += f"GMGN_KEY={('<span class=ok>✅</span>' if GMGN_API_KEY else '<span class=err>❌ NOT SET</span>')}</p>"
+
+    # ── Task 1: últimos 30 trades pós-patch ───────────────────────────────────
+    conn = psycopg2.connect(db.DATABASE_URL)
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    # Detect se colunas audit existem
+    cur.execute("""
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name='trades'
+          AND column_name='config_bounce_min_pct'
+    """)
+    has_patch = bool(cur.fetchone())
+
+    if has_patch:
+        where_clause = "WHERE t.config_bounce_min_pct IS NOT NULL"
+        extra_note   = "filtrado por config_bounce_min_pct IS NOT NULL (pós-patch)"
+    else:
+        where_clause = ""
+        extra_note   = "⚠️ patch não deployado — mostrando últimos 30 trades"
+
+    cur.execute(f"""
+        SELECT
+            t.id, t.symbol, t.mint, t.status, t.exit_type,
+            t.ts_signal, t.ts_order_sent, t.ts_order_confirmed,
+            t.order_id,
+            t.entry_price_usd, t.tokens_received, t.fill_source,
+            t.amount_sol, t.amount_usd, t.fee_sol, t.slippage_pct,
+            t.latency_sec, t.pnl_pct_real, t.error_msg,
+            EXTRACT(EPOCH FROM (t.ts_order_sent - t.ts_signal)) AS sig_to_order_sec
+        FROM trades t
+        {where_clause}
+        ORDER BY t.created_at DESC
+        LIMIT 30
+    """)
+    trades = cur.fetchall()
+    conn.close()
+
+    H += f"<h3>Task 1 — Trades ({extra_note})</h3>"
+    H += """<table><tr>
+    <th>#</th><th>symbol</th><th>status</th><th>exit_type</th>
+    <th>order_id</th><th>fill_source</th>
+    <th>entry_usd</th><th>tokens</th><th>real_entry_mc</th>
+    <th>sig→order s</th><th>ts_confirmed</th><th>error_msg</th>
+    </tr>"""
+
+    fill_missing = []
+    fill_ok      = []
+
+    for tr in trades:
+        has_fill  = bool(tr["entry_price_usd"] and tr["tokens_received"])
+        real_mc   = (tr["entry_price_usd"] / tr["tokens_received"] * 1e9) if has_fill else None
+        fill_cls  = "ok" if has_fill else "err"
+        fill_lbl  = f"${tr['entry_price_usd']:.4f}" if tr["entry_price_usd"] else "<span class='err'>NULL</span>"
+        tok_lbl   = f"{tr['tokens_received']:.0f}" if tr["tokens_received"] else "<span class='err'>NULL</span>"
+        mc_lbl    = f"${real_mc:,.0f}" if real_mc else "<span class='null'>—</span>"
+        ord_lbl   = (tr["order_id"] or "<span class='null'>—</span>")[:20]
+        conf_lbl  = str(tr["ts_order_confirmed"])[:16] if tr["ts_order_confirmed"] else "<span class='null'>—</span>"
+        gap_lbl   = f"{tr['sig_to_order_sec']:.1f}s" if tr["sig_to_order_sec"] else "—"
+        err_lbl   = (tr["error_msg"] or "")[:40]
+        bg = "background:#0a1a0a" if has_fill else "background:#1a0a0a"
+
+        H += f"""<tr style='{bg}'>
+        <td>{tr['id']}</td><td><b>{tr['symbol']}</b></td>
+        <td class='{fill_cls}'>{tr['status']}</td>
+        <td>{tr['exit_type'] or '—'}</td>
+        <td style='font-size:10px'>{ord_lbl}</td>
+        <td class='{fill_cls}'>{tr['fill_source'] or '<span class=err>NULL</span>'}</td>
+        <td>{fill_lbl}</td><td>{tok_lbl}</td><td>{mc_lbl}</td>
+        <td>{gap_lbl}</td><td>{conf_lbl}</td>
+        <td class='warn'>{err_lbl}</td>
+        </tr>"""
+
+        if not has_fill and tr["order_id"]:
+            fill_missing.append(tr)
+        elif has_fill:
+            fill_ok.append(tr)
+
+    H += "</table>"
+    H += f"<p><span class='ok'>✅ Com fill: {len(fill_ok)}</span> &nbsp;|&nbsp; "
+    H += f"<span class='err'>❌ Sem fill (order_id presente): {len(fill_missing)}</span></p>"
+
+    # ── Tasks 2-4: investigar cada trade sem fill ─────────────────────────────
+    H += "<h3>Tasks 2–4 — Investigação por trade (query_order + tx_sig + Helius)</h3>"
+
+    for tr in fill_missing[:10]:  # limita a 10 para não estourar timeout
+        oid    = tr["order_id"]
+        symbol = tr["symbol"]
+        mint   = tr["mint"]
+
+        H += f"<div class='box'><h4>#{tr['id']} {symbol} — {tr['status']} | order_id: {oid}</h4>"
+
+        # Task 2: GMGN query_order
+        H += "<b>Task 2 — GMGN query_order:</b><br>"
+        status_code, raw_text, qr = gmgn_query_order(oid)
+        H += f"HTTP {status_code}<br>"
+
+        if status_code == 200:
+            qd   = qr.get("data") or qr
+            conf = qd.get("confirmation") or {}
+            state = conf.get("state") or qd.get("state") or "?"
+            filled_out = qd.get("filled_output_amount")
+            filled_in  = qd.get("filled_input_amount")
+            fee        = qd.get("fee")
+            co         = qd.get("condition_orders")
+
+            state_cls = "ok" if state in ("processed", "confirmed") else "warn"
+            H += f"<span class='{state_cls}'>state={state}</span> | "
+            H += f"filled_output_amount={filled_out} | filled_input_amount={filled_in} | fee={fee}<br>"
+            H += f"condition_orders: {co}<br>"
+            H += f"Keys em data: {list(qd.keys())}<br>"
+            H += f"Keys em confirmation: {list(conf.keys())}<br>"
+            H += f"<details><summary>Raw JSON (clique)</summary><pre>{raw_text[:3000]}</pre></details>"
+
+            # Task 3: extract tx signature
+            H += "<br><b>Task 3 — extract_tx_signature:</b><br>"
+            tx_sig, where_found = extract_tx_sig_extended(qr)
+            if tx_sig:
+                H += f"<span class='ok'>✅ Encontrada: {tx_sig[:30]}... (campo: {where_found})</span><br>"
+            else:
+                H += f"<span class='err'>❌ Não encontrada: {where_found}</span><br>"
+
+            # Task 4: Helius getTransaction
+            H += "<br><b>Task 4 — Helius getTransaction:</b><br>"
+            if tx_sig and HELIUS_URL:
+                tx_result, err = helius_rpc_call("getTransaction", [
+                    tx_sig,
+                    {"encoding": "jsonParsed", "commitment": "confirmed",
+                     "maxSupportedTransactionVersion": 0},
+                ])
+                if err:
+                    H += f"<span class='err'>❌ Helius erro: {err}</span><br>"
+                elif not tx_result:
+                    H += "<span class='err'>❌ Helius retornou null (tx não encontrada/não confirmada)</span><br>"
+                else:
+                    meta     = tx_result.get("meta") or {}
+                    tx_inner = tx_result.get("transaction") or {}
+                    msg_inner = tx_inner.get("message") or {}
+                    raw_keys = msg_inner.get("accountKeys") or []
+                    account_keys = [(k.get("pubkey") if isinstance(k, dict) else str(k)) for k in raw_keys]
+                    pre_bal  = meta.get("preBalances") or []
+                    post_bal = meta.get("postBalances") or []
+                    fee_lamp = meta.get("fee") or 0
+                    pre_tok  = {t["accountIndex"]: t for t in (meta.get("preTokenBalances") or [])}
+                    post_tok = {t["accountIndex"]: t for t in (meta.get("postTokenBalances") or [])}
+                    block_time = tx_result.get("blockTime")
+
+                    H += f"<span class='ok'>✅ TX encontrada</span> | block_time={block_time}<br>"
+
+                    # Task 5: wallet match
+                    H += "<br><b>Task 5 — Wallet match:</b><br>"
+                    wallet_idx = next((i for i, k in enumerate(account_keys) if k == WALLET), None)
+                    H += f"WALLET={WALLET}<br>"
+                    if wallet_idx is not None:
+                        sol_delta = (pre_bal[wallet_idx] - post_bal[wallet_idx]) / 1e9 if wallet_idx < len(pre_bal) else None
+                        H += f"<span class='ok'>✅ Wallet encontrada em account_keys[{wallet_idx}]</span> | SOL gasto={sol_delta:.6f}<br>"
+                    else:
+                        H += f"<span class='err'>❌ Wallet NÃO encontrada em account_keys!</span><br>"
+                        H += f"account_keys: {account_keys[:8]}<br>"
+
+                    # Task 6: token balances com decimals
+                    H += "<br><b>Task 6 — Token balances (decimals check):</b><br>"
+                    H += "<table><tr><th>idx</th><th>owner</th><th>mint</th><th>decimals</th>"
+                    H += "<th>pre_ui</th><th>post_ui</th><th>delta_ui</th><th>wallet?</th><th>mint_match?</th></tr>"
+
+                    found_token = False
+                    all_tok_idxs = set(pre_tok.keys()) | set(post_tok.keys())
+                    for idx in sorted(all_tok_idxs):
+                        post_e = post_tok.get(idx) or {}
+                        pre_e  = pre_tok.get(idx) or {}
+                        owner  = post_e.get("owner") or pre_e.get("owner") or "?"
+                        tmint  = post_e.get("mint") or pre_e.get("mint") or "?"
+                        decimals = (post_e.get("uiTokenAmount") or {}).get("decimals") or \
+                                   (pre_e.get("uiTokenAmount") or {}).get("decimals") or "?"
+                        pre_ui  = float((pre_e.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+                        post_ui = float((post_e.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+                        delta   = post_ui - pre_ui
+                        is_wallet = owner == WALLET
+                        is_mint   = tmint == mint
+
+                        if is_wallet and is_mint and delta > 0:
+                            found_token = True
+
+                        row_cls = "background:#0a2a0a" if (is_wallet and is_mint and delta > 0) else \
+                                  ("background:#2a0a0a" if (is_mint and not is_wallet) else "")
+                        H += f"""<tr style='{row_cls}'>
+                        <td>{idx}</td>
+                        <td style='font-size:10px'>{owner[:20]}{'...' if len(owner)>20 else ''}</td>
+                        <td style='font-size:10px'>{tmint[:20]}{'...' if len(tmint)>20 else ''}</td>
+                        <td>{decimals}</td>
+                        <td>{pre_ui:,.2f}</td><td>{post_ui:,.2f}</td>
+                        <td class='{'ok' if delta>0 else 'null'}'>{delta:,.2f}</td>
+                        <td>{'<span class=ok>✅</span>' if is_wallet else '❌'}</td>
+                        <td>{'<span class=ok>✅</span>' if is_mint else ''}</td>
+                        </tr>"""
+                    H += "</table>"
+
+                    if found_token:
+                        H += "<span class='ok'>✅ Token encontrado com owner=WALLET e delta>0 — get_swap_fill deveria funcionar</span><br>"
+                    elif [idx for idx in all_tok_idxs if (post_tok.get(idx) or {}).get("mint") == mint]:
+                        H += "<span class='err'>❌ Mint encontrado mas owner ≠ WALLET — esse é o bug!</span><br>"
+                    else:
+                        H += "<span class='err'>❌ Mint não encontrado em token balances — token errado ou tx errada</span><br>"
+
+                    # Chamar get_swap_fill real
+                    H += "<br><b>get_swap_fill() real:</b><br>"
+                    import helius_rpc as _hrpc
+                    fill = _hrpc.get_swap_fill(tx_sig, mint)
+                    if fill:
+                        tokens = fill["tokens_received"]
+                        sol    = fill["sol_spent"]
+                        fee    = fill["fee_sol"]
+                        sol_usd_now = 0
+                        try:
+                            from gmgn_client import get_sol_usd
+                            sol_usd_now = get_sol_usd() or 0
+                        except Exception:
+                            pass
+                        real_mc = (sol * sol_usd_now / tokens * 1e9) if tokens and sol_usd_now else None
+                        H += f"<span class='ok'>✅ tokens={tokens:,.2f} | sol_spent={sol:.6f} | fee={fee:.6f}</span><br>"
+                        H += f"real_entry_mc estimado: ${real_mc:,.0f}" if real_mc else ""
+                    else:
+                        H += "<span class='err'>❌ get_swap_fill retornou None</span><br>"
+
+            elif not tx_sig:
+                H += "<span class='null'>Pulado — tx_sig não encontrada</span><br>"
+            else:
+                H += "<span class='null'>Pulado — HELIUS_RPC_URL não configurado</span><br>"
+        else:
+            H += f"<span class='err'>GMGN error: {raw_text[:300]}</span><br>"
+
+        H += "</div>"
+
+    # ── Task 7: verificar tipo do order_id ────────────────────────────────────
+    H += "<h3>Task 7 — Tipo do order_id (buy vs condition_order)</h3>"
+    H += """<div class='box'>
+O GMGN salva condition_orders (TP/SL) como IDs separados.<br>
+Se o bot salvasse o order_id de uma condition_order ao invés do buy, query_order retornaria dados diferentes.<br>
+Verificar: <code>strategy_id</code> salvo na tabela trades — deve diferir do order_id se há condition_orders.<br>
+</div>"""
+    conn2 = psycopg2.connect(db.DATABASE_URL)
+    c2    = conn2.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    c2.execute("""
+        SELECT id, symbol, order_id, strategy_id, status
+        FROM trades
+        WHERE order_id IS NOT NULL
+        ORDER BY created_at DESC LIMIT 10
+    """)
+    ord_rows = c2.fetchall()
+    conn2.close()
+    H += "<table><tr><th>#</th><th>symbol</th><th>order_id</th><th>strategy_id</th><th>status</th><th>same?</th></tr>"
+    for r in ord_rows:
+        oid = r["order_id"] or ""
+        sid = r["strategy_id"] or ""
+        same = oid == sid
+        H += f"<tr><td>{r['id']}</td><td>{r['symbol']}</td>"
+        H += f"<td style='font-size:10px'>{oid[:40]}</td>"
+        H += f"<td style='font-size:10px'>{sid[:60]}</td>"
+        H += f"<td>{r['status']}</td>"
+        H += f"<td>{'<span class=ok>igual</span>' if same else '<span class=ok>diferente ✅</span>'}</td></tr>"
+    H += "</table>"
+
+    # ── Tasks 8-9: por que _execute / _recover_fill não preencheu ─────────────
+    H += "<h3>Tasks 8-9 — Por que fill não foi salvo</h3>"
+    H += """<div class='box'>
+<b>Razões possíveis identificadas no código:</b><br><br>
+
+<b>1. state nunca virou "processed/confirmed" em 120s:</b><br>
+&nbsp;&nbsp;_execute() faz poll por FILL_TIMEOUT_SEC=120s. Se GMGN demorou mais, fill fica NULL.<br>
+&nbsp;&nbsp;Verificar: ts_order_confirmed NULL + order_id presente → timeout aconteceu.<br><br>
+
+<b>2. extract_tx_signature retornou None:</b><br>
+&nbsp;&nbsp;Mesmo com state=confirmed, se GMGN não retorna o campo da sig em lugar conhecido, Helius não é chamado.<br>
+&nbsp;&nbsp;Verificar: resposta real do query_order acima (Task 2) — o campo da sig existe?<br><br>
+
+<b>3. get_swap_fill retornou None por owner mismatch:</b><br>
+&nbsp;&nbsp;Se WALLET_ADDRESS != owner da token account na tx, tokens_received=0 → retorna None.<br>
+&nbsp;&nbsp;Verificar: tabela de token balances acima (Task 6) — owner bate com WALLET?<br><br>
+
+<b>4. _recover_fill não alcança trades sem status='open':</b><br>
+&nbsp;&nbsp;get_open_trades() retorna APENAS status='open'. Se trade foi para trailing_active/sl/tp<br>
+&nbsp;&nbsp;antes de ter fill, _recover_fill() nunca mais é chamado para ele.<br>
+&nbsp;&nbsp;<span class='err'>ESTE É O BUG ESTRUTURAL — confirmado no código executor.py _check_all().</span><br><br>
+
+<b>5. exception silenciosa em _execute():</b><br>
+&nbsp;&nbsp;O bloco except em _execute() usa logger.debug() — não aparece nos logs de produção.<br>
+&nbsp;&nbsp;Qualquer erro de rede/parse durante o poll é silenciado.<br><br>
+
+<b>6. trailing_active antes de ter fill:</b><br>
+&nbsp;&nbsp;Se GMGN executa o trailing TP rápido e TradeMonitor detecta via Helius balance=0,<br>
+&nbsp;&nbsp;status vai para trailing_active/tp sem que fill foi salvo. Dados de entrada ficam NULL.
+</div>"""
+
+    # ── Task 10: summary ───────────────────────────────────────────────────────
+    H += "<h3>Task 10 — Patch proposto (ver /debug/fill-pipeline#patch)</h3>"
+    H += """<div class='box' id='patch'>
+<b>1. extract_tx_signature — busca regex em toda a resposta:</b> já implementado neste endpoint como extract_tx_sig_extended.<br>
+<b>2. get_swap_fill — retornar block_time:</b> adicionar campo ao dict de retorno.<br>
+<b>3. _recover_fill para qualquer status:</b> chamar também para trailing_active/tp/sl sem fill.<br>
+<b>4. Impedir trailing_active sem fill:</b> _check_position_closed() só marca trailing_active se entry_price_usd != NULL.<br>
+<b>5. save_raw_qr:</b> log de warning com raw response quando state=confirmed mas sem sig extraída.<br>
+<b>6. FILL_TIMEOUT_SEC aumentar de 120 para 300s</b> — GMGN pode demorar mais para confirmar.<br>
+<b>7. Dashboard PnL:</b> exibir asterisco ou "sem fill" quando pnl_pct_real calculado sem entry real.<br>
+</div>"""
+
+    H += "</body></html>"
+    return H
+
 
 @app.route("/debug/price-chain")
 def debug_price_chain():
