@@ -22192,6 +22192,435 @@ LIMIT 50;
 
 
 # ==============================================================================
+# /analise/ttp-sim  — simula múltiplas configs de TTP/SL sobre ticks reais
+# ==============================================================================
+
+@app.route("/analise/ttp-sim")
+def analise_ttp_sim():
+    import psycopg2
+    import psycopg2.extras
+    import math
+
+    PUMP_SUPPLY = 1_000_000_000
+
+    # ── parâmetros via query string ──────────────────────────────────────────
+    limit      = min(int(request.args.get("limit",  "60")), 200)
+    min_ticks  = int(request.args.get("min_ticks",  "3"))
+    since_days = int(request.args.get("since_days", "30"))
+
+    # ── estratégias a simular ────────────────────────────────────────────────
+    # Cada entry: (label, tipo, p1, p2, p3)
+    # tipo="ttp"    p1=act_pct  p2=dd_pct   p3=sl_pct
+    # tipo="fixed"  p1=tp_pct   p2=sl_pct   p3=unused(0)
+    # tipo="mov_sl" p1=act_pct  p2=sl_pct   p3=unused(0)
+    STRATEGIES = [
+        ("ATUAL TTP 75/30/SL25",  "ttp",    0.75, 0.30, 0.25),
+        ("TTP 75/30/SL15",        "ttp",    0.75, 0.30, 0.15),
+        ("TTP 100/30/SL25",       "ttp",    1.00, 0.30, 0.25),
+        ("TTP 100/35/SL25",       "ttp",    1.00, 0.35, 0.25),
+        ("TTP 150/30/SL25",       "ttp",    1.50, 0.30, 0.25),
+        ("TTP 150/35/SL25",       "ttp",    1.50, 0.35, 0.25),
+        ("TTP 200/35/SL25",       "ttp",    2.00, 0.35, 0.25),
+        ("TTP 300/40/SL25",       "ttp",    3.00, 0.40, 0.25),
+        ("Fixed TP75 SL25",       "fixed",  0.75, 0.25, 0),
+        ("Fixed TP100 SL25",      "fixed",  1.00, 0.25, 0),
+        ("Fixed TP150 SL25",      "fixed",  1.50, 0.25, 0),
+        ("Fixed TP200 SL25",      "fixed",  2.00, 0.25, 0),
+        ("MovSL start75 SL25",    "mov_sl", 0.75, 0.25, 0),
+        ("MovSL start100 SL25",   "mov_sl", 1.00, 0.25, 0),
+        ("MovSL start150 SL25",   "mov_sl", 1.50, 0.25, 0),
+    ]
+
+    def simulate_trade(ticks, entry_mc, strat):
+        label, tipo, p1, p2, p3 = strat
+        sl_pct   = p3 if tipo == "ttp" else p2
+        tp_pct   = p2 if tipo == "fixed" else None
+        act_pct  = p1
+        dd_pct   = p2 if tipo == "ttp" else None
+
+        sl_floor     = entry_mc * (1 - sl_pct)
+        tp_target    = entry_mc * (1 + tp_pct) if tp_pct else None
+        activated    = False
+        peak_mc      = entry_mc
+        mov_sl_floor = sl_floor
+        max_gain     = 0.0
+
+        for i, tick in enumerate(ticks):
+            mc_high  = tick.get("mc_high") or tick.get("mc") or 0
+            mc_low   = tick.get("mc_low")  or tick.get("mc") or 0
+            mc_close = tick.get("mc")      or 0
+            if mc_high <= 0 and mc_low <= 0:
+                continue
+            gain_high = (mc_high - entry_mc) / entry_mc if mc_high else 0
+            max_gain  = max(max_gain, gain_high)
+
+            # effective SL
+            eff_sl = mov_sl_floor if tipo == "mov_sl" else sl_floor
+
+            # SL check
+            if mc_low > 0 and mc_low <= eff_sl:
+                sl_pnl = (eff_sl - entry_mc) / entry_mc
+                if tp_target and mc_high >= tp_target:
+                    mc_open = tick.get("mc_open") or mc_close
+                    mid = (eff_sl + tp_target) / 2
+                    if mc_open <= mid:
+                        return {"exit_pnl": sl_pnl, "exit_type": "sl",
+                                "n_ticks": i+1, "max_gain": max_gain, "activated": activated}
+                    else:
+                        return {"exit_pnl": (tp_target - entry_mc)/entry_mc, "exit_type": "tp",
+                                "n_ticks": i+1, "max_gain": max_gain, "activated": activated}
+                return {"exit_pnl": sl_pnl, "exit_type": "sl",
+                        "n_ticks": i+1, "max_gain": max_gain, "activated": activated}
+
+            # Fixed TP
+            if tipo == "fixed" and tp_target and mc_high >= tp_target:
+                return {"exit_pnl": (tp_target - entry_mc)/entry_mc, "exit_type": "tp",
+                        "n_ticks": i+1, "max_gain": max_gain, "activated": activated}
+
+            # TTP trailing
+            if tipo == "ttp":
+                act_thr = entry_mc * (1 + act_pct)
+                if not activated and mc_high >= act_thr:
+                    activated = True
+                if activated:
+                    peak_mc = max(peak_mc, mc_high)
+                    trail_sl = peak_mc * (1 - dd_pct)
+                    if mc_low > 0 and mc_low <= trail_sl:
+                        return {"exit_pnl": (trail_sl - entry_mc)/entry_mc, "exit_type": "ttp_exit",
+                                "n_ticks": i+1, "max_gain": max_gain, "activated": True}
+
+            # MovSL
+            if tipo == "mov_sl":
+                act_thr = entry_mc * (1 + act_pct)
+                if mc_high >= act_thr:
+                    activated = True
+                if activated:
+                    peak_mc      = max(peak_mc, mc_high)
+                    mov_sl_floor = max(entry_mc, peak_mc * (1 - sl_pct))
+
+        last_mc  = ticks[-1].get("mc") or entry_mc if ticks else entry_mc
+        return {"exit_pnl": (last_mc - entry_mc)/entry_mc, "exit_type": "time_exit",
+                "n_ticks": len(ticks), "max_gain": max_gain, "activated": activated}
+
+    # ── Queries ───────────────────────────────────────────────────────────────
+    conn = psycopg2.connect(db.DATABASE_URL)
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("""SELECT column_name FROM information_schema.columns
+        WHERE table_name='trades' AND column_name='mc_at_signal'""")
+    has_audit = bool(cur.fetchone())
+    sig_expr  = "t.mc_at_signal" if has_audit else "NULL::float"
+
+    cur.execute(f"""
+        SELECT t.id, t.symbol, t.mint, t.status, t.exit_type,
+            t.ts_signal, t.ts_order_sent, t.ts_order_confirmed,
+            t.mc_bottom, t.entry_expected, t.mc_migration,
+            t.entry_price_usd, t.tokens_received, t.fill_source,
+            t.amount_usd, t.pnl_pct_real, t.sl_pct, t.tp_pct,
+            {sig_expr} AS mc_at_signal,
+            COALESCE(bs.mc_at_signal, {sig_expr}) AS signal_mc,
+            bs.bounce_pct AS bs_bounce_pct
+        FROM trades t
+        LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+        WHERE t.created_at > NOW() - INTERVAL '{since_days} days'
+          AND t.status NOT IN ('error','pending','cancelled')
+          AND t.order_id IS NOT NULL
+        ORDER BY t.created_at DESC
+        LIMIT {limit}
+    """)
+    trades_raw = cur.fetchall()
+
+    trade_data = []
+    for tr in trades_raw:
+        mint   = tr["mint"]
+        ref_ts = tr["ts_order_confirmed"] or tr["ts_order_sent"] or tr["ts_signal"]
+        if not ref_ts:
+            continue
+        cur.execute("""
+            SELECT tick_ts, mc,
+                   COALESCE(mc_high, mc) AS mc_high,
+                   COALESCE(mc_low,  mc) AS mc_low,
+                   mc_open, source
+            FROM token_ticks
+            WHERE mint=%s AND tick_ts>=%s AND mc IS NOT NULL AND mc>0
+            ORDER BY tick_ts ASC
+        """, (mint, ref_ts))
+        ticks = [dict(r) for r in cur.fetchall()]
+
+        if tr["entry_price_usd"] and tr["tokens_received"] and tr["tokens_received"] > 0:
+            entry_mc  = (tr["entry_price_usd"] / tr["tokens_received"]) * PUMP_SUPPLY
+            entry_src = "real_fill"
+        elif tr["entry_expected"]:
+            entry_mc  = tr["entry_expected"]
+            entry_src = "expected*"
+        else:
+            continue
+
+        trade_data.append({"trade": dict(tr), "ticks": ticks,
+                            "entry_mc": entry_mc, "entry_src": entry_src,
+                            "n_ticks": len(ticks)})
+    conn.close()
+
+    n_total      = len(trade_data)
+    n_with_ticks = sum(1 for td in trade_data if td["n_ticks"] >= min_ticks)
+
+    # ── Simulações ────────────────────────────────────────────────────────────
+    results = {s[0]: [] for s in STRATEGIES}
+    for td in trade_data:
+        for s in STRATEGIES:
+            if td["n_ticks"] < min_ticks:
+                results[s[0]].append(None)
+            else:
+                sim = simulate_trade(td["ticks"], td["entry_mc"], s)
+                sim.update({"trade_id": td["trade"]["id"], "symbol": td["trade"]["symbol"],
+                             "entry_src": td["entry_src"], "entry_mc": td["entry_mc"]})
+                results[s[0]].append(sim)
+
+    def strat_stats(sims):
+        valid = [s for s in sims if s is not None]
+        if not valid:
+            return {}
+        tps   = [s for s in valid if s["exit_type"] in ("tp","ttp_exit")]
+        sls   = [s for s in valid if s["exit_type"] == "sl"]
+        times = [s for s in valid if s["exit_type"] == "time_exit"]
+        pnls  = [s["exit_pnl"] for s in valid]
+        return {
+            "n": len(valid), "n_tp": len(tps), "n_sl": len(sls),
+            "n_time": len(times),
+            "wr": len(tps)/len(valid) if valid else 0,
+            "avg_pnl": sum(pnls)/len(pnls) if pnls else 0,
+            "median_pnl": sorted(pnls)[len(pnls)//2] if pnls else 0,
+            "runners_3x": sum(1 for s in valid if s["max_gain"] >= 2.0),
+            "runners_5x": sum(1 for s in valid if s["max_gain"] >= 4.0),
+            "n_activated": sum(1 for s in valid if s.get("activated")),
+        }
+
+    grid = [(s[0], strat_stats(results[s[0]])) for s in STRATEGIES]
+    grid_sorted = sorted(grid, key=lambda x: x[1].get("avg_pnl", -99), reverse=True)
+    best_ev    = grid_sorted[0][1].get("avg_pnl", 0) if grid_sorted else 0
+    best_label = grid_sorted[0][0] if grid_sorted else STRATEGIES[0][0]
+
+    runners_detail = sorted(
+        [(results[STRATEGIES[0][0]][i], td)
+         for i, td in enumerate(trade_data)
+         if results[STRATEGIES[0][0]][i] is not None
+         and results[STRATEGIES[0][0]][i]["max_gain"] >= 1.5],
+        key=lambda x: -x[0]["max_gain"],
+    )[:25]
+
+    # ── HTML ──────────────────────────────────────────────────────────────────
+    def pct(v, d=1):
+        if v is None:
+            return "<span style='color:#555'>—</span>"
+        c = "#4f4" if v > 0 else ("#f44" if v < -0.01 else "#888")
+        return f"<span style='color:{c}'>{v*100:+.{d}f}%</span>"
+
+    H = """<!DOCTYPE html><html><head><meta charset='utf-8'><title>TTP-SIM</title>
+<style>
+body{font-family:monospace;font-size:12px;background:#0e0e0e;color:#ddd;padding:16px}
+h2{color:#f90}h3{color:#8cf;margin-top:24px}
+table{border-collapse:collapse;margin-bottom:16px;width:100%}
+th{background:#1a1a2e;color:#8cf;padding:4px 10px;border:1px solid #333;white-space:nowrap;text-align:right}
+th.L{text-align:left}
+td{padding:3px 10px;border:1px solid #1a1a1a;text-align:right;white-space:nowrap}
+td.L{text-align:left}
+tr.E{background:#0a1a0a!important}
+tr.W{background:#1a0a0a!important}
+.pos{color:#4f4}.neg{color:#f44}.warn{color:#fa0}.null{color:#555}
+.box{background:#111;border:1px solid #333;padding:10px;margin:8px 0;border-radius:4px}
+</style></head><body>"""
+
+    n_real_fill = sum(1 for td in trade_data if td["entry_src"]=="real_fill")
+    n_expected  = sum(1 for td in trade_data if td["entry_src"]=="expected*")
+    n_no_ticks  = sum(1 for td in trade_data if td["n_ticks"] < min_ticks)
+
+    H += f"<h2>📊 TTP/SL Simulation — {n_total} trades | {n_with_ticks} com ≥{min_ticks} ticks</h2>"
+    H += f"<p>?limit={limit} | ?min_ticks={min_ticks} | ?since_days={since_days}</p>"
+    H += f"""<div class='box'>
+<b>Cobertura:</b> fill_real={n_real_fill} | entry_expected*={n_expected} | sem_ticks_excluídos={n_no_ticks}<br>
+<small>* entry_expected=mc_bottom×1.15 — subestima entry real em ~10-15%</small>
+</div>"""
+
+    if n_with_ticks < 10:
+        H += f"<div class='box'><span class='neg'>⚠️ Apenas {n_with_ticks} com ticks — conclusões fracas.</span></div>"
+
+    # Grid
+    H += "<h3>Grid — ranking por EV médio</h3>"
+    H += "<table><tr><th class='L'>Estratégia</th><th>n</th><th>WR</th><th>TP</th><th>SL</th><th>TimeExit</th><th>avg_PnL</th><th>median</th><th>Ativados</th><th>Max≥3x</th><th>Max≥5x</th></tr>"
+    for label, st in grid_sorted:
+        if not st:
+            continue
+        is_curr = (label == STRATEGIES[0][0])
+        is_best = (label == best_label and not is_curr)
+        row_cls = "E" if is_best else ("W" if st.get("wr",0) < 0.10 else "")
+        brd     = "border-left:3px solid #f90" if is_curr else ("border-left:3px solid #4f4" if is_best else "")
+        wr_val  = st.get("wr",0)
+        wr_c    = "#4f4" if wr_val>=0.25 else ("#fa0" if wr_val>=0.15 else "#f44")
+        H += f"""<tr class='{row_cls}' style='{brd}'>
+        <td class='L'>{'⚡' if is_curr else ''}{'🏆' if is_best else ''}<b>{label}</b></td>
+        <td>{st.get('n','—')}</td>
+        <td><span style='color:{wr_c}'>{wr_val*100:.1f}%</span></td>
+        <td>{st.get('n_tp','—')}</td><td>{st.get('n_sl','—')}</td><td>{st.get('n_time','—')}</td>
+        <td>{pct(st.get('avg_pnl'))}</td><td>{pct(st.get('median_pnl'))}</td>
+        <td>{st.get('n_activated','—')}</td>
+        <td>{st.get('runners_3x','—')}</td><td>{st.get('runners_5x','—')}</td>
+        </tr>"""
+    H += "</table>"
+
+    # Runners
+    H += f"<h3>Runners — max_gain≥150% (config ATUAL vs alternativas)</h3>"
+    if not runners_detail:
+        H += "<p class='null'>Nenhum runner ≥150% na amostra.</p>"
+    else:
+        hdr = "".join(f"<th>{s[0][:16]}</th>" for s in STRATEGIES[:8])
+        H += f"<table><tr><th class='L'>#</th><th class='L'>symbol</th><th>src</th><th>max_gain</th><th>n_ticks</th>{hdr}</tr>"
+        for sim_c, td in runners_detail:
+            idx   = trade_data.index(td)
+            tr    = td["trade"]
+            mg    = sim_c["max_gain"]
+            mg_c  = "#ff0" if mg>=4 else ("#4f4" if mg>=2 else "#fa0")
+            H += f"<tr><td class='L'>{tr['id']}</td><td class='L'><b>{tr['symbol']}</b></td>"
+            H += f"<td>{'f' if td['entry_src']=='real_fill' else '*'}</td>"
+            H += f"<td><span style='color:{mg_c}'>{mg*100:+.0f}%</span></td><td>{td['n_ticks']}</td>"
+            for s in STRATEGIES[:8]:
+                sim = results[s[0]][idx]
+                if sim is None:
+                    H += "<td class='null'>—</td>"
+                else:
+                    ep = sim["exit_pnl"]
+                    c  = "#4f4" if ep>=0.5 else ("#fa0" if ep>=0 else "#f44")
+                    left = mg - ep
+                    H += f"<td title='deixou {left*100:.0f}%'><span style='color:{c}'>{ep*100:+.0f}%</span></td>"
+            H += "</tr>"
+        H += "</table>"
+
+    # Trade-by-trade ATUAL vs MELHOR
+    H += f"<h3>Trade-by-trade — ATUAL vs MELHOR ({best_label})</h3>"
+    H += "<table><tr><th class='L'>#</th><th class='L'>symbol</th><th>status</th><th>src</th><th>ticks</th><th>max_gain</th><th>ATUAL exit</th><th>ATUAL type</th><th>MELHOR exit</th><th>MELHOR type</th><th>delta</th><th>pnl_db</th></tr>"
+    for i, td in enumerate(trade_data):
+        csim = results[STRATEGIES[0][0]][i]
+        bsim = results[best_label][i]
+        if csim is None:
+            continue
+        tr    = td["trade"]
+        ep_c  = csim["exit_pnl"]
+        ep_b  = bsim["exit_pnl"] if bsim else None
+        delta = (ep_b - ep_c) if ep_b is not None else None
+        mg    = csim["max_gain"]
+        mg_c  = "#ff0" if mg>=4 else ("#fa0" if mg>=1.5 else "#888")
+        pnl_db = tr.get("pnl_pct_real")
+        bg = "background:#1a1000" if (delta and delta>0.20) else ""
+        H += f"""<tr style='{bg}'>
+        <td class='L'>{tr['id']}</td><td class='L'><b>{tr['symbol']}</b></td>
+        <td>{tr['status']}</td>
+        <td>{'f' if td['entry_src']=='real_fill' else '*'}</td>
+        <td>{td['n_ticks']}</td>
+        <td><span style='color:{mg_c}'>{mg*100:+.0f}%</span></td>
+        <td>{pct(ep_c)}</td><td style='font-size:10px'>{csim['exit_type']}</td>
+        <td>{pct(ep_b)}</td><td style='font-size:10px'>{bsim['exit_type'] if bsim else '—'}</td>
+        <td>{pct(delta)}</td>
+        <td>{pct(pnl_db) if pnl_db is not None else '<span class=null>NULL</span>'}</td>
+        </tr>"""
+    H += "</table>"
+
+    # WR por SL/TP camadas
+    H += "<h3>WR por SL e TP avg</h3>"
+    H += "<table><tr><th class='L'>Estratégia</th><th>WR</th><th>avg_PnL</th><th>avg_SL_pnl</th><th>avg_TP_pnl</th></tr>"
+    for label, st in grid_sorted:
+        if not st:
+            continue
+        valid   = [s for s in results[label] if s]
+        sl_pnls = [s["exit_pnl"] for s in valid if s["exit_type"]=="sl"]
+        tp_pnls = [s["exit_pnl"] for s in valid if s["exit_type"] in ("tp","ttp_exit")]
+        avg_sl  = sum(sl_pnls)/len(sl_pnls) if sl_pnls else None
+        avg_tp  = sum(tp_pnls)/len(tp_pnls) if tp_pnls else None
+        is_curr = (label==STRATEGIES[0][0])
+        brd     = "border-left:3px solid #f90" if is_curr else ""
+        H += f"<tr style='{brd}'><td class='L'>{'⚡' if is_curr else ''}{label}</td><td>{pct(st.get('wr'))}</td><td>{pct(st.get('avg_pnl'))}</td><td>{pct(avg_sl)}</td><td>{pct(avg_tp)}</td></tr>"
+    H += "</table>"
+
+    # TTP activation rate
+    H += "<h3>Taxa de ativação do TTP</h3>"
+    H += "<table><tr><th class='L'>Estratégia TTP</th><th>n</th><th>Ativados</th><th>%Ativ</th><th>WR(ativados)</th><th>WR(não-ativou)</th></tr>"
+    for s in STRATEGIES:
+        if s[1] != "ttp":
+            continue
+        label = s[0]
+        valid = [r for r in results[label] if r]
+        if not valid:
+            continue
+        act   = [r for r in valid if r.get("activated")]
+        nact  = [r for r in valid if not r.get("activated")]
+        wr_a  = sum(1 for r in act  if r["exit_type"] in ("tp","ttp_exit"))/len(act)  if act  else None
+        wr_n  = sum(1 for r in nact if r["exit_type"] in ("tp","ttp_exit"))/len(nact) if nact else None
+        is_c  = (label==STRATEGIES[0][0])
+        brd   = "border-left:3px solid #f90" if is_c else ""
+        H += f"<tr style='{brd}'><td class='L'>{'⚡' if is_c else ''}{label}</td><td>{len(valid)}</td><td>{len(act)}</td><td>{len(act)/len(valid)*100:.1f}%</td><td>{pct(wr_a)}</td><td>{pct(wr_n)}</td></tr>"
+    H += "</table>"
+
+    # Conclusões
+    H += "<h3>Conclusões</h3>"
+    curr_st   = dict(grid).get(STRATEGIES[0][0], {})
+    curr_ev   = curr_st.get("avg_pnl", 0)
+    curr_wr   = curr_st.get("wr", 0)
+    n_cv      = curr_st.get("n", 0)
+    act_rate  = curr_st.get("n_activated", 0) / n_cv if n_cv else 0
+
+    runners_underperformed = [
+        (s, td) for s, td in zip(results[STRATEGIES[0][0]], trade_data)
+        if s and s["max_gain"] >= 1.0 and s["exit_pnl"] < s["max_gain"] * 0.4
+    ]
+
+    H += "<div class='box'>"
+    H += "<b>Q1 — TTP 75/30 está matando runners?</b><br>"
+    if not runners_detail:
+        H += "<span class='warn'>Sem runners ≥150% na amostra — inconclusivo.</span><br>"
+    elif len(runners_underperformed) >= 3:
+        avg_left = sum(s["max_gain"]-s["exit_pnl"] for s,_ in runners_underperformed)/len(runners_underperformed)
+        H += f"<span class='warn'>⚠️ SIM — {len(runners_underperformed)} trades com max_gain≥100% capturaram <40% do potencial. Média deixada na mesa: {avg_left*100:.0f}%.</span><br>"
+    else:
+        H += f"<span class='pos'>Inconclusivo — {len(runners_underperformed)} underperformers (n pequeno).</span><br>"
+
+    H += f"<br><b>Q2 — Taxa de ativação ({STRATEGIES[0][0]}):</b><br>"
+    H += f"{curr_st.get('n_activated',0)}/{n_cv} trades ativam ({act_rate*100:.1f}%). "
+    H += ("<span class='neg'>Baixa — maioria fecha pelo SL sem chegar em +75%.</span>" if act_rate < 0.20 else
+          "<span class='warn'>Moderada.</span>" if act_rate < 0.40 else "<span class='pos'>Razoável.</span>")
+    H += "<br>"
+
+    H += f"<br><b>Q3 — Config com melhor EV:</b><br>"
+    H += f"<span class='pos'>{best_label}</span> avg_pnl={pct(best_ev)}<br>"
+    H += f"ATUAL avg_pnl={pct(curr_ev)}<br>"
+    if best_ev > curr_ev + 0.05 and n_cv >= 10:
+        H += f"<span class='warn'>Diferença de {(best_ev-curr_ev)*100:.1f}pp — potencialmente real mas verificar com n maior.</span><br>"
+    elif n_cv < 15:
+        H += "<span class='warn'>n<15 com ticks — diferença provavelmente ruído. Não mudar config agora.</span><br>"
+    else:
+        H += "<span class='pos'>Diferença pequena — config atual adequada no ruído amostral.</span><br>"
+
+    movsl_evs = [(s[0], dict(grid).get(s[0],{}).get("avg_pnl",-99)) for s in STRATEGIES if s[1]=="mov_sl"]
+    best_movsl = max(movsl_evs, key=lambda x: x[1]) if movsl_evs else None
+    H += "<br><b>Q4 — Evidência para SL móvel?</b><br>"
+    if best_movsl and best_movsl[1] > curr_ev + 0.03:
+        H += f"<span class='warn'>MovSL {best_movsl[0]} tem EV {(best_movsl[1]-curr_ev)*100:.1f}pp acima do atual — hipótese fraca, monitorar.</span><br>"
+    else:
+        H += "SL móvel não supera TTP atual na amostra.<br>"
+
+    sample_note = f"<span class='neg'>n_com_ticks={n_with_ticks} insuficiente — coletar mais dados antes de mudar</span>" if n_with_ticks < 20 else f"<span class='pos'>n={n_with_ticks} razoável</span>"
+
+    H += f"""<br><b>Q5 — Recomendação objetiva:</b>
+<div style='margin-left:12px;margin-top:6px'>
+TRAILING_ACTIVATION_PCT = {"75 (manter)" if act_rate >= 0.20 else "50-60 (muitos SLs antes de ativar)"}<br>
+TRAILING_DRAWDOWN_PCT   = 30 (manter — sem evidência para mudar)<br>
+TRADE_SL_PCT            = 25 (manter — 15% disparava por ruído pAMM)<br>
+Tipo preferido          = {"TTP" if [s[1] for s in STRATEGIES if s[0]==best_label][0]=="ttp" else "avaliar"} (melhor EV na simulação)<br>
+Ação imediata           = {sample_note}
+</div>"""
+
+    H += "</div></body></html>"
+    return H
+
+
+# ==============================================================================
 # /debug/fill-pipeline  — investiga por que fill não está sendo salvo
 # ==============================================================================
 
