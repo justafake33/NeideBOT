@@ -19426,5 +19426,940 @@ def analise_signal_edge_v2():
     return "".join(out)
 
 
+@app.route("/analise/rodada3")
+def analise_rodada3():
+    """Rodada 3 — Edge bruto vs execução real.
+    Compara resultado teórico (signal_entry_mc) com resultado real (real_entry_mc).
+    Fonte de verdade: trades com entry_price_usd > 0 AND tokens_received > 0.
+    """
+    import traceback as _tb
+    import statistics as _st
+    from datetime import timezone
+
+    CSS = """<style>
+    body{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:20px;max-width:1600px;margin:0 auto}
+    h1{color:#58a6ff;border-bottom:1px solid #30363d;padding-bottom:8px}
+    h2{color:#79c0ff;margin-top:32px;margin-bottom:6px;border-bottom:1px solid #21262d;padding-bottom:4px}
+    h3{color:#8b949e;margin:14px 0 4px}
+    table{border-collapse:collapse;width:100%;margin-bottom:14px;font-size:12px}
+    th{background:#161b22;color:#8b949e;padding:5px 8px;text-align:right;border:1px solid #30363d;white-space:nowrap}
+    th.l{text-align:left} td{padding:4px 8px;border:1px solid #21262d;text-align:right;white-space:nowrap}
+    td.l{text-align:left}
+    tr:hover td{background:#1c2128}
+    .tp{color:#3fb950;font-weight:bold}.sl{color:#f85149;font-weight:bold}
+    .neu{color:#e3b341}.dim{color:#6e7681}.hi{color:#58a6ff}
+    .pos{color:#3fb950}.neg{color:#f85149}.amb{color:#bb8009}
+    .box{background:#161b22;border:1px solid #30363d;padding:12px 16px;margin:10px 0;border-radius:6px;font-size:13px}
+    .warn{background:#1c1400;border:1px solid #bb8009;padding:8px 12px;border-radius:4px;margin:6px 0;font-size:12px}
+    .fix{background:#001a0e;border:1px solid #238636;padding:8px 12px;border-radius:4px;margin:6px 0;font-size:12px}
+    .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:10px 0}
+    .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:10px 0}
+    .grid5{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:10px 0}
+    .kpi{background:#161b22;border:1px solid #30363d;padding:10px;border-radius:6px;text-align:center}
+    .kpi-val{font-size:20px;font-weight:bold;display:block}
+    .kpi-lbl{font-size:11px;color:#8b949e;margin-top:3px}
+    a{color:#58a6ff}
+    pre{background:#0d1117;padding:8px;overflow:auto;font-size:11px;border:1px solid #21262d;border-radius:4px}
+    .section{margin-top:20px;padding:14px;background:#0d1117;border:1px solid #21262d;border-radius:6px}
+    </style>"""
+
+    NAV = ("<p style='margin-bottom:16px'>"
+           "<a href='/analise/signal-edge'>Signal Edge v1</a> · "
+           "<a href='/analise/signal-edge-v2'>Signal Edge v2</a> · "
+           "<a href='/analise/rodada3'><b>Rodada 3 (Execução Real)</b></a> · "
+           "<a href='/analise/correlacao'>Correlação</a></p>")
+
+    out = [f"<!DOCTYPE html><html><head><title>Rodada 3 — Execução Real</title>{CSS}</head><body>",
+           NAV, "<h1>⚡ Rodada 3 — Edge Bruto vs Execução Real</h1>",
+           "<div class='box'>Fonte de verdade: <code>entry_price_usd > 0 AND tokens_received > 0</code>.<br>"
+           "real_entry_mc = (entry_price_usd / tokens_received) × 10⁹ &nbsp;|&nbsp; "
+           "slippage = real_entry_mc / signal_mc − 1 &nbsp;|&nbsp; "
+           "PnL real = pnl_pct_real (blockchain-verified onde disponível)</div>"]
+
+    def _f(v, d=0.0): return float(v) if v is not None else d
+    def _avg(lst):
+        lst = [x for x in lst if x is not None]
+        return _st.mean(lst) if lst else None
+    def _med(lst):
+        lst = [x for x in lst if x is not None]
+        return _st.median(lst) if lst else None
+    def _p(lst, p):
+        lst = sorted(x for x in lst if x is not None)
+        if not lst: return None
+        return lst[min(int(len(lst)*p/100), len(lst)-1)]
+    def fmt(v, dec=1, sfx='%', d='—'):
+        if v is None: return d
+        s = '+' if v > 0 else ''
+        return f"{s}{v:.{dec}f}{sfx}"
+    def fmtn(v, dec=2, d='—'):
+        if v is None: return d
+        return f"{v:.{dec}f}"
+    def ec(v):
+        if v is None: return 'dim'
+        return 'tp' if v > 3 else ('sl' if v < -3 else 'neu')
+    def flag(n): return "⚠️ " if n < 30 else ""
+    def ts_diff_sec(a, b):
+        """(a - b) in seconds. a, b are datetime or None."""
+        if a is None or b is None: return None
+        try:
+            delta = a - b
+            return delta.total_seconds()
+        except Exception:
+            return None
+
+    def tick_hilo(t):
+        cl = _f(t['mc'])
+        if t['source'] == 'kline':
+            hi = _f(t['mc_high']) if t['mc_high'] else cl
+            lo = _f(t['mc_low'])  if t['mc_low']  else cl
+        else:
+            hi = cl; lo = cl
+        return hi, lo, cl
+
+    def sim_tpsl(entry, ticks, tp_pct, sl_pct, window_sec=1800):
+        """Walk ticks from entry. Conservative (SL wins on same candle). Returns (outcome, secs, close_pnl)."""
+        if not entry or entry <= 0 or not ticks:
+            return None, None, None
+        tp_mc = entry * (1 + tp_pct)
+        sl_mc = entry * (1 - sl_pct)
+        last_cl = None; last_s = None
+        for t in ticks:
+            s = _f(t['secs_after'])
+            if s > window_sec: break
+            hi, lo, cl = tick_hilo(t)
+            if cl > 0: last_cl = cl; last_s = s
+            tp_h = hi > 0 and hi >= tp_mc
+            sl_h = lo > 0 and lo <= sl_mc
+            if tp_h and sl_h: return 'loss', s, -sl_pct*100
+            if tp_h: return 'win', s, tp_pct*100
+            if sl_h: return 'loss', s, -sl_pct*100
+        close_pnl = (last_cl/entry-1)*100 if last_cl else None
+        return 'unresolved', last_s, close_pnl
+
+    def sim_trailing(entry, ticks, act_pct, dd_pct, stop_pct, window_sec=1800):
+        """Trailing with stop protection. Returns (outcome, pnl, activated, tt_act)."""
+        if not entry or entry <= 0 or not ticks:
+            return None, None, False, None
+        act_mc = entry*(1+act_pct); stop_mc = entry*(1-stop_pct)
+        peak = entry; trail_on = False; trail_fl = None; tt_act = None
+        last_cl = None; last_s = None
+        for t in ticks:
+            s = _f(t['secs_after'])
+            if s > window_sec: break
+            hi, lo, cl = tick_hilo(t)
+            if cl > 0: last_cl = cl; last_s = s
+            if not trail_on:
+                if lo > 0 and lo <= stop_mc:
+                    return 'stop', -stop_pct*100, False, None
+                if hi > 0 and hi >= act_mc:
+                    trail_on = True; tt_act = s
+                    if hi > peak: peak = hi
+                    trail_fl = peak*(1-dd_pct)
+            else:
+                if hi > peak: peak = hi; trail_fl = peak*(1-dd_pct)
+                if lo > 0 and lo <= trail_fl:
+                    return 'trail_exit', (trail_fl/entry-1)*100, True, tt_act
+        close_pnl = (last_cl/entry-1)*100 if last_cl else None
+        return 'timeout', close_pnl, trail_on, tt_act
+
+    try:
+      with db._cursor() as cur:
+
+        # ═══════════════════════════════════════════════════════════════════
+        # LOAD — trades + bounce_signals + migrations
+        # ═══════════════════════════════════════════════════════════════════
+        cur.execute("""
+            SELECT
+                t.id, t.mint, t.symbol, t.status, t.exit_type, t.fill_source,
+                t.ts_signal         AS trade_ts_signal,
+                t.ts_order_sent, t.ts_order_confirmed, t.exit_ts,
+                t.entry_price_usd, t.tokens_received, t.amount_usd, t.amount_sol,
+                t.entry_price_sol, t.fee_sol, t.slippage_pct, t.latency_sec,
+                t.tp_pct, t.sl_pct, t.pnl_pct_real, t.pnl_pct_expected,
+                t.mc_bottom, t.mc_migration AS trade_mc_mig, t.entry_expected,
+                bs.ts_signal        AS bs_ts_signal,
+                bs.mc_at_signal, bs.mc_min AS bs_mc_min,
+                bs.mc_migration     AS bs_mc_mig,
+                bs.bounce_pct, bs.drop_from_mig, bs.elapsed_sec AS bs_elapsed,
+                bs.absorption_events, bs.absorption_buy_vol, bs.absorption_sell_vol,
+                bs.p30s_buy_vol, bs.p30s_sell_vol, bs.p30s_events,
+                m.liq_migration, m.smart_wallets, m.top10_holder_rate,
+                m.rug_ratio, m.bot_degen_rate, m.volume_1m, m.holders_count,
+                t.created_at
+            FROM trades t
+            LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+            LEFT JOIN migrations m      ON m.mint  = t.mint
+            ORDER BY t.id
+        """)
+        all_rows = cur.fetchall()
+
+        # Fill-reliable trades
+        fill_rows = [r for r in all_rows
+                     if r['entry_price_usd'] and _f(r['entry_price_usd']) > 0
+                     and r['tokens_received'] and _f(r['tokens_received']) > 0]
+
+        # Enrich with computed fields
+        enriched = []
+        for r in fill_rows:
+            d = dict(r)
+            ep = _f(r['entry_price_usd'])
+            tr = _f(r['tokens_received'])
+            real_mc = (ep / tr) * 1e9 if tr > 0 else None
+            d['real_entry_mc'] = real_mc
+            sig_mc = _f(r['mc_at_signal']) if r['mc_at_signal'] else None
+            d['signal_mc'] = sig_mc
+            d['slippage_vs_signal'] = (real_mc/sig_mc - 1)*100 if real_mc and sig_mc and sig_mc > 0 else None
+            bs_min = _f(r['bs_mc_min']) if r['bs_mc_min'] else None
+            d['bottom_entry_diff'] = (real_mc/bs_min - 1)*100 if real_mc and bs_min and bs_min > 0 else None
+            # latency
+            sig_ts = r['bs_ts_signal'] or r['trade_ts_signal']
+            d['sig_ts'] = sig_ts
+            d['lat_sent_sec']      = ts_diff_sec(r['ts_order_sent'], sig_ts)
+            d['lat_confirmed_sec'] = ts_diff_sec(r['ts_order_confirmed'], sig_ts)
+            d['lat_fill_sec']      = ts_diff_sec(r['ts_order_confirmed'], r['ts_order_sent'])
+            # cohort flags
+            liq  = _f(r['liq_migration'])
+            drop = _f(r['drop_from_mig']) if r['drop_from_mig'] else 0.0
+            bp   = _f(r['bounce_pct'])    if r['bounce_pct']    else 0.0
+            ela  = _f(r['bs_elapsed'])    if r['bs_elapsed']    else 9999.0
+            bs_mig = _f(r['bs_mc_mig']) if r['bs_mc_mig'] else 0
+            entry_ratio = real_mc/bs_mig if real_mc and bs_mig > 0 else None
+            abs_ev = _f(r['absorption_events']) if r['absorption_events'] is not None else None
+            d['liq']  = liq; d['drop'] = drop; d['bp'] = bp
+            d['ela']  = ela; d['entry_ratio'] = entry_ratio; d['abs_ev'] = abs_ev
+            d['has_signal'] = r['bs_ts_signal'] is not None
+            d['has_pnl']   = r['pnl_pct_real'] is not None
+            d['is_helius_verified'] = r['exit_type'] == 'helius_sell_recovery'
+            enriched.append(d)
+
+        # Cohort filters
+        def cohort_filter(d, cohort):
+            liq  = d['liq']; drop = d['drop']; bp = d['bp']
+            ela  = d['ela']; er   = d['entry_ratio']
+            abs_ev = d['abs_ev']
+            if cohort == 'A': return True
+            if cohort == 'B': return 20000 <= liq <= 50000
+            if cohort == 'C': return drop >= 0.70
+            if cohort == 'D': return drop >= 0.60 and liq >= 20000
+            if cohort == 'E': return bp   >= 0.75 and liq >= 20000
+            if cohort == 'F': return ela  <= 300  and drop >= 0.60 and liq >= 20000
+            if cohort == 'G': return er is not None and not (0.50 <= er <= 0.65)
+            if cohort == 'H': return 0.30 <= bp <= 0.50
+            if cohort == 'I': return abs_ev is not None and abs_ev >= 11
+            return False
+
+        cohort_labels = {
+            'A': 'All fills',
+            'B': 'liq 20K–50K',
+            'C': 'drop ≥70%',
+            'D': 'drop ≥60% + liq ≥20K',
+            'E': 'bounce ≥75% + liq ≥20K',
+            'F': 'elapsed ≤5min + drop ≥60% + liq ≥20K',
+            'G': 'entry fora dead zone',
+            'H': 'bounce 30–50%',
+            'I': 'absorption ≥11',
+        }
+
+        # ═══════════════════════════════════════════════════════════════════
+        # LOAD TICKS — batch for all fill mints
+        # ═══════════════════════════════════════════════════════════════════
+        fill_mints = list({d['mint'] for d in enriched})
+        ticks_raw = []
+        if fill_mints:
+            cur.execute("""
+                SELECT tt.mint, tt.tick_ts, tt.mc, tt.mc_high, tt.mc_low, tt.source
+                FROM token_ticks tt
+                WHERE tt.mint = ANY(%s)
+                ORDER BY tt.mint, tt.tick_ts
+            """, (fill_mints,))
+            ticks_raw = cur.fetchall()
+        ticks_by_mint = {}
+        for t in ticks_raw:
+            ticks_by_mint.setdefault(t['mint'], []).append(t)
+
+        def get_ticks_after(mint, ref_ts, window_sec=1800):
+            """Return ticks after ref_ts, with secs_after computed, within window_sec."""
+            if not ref_ts or mint not in ticks_by_mint:
+                return []
+            result = []
+            for t in ticks_by_mint[mint]:
+                secs = ts_diff_sec(t['tick_ts'], ref_ts)
+                if secs is None or secs < 0: continue
+                if secs > window_sec: break
+                result.append({**dict(t), 'secs_after': secs})
+            return result
+
+        def get_ticks_between(mint, t_start, t_end):
+            """Return ticks in [t_start, t_end] window."""
+            if not t_start or not t_end or mint not in ticks_by_mint:
+                return []
+            result = []
+            for t in ticks_by_mint[mint]:
+                secs_s = ts_diff_sec(t['tick_ts'], t_start)
+                secs_e = ts_diff_sec(t['tick_ts'], t_end)
+                if secs_s is not None and secs_e is not None and secs_s >= 0 and secs_e <= 0:
+                    result.append(dict(t))
+            return result
+
+        # ═══════════════════════════════════════════════════════════════════
+        # §1 — UNIVERSO DE EXECUÇÃO CONFIÁVEL
+        # ═══════════════════════════════════════════════════════════════════
+        out.append("<h2>§1 — Universo de Execução Confiável</h2>")
+
+        n_all      = len(all_rows)
+        n_fill     = len(enriched)
+        n_w_signal = sum(1 for d in enriched if d['has_signal'])
+        n_w_pnl    = sum(1 for d in enriched if d['has_pnl'])
+        n_helius   = sum(1 for d in enriched if d['is_helius_verified'])
+        n_w_ticks  = sum(1 for d in enriched if ticks_by_mint.get(d['mint']))
+        ts_min = min((r['created_at'] for r in all_rows if r['created_at']), default=None)
+        ts_max = max((r['created_at'] for r in all_rows if r['created_at']), default=None)
+
+        out.append(f"""<div class='grid5'>
+          <div class='kpi'><span class='kpi-val'>{n_all}</span><span class='kpi-lbl'>Total trades</span></div>
+          <div class='kpi'><span class='kpi-val tp'>{n_fill}</span><span class='kpi-lbl'>Fill confiável ({100*n_fill//max(n_all,1)}%)</span></div>
+          <div class='kpi'><span class='kpi-val'>{n_w_signal}</span><span class='kpi-lbl'>Com bounce_signal ({100*n_w_signal//max(n_fill,1)}%)</span></div>
+          <div class='kpi'><span class='kpi-val'>{n_w_pnl}</span><span class='kpi-lbl'>Com pnl_pct_real ({100*n_w_pnl//max(n_fill,1)}%)</span></div>
+          <div class='kpi'><span class='kpi-val tp'>{n_helius}</span><span class='kpi-lbl'>Helius-verified ({100*n_helius//max(n_fill,1)}%)</span></div>
+        </div>""")
+        out.append(f"<div class='box dim'>Período: {ts_min} → {ts_max} | Com ticks: {n_w_ticks} ({100*n_w_ticks//max(n_fill,1)}%)</div>")
+
+        # By fill_source
+        from collections import Counter
+        src_ctr = Counter(d['fill_source'] or 'NULL' for d in enriched)
+        out.append("<h3>Por fill_source</h3><table><tr><th class='l'>fill_source</th><th>n</th><th>%</th>"
+                   "<th>com pnl_real</th><th>WR (pnl_real)</th></tr>")
+        for src, n in sorted(src_ctr.items(), key=lambda x: -x[1]):
+            grp = [d for d in enriched if (d['fill_source'] or 'NULL') == src]
+            n_pnl = sum(1 for d in grp if d['has_pnl'])
+            wins  = sum(1 for d in grp if d['has_pnl'] and _f(d['pnl_pct_real']) > 0)
+            wr    = wins/n_pnl*100 if n_pnl else None
+            out.append(f"<tr><td class='l'>{src}</td><td>{n}</td><td>{100*n//max(n_fill,1)}%</td>"
+                       f"<td>{n_pnl}</td><td class='{ec(wr-50 if wr else None)}'>{fmt(wr,'1','%','—')}</td></tr>")
+        out.append("</table>")
+
+        # By status/exit_type
+        status_ctr = Counter(f"{d['status']}/{d['exit_type'] or '—'}" for d in enriched)
+        out.append("<h3>Por status/exit_type (fills confiáveis)</h3><table><tr><th class='l'>status/exit_type</th><th>n</th></tr>")
+        for k, n in sorted(status_ctr.items(), key=lambda x: -x[1])[:15]:
+            out.append(f"<tr><td class='l'>{k}</td><td>{n}</td></tr>")
+        out.append("</table>")
+
+        # Cohorts
+        out.append("<h3>Fills por cohort (Rodada 2.1)</h3>")
+        out.append("<table><tr><th class='l'>Cohort</th><th>n fills</th><th>% dos fills</th>"
+                   "<th>com signal</th><th>com pnl_real</th><th>helius-verified</th></tr>")
+        for c, lbl in cohort_labels.items():
+            grp = [d for d in enriched if cohort_filter(d, c)]
+            n_c = len(grp)
+            fw = flag(n_c)
+            n_cs = sum(1 for d in grp if d['has_signal'])
+            n_cp = sum(1 for d in grp if d['has_pnl'])
+            n_ch = sum(1 for d in grp if d['is_helius_verified'])
+            out.append(f"<tr><td class='l'>{fw}{lbl}</td><td>{n_c}</td>"
+                       f"<td>{100*n_c//max(n_fill,1)}%</td>"
+                       f"<td>{n_cs}</td><td>{n_cp}</td><td>{n_ch}</td></tr>")
+        out.append("</table>")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # §2 — CUSTO DE EXECUÇÃO NA ENTRADA
+        # ═══════════════════════════════════════════════════════════════════
+        out.append("<h2>§2 — Custo de Execução na Entrada</h2>")
+        out.append("<div class='warn'>Pergunta: a execução entra quanto % pior que o sinal? Esse custo já elimina o EV bruto?</div>")
+
+        def dist_row(label, vals, sfx='%'):
+            vals = [x for x in vals if x is not None]
+            n = len(vals)
+            if n == 0:
+                return f"<tr><td class='l'>{label}</td><td colspan='7' class='dim'>sem dados</td></tr>"
+            avg = _avg(vals); med = _med(vals)
+            p25 = _p(vals,25); p75 = _p(vals,75)
+            mn = min(vals); mx = max(vals)
+            fw = flag(n)
+            def f(v): return fmt(v,1,sfx) if sfx=='%' else fmtn(v,1)
+            ac = ec(avg) if sfx == '%' else 'dim'
+            return (f"<tr><td class='l'>{fw}{label}</td><td>{n}</td>"
+                    f"<td class='{ac}'>{f(avg)}</td><td class='{ac}'>{f(med)}</td>"
+                    f"<td>{f(p25)}</td><td>{f(p75)}</td>"
+                    f"<td>{f(mn)}</td><td>{f(mx)}</td></tr>")
+
+        out.append("<table><tr><th class='l'>Métrica</th><th>n</th>"
+                   "<th>avg</th><th>median</th><th>p25</th><th>p75</th><th>min</th><th>max</th></tr>")
+
+        w_sig = [d for d in enriched if d['has_signal']]
+        out.append(dist_row("slippage vs sinal (%)",   [d['slippage_vs_signal'] for d in w_sig]))
+        out.append(dist_row("bottom_entry_diff (%)",   [d['bottom_entry_diff']  for d in w_sig]))
+        out.append(dist_row("latency: signal→sent (s)", [d['lat_sent_sec'] for d in w_sig], sfx='s'))
+        out.append(dist_row("latency: signal→confirmed (s)", [d['lat_confirmed_sec'] for d in w_sig], sfx='s'))
+        out.append(dist_row("latency: sent→fill (s)",  [d['lat_fill_sec'] for d in w_sig], sfx='s'))
+        out.append(dist_row("fee_sol (SOL)",            [_f(d['fee_sol']) for d in enriched if d['fee_sol']], sfx='s'))
+        out.append(dist_row("slippage_pct (GMGN field)",[_f(d['slippage_pct'])*100 for d in enriched if d['slippage_pct']], sfx='%'))
+        out.append("</table>")
+
+        # By liq bucket
+        out.append("<h3>Slippage por bucket liq_migration</h3>")
+        out.append("<table><tr><th class='l'>Liq bucket</th><th>n</th>"
+                   "<th>slip avg</th><th>slip med</th><th>lat_sig→conf avg</th></tr>")
+        for lbl, lo, hi in [('<10K',0,10000),('10–20K',10000,20000),('20–50K',20000,50000),('50K+',50000,1e9)]:
+            grp = [d for d in w_sig if lo <= d['liq'] < hi]
+            fw = flag(len(grp))
+            out.append(f"<tr><td class='l'>{fw}{lbl}</td><td>{len(grp)}</td>"
+                       f"<td class='neg'>{fmt(_avg([d['slippage_vs_signal'] for d in grp]))}</td>"
+                       f"<td class='neg'>{fmt(_med([d['slippage_vs_signal'] for d in grp]))}</td>"
+                       f"<td class='dim'>{fmtn(_avg([d['lat_confirmed_sec'] for d in grp]),1)+'s' if _avg([d['lat_confirmed_sec'] for d in grp]) else '—'}</td></tr>")
+        out.append("</table>")
+
+        # Break-even check
+        out.append("<h3>Veredicto: slippage elimina o edge bruto?</h3>")
+        slip_med = _med([d['slippage_vs_signal'] for d in w_sig])
+        if slip_med is not None:
+            out.append(f"<div class='box'>Slippage mediano vs sinal: <b class='{'neg' if slip_med > 0 else 'pos'}'>{fmt(slip_med)}</b> "
+                       f"(entrada real está {abs(slip_med):.1f}% {'ACIMA' if slip_med > 0 else 'abaixo'} do sinal teórico).<br>"
+                       f"EV bruto da Rodada 2.1 (EV_B melhor cohort): verificar se EV_B > {fmt(slip_med)} para que execução valha a pena.</div>")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # §3 — TEORIA vs REAL (por configuração)
+        # ═══════════════════════════════════════════════════════════════════
+        out.append("<h2>§3 — Sinal Teórico vs Trade Real</h2>")
+        out.append("<div class='warn'>Teórico = simula a partir de signal_entry_mc usando ticks após ts_signal. "
+                   "Real = pnl_pct_real do trade. Apenas trades com ambos disponíveis.</div>")
+
+        # Subset: fill + signal + pnl_real
+        w_both = [d for d in enriched if d['has_signal'] and d['has_pnl'] and d['signal_mc'] and d['real_entry_mc']]
+        out.append(f"<div class='box dim'>n com signal+pnl_real: {len(w_both)}</div>")
+
+        configs = [
+            ('TP+200%/SL-10%/30min',   0.200, 0.10),
+            ('TP+75%/SL-10%/30min',    0.075, 0.10),  # typo intentional: +75% is 0.75
+            ('TP+75%/SL-25%/30min',    0.75,  0.25),
+            ('TP+150%/SL-15%/30min',   1.50,  0.15),
+        ]
+        # Fix: TP+75% is +75% = 0.75 multiplier
+        configs = [
+            ('TP+200%/SL-10%/30min',  2.00,  0.10),
+            ('TP+75%/SL-10%/30min',   0.75,  0.10),
+            ('TP+75%/SL-25%/30min',   0.75,  0.25),
+            ('TP+150%/SL-15%/30min',  1.50,  0.15),
+        ]
+
+        out.append("""<table><tr>
+          <th class='l'>Config</th><th>n</th>
+          <th>EV teórico</th><th>EV real</th><th>Δ EV</th>
+          <th>WR teórico</th><th>WR real</th><th>Δ WR</th>
+          <th>Med teórico</th><th>Med real</th>
+          <th>Bons→ruim</th><th>Ruins→bom</th></tr>""")
+
+        for cfg_lbl, tp_pct, sl_pct in configs:
+            if not w_both:
+                out.append(f"<tr><td class='l'>{cfg_lbl}</td><td colspan='11' class='dim'>sem dados</td></tr>")
+                continue
+            th_pnls=[]; re_pnls=[]; th_wins=0; re_wins=0
+            good_to_bad=0; bad_to_good=0
+            for d in w_both:
+                sig_tks = get_ticks_after(d['mint'], d['sig_ts'], 1800)
+                oc, _, close_p = sim_tpsl(d['signal_mc'], sig_tks, tp_pct, sl_pct)
+                if oc == 'win':   th_pnl = tp_pct*100; th_wins += 1
+                elif oc == 'loss': th_pnl = -sl_pct*100
+                else:              th_pnl = close_p or 0
+                th_pnls.append(th_pnl)
+                re_pnl = _f(d['pnl_pct_real'])*100 if d['pnl_pct_real'] is not None else 0
+                re_pnls.append(re_pnl)
+                if re_pnl > 0: re_wins += 1
+                # good signal turned bad trade
+                if th_pnl > 0 and re_pnl < 0: good_to_bad += 1
+                if th_pnl < 0 and re_pnl > 0: bad_to_good += 1
+            n = len(w_both)
+            ev_th = _avg(th_pnls); ev_re = _avg(re_pnls)
+            med_th = _med(th_pnls); med_re = _med(re_pnls)
+            wr_th = th_wins/n*100; wr_re = re_wins/n*100
+            delta_ev = (ev_re-ev_th) if ev_th is not None and ev_re is not None else None
+            delta_wr = wr_re - wr_th
+            fw = flag(n)
+            out.append(f"""<tr>
+              <td class='l'>{fw}{cfg_lbl}</td><td>{n}</td>
+              <td class='{ec(ev_th)}'>{fmt(ev_th)}</td>
+              <td class='{ec(ev_re)}'>{fmt(ev_re)}</td>
+              <td class='{ec(delta_ev)}'>{fmt(delta_ev)}</td>
+              <td>{fmt(wr_th,'1','%','—')}</td>
+              <td>{fmt(wr_re,'1','%','—')}</td>
+              <td class='{ec(delta_wr)}'>{fmt(delta_wr)}</td>
+              <td>{fmt(med_th)}</td><td>{fmt(med_re)}</td>
+              <td class='sl'>{good_to_bad}</td><td class='tp'>{bad_to_good}</td>
+            </tr>""")
+        out.append("</table>")
+
+        # Trailing configs
+        trail_cfgs = [
+            ('Trail ativ+50%/DD20%/stop-15%', 0.50, 0.20, 0.15),
+            ('Trail ativ+50%/DD20%/stop-25%', 0.50, 0.20, 0.25),
+        ]
+        out.append("<h3>Trailing teórico (sinal) vs pnl_real</h3>")
+        out.append("""<table><tr>
+          <th class='l'>Config</th><th>n</th>
+          <th>EV teórico</th><th>EV real</th><th>Δ EV</th>
+          <th>Ativou (teórico)</th><th>WR real</th></tr>""")
+        for cfg_lbl, act, dd, stop in trail_cfgs:
+            if not w_both:
+                out.append(f"<tr><td class='l'>{cfg_lbl}</td><td colspan='6' class='dim'>sem dados</td></tr>")
+                continue
+            th_pnls=[]; re_pnls=[]; n_act=0
+            for d in w_both:
+                sig_tks = get_ticks_after(d['mint'], d['sig_ts'], 1800)
+                oc, pnl, activated, _ = sim_trailing(d['signal_mc'], sig_tks, act, dd, stop)
+                th_pnl = pnl if pnl is not None else 0
+                th_pnls.append(th_pnl)
+                if activated: n_act += 1
+                re_pnl = _f(d['pnl_pct_real'])*100 if d['pnl_pct_real'] is not None else 0
+                re_pnls.append(re_pnl)
+            n = len(w_both)
+            re_wins = sum(1 for p in re_pnls if p > 0)
+            ev_th = _avg(th_pnls); ev_re = _avg(re_pnls)
+            delta_ev = (ev_re-ev_th) if ev_th and ev_re else None
+            fw = flag(n)
+            out.append(f"""<tr>
+              <td class='l'>{fw}{cfg_lbl}</td><td>{n}</td>
+              <td class='{ec(ev_th)}'>{fmt(ev_th)}</td>
+              <td class='{ec(ev_re)}'>{fmt(ev_re)}</td>
+              <td class='{ec(delta_ev)}'>{fmt(delta_ev)}</td>
+              <td class='tp'>{n_act}/{n}</td>
+              <td>{fmt(re_wins/n*100,'1','%')}</td>
+            </tr>""")
+        out.append("</table>")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # §4 — CAPTURE RATIO
+        # ═══════════════════════════════════════════════════════════════════
+        out.append("<h2>§4 — Capture Ratio (o bot chega tarde?)</h2>")
+        out.append("<div class='warn'>capture_ratio = MFE_from_real_entry / MFE_from_signal. <1 = bot chegou tarde e perdeu parte do move.</div>")
+
+        w_sig_conf = [d for d in enriched if d['has_signal'] and d['real_entry_mc'] and d['signal_mc']
+                      and d['ts_order_confirmed']]
+
+        cap_ratios=[]; mfe_sig_l=[]; mfe_real_l=[]; mae_sig_l=[]; mae_real_l=[]
+        for d in w_sig_conf:
+            sig_tks  = get_ticks_after(d['mint'], d['sig_ts'], 1800)
+            real_tks = get_ticks_after(d['mint'], d['ts_order_confirmed'], 1800)
+            sig_mc   = d['signal_mc']; real_mc = d['real_entry_mc']
+            # MFE/MAE from signal
+            hs=[tick_hilo(t)[0] for t in sig_tks if tick_hilo(t)[0]>0]
+            ls=[tick_hilo(t)[1] for t in sig_tks if tick_hilo(t)[1]>0]
+            mfe_s = (max(hs)/sig_mc-1)*100 if hs and sig_mc>0 else None
+            mae_s = (min(ls)/sig_mc-1)*100 if ls and sig_mc>0 else None
+            # MFE/MAE from real entry
+            hs2=[tick_hilo(t)[0] for t in real_tks if tick_hilo(t)[0]>0]
+            ls2=[tick_hilo(t)[1] for t in real_tks if tick_hilo(t)[1]>0]
+            mfe_r = (max(hs2)/real_mc-1)*100 if hs2 and real_mc>0 else None
+            mae_r = (min(ls2)/real_mc-1)*100 if ls2 and real_mc>0 else None
+            if mfe_s is not None: mfe_sig_l.append(mfe_s)
+            if mfe_r is not None: mfe_real_l.append(mfe_r)
+            if mae_s is not None: mae_sig_l.append(mae_s)
+            if mae_r is not None: mae_real_l.append(mae_r)
+            if mfe_s and mfe_s != 0 and mfe_r is not None:
+                cap_ratios.append(mfe_r/mfe_s)
+
+        out.append(f"""<div class='grid4'>
+          <div class='kpi'><span class='kpi-val {ec((_med(cap_ratios) or 0)*100-50)}'>{fmtn(_med(cap_ratios),'3') if cap_ratios else '—'}</span>
+          <span class='kpi-lbl'>Capture ratio mediano (1.0 = perfeito)</span></div>
+          <div class='kpi'><span class='kpi-val pos'>{fmt(_med(mfe_sig_l))}</span>
+          <span class='kpi-lbl'>MFE mediano (do sinal, 30min)</span></div>
+          <div class='kpi'><span class='kpi-val pos'>{fmt(_med(mfe_real_l))}</span>
+          <span class='kpi-lbl'>MFE mediano (da entrada real, 30min)</span></div>
+          <div class='kpi'><span class='kpi-val neg'>{fmt(_med(mae_real_l))}</span>
+          <span class='kpi-lbl'>MAE mediano (da entrada real)</span></div>
+        </div>""")
+
+        # By cohort
+        out.append("<table><tr><th class='l'>Cohort</th><th>n</th>"
+                   "<th>MFE_sig med</th><th>MFE_real med</th><th>Capture med</th>"
+                   "<th>MAE_sig med</th><th>MAE_real med</th></tr>")
+        for c, lbl in cohort_labels.items():
+            grp = [d for d in w_sig_conf if cohort_filter(d, c)]
+            if not grp: continue
+            fw = flag(len(grp))
+            cr=[]; ms=[]; mr=[]; as_=[]; ar=[]
+            for d in grp:
+                sig_tks  = get_ticks_after(d['mint'], d['sig_ts'], 1800)
+                real_tks = get_ticks_after(d['mint'], d['ts_order_confirmed'], 1800)
+                sm = d['signal_mc']; rm = d['real_entry_mc']
+                hs=[tick_hilo(t)[0] for t in sig_tks if tick_hilo(t)[0]>0]
+                ls=[tick_hilo(t)[1] for t in sig_tks if tick_hilo(t)[1]>0]
+                hs2=[tick_hilo(t)[0] for t in real_tks if tick_hilo(t)[0]>0]
+                ls2=[tick_hilo(t)[1] for t in real_tks if tick_hilo(t)[1]>0]
+                mfe_s=(max(hs)/sm-1)*100 if hs and sm>0 else None
+                mfe_r=(max(hs2)/rm-1)*100 if hs2 and rm>0 else None
+                mae_s=(min(ls)/sm-1)*100 if ls and sm>0 else None
+                mae_r=(min(ls2)/rm-1)*100 if ls2 and rm>0 else None
+                if mfe_s: ms.append(mfe_s)
+                if mfe_r: mr.append(mfe_r)
+                if mae_s: as_.append(mae_s)
+                if mae_r: ar.append(mae_r)
+                if mfe_s and mfe_s != 0 and mfe_r is not None: cr.append(mfe_r/mfe_s)
+            out.append(f"<tr><td class='l'>{fw}{lbl}</td><td>{len(grp)}</td>"
+                       f"<td class='pos'>{fmt(_med(ms))}</td>"
+                       f"<td class='pos'>{fmt(_med(mr))}</td>"
+                       f"<td class='{ec((_med(cr) or 0)*100-50) if cr else 'dim'}'>{fmtn(_med(cr),'3') if cr else '—'}</td>"
+                       f"<td class='neg'>{fmt(_med(as_))}</td>"
+                       f"<td class='neg'>{fmt(_med(ar))}</td></tr>")
+        out.append("</table>")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # §5 — A MORTE ACONTECE ANTES DA ORDEM?
+        # ═══════════════════════════════════════════════════════════════════
+        out.append("<h2>§5 — A Morte Acontece Antes da Ordem?</h2>")
+        out.append("<div class='warn'>Verifica se entre ts_signal e ts_order_confirmed o preço já moveu o suficiente para bater SL ou TP. "
+                   "LIMITAÇÃO: ticks são snapshots a cada 30s — janela de latência típica (5-30s) pode ter zero ticks.</div>")
+
+        w_lat = [d for d in enriched if d['has_signal'] and d['sig_ts'] and d['ts_order_confirmed'] and d['real_entry_mc']]
+
+        # For each, check ticks between signal and confirmed
+        sl_thresholds = [0.10, 0.15, 0.25]
+        tp_thresholds = [0.30, 0.50, 0.75]
+        results_lat = []
+        n_no_ticks_in_window = 0
+        for d in w_lat:
+            tks_window = get_ticks_between(d['mint'], d['sig_ts'], d['ts_order_confirmed'])
+            sig_mc = d['signal_mc']
+            if not tks_window:
+                n_no_ticks_in_window += 1
+                results_lat.append({'d': d, 'moves': [], 'max_hi': None, 'min_lo': None})
+                continue
+            moves = []
+            his = [tick_hilo(t)[0] for t in tks_window if tick_hilo(t)[0] > 0]
+            los = [tick_hilo(t)[1] for t in tks_window if tick_hilo(t)[1] > 0]
+            max_hi = max(his) if his else None
+            min_lo = min(los) if los else None
+            move_hi = (max_hi/sig_mc-1)*100 if max_hi and sig_mc > 0 else None
+            move_lo = (min_lo/sig_mc-1)*100 if min_lo and sig_mc > 0 else None
+            results_lat.append({'d': d, 'max_hi': move_hi, 'min_lo': move_lo})
+
+        out.append(f"<div class='box dim'>Trades com latency window: {len(w_lat)} | Sem ticks no window: {n_no_ticks_in_window} ({100*n_no_ticks_in_window//max(len(w_lat),1)}%) — resultado inconclusivo para esses.</div>")
+
+        n_any = len(results_lat) - n_no_ticks_in_window
+        out.append("<table><tr><th class='l'>Threshold</th><th>n com ticks</th><th>% bateu antes</th>"
+                   "<th>med movimento up</th><th>med movimento down</th></tr>")
+        for sl_t in sl_thresholds:
+            hit = sum(1 for r in results_lat if r.get('min_lo') is not None and r['min_lo'] <= -sl_t*100)
+            med_lo = _med([r['min_lo'] for r in results_lat if r.get('min_lo') is not None])
+            out.append(f"<tr><td class='l'>SL -{sl_t*100:.0f}% batido antes fill</td>"
+                       f"<td>{n_any}</td><td class='neg'>{100*hit//max(n_any,1)}%</td>"
+                       f"<td class='dim'>—</td><td class='neg'>{fmt(med_lo)}</td></tr>")
+        for tp_t in tp_thresholds:
+            hit = sum(1 for r in results_lat if r.get('max_hi') is not None and r['max_hi'] >= tp_t*100)
+            med_hi = _med([r['max_hi'] for r in results_lat if r.get('max_hi') is not None])
+            out.append(f"<tr><td class='l'>TP +{tp_t*100:.0f}% batido antes fill</td>"
+                       f"<td>{n_any}</td><td class='tp'>{100*hit//max(n_any,1)}%</td>"
+                       f"<td class='pos'>{fmt(med_hi)}</td><td class='dim'>—</td></tr>")
+        out.append("</table>")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # §6 — SL -10% É EXECUTÁVEL? (simulação a partir de real_entry_mc)
+        # ═══════════════════════════════════════════════════════════════════
+        out.append("<h2>§6 — SL Apertado (-10%) Sobrevive à Execução Real?</h2>")
+        out.append("<div class='warn'>Simula a partir de real_entry_mc usando ticks após ts_order_confirmed. "
+                   "Responde: SL-10% (que criava edge bruto na R2.1) vira stop falso na entrada real?</div>")
+
+        w_real_tks = [d for d in enriched if d['real_entry_mc'] and d['ts_order_confirmed']
+                      and get_ticks_after(d['mint'], d['ts_order_confirmed'], 1800)]
+
+        out.append(f"<div class='box dim'>Trades com real_entry_mc + ticks após confirmed: {len(w_real_tks)}</div>")
+
+        tp_levels = [0.50, 0.75, 1.00, 1.50, 2.00]
+        sl_levels = [0.10, 0.15, 0.20, 0.25, 0.30]
+
+        out.append("""<table><tr>
+          <th class='l'>TP</th><th class='l'>SL</th>
+          <th>n_res</th><th>Wins</th><th>Loss</th><th>Unres</th>
+          <th>WR</th><th>EV_A</th><th>EV_B</th><th>Med_B</th>
+          <th>TTtp</th><th>TTsl</th></tr>""")
+        for tp_pct in tp_levels:
+            for sl_pct in sl_levels:
+                wins=0; losses=0; unres=0
+                win_s=[]; loss_s=[]; close_pnls=[]
+                for d in w_real_tks:
+                    real_tks = get_ticks_after(d['mint'], d['ts_order_confirmed'], 1800)
+                    oc, secs, cp = sim_tpsl(d['real_entry_mc'], real_tks, tp_pct, sl_pct)
+                    if oc == 'win':
+                        wins += 1; win_s.append(secs)
+                    elif oc == 'loss':
+                        losses += 1; loss_s.append(secs)
+                    else:
+                        unres += 1; close_pnls.append(cp)
+                n_res = wins + losses
+                wr = wins/n_res*100 if n_res else None
+                ev_a = (wr*tp_pct*100 - (100-wr)*sl_pct*100)/100 if wr is not None else None
+                pnls_b = [tp_pct*100]*wins + [-sl_pct*100]*losses + [p for p in close_pnls if p is not None]
+                ev_b = _avg(pnls_b)
+                med_b = _med(pnls_b)
+                fw = flag(n_res)
+                out.append(f"""<tr>
+                  <td class='l'>{fw}+{tp_pct*100:.0f}%</td>
+                  <td class='l'>-{sl_pct*100:.0f}%</td>
+                  <td>{n_res}</td>
+                  <td class='tp'>{wins}</td><td class='sl'>{losses}</td>
+                  <td class='dim'>{unres}</td>
+                  <td>{fmt(wr,'1','%','—')}</td>
+                  <td class='{ec(ev_a)}'>{fmt(ev_a)}</td>
+                  <td class='{ec(ev_b)}'>{fmt(ev_b)}</td>
+                  <td class='{ec(med_b)}'>{fmt(med_b)}</td>
+                  <td class='dim'>{fmtn(_avg([s/60 for s in win_s if s]),1)+'min' if win_s else '—'}</td>
+                  <td class='dim'>{fmtn(_avg([s/60 for s in loss_s if s]),1)+'min' if loss_s else '—'}</td>
+                </tr>""")
+        out.append("</table>")
+
+        # Trailing from real entry
+        out.append("<h3>Trailing a partir de real_entry_mc</h3>")
+        trail_cfgs2 = [
+            ('ativ+50%/DD20%/stop-10%', 0.50, 0.20, 0.10),
+            ('ativ+50%/DD20%/stop-15%', 0.50, 0.20, 0.15),
+            ('ativ+50%/DD20%/stop-25%', 0.50, 0.20, 0.25),
+        ]
+        out.append("""<table><tr>
+          <th class='l'>Config</th><th>n</th>
+          <th>Ativou</th><th>Stop_exit</th><th>Trail_exit</th><th>Timeout</th>
+          <th>EV avg</th><th>EV med</th><th>MaxW</th><th>MaxL</th></tr>""")
+        for cfg_lbl, act, dd, stop in trail_cfgs2:
+            n_act=0; n_stop=0; n_trail=0; n_tout=0
+            pnls=[]
+            for d in w_real_tks:
+                real_tks = get_ticks_after(d['mint'], d['ts_order_confirmed'], 1800)
+                oc, pnl, activated, _ = sim_trailing(d['real_entry_mc'], real_tks, act, dd, stop)
+                if activated: n_act += 1
+                if oc == 'stop': n_stop += 1
+                elif oc == 'trail_exit': n_trail += 1
+                elif oc == 'timeout': n_tout += 1
+                if pnl is not None: pnls.append(pnl)
+            n = len(w_real_tks)
+            fw = flag(n)
+            ev_avg = _avg(pnls); ev_med = _med(pnls)
+            max_w = max(pnls) if pnls else None
+            max_l = min(pnls) if pnls else None
+            out.append(f"""<tr>
+              <td class='l'>{fw}{cfg_lbl}</td><td>{n}</td>
+              <td class='tp'>{n_act}</td><td class='sl'>{n_stop}</td>
+              <td class='tp'>{n_trail}</td><td class='dim'>{n_tout}</td>
+              <td class='{ec(ev_avg)}'>{fmt(ev_avg)}</td>
+              <td class='{ec(ev_med)}'>{fmt(ev_med)}</td>
+              <td class='pos'>{fmt(max_w)}</td><td class='neg'>{fmt(max_l)}</td>
+            </tr>""")
+        out.append("</table>")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # §7 — GMGN REAL vs SIMULADO
+        # ═══════════════════════════════════════════════════════════════════
+        out.append("<h2>§7 — GMGN Real vs Simulado (a partir de real_entry_mc)</h2>")
+        out.append("<div class='warn'>Usa tp_pct/sl_pct configurados + simulação de ticks para comparar com pnl_pct_real.</div>")
+
+        w_exit = [d for d in enriched if d['has_pnl'] and d['real_entry_mc']
+                  and d['ts_order_confirmed'] and d['tp_pct'] and d['sl_pct']]
+        out.append(f"<div class='box dim'>Trades com pnl_real + real_entry_mc + tp/sl: {len(w_exit)}</div>")
+
+        sim_pnls=[]; real_pnls2=[]; diffs=[]
+        for d in w_exit:
+            real_tks = get_ticks_after(d['mint'], d['ts_order_confirmed'], 1800)
+            tp_pct = _f(d['tp_pct']); sl_pct = _f(d['sl_pct'])
+            oc, _, cp = sim_tpsl(d['real_entry_mc'], real_tks, tp_pct, sl_pct)
+            if oc == 'win':   sim_p = tp_pct*100
+            elif oc == 'loss': sim_p = -sl_pct*100
+            else:              sim_p = cp or 0
+            real_p = _f(d['pnl_pct_real'])*100
+            sim_pnls.append(sim_p); real_pnls2.append(real_p)
+            diffs.append(real_p - sim_p)
+
+        out.append(f"""<div class='grid3'>
+          <div class='kpi'><span class='kpi-val {ec(_avg(sim_pnls))}'>{fmt(_avg(sim_pnls))}</span>
+          <span class='kpi-lbl'>EV simulado (da entrada real)</span></div>
+          <div class='kpi'><span class='kpi-val {ec(_avg(real_pnls2))}'>{fmt(_avg(real_pnls2))}</span>
+          <span class='kpi-lbl'>EV real (pnl_pct_real)</span></div>
+          <div class='kpi'><span class='kpi-val {ec(_avg(diffs))}'>{fmt(_avg(diffs))}</span>
+          <span class='kpi-lbl'>Δ (real − simulado)</span></div>
+        </div>""")
+
+        # By exit_type
+        out.append("<h3>Por exit_type</h3>")
+        exit_types = list(set(d['exit_type'] or 'NULL' for d in w_exit))
+        out.append("<table><tr><th class='l'>exit_type</th><th>n</th>"
+                   "<th>EV sim</th><th>EV real</th><th>Δ</th>"
+                   "<th>Med sim</th><th>Med real</th></tr>")
+        for et in sorted(exit_types):
+            grp = [d for d in w_exit if (d['exit_type'] or 'NULL') == et]
+            if not grp: continue
+            sp=[]; rp=[]; di=[]
+            for d in grp:
+                real_tks = get_ticks_after(d['mint'], d['ts_order_confirmed'], 1800)
+                tp_pct = _f(d['tp_pct']); sl_pct = _f(d['sl_pct'])
+                oc, _, cp = sim_tpsl(d['real_entry_mc'], real_tks, tp_pct, sl_pct)
+                sim_p = tp_pct*100 if oc=='win' else (-sl_pct*100 if oc=='loss' else cp or 0)
+                real_p = _f(d['pnl_pct_real'])*100
+                sp.append(sim_p); rp.append(real_p); di.append(real_p-sim_p)
+            fw = flag(len(grp))
+            out.append(f"<tr><td class='l'>{fw}{et}</td><td>{len(grp)}</td>"
+                       f"<td class='{ec(_avg(sp))}'>{fmt(_avg(sp))}</td>"
+                       f"<td class='{ec(_avg(rp))}'>{fmt(_avg(rp))}</td>"
+                       f"<td class='{ec(_avg(di))}'>{fmt(_avg(di))}</td>"
+                       f"<td>{fmt(_med(sp))}</td><td>{fmt(_med(rp))}</td></tr>")
+        out.append("</table>")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # §8 — COHORTS NA EXECUÇÃO REAL
+        # ═══════════════════════════════════════════════════════════════════
+        out.append("<h2>§8 — Cohorts Promissores na Execução Real</h2>")
+
+        out.append("""<table style='font-size:11px'><tr>
+          <th class='l'>Cohort</th>
+          <th>n fills</th><th>n pnl</th><th>n helius</th>
+          <th>WR real</th><th>EV real</th><th>Med real</th>
+          <th>EV sim(TP75/SL25)</th>
+          <th>Slip med</th><th>Lat med</th>
+          <th>Cap ratio</th>
+          <th>AvgWin</th><th>AvgLoss</th>
+          <th>MaxW</th><th>MaxL</th></tr>""")
+
+        for c, lbl in cohort_labels.items():
+            grp = [d for d in enriched if cohort_filter(d, c)]
+            if not grp: continue
+            fw = flag(len(grp))
+            n_p = [d for d in grp if d['has_pnl']]
+            wins = [d for d in n_p if _f(d['pnl_pct_real'])*100 > 0]
+            wr   = len(wins)/len(n_p)*100 if n_p else None
+            pnls = [_f(d['pnl_pct_real'])*100 for d in n_p]
+            ev_r = _avg(pnls); med_r = _med(pnls)
+            win_pnls  = [p for p in pnls if p > 0]
+            loss_pnls = [p for p in pnls if p <= 0]
+            avg_w = _avg(win_pnls); avg_l = _avg(loss_pnls)
+            max_w = max(pnls) if pnls else None
+            max_l = min(pnls) if pnls else None
+            slip_med = _med([d['slippage_vs_signal'] for d in grp if d['slippage_vs_signal'] is not None])
+            lat_med  = _med([d['lat_confirmed_sec'] for d in grp if d['lat_confirmed_sec'] is not None])
+            # simulated EV from real entry TP75/SL25
+            sim_pvec=[]
+            for d in grp:
+                if not d['real_entry_mc'] or not d['ts_order_confirmed']: continue
+                real_tks = get_ticks_after(d['mint'], d['ts_order_confirmed'], 1800)
+                if not real_tks: continue
+                oc, _, cp = sim_tpsl(d['real_entry_mc'], real_tks, 0.75, 0.25)
+                sim_p = 75.0 if oc=='win' else (-25.0 if oc=='loss' else cp or 0)
+                sim_pvec.append(sim_p)
+            ev_sim = _avg(sim_pvec)
+            # cap ratio
+            cr_vec=[]
+            for d in grp:
+                if not d['signal_mc'] or not d['real_entry_mc'] or not d['sig_ts'] or not d['ts_order_confirmed']: continue
+                sig_tks  = get_ticks_after(d['mint'], d['sig_ts'], 1800)
+                real_tks = get_ticks_after(d['mint'], d['ts_order_confirmed'], 1800)
+                hs  = [tick_hilo(t)[0] for t in sig_tks  if tick_hilo(t)[0]>0]
+                hs2 = [tick_hilo(t)[0] for t in real_tks if tick_hilo(t)[0]>0]
+                mfe_s = (max(hs)/d['signal_mc']-1)*100  if hs  and d['signal_mc']>0  else None
+                mfe_r = (max(hs2)/d['real_entry_mc']-1)*100 if hs2 and d['real_entry_mc']>0 else None
+                if mfe_s and mfe_s != 0 and mfe_r is not None:
+                    cr_vec.append(mfe_r/mfe_s)
+            cap = _med(cr_vec)
+            n_helius = sum(1 for d in grp if d['is_helius_verified'])
+            out.append(f"""<tr>
+              <td class='l'>{fw}{lbl}</td>
+              <td>{len(grp)}</td><td>{len(n_p)}</td><td>{n_helius}</td>
+              <td class='{ec((wr or 0)-50)}'>{fmt(wr,'1','%','—')}</td>
+              <td class='{ec(ev_r)}'>{fmt(ev_r)}</td>
+              <td class='{ec(med_r)}'>{fmt(med_r)}</td>
+              <td class='{ec(ev_sim)}'>{fmt(ev_sim)}</td>
+              <td class='neg'>{fmt(slip_med)}</td>
+              <td class='dim'>{fmtn(lat_med,1)+'s' if lat_med else '—'}</td>
+              <td class='{ec((cap or 0)*100-50) if cap else "dim"}'>{fmtn(cap,2) if cap else '—'}</td>
+              <td class='pos'>{fmt(avg_w)}</td>
+              <td class='neg'>{fmt(avg_l)}</td>
+              <td class='pos'>{fmt(max_w)}</td>
+              <td class='neg'>{fmt(max_l)}</td>
+            </tr>""")
+        out.append("</table>")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # §9 — DIAGNÓSTICO FINAL
+        # ═══════════════════════════════════════════════════════════════════
+        out.append("<h2>§9 — Diagnóstico Final da Rodada 3</h2>")
+
+        # Compute quick answers
+        slip_med_all = _med([d['slippage_vs_signal'] for d in w_sig if d['slippage_vs_signal'] is not None])
+        wr_all  = sum(1 for d in enriched if d['has_pnl'] and _f(d['pnl_pct_real'])*100>0)
+        n_pnl_all = sum(1 for d in enriched if d['has_pnl'])
+        wr_all_pct = wr_all/n_pnl_all*100 if n_pnl_all else None
+        ev_all_real = _avg([_f(d['pnl_pct_real'])*100 for d in enriched if d['has_pnl']])
+
+        # Which cohort has best real EV?
+        best_cohort_ev = None; best_cohort_lbl = None
+        for c, lbl in cohort_labels.items():
+            grp = [d for d in enriched if cohort_filter(d, c) and d['has_pnl']]
+            if len(grp) < 10: continue
+            ev = _avg([_f(d['pnl_pct_real'])*100 for d in grp])
+            if best_cohort_ev is None or (ev is not None and ev > best_cohort_ev):
+                best_cohort_ev = ev; best_cohort_lbl = lbl
+
+        # Problem diagnosis
+        if slip_med_all is not None and slip_med_all > 5:
+            exec_issue = "entrada acima do sinal"
+        elif _avg([d['lat_confirmed_sec'] for d in w_sig if d['lat_confirmed_sec']]) and \
+             _avg([d['lat_confirmed_sec'] for d in w_sig if d['lat_confirmed_sec']]) > 30:
+            exec_issue = "latência excessiva"
+        else:
+            exec_issue = "a investigar com mais dados"
+
+        out.append(f"""<div class='section'>
+        <h3>A) O problema é sinal ou execução?</h3>
+        <div class='box'>
+        WR real geral: <b class='{ec((wr_all_pct or 0)-50)}'>{fmt(wr_all_pct,'1','%','—')} ({wr_all}/{n_pnl_all})</b><br>
+        EV real geral: <b class='{ec(ev_all_real)}'>{fmt(ev_all_real)}</b><br>
+        Slippage mediano vs sinal: <b class='neg'>{fmt(slip_med_all)}</b><br>
+        <br>
+        {"<span class='sl'>⚠️ n de trades com fill+pnl ainda pequeno — resultado INCONCLUSIVO. Coletar mais dados antes de concluir.</span>" if n_pnl_all < 30
+         else (f"<span class='tp'>Edge real positivo detectado. Verificar cohorts específicos.</span>" if (ev_all_real or 0) > 0
+         else f"<span class='sl'>EV real negativo. Investigar: sinal sem edge suficiente OU execução destrói edge.</span>")}
+        </div>
+
+        <h3>B) Cohort com EV real positivo</h3>
+        <div class='box'>
+        {f"Melhor cohort: <b>{best_cohort_lbl}</b> → EV real médio = {fmt(best_cohort_ev)}" if best_cohort_lbl else "Dados insuficientes para determinar cohort dominante."}
+        <br>Todos os cohorts com n≥30: ver tabela §8 acima.
+        </div>
+
+        <h3>C) Qual parte da execução mais destrói edge?</h3>
+        <div class='box'>
+        Foco primário identificado: <b>{exec_issue}</b><br>
+        Slippage mediano: {fmt(slip_med_all)} (entrada real acima do sinal)<br>
+        Latência mediana signal→fill: {fmtn(_med([d['lat_confirmed_sec'] for d in w_sig if d['lat_confirmed_sec']]),1)}s<br>
+        Capture ratio mediano: {fmtn(_med(cap_ratios),2) if cap_ratios else '—'} (1.0 = captura todo o move, &lt;1 = bot chega tarde)<br>
+        Fee mediana: {fmtn(_avg([_f(d['fee_sol']) for d in enriched if d['fee_sol']]),4)} SOL/trade
+        </div>
+
+        <h3>D) Devemos mudar?</h3>
+        <div class='box'>
+        {"<span class='warn'>⚠️ n&lt;30 trades com pnl confiável — NÃO mudar produção ainda. Coletar mais dados.</span>"
+         if n_pnl_all < 30
+         else "Verificar §6 (SL viability): se SL-10% se sustenta na entrada real → testar em produção com cohort específico."}
+        <br>
+        <ul>
+        <li>Filtro de entrada: verificar se cohorts R2.1 sobrevivem ao slippage</li>
+        <li>Mecanismo de execução: latência alta → investigar se Jupiter reduziria</li>
+        <li>Regra de saída: trailing real vs simulado (§7) — verificar se GMGN executa próximo do teórico</li>
+        <li>Parar e coletar: se n&lt;30 confiáveis → sim, coletar mais antes de mudar</li>
+        </ul>
+        </div>
+
+        <h3>E) 5 perguntas da Rodada 4</h3>
+        <div class='box'>
+        <ol>
+        <li><b>O slippage é sistemático ou varia por liq/bounce?</b> Se tokens com liq≥20K têm slip menor, filtrar por liq elimina o problema de entrada sem perder frequência.</li>
+        <li><b>O trailing GMGN captura a cauda direita (moons)?</b> §7 mostra Δ real−simulado por exit_type. Se trailing_exit real tem EV muito menor que simulado, GMGN devolvendo demais.</li>
+        <li><b>Qual o impacto real de SL -25% vs SL -15%?</b> Com dados reais de fill, simular ambos a partir de real_entry_mc e comparar WR. Resultado de §6 responde isso.</li>
+        <li><b>Existe cohort com capture_ratio ≥ 0.7 AND EV real positivo?</b> Capture ratio alto significa que o bot não está chegando tarde. Esse cohort é o candidato para Rodada 5 (escala).</li>
+        <li><b>O SL de -10% (edge bruto R2.1) é praticável?</b> §6 quantifica quantos winners seriam stopados antes de subir. Se &gt;40% dos winners stopam com -10%, o edge teórico é destruído na prática.</li>
+        </ol>
+        </div>
+        </div>""")
+
+    except Exception:
+        out.append(f"<pre style='color:#f85149'>{_tb.format_exc()}</pre>")
+
+    out.append("</body></html>")
+    return "".join(out)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
