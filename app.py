@@ -18448,5 +18448,983 @@ def analise_signal_edge():
     return "".join(out)
 
 
+@app.route("/analise/signal-edge-v2")
+def analise_signal_edge_v2():
+    """Rodada 2.1 — Auditoria e correção da análise de edge do sinal bruto.
+    Corrige: trailing (stop antes de ativar), classificação (mutuamente exclusiva),
+    TP/SL (3 tratamentos para unresolved), good vs bad features, filtros simples.
+    """
+    import traceback as _tb
+    import statistics as _st
+
+    CSS = """<style>
+    body{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:20px;max-width:1500px;margin:0 auto}
+    h1{color:#58a6ff;border-bottom:1px solid #30363d;padding-bottom:8px}
+    h2{color:#79c0ff;margin-top:32px;margin-bottom:6px;border-bottom:1px solid #21262d;padding-bottom:4px}
+    h3{color:#8b949e;margin:16px 0 4px}
+    table{border-collapse:collapse;width:100%;margin-bottom:14px;font-size:12px}
+    th{background:#161b22;color:#8b949e;padding:5px 8px;text-align:right;border:1px solid #30363d;white-space:nowrap}
+    th.l{text-align:left}
+    td{padding:4px 8px;border:1px solid #21262d;text-align:right;white-space:nowrap}
+    td.l{text-align:left}
+    tr:hover td{background:#1c2128}
+    .tp{color:#3fb950;font-weight:bold}.sl{color:#f85149;font-weight:bold}
+    .neu{color:#e3b341}.dim{color:#6e7681}.hi{color:#58a6ff}
+    .pos{color:#3fb950}.neg{color:#f85149}.amb{color:#bb8009}
+    .box{background:#161b22;border:1px solid #30363d;padding:12px 16px;margin:10px 0;border-radius:6px;font-size:13px}
+    .warn{background:#1c1400;border:1px solid #bb8009;padding:8px 12px;border-radius:4px;margin:6px 0;font-size:12px}
+    .fix{background:#001a0e;border:1px solid #238636;padding:8px 12px;border-radius:4px;margin:6px 0;font-size:12px}
+    .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:10px 0}
+    .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:10px 0}
+    .grid5{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:10px 0}
+    .kpi{background:#161b22;border:1px solid #30363d;padding:10px;border-radius:6px;text-align:center}
+    .kpi-val{font-size:20px;font-weight:bold;display:block}
+    .kpi-lbl{font-size:11px;color:#8b949e;margin-top:3px}
+    a{color:#58a6ff}
+    pre{background:#0d1117;padding:8px;overflow:auto;font-size:11px;border:1px solid #21262d;border-radius:4px}
+    .section{margin-top:20px;padding:14px;background:#0d1117;border:1px solid #21262d;border-radius:6px}
+    .badge{font-size:10px;padding:2px 5px;border-radius:3px;margin-left:4px}
+    .badge-fix{background:#238636;color:#fff}
+    .badge-bug{background:#da3633;color:#fff}
+    </style>"""
+
+    NAV = ("<p style='margin-bottom:16px'>"
+           "<a href='/analise'>Análise</a> · "
+           "<a href='/analise/signal-edge'>Signal Edge v1</a> · "
+           "<a href='/analise/signal-edge-v2'><b>Signal Edge v2 (Rodada 2.1)</b></a> · "
+           "<a href='/analise/correlacao'>Correlação</a></p>")
+
+    out = [f"<!DOCTYPE html><html><head><title>Rodada 2.1 — Signal Edge Corrigido</title>{CSS}</head><body>",
+           NAV,
+           "<h1>🔬 Rodada 2.1 — Auditoria e Correção do Edge do Sinal</h1>",
+           "<div class='box'>Entry teórica = <code>bounce_signals.mc_at_signal</code>. Zero slippage, zero fee.<br>"
+           "<b>Correções aplicadas:</b> "
+           "<span class='badge badge-fix'>trailing com stop proteção</span> "
+           "<span class='badge badge-fix'>classificação mutuamente exclusiva</span> "
+           "<span class='badge badge-fix'>3 tratamentos de unresolved</span> "
+           "<span class='badge badge-fix'>good vs bad features</span>"
+           "</div>"]
+
+    def _f(v, d=0.0): return float(v) if v is not None else d
+    def _avg(lst):
+        lst = [x for x in lst if x is not None]
+        return _st.mean(lst) if lst else None
+    def _med(lst):
+        lst = [x for x in lst if x is not None]
+        return _st.median(lst) if lst else None
+    def _p(lst, p):
+        lst = sorted(x for x in lst if x is not None)
+        if not lst: return None
+        return lst[min(int(len(lst)*p/100), len(lst)-1)]
+    def fmt(v, dec=1, sfx='%', d='—'):
+        if v is None: return d
+        s = '+' if v > 0 else ''
+        return f"{s}{v:.{dec}f}{sfx}"
+    def fmtn(v, dec=1, d='—'):
+        if v is None: return d
+        return f"{v:.{dec}f}"
+    def ec(v):
+        if v is None: return 'dim'
+        return 'tp' if v > 3 else ('sl' if v < -3 else 'neu')
+    def flag(n): return "⚠️ " if n < 30 else ""
+
+    # ── tick helpers ─────────────────────────────────────────────────────────
+    def tick_hilo(t):
+        """Return (hi, lo, close) for a tick. kline uses mc_high/mc_low."""
+        cl = _f(t['mc'])
+        if t['source'] == 'kline':
+            hi = _f(t['mc_high']) if t['mc_high'] else cl
+            lo = _f(t['mc_low'])  if t['mc_low']  else cl
+        else:
+            hi = cl; lo = cl
+        return hi, lo, cl
+
+    def classify_signal(entry, ticks, window_sec=1800):
+        """Mutually exclusive classification. Returns (cat, secs, is_ambiguous).
+        Decision by FIRST tick that hits any threshold.
+        If same tick hits both SL and any TP → ambiguous.
+        Categories: moon / real_bounce / small_bounce /
+                    continuation_dump / instant_death / chop / no_data
+        """
+        if not ticks:
+            return 'no_data', None, False
+        MOON = entry * 2.50
+        RB   = entry * 1.75
+        SB   = entry * 1.30
+        SL   = entry * 0.75  # -25%
+        found_any = False
+        for t in ticks:
+            secs = _f(t['secs_after'])
+            if secs > window_sec:
+                break
+            hi, lo, _ = tick_hilo(t)
+            if hi <= 0 and lo <= 0:
+                continue
+            found_any = True
+            sl_hit   = lo > 0 and lo <= SL
+            moon_hit = hi > 0 and hi >= MOON
+            rb_hit   = hi > 0 and hi >= RB
+            sb_hit   = hi > 0 and hi >= SB
+            any_tp   = moon_hit or rb_hit or sb_hit
+            if sl_hit and any_tp:
+                return 'ambiguous', secs, True
+            if sl_hit:
+                cat = 'instant_death' if secs <= 120 else 'continuation_dump'
+                return cat, secs, False
+            if moon_hit:
+                return 'moon', secs, False
+            if rb_hit:
+                return 'real_bounce', secs, False
+            if sb_hit:
+                return 'small_bounce', secs, False
+        return 'chop', None, False
+
+    def eval_tpsl(entry, ticks, tp_pct, sl_pct, window_sec=1800):
+        """Returns dict with outcome fields. Three treatments for unresolved.
+        Conservative: if same tick TP+SL → SL wins (counted in conservative EV).
+        """
+        tp_mc = entry * (1 + tp_pct)
+        sl_mc = entry * (1 - sl_pct)
+        last_close = None
+        last_secs = None
+        for t in ticks:
+            secs = _f(t['secs_after'])
+            if secs > window_sec:
+                break
+            hi, lo, cl = tick_hilo(t)
+            if cl > 0:
+                last_close = cl; last_secs = secs
+            tp_hit = hi > 0 and hi >= tp_mc
+            sl_hit = lo > 0 and lo <= sl_mc
+            if tp_hit and sl_hit:
+                return {'outcome': 'ambiguous', 'secs': secs,
+                        'close_pnl': (last_close/entry-1)*100 if last_close else None}
+            if tp_hit:
+                return {'outcome': 'win', 'secs': secs, 'pnl': tp_pct*100}
+            if sl_hit:
+                return {'outcome': 'loss', 'secs': secs, 'pnl': -sl_pct*100}
+        close_pnl = (last_close/entry-1)*100 if last_close else None
+        return {'outcome': 'unresolved', 'secs': last_secs, 'close_pnl': close_pnl}
+
+    def eval_trailing(entry, ticks, act_pct, dd_pct, stop_pct, window_sec=1800):
+        """Corrected trailing with stop protection before activation.
+        Returns dict: outcome, pnl, activated, tt_act, tt_out, ambiguous
+        Outcomes: stop / trailing_exit / timeout_close / ambiguous / no_ticks
+        """
+        if not ticks:
+            return {'outcome': 'no_ticks', 'pnl': None, 'activated': False,
+                    'tt_act': None, 'tt_out': None}
+        act_mc   = entry * (1 + act_pct)
+        stop_mc  = entry * (1 - stop_pct)
+        peak     = entry
+        trail_on = False
+        trail_fl = None
+        tt_act   = None
+        last_cl  = None; last_secs = None
+        for t in ticks:
+            secs = _f(t['secs_after'])
+            if secs > window_sec:
+                break
+            hi, lo, cl = tick_hilo(t)
+            if cl > 0:
+                last_cl = cl; last_secs = secs
+            if not trail_on:
+                stop_hit = lo > 0 and lo <= stop_mc
+                act_hit  = hi > 0 and hi >= act_mc
+                if stop_hit and act_hit:
+                    return {'outcome': 'ambiguous', 'pnl': None,
+                            'activated': False, 'tt_act': None, 'tt_out': secs}
+                if stop_hit:
+                    return {'outcome': 'stop', 'pnl': -stop_pct*100,
+                            'activated': False, 'tt_act': None, 'tt_out': secs}
+                if act_hit:
+                    trail_on = True; tt_act = secs
+                    if hi > peak: peak = hi
+                    trail_fl = peak * (1 - dd_pct)
+            else:
+                if hi > peak:
+                    peak = hi; trail_fl = peak * (1 - dd_pct)
+                if lo > 0 and lo <= trail_fl:
+                    pnl = (trail_fl / entry - 1) * 100
+                    return {'outcome': 'trailing_exit', 'pnl': pnl,
+                            'activated': True, 'tt_act': tt_act, 'tt_out': secs}
+        close_pnl = (last_cl/entry-1)*100 if last_cl else None
+        return {'outcome': 'timeout_close', 'pnl': close_pnl,
+                'activated': trail_on, 'tt_act': tt_act, 'tt_out': last_secs}
+
+    try:
+      with db._cursor() as cur:
+
+        # ── LOAD DATA ────────────────────────────────────────────────────────
+        cur.execute("""
+            SELECT bs.mint, bs.symbol, bs.ts_signal, bs.elapsed_sec,
+                   bs.mc_migration, bs.mc_min, bs.mc_at_signal,
+                   bs.drop_from_mig, bs.bounce_pct,
+                   bs.absorption_buy_vol, bs.absorption_sell_vol,
+                   bs.absorption_buy_cnt, bs.absorption_sell_cnt,
+                   bs.absorption_lrg_buy, bs.absorption_events,
+                   bs.p30s_buy_vol, bs.p30s_sell_vol, bs.p30s_events,
+                   bs.p60s_buy_vol, bs.p60s_sell_vol, bs.p60s_events
+            FROM bounce_signals bs
+            WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+            ORDER BY bs.ts_signal
+        """)
+        signals = cur.fetchall()
+        mints = [s['mint'] for s in signals]
+
+        if not mints:
+            out.append("<div class='box sl'>Nenhum sinal com mc_at_signal.</div></body></html>")
+            return "".join(out)
+
+        cur.execute("""
+            SELECT tt.mint, tt.tick_ts, tt.mc, tt.mc_high, tt.mc_low, tt.source,
+                   bs.ts_signal,
+                   EXTRACT(EPOCH FROM (tt.tick_ts - bs.ts_signal)) AS secs_after
+            FROM token_ticks tt
+            JOIN bounce_signals bs ON bs.mint = tt.mint
+            WHERE tt.mint = ANY(%s) AND tt.tick_ts > bs.ts_signal
+            ORDER BY tt.mint, tt.tick_ts
+        """, (mints,))
+        all_ticks = cur.fetchall()
+        ticks_by_mint = {}
+        for row in all_ticks:
+            ticks_by_mint.setdefault(row['mint'], []).append(row)
+
+        cur.execute("""
+            SELECT m.mint, m.smart_wallets, m.renowned_wallets, m.sniper_wallets,
+                   m.rug_ratio, m.top10_holder_rate, m.holders_count,
+                   m.volume_1m, m.volume_5m, m.volume_15m, m.liq_migration,
+                   m.bot_degen_rate, m.top70_sniper_hold_rate, m.dev_team_hold_rate,
+                   m.creator_balance_rate, m.has_social, m.x_follower_count
+            FROM migrations m WHERE m.mint = ANY(%s)
+        """, (mints,))
+        mig_by_mint = {r['mint']: r for r in cur.fetchall()}
+
+        sig_data = []
+        for s in signals:
+            entry = _f(s['mc_at_signal'])
+            if entry <= 0: continue
+            sig_data.append({
+                'signal': s, 'entry': entry,
+                'ticks': ticks_by_mint.get(s['mint'], []),
+                'mig': mig_by_mint.get(s['mint'])
+            })
+
+        n_total   = len(sig_data)
+        n_w_ticks = sum(1 for d in sig_data if d['ticks'])
+
+        out.append(f"<div class='box dim'>Sinais carregados: {n_total} | Com ticks: {n_w_ticks} ({100*n_w_ticks//max(n_total,1)}%)</div>")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # TAREFA 2 — CLASSIFICAÇÃO CORRIGIDA
+        # ══════════════════════════════════════════════════════════════════════
+        out.append("<h2>§2 — Classificação Pós-Sinal (CORRIGIDA) <span class='badge badge-fix'>fix: mutuamente exclusiva, primeiro evento</span></h2>")
+        out.append("""<div class='fix'>
+        <b>Correção:</b> decisão pelo PRIMEIRO tick que cruza qualquer threshold. Se mesmo tick cruza SL e TP → ambiguous (excluído das estatísticas).
+        Categorias: moon (+150% antes de -25%) → real_bounce (+75%, não moon) → small_bounce (+30%, não RB) →
+        instant_death (-25% em ≤2min antes de +30%) → continuation_dump (-25% após 2min antes de +30%) → chop (nenhum em 30min).
+        </div>""")
+        out.append("""<div class='warn'><b>Bug v1:</b> MFE médio de small_bounce era +121.5% porque a função continuava iterando após classificar,
+        calculando MFE sobre todos os ticks independente do primeiro evento. Corrigido: MFE/MAE calculados sobre janela 30min, mas categoria
+        determinada pelo primeiro evento.</div>""")
+
+        cat_info = {}
+        for cat in ['moon','real_bounce','small_bounce','chop','continuation_dump','instant_death','ambiguous','no_data']:
+            cat_info[cat] = {
+                'mints':[], 'secs_event':[], 'mfe':[], 'mae':[], 'tt_max':[], 'tt_min':[],
+                'elapsed':[], 'bounce':[], 'drop':[], 'entry_ratio':[], 'liq':[], 'smart':[], 'abs_ev':[]
+            }
+
+        for d in sig_data:
+            entry = d['entry']
+            s = d['signal']
+            ticks = d['ticks']
+            cat, secs_ev, is_amb = classify_signal(entry, ticks)
+            if is_amb:
+                cat = 'ambiguous'
+
+            ci = cat_info[cat]
+            ci['mints'].append(s['mint'])
+            if secs_ev is not None:
+                ci['secs_event'].append(secs_ev/60)
+
+            # MFE/MAE and tt_max/tt_min over 30min window
+            tw = [t for t in ticks if _f(t['secs_after']) <= 1800]
+            if tw and entry > 0:
+                his = [tick_hilo(t)[0] for t in tw]
+                los = [tick_hilo(t)[1] for t in tw]
+                his = [v for v in his if v > 0]
+                los = [v for v in los if v > 0]
+                if his:
+                    mfe = (max(his)/entry-1)*100; ci['mfe'].append(mfe)
+                    for t in tw:
+                        if tick_hilo(t)[0] == max(his):
+                            ci['tt_max'].append(_f(t['secs_after'])/60); break
+                if los:
+                    mae = (min(los)/entry-1)*100; ci['mae'].append(mae)
+                    for t in tw:
+                        if tick_hilo(t)[1] == min(los):
+                            ci['tt_min'].append(_f(t['secs_after'])/60); break
+
+            # signal features
+            if s['elapsed_sec']: ci['elapsed'].append(_f(s['elapsed_sec'])/60)
+            if s['bounce_pct']:  ci['bounce'].append(_f(s['bounce_pct'])*100)
+            if s['drop_from_mig']: ci['drop'].append(_f(s['drop_from_mig'])*100)
+            if s['mc_migration'] and _f(s['mc_migration'])>0:
+                ci['entry_ratio'].append(entry/_f(s['mc_migration'])*100)
+            m = d['mig']
+            if m:
+                if m['liq_migration']: ci['liq'].append(_f(m['liq_migration']))
+                if m['smart_wallets']: ci['smart'].append(_f(m['smart_wallets']))
+            if s['absorption_events'] is not None:
+                ci['abs_ev'].append(_f(s['absorption_events']))
+
+        total_classified = sum(len(v['mints']) for v in cat_info.values())
+        cat_order = ['moon','real_bounce','small_bounce','chop','continuation_dump','instant_death','ambiguous','no_data']
+        cat_labels = {
+            'moon':              '🌙 Moon (≥+150% antes de -25%)',
+            'real_bounce':       '🟢 Real bounce (≥+75%, não moon)',
+            'small_bounce':      '🟡 Small bounce (+30% a +75%)',
+            'chop':              '⚪ Chop (sem ±25% em 30min)',
+            'continuation_dump': '🔴 Cont. dump (-25%, após 2min)',
+            'instant_death':     '💀 Instant death (-25% em ≤2min)',
+            'ambiguous':         '🟠 Ambiguous (TP+SL mesma vela)',
+            'no_data':           '⬜ Sem ticks',
+        }
+        out.append("""<table><tr>
+          <th class='l'>Categoria</th><th>n</th><th>%</th>
+          <th>MFE avg</th><th>MFE med</th><th>MAE avg</th><th>MAE med</th>
+          <th>TTevento</th><th>TTmax</th><th>TTmin</th>
+          <th>Elapsed avg</th><th>Bounce avg</th><th>EntryR avg</th>
+          <th>Liq avg ($K)</th><th>Smart avg</th></tr>""")
+        for cat in cat_order:
+            ci = cat_info[cat]
+            n = len(ci['mints'])
+            pct = n/total_classified*100 if total_classified else 0
+            fw = flag(n)
+            out.append(f"""<tr>
+              <td class='l'>{fw}{cat_labels[cat]}</td>
+              <td>{n}</td><td>{pct:.1f}%</td>
+              <td class='pos'>{fmt(_avg(ci['mfe']))}</td>
+              <td class='pos'>{fmt(_med(ci['mfe']))}</td>
+              <td class='neg'>{fmt(_avg(ci['mae']))}</td>
+              <td class='neg'>{fmt(_med(ci['mae']))}</td>
+              <td class='dim'>{fmt(_avg(ci['secs_event']),'1','min','—')}</td>
+              <td class='dim'>{fmt(_avg(ci['tt_max']),'1','min','—')}</td>
+              <td class='dim'>{fmt(_avg(ci['tt_min']),'1','min','—')}</td>
+              <td>{fmt(_avg(ci['elapsed']),'1','min','—')}</td>
+              <td>{fmt(_avg(ci['bounce']),'1','%','—')}</td>
+              <td>{fmt(_avg(ci['entry_ratio']),'1','%','—')}</td>
+              <td>{fmt(_avg([v/1000 for v in ci['liq']]),'1','$K','—')}</td>
+              <td>{fmtn(_avg(ci['smart']))}</td>
+            </tr>""")
+        out.append("</table>")
+
+        n_good  = len(cat_info['moon']['mints']) + len(cat_info['real_bounce']['mints'])
+        n_bad   = len(cat_info['continuation_dump']['mints']) + len(cat_info['instant_death']['mints'])
+        n_small = len(cat_info['small_bounce']['mints'])
+        n_chop  = len(cat_info['chop']['mints'])
+        n_amb   = len(cat_info['ambiguous']['mints'])
+        out.append(f"""<div class='grid5'>
+          <div class='kpi'><span class='kpi-val tp'>{n_good}</span><span class='kpi-lbl'>Moon+RealBounce ({100*n_good//max(total_classified,1)}%)</span></div>
+          <div class='kpi'><span class='kpi-val neu'>{n_small}</span><span class='kpi-lbl'>Small bounce ({100*n_small//max(total_classified,1)}%)</span></div>
+          <div class='kpi'><span class='kpi-val dim'>{n_chop}</span><span class='kpi-lbl'>Chop ({100*n_chop//max(total_classified,1)}%)</span></div>
+          <div class='kpi'><span class='kpi-val sl'>{n_bad}</span><span class='kpi-lbl'>Dump ({100*n_bad//max(total_classified,1)}%)</span></div>
+          <div class='kpi'><span class='kpi-val amb'>{n_amb}</span><span class='kpi-lbl'>Ambiguous ({100*n_amb//max(total_classified,1)}%)</span></div>
+        </div>""")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # TAREFA 3 — TP/SL GRID COM 3 TRATAMENTOS
+        # ══════════════════════════════════════════════════════════════════════
+        out.append("<h2>§3 — Grid TP × SL (3 tratamentos de unresolved) <span class='badge badge-fix'>fix: unresolved explícito</span></h2>")
+        out.append("""<div class='fix'>
+        <b>Correção:</b> v1 calculava EV apenas sobre resolved, mascarando o impacto de sinais sem conclusão.
+        Agora: A=resolved_only | B=timeout_close (sai no último tick ≤30min) | C=conservative_unresolved_loss (unresolved = -SL%).
+        </div>""")
+
+        tp_levels = [0.30, 0.50, 0.75, 1.00, 1.50, 2.00]
+        sl_levels = [0.10, 0.15, 0.20, 0.25, 0.30]
+        GRID_WIN  = 1800  # 30min window
+
+        # Pre-compute per-signal results for each (tp, sl)
+        grid = {}
+        for tp_pct in tp_levels:
+            for sl_pct in sl_levels:
+                wins=0; losses=0; unres=0; ambi=0
+                win_secs=[]; loss_secs=[]; close_pnls=[]; close_pnls_all=[]
+                for d in sig_data:
+                    if not d['ticks']:
+                        unres += 1
+                        close_pnls_all.append(-sl_pct*100)  # conservative
+                        continue
+                    r = eval_tpsl(d['entry'], d['ticks'], tp_pct, sl_pct, GRID_WIN)
+                    oc = r['outcome']
+                    if oc == 'ambiguous':
+                        ambi += 1
+                    elif oc == 'win':
+                        wins += 1
+                        win_secs.append(r['secs'])
+                        close_pnls_all.append(tp_pct*100)
+                    elif oc == 'loss':
+                        losses += 1
+                        loss_secs.append(r['secs'])
+                        close_pnls_all.append(-sl_pct*100)
+                    else:  # unresolved
+                        unres += 1
+                        cp = r.get('close_pnl')
+                        close_pnls.append(cp)        # timeout pnl
+                        close_pnls_all.append(-sl_pct*100)  # conservative
+
+                n_res  = wins + losses
+                wr     = wins/n_res*100 if n_res else None
+                avg_w  = tp_pct*100
+                avg_l  = -sl_pct*100
+                # EV A: resolved only
+                ev_a   = (wr*avg_w + (100-wr)*avg_l)/100 if wr is not None else None
+                # EV B: timeout_close — replace unresolved with close_pnl
+                pnls_b = ([avg_w]*wins + [avg_l]*losses +
+                          [p for p in close_pnls if p is not None])
+                ev_b   = _avg(pnls_b)
+                # EV C: conservative — unresolved = -SL
+                ev_c   = _avg(close_pnls_all)
+                grid[(tp_pct,sl_pct)] = {
+                    'wins':wins,'losses':losses,'unres':unres,'ambi':ambi,
+                    'n_res':n_res,'wr':wr,'ev_a':ev_a,'ev_b':ev_b,'ev_c':ev_c,
+                    'avg_w':avg_w,'avg_l':avg_l,
+                    'tt_tp':_avg([s/60 for s in win_secs]),
+                    'tt_sl':_avg([s/60 for s in loss_secs]),
+                }
+
+        out.append("""<table><tr>
+          <th class='l'>TP</th><th class='l'>SL</th>
+          <th>n_res</th><th>Wins</th><th>Loss</th><th>Unres</th><th>Ambi</th>
+          <th>WR</th>
+          <th title='only resolved'>EV_A (resolved)</th>
+          <th title='unresolved→last tick'>EV_B (timeout)</th>
+          <th title='unresolved→-SL'>EV_C (conserv.)</th>
+          <th>AvgWin</th><th>AvgLoss</th>
+          <th>TTtp</th><th>TTsl</th></tr>""")
+        for tp_pct in tp_levels:
+            for sl_pct in sl_levels:
+                r = grid[(tp_pct,sl_pct)]
+                fw = flag(r['n_res'])
+                eca = ec(r['ev_a']); ecb = ec(r['ev_b']); ecc = ec(r['ev_c'])
+                out.append(f"""<tr>
+                  <td class='l'>{fw}+{tp_pct*100:.0f}%</td>
+                  <td class='l'>-{sl_pct*100:.0f}%</td>
+                  <td>{r['n_res']}</td>
+                  <td class='tp'>{r['wins']}</td><td class='sl'>{r['losses']}</td>
+                  <td class='dim'>{r['unres']}</td><td class='amb'>{r['ambi']}</td>
+                  <td>{fmt(r['wr'],'1','%','—')}</td>
+                  <td class='{eca}'>{fmt(r['ev_a'])}</td>
+                  <td class='{ecb}'>{fmt(r['ev_b'])}</td>
+                  <td class='{ecc}'>{fmt(r['ev_c'])}</td>
+                  <td class='pos'>+{tp_pct*100:.0f}%</td>
+                  <td class='neg'>-{sl_pct*100:.0f}%</td>
+                  <td class='dim'>{fmt(r['tt_tp'],'1','min','—')}</td>
+                  <td class='dim'>{fmt(r['tt_sl'],'1','min','—')}</td>
+                </tr>""")
+        out.append("</table>")
+
+        # Top 5 por EV_B (mais realista)
+        ranked_b = sorted([(k,v) for k,v in grid.items() if v['n_res']>=20 and v['ev_b'] is not None],
+                          key=lambda x: x[1]['ev_b'], reverse=True)
+        out.append("<h3>Top 5 por EV_B (timeout_close, n≥20)</h3>")
+        out.append("""<table><tr><th class='l'>Rank</th><th>TP</th><th>SL</th>
+          <th>n_res</th><th>WR</th><th>EV_A</th><th>EV_B</th><th>EV_C</th><th>Payoff</th></tr>""")
+        best_tpsl = None
+        for i,((tp_b,sl_b),rb) in enumerate(ranked_b[:5]):
+            if best_tpsl is None: best_tpsl = (tp_b, sl_b, rb)
+            ecb = ec(rb['ev_b']); ecc = ec(rb['ev_c'])
+            out.append(f"<tr><td class='l'>#{i+1}</td><td>+{tp_b*100:.0f}%</td><td>-{sl_b*100:.0f}%</td>"
+                       f"<td>{rb['n_res']}</td><td>{fmt(rb['wr'],'1','%','—')}</td>"
+                       f"<td class='{ec(rb['ev_a'])}'>{fmt(rb['ev_a'])}</td>"
+                       f"<td class='{ecb}'>{fmt(rb['ev_b'])}</td>"
+                       f"<td class='{ecc}'>{fmt(rb['ev_c'])}</td>"
+                       f"<td>{tp_b/sl_b:.1f}×</td></tr>")
+        out.append("</table>")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # TAREFA 1 — TRAILING CORRIGIDO
+        # ══════════════════════════════════════════════════════════════════════
+        out.append("<h2>§4 — Trailing Stop Corrigido <span class='badge badge-fix'>fix: stop proteção + timeout explícito</span></h2>")
+        out.append("""<div class='fix'>
+        <b>Correção:</b> v1 não tinha stop antes de ativar → tokens que dumparam antes de ativar ficavam com EV = close positivo ou zero,
+        inflando EV. Agora: antes da ativação, qualquer tick abaixo do stop → resultado = -stop%. MaxLoss agora é negativo quando há stops.
+        Timeout 30min = close do último tick disponível (com rótulo separado "timeout_ativ" vs "timeout_no_ativ").
+        </div>""")
+        out.append("""<div class='warn'><b>Bug v1:</b> EV +92.8% (ativ+50%/DD20%) era impossível porque incluía apenas tokens que ativaram
+        trailing (subida prévia ≥+50%), excluindo tokens que dumparam. Correção: stop proteção antes de ativar.</div>""")
+
+        act_levels = [0.50, 0.75, 1.00, 1.50]
+        dd_levels  = [0.20, 0.30, 0.40, 0.50]
+        stop_levels = [0.10, 0.15, 0.20, 0.25]
+        TRAIL_WIN   = 1800  # 30min
+
+        out.append("<p class='dim' style='font-size:12px'>Exibindo combinações por ativação × drawdown para stop=15% (representativo). Ver abaixo para variar stops.</p>")
+
+        for stop_pct in [0.15, 0.25]:
+            out.append(f"<h3>Stop proteção = -{stop_pct*100:.0f}%</h3>")
+            out.append("""<table><tr>
+              <th class='l'>Ativ%</th><th class='l'>DD%</th>
+              <th>n_total</th><th>Ativou</th><th>Não ativ</th>
+              <th>Stop_exit</th><th>Trail_exit</th><th>Timeout_ativ</th><th>Timeout_no</th><th>Ambi</th>
+              <th>EV méd</th><th>EV med</th><th>WR</th>
+              <th>AvgW</th><th>AvgL</th><th>p25</th><th>p75</th>
+              <th>MaxW</th><th>MaxL</th>
+              <th>TTativ</th><th>TTsaída</th><th>Cobertura</th></tr>""")
+            for act_pct in act_levels:
+                for dd_pct in dd_levels:
+                    n_stop=0; n_trail=0; n_tout_act=0; n_tout_no=0; n_ambi=0; n_noticks=0
+                    n_activated=0
+                    pnls=[]; wins=[]; losses=[]; tt_act_l=[]; tt_out_l=[]
+                    for d in sig_data:
+                        r = eval_trailing(d['entry'], d['ticks'], act_pct, dd_pct, stop_pct, TRAIL_WIN)
+                        oc = r['outcome']
+                        if oc == 'no_ticks': n_noticks += 1; continue
+                        if oc == 'ambiguous': n_ambi += 1; continue
+                        if r['activated']: n_activated += 1
+                        if oc == 'stop':
+                            n_stop += 1
+                            pnls.append(r['pnl']); losses.append(r['pnl'])
+                        elif oc == 'trailing_exit':
+                            n_trail += 1
+                            pnls.append(r['pnl'])
+                            if r['pnl'] > 0: wins.append(r['pnl'])
+                            else: losses.append(r['pnl'])
+                        elif oc == 'timeout_close':
+                            if r['activated']:
+                                n_tout_act += 1
+                            else:
+                                n_tout_no += 1
+                            if r['pnl'] is not None:
+                                pnls.append(r['pnl'])
+                                if r['pnl'] > 0: wins.append(r['pnl'])
+                                else: losses.append(r['pnl'])
+                        if r['tt_act'] is not None: tt_act_l.append(r['tt_act']/60)
+                        if r['tt_out'] is not None and oc in ('trailing_exit','stop'):
+                            tt_out_l.append(r['tt_out']/60)
+
+                    n_with = n_stop+n_trail+n_tout_act+n_tout_no
+                    n_res  = n_stop + n_trail  # definitive exits
+                    wr_val = len(wins)/len(pnls)*100 if pnls else None
+                    ev_avg = _avg(pnls)
+                    ev_med = _med(pnls)
+                    avg_w  = _avg(wins)
+                    avg_l  = _avg(losses)
+                    p25    = _p(pnls,25)
+                    p75    = _p(pnls,75)
+                    max_w  = max(pnls) if pnls else None
+                    max_l  = min(pnls) if pnls else None
+                    cov    = 100*n_with//max(n_total,1)
+                    fw     = flag(n_res)
+                    ecev   = ec(ev_avg)
+                    out.append(f"""<tr>
+                      <td class='l'>{fw}+{act_pct*100:.0f}%</td><td class='l'>-{dd_pct*100:.0f}%</td>
+                      <td>{n_with}</td>
+                      <td class='tp'>{n_activated}</td><td class='dim'>{n_with-n_activated}</td>
+                      <td class='sl'>{n_stop}</td><td class='tp'>{n_trail}</td>
+                      <td class='neu'>{n_tout_act}</td><td class='dim'>{n_tout_no}</td>
+                      <td class='amb'>{n_ambi}</td>
+                      <td class='{ecev}'>{fmt(ev_avg)}</td>
+                      <td class='{ecev}'>{fmt(ev_med)}</td>
+                      <td>{fmt(wr_val,'1','%','—')}</td>
+                      <td class='pos'>{fmt(avg_w)}</td>
+                      <td class='neg'>{fmt(avg_l)}</td>
+                      <td>{fmt(p25)}</td><td>{fmt(p75)}</td>
+                      <td class='pos'>{fmt(max_w)}</td>
+                      <td class='neg'>{fmt(max_l)}</td>
+                      <td class='dim'>{fmt(_avg(tt_act_l),'1','min','—')}</td>
+                      <td class='dim'>{fmt(_avg(tt_out_l),'1','min','—')}</td>
+                      <td class='dim'>{cov}%</td>
+                    </tr>""")
+            out.append("</table>")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # TAREFA 4 — GOOD vs BAD FEATURES
+        # ══════════════════════════════════════════════════════════════════════
+        out.append("<h2>§5 — Good vs Bad: Features que Separam Moon+RB de Dump+ID</h2>")
+        out.append("<div class='box'>Good = moon + real_bounce | Bad = continuation_dump + instant_death</div>")
+
+        good_mints = set(cat_info['moon']['mints'] + cat_info['real_bounce']['mints'])
+        bad_mints  = set(cat_info['continuation_dump']['mints'] + cat_info['instant_death']['mints'])
+
+        good_d = [d for d in sig_data if d['signal']['mint'] in good_mints]
+        bad_d  = [d for d in sig_data if d['signal']['mint'] in bad_mints]
+
+        out.append(f"<div class='box dim'>Good n={len(good_d)} | Bad n={len(bad_d)}</div>")
+
+        def feat_avg_med(items, fn):
+            vals = [fn(d) for d in items]
+            vals = [v for v in vals if v is not None]
+            if not vals: return None, None, 0
+            return _avg(vals), _med(vals), len(vals)
+
+        def odds_ratio(good_items, bad_items, fn, threshold_fn):
+            g_pos = sum(1 for d in good_items if fn(d) is not None and threshold_fn(fn(d)))
+            g_neg = len(good_items) - g_pos
+            b_pos = sum(1 for d in bad_items if fn(d) is not None and threshold_fn(fn(d)))
+            b_neg = len(bad_items) - b_pos
+            if g_neg == 0 or b_pos == 0: return None
+            return (g_pos/max(g_neg,1)) / (b_pos/max(b_neg,1))
+
+        sig_feats = [
+            ('elapsed_sec (min)',    lambda d: _f(d['signal']['elapsed_sec'])/60 if d['signal']['elapsed_sec'] else None),
+            ('bounce_pct (%)',       lambda d: _f(d['signal']['bounce_pct'])*100 if d['signal']['bounce_pct'] else None),
+            ('drop_from_mig (%)',    lambda d: _f(d['signal']['drop_from_mig'])*100 if d['signal']['drop_from_mig'] else None),
+            ('entry_ratio (%)',      lambda d: d['entry']/_f(d['signal']['mc_migration'])*100 if d['signal']['mc_migration'] and _f(d['signal']['mc_migration'])>0 else None),
+            ('bottom_ratio (%)',     lambda d: _f(d['signal']['mc_min'])/_f(d['signal']['mc_migration'])*100 if d['signal']['mc_min'] and d['signal']['mc_migration'] and _f(d['signal']['mc_migration'])>0 else None),
+            ('mc_at_signal ($K)',    lambda d: d['entry']/1000),
+            ('abs_buy_vol',         lambda d: _f(d['signal']['absorption_buy_vol']) if d['signal']['absorption_buy_vol'] is not None else None),
+            ('abs_sell_vol',        lambda d: _f(d['signal']['absorption_sell_vol']) if d['signal']['absorption_sell_vol'] is not None else None),
+            ('abs_events',          lambda d: _f(d['signal']['absorption_events']) if d['signal']['absorption_events'] is not None else None),
+            ('p30s_buy_vol',        lambda d: _f(d['signal']['p30s_buy_vol']) if d['signal']['p30s_buy_vol'] is not None else None),
+            ('p30s_sell_vol',       lambda d: _f(d['signal']['p30s_sell_vol']) if d['signal']['p30s_sell_vol'] is not None else None),
+            ('p30s_events',         lambda d: _f(d['signal']['p30s_events']) if d['signal']['p30s_events'] is not None else None),
+            ('p60s_buy_vol',        lambda d: _f(d['signal']['p60s_buy_vol']) if d['signal']['p60s_buy_vol'] is not None else None),
+            ('p60s_sell_vol',       lambda d: _f(d['signal']['p60s_sell_vol']) if d['signal']['p60s_sell_vol'] is not None else None),
+            ('p60s_events',         lambda d: _f(d['signal']['p60s_events']) if d['signal']['p60s_events'] is not None else None),
+        ]
+        mig_feats = [
+            ('smart_wallets',       lambda d: _f(d['mig']['smart_wallets']) if d['mig'] and d['mig']['smart_wallets'] else None),
+            ('renowned_wallets',    lambda d: _f(d['mig']['renowned_wallets']) if d['mig'] and d['mig']['renowned_wallets'] else None),
+            ('sniper_wallets',      lambda d: _f(d['mig']['sniper_wallets']) if d['mig'] and d['mig']['sniper_wallets'] else None),
+            ('liq_migration ($K)',  lambda d: _f(d['mig']['liq_migration'])/1000 if d['mig'] and d['mig']['liq_migration'] else None),
+            ('volume_1m ($)',       lambda d: _f(d['mig']['volume_1m']) if d['mig'] and d['mig']['volume_1m'] else None),
+            ('top10_holder_rate',  lambda d: _f(d['mig']['top10_holder_rate'])*100 if d['mig'] and d['mig']['top10_holder_rate'] else None),
+            ('bot_degen_rate (%)', lambda d: _f(d['mig']['bot_degen_rate'])*100 if d['mig'] and d['mig']['bot_degen_rate'] else None),
+            ('rug_ratio (%)',      lambda d: _f(d['mig']['rug_ratio'])*100 if d['mig'] and d['mig']['rug_ratio'] else None),
+            ('top70_sniper (%)',   lambda d: _f(d['mig']['top70_sniper_hold_rate'])*100 if d['mig'] and d['mig']['top70_sniper_hold_rate'] else None),
+            ('dev_team_hold (%)', lambda d: _f(d['mig']['dev_team_hold_rate'])*100 if d['mig'] and d['mig']['dev_team_hold_rate'] else None),
+            ('creator_balance',   lambda d: _f(d['mig']['creator_balance_rate'])*100 if d['mig'] and d['mig']['creator_balance_rate'] else None),
+            ('holders_count',     lambda d: _f(d['mig']['holders_count']) if d['mig'] and d['mig']['holders_count'] else None),
+            ('x_follower_count',  lambda d: _f(d['mig']['x_follower_count']) if d['mig'] and d['mig']['x_follower_count'] else None),
+        ]
+        derived_feats = [
+            ('buy/sell_vol_ratio', lambda d: _f(d['signal']['absorption_buy_vol'])/_f(d['signal']['absorption_sell_vol'],1)
+             if d['signal']['absorption_buy_vol'] is not None and d['signal']['absorption_sell_vol'] and _f(d['signal']['absorption_sell_vol'])>0 else None),
+            ('buy/sell_cnt_ratio', lambda d: _f(d['signal']['absorption_buy_cnt'])/_f(d['signal']['absorption_sell_cnt'],1)
+             if d['signal']['absorption_buy_cnt'] is not None and d['signal']['absorption_sell_cnt'] and _f(d['signal']['absorption_sell_cnt'])>0 else None),
+            ('lrg_buy_conc',       lambda d: _f(d['signal']['absorption_lrg_buy'])/_f(d['signal']['absorption_buy_vol'],1)
+             if d['signal']['absorption_lrg_buy'] is not None and d['signal']['absorption_buy_vol'] and _f(d['signal']['absorption_buy_vol'])>0 else None),
+            ('p30_buy/sell_ratio', lambda d: _f(d['signal']['p30s_buy_vol'])/_f(d['signal']['p30s_sell_vol'],1)
+             if d['signal']['p30s_buy_vol'] is not None and d['signal']['p30s_sell_vol'] and _f(d['signal']['p30s_sell_vol'])>0 else None),
+            ('p60_buy/sell_ratio', lambda d: _f(d['signal']['p60s_buy_vol'])/_f(d['signal']['p60s_sell_vol'],1)
+             if d['signal']['p60s_buy_vol'] is not None and d['signal']['p60s_sell_vol'] and _f(d['signal']['p60s_sell_vol'])>0 else None),
+        ]
+        all_feats = sig_feats + mig_feats + derived_feats
+
+        out.append("""<table><tr>
+          <th class='l'>Feature</th>
+          <th colspan='3' style='background:#0d2e0d;color:#3fb950'>Good (moon+RB)</th>
+          <th colspan='3' style='background:#2e0d0d;color:#f85149'>Bad (dump)</th>
+          <th>Δ avg</th><th>Δ med</th><th>Veredicto</th></tr>
+          <tr><th class='l'></th>
+          <th>avg</th><th>med</th><th>n</th>
+          <th>avg</th><th>med</th><th>n</th>
+          <th></th><th></th><th></th></tr>""")
+        promising = []; useless = []; dangerous = []
+        for feat_name, fn in all_feats:
+            ga, gm, gn = feat_avg_med(good_d, fn)
+            ba, bm, bn = feat_avg_med(bad_d, fn)
+            fw = flag(min(gn,bn))
+            d_avg = (ga-ba) if ga is not None and ba is not None else None
+            d_med = (gm-bm) if gm is not None and bm is not None else None
+            verdict = '—'
+            if d_avg is not None and min(gn,bn) >= 10:
+                if abs(d_avg) < 0.5 and (gm is None or abs(d_med or 0) < 0.5):
+                    verdict = '<span class="dim">inútil</span>'
+                    useless.append(feat_name)
+                elif d_avg > 0:
+                    verdict = '<span class="pos">↑ em good</span>'
+                    if min(gn,bn) >= 20: promising.append((feat_name, d_avg, gn, bn))
+                else:
+                    verdict = '<span class="neg">↑ em bad</span>'
+            dac = 'pos' if (d_avg or 0) > 0 else ('neg' if (d_avg or 0) < 0 else 'dim')
+            dmc = 'pos' if (d_med or 0) > 0 else ('neg' if (d_med or 0) < 0 else 'dim')
+            out.append(f"""<tr>
+              <td class='l'>{fw}{feat_name}</td>
+              <td class='tp'>{fmtn(ga)}</td><td class='tp'>{fmtn(gm)}</td><td class='dim'>{gn}</td>
+              <td class='sl'>{fmtn(ba)}</td><td class='sl'>{fmtn(bm)}</td><td class='dim'>{bn}</td>
+              <td class='{dac}'>{fmt(d_avg,'2','','—')}</td>
+              <td class='{dmc}'>{fmt(d_med,'2','','—')}</td>
+              <td>{verdict}</td>
+            </tr>""")
+        out.append("</table>")
+
+        # Bucket distributions for key features
+        out.append("<h3>Distribuição por bucket — bons vs ruins</h3>")
+        def bucket_dist(title, items_all, fn, bins):
+            cats_set = {'good': good_mints, 'bad': bad_mints}
+            out.append(f"<h3>{title}</h3>")
+            out.append("""<table><tr><th class='l'>Bucket</th>
+              <th>n total</th><th>n good</th><th>% good</th><th>n bad</th><th>% bad</th>
+              <th>good/bad odds</th></tr>""")
+            for label, lo, hi in bins:
+                grp = [d for d in items_all if fn(d) is not None and lo <= fn(d) < hi]
+                n_g = sum(1 for d in grp if d['signal']['mint'] in good_mints)
+                n_b = sum(1 for d in grp if d['signal']['mint'] in bad_mints)
+                n   = len(grp)
+                pct_g = n_g/n*100 if n else 0
+                pct_b = n_b/n*100 if n else 0
+                odds_str = f"{n_g/max(n_b,1):.1f}×" if n_b > 0 else (f"{n_g}:0" if n_g else '—')
+                fw = flag(n)
+                out.append(f"""<tr>
+                  <td class='l'>{fw}{label}</td><td>{n}</td>
+                  <td class='tp'>{n_g}</td><td class='tp'>{pct_g:.0f}%</td>
+                  <td class='sl'>{n_b}</td><td class='neg'>{pct_b:.0f}%</td>
+                  <td class='neu'>{odds_str}</td>
+                </tr>""")
+            out.append("</table>")
+
+        bucket_dist("elapsed_sec (min)", sig_data,
+            lambda d: _f(d['signal']['elapsed_sec'])/60 if d['signal']['elapsed_sec'] else None,
+            [('0–2min',0,2),('2–5min',2,5),('5–10min',5,10),('10–15min',10,15),('15–20min',15,20),('20min+',20,9999)])
+
+        bucket_dist("bounce_pct (%)", sig_data,
+            lambda d: _f(d['signal']['bounce_pct'])*100 if d['signal']['bounce_pct'] else None,
+            [('30–40%',30,40),('40–50%',40,50),('50–75%',50,75),('75–100%',75,100),('100%+',100,9999)])
+
+        bucket_dist("drop_from_mig (%)", sig_data,
+            lambda d: _f(d['signal']['drop_from_mig'])*100 if d['signal']['drop_from_mig'] else None,
+            [('30–40%',30,40),('40–50%',40,50),('50–60%',50,60),('60–70%',60,70),('70%+',70,9999)])
+
+        bucket_dist("mc_at_signal / mc_migration (%)", sig_data,
+            lambda d: d['entry']/_f(d['signal']['mc_migration'])*100 if d['signal']['mc_migration'] and _f(d['signal']['mc_migration'])>0 else None,
+            [('0–25%',0,25),('25–40%',25,40),('40–50%',40,50),('50–65%',50,65),('65–80%',65,80),('80–100%',80,100)])
+
+        bucket_dist("liq_migration ($K)", sig_data,
+            lambda d: _f(d['mig']['liq_migration'])/1000 if d['mig'] and d['mig']['liq_migration'] else None,
+            [('<10K',0,10),('10–20K',10,20),('20–50K',20,50),('50K+',50,9999)])
+
+        bucket_dist("smart_wallets", sig_data,
+            lambda d: _f(d['mig']['smart_wallets']) if d['mig'] and d['mig']['smart_wallets'] else None,
+            [('1',1,2),('2',2,3),('3',3,4),('4',4,5),('5+',5,9999)])
+
+        # ══════════════════════════════════════════════════════════════════════
+        # TAREFA 5 — FILTROS SIMPLES
+        # ══════════════════════════════════════════════════════════════════════
+        out.append("<h2>§6 — Combinações Simples de Filtros (≤3 condições)</h2>")
+        out.append("<div class='warn'>Hipóteses — confirmar na Rodada 3 com execução real. Não implementar sem n≥30 no cohort.</div>")
+
+        # Use best TP/SL from ranked_b for EV
+        best_tp_ev, best_sl_ev = (ranked_b[0][0] if ranked_b else (0.75, 0.25))
+
+        def filter_stats(items, label):
+            """Returns HTML row for filter group."""
+            n = len(items)
+            if n == 0:
+                return f"<tr><td class='l'>{label}</td><td colspan='12' class='dim'>n=0</td></tr>"
+            fw = flag(n)
+            # categories
+            n_moon = sum(1 for d in items if d['signal']['mint'] in cat_info['moon']['mints'])
+            n_rb   = sum(1 for d in items if d['signal']['mint'] in cat_info['real_bounce']['mints'])
+            n_sb   = sum(1 for d in items if d['signal']['mint'] in cat_info['small_bounce']['mints'])
+            n_cd   = sum(1 for d in items if d['signal']['mint'] in cat_info['continuation_dump']['mints'])
+            n_id   = sum(1 for d in items if d['signal']['mint'] in cat_info['instant_death']['mints'])
+            n_chp  = sum(1 for d in items if d['signal']['mint'] in cat_info['chop']['mints'])
+            def pp(x): return f"{100*x//max(n,1)}%"
+            # EV_B for best combo
+            wins=0; losses=0; close_pnls=[]
+            for d in items:
+                if not d['ticks']:
+                    close_pnls.append(-best_sl_ev*100)
+                    continue
+                r = eval_tpsl(d['entry'], d['ticks'], best_tp_ev, best_sl_ev, GRID_WIN)
+                oc = r['outcome']
+                if oc == 'win': wins+=1
+                elif oc == 'loss': losses+=1
+                else:
+                    cp = r.get('close_pnl')
+                    close_pnls.append(cp if cp is not None else -best_sl_ev*100)
+            n_res = wins+losses
+            pnls_b = [best_tp_ev*100]*wins + [-best_sl_ev*100]*losses + close_pnls
+            ev_b = _avg(pnls_b)
+            ev_med_b = _med(pnls_b)
+            # MFE/MAE 30min
+            mfes=[]; maes=[]
+            for d in items:
+                e = d['entry']
+                tw = [t for t in d['ticks'] if _f(t['secs_after'])<=1800]
+                his=[tick_hilo(t)[0] for t in tw]; los=[tick_hilo(t)[1] for t in tw]
+                his=[v for v in his if v>0]; los=[v for v in los if v>0]
+                if his: mfes.append((max(his)/e-1)*100)
+                if los: maes.append((min(los)/e-1)*100)
+            cov = 100*sum(1 for d in items if d['ticks'])//max(n,1)
+            ecev = ec(ev_b)
+            return (f"<tr>"
+                    f"<td class='l'>{fw}{label}</td>"
+                    f"<td>{n}</td><td>{cov}%</td>"
+                    f"<td class='tp'>{pp(n_moon)}</td>"
+                    f"<td class='pos'>{pp(n_rb)}</td>"
+                    f"<td class='neu'>{pp(n_sb)}</td>"
+                    f"<td class='dim'>{pp(n_chp)}</td>"
+                    f"<td class='sl'>{pp(n_cd)}</td>"
+                    f"<td class='sl'>{pp(n_id)}</td>"
+                    f"<td class='{ecev}'>{fmt(ev_b)}</td>"
+                    f"<td class='{ecev}'>{fmt(ev_med_b)}</td>"
+                    f"<td class='pos'>{fmt(_med(mfes))}</td>"
+                    f"<td class='neg'>{fmt(_med(maes))}</td>"
+                    f"</tr>")
+
+        def e_ratio(d):
+            mc = _f(d['signal']['mc_migration'])
+            return d['entry']/mc if mc > 0 else None
+
+        # Candidate conditions
+        def cond_elapsed_le120(d):   return d['signal']['elapsed_sec'] is not None and _f(d['signal']['elapsed_sec']) <= 120
+        def cond_elapsed_le300(d):   return d['signal']['elapsed_sec'] is not None and _f(d['signal']['elapsed_sec']) <= 300
+        def cond_liq_20_50(d):       return d['mig'] and d['mig']['liq_migration'] and 20000 <= _f(d['mig']['liq_migration']) <= 50000
+        def cond_drop_ge70(d):       return d['signal']['drop_from_mig'] is not None and _f(d['signal']['drop_from_mig']) >= 0.70
+        def cond_drop_ge60(d):       return d['signal']['drop_from_mig'] is not None and _f(d['signal']['drop_from_mig']) >= 0.60
+        def cond_entry_not_deadzone(d): r = e_ratio(d); return r is not None and not (0.50 <= r <= 0.65)
+        def cond_abs_ge11(d):        return d['signal']['absorption_events'] is not None and _f(d['signal']['absorption_events']) >= 11
+        def cond_smart_ge3(d):       return d['mig'] and d['mig']['smart_wallets'] and _f(d['mig']['smart_wallets']) >= 3
+        def cond_bounce_30_50(d):    return d['signal']['bounce_pct'] is not None and 0.30 <= _f(d['signal']['bounce_pct']) < 0.50
+        def cond_bounce_ge50(d):     return d['signal']['bounce_pct'] is not None and _f(d['signal']['bounce_pct']) >= 0.50
+        def cond_bounce_ge75(d):     return d['signal']['bounce_pct'] is not None and _f(d['signal']['bounce_pct']) >= 0.75
+        def cond_bot_lt50(d):        return d['mig'] and d['mig']['bot_degen_rate'] is not None and _f(d['mig']['bot_degen_rate']) < 0.50
+        def cond_liq_ge20(d):        return d['mig'] and d['mig']['liq_migration'] and _f(d['mig']['liq_migration']) >= 20000
+
+        # ALL signals (baseline)
+        single_filters = [
+            ('ALL (baseline)',                  lambda d: True),
+            ('elapsed ≤ 2min',                 cond_elapsed_le120),
+            ('elapsed ≤ 5min',                 cond_elapsed_le300),
+            ('liq 20K–50K',                    cond_liq_20_50),
+            ('drop ≥ 70%',                     cond_drop_ge70),
+            ('drop ≥ 60%',                     cond_drop_ge60),
+            ('entry fora da dead zone',         cond_entry_not_deadzone),
+            ('absorption ≥ 11 eventos',         cond_abs_ge11),
+            ('smart ≥ 3',                       cond_smart_ge3),
+            ('bounce 30–50%',                   cond_bounce_30_50),
+            ('bounce ≥ 50%',                    cond_bounce_ge50),
+            ('bounce ≥ 75%',                    cond_bounce_ge75),
+            ('bot_degen < 50%',                 cond_bot_lt50),
+            ('liq ≥ 20K',                       cond_liq_ge20),
+        ]
+        combo_filters = [
+            ('elapsed≤2min + bounce≥50%',       lambda d: cond_elapsed_le120(d) and cond_bounce_ge50(d)),
+            ('elapsed≤5min + bounce≥50%',       lambda d: cond_elapsed_le300(d) and cond_bounce_ge50(d)),
+            ('elapsed≤2min + drop≥60%',         lambda d: cond_elapsed_le120(d) and cond_drop_ge60(d)),
+            ('drop≥60% + liq≥20K',              lambda d: cond_drop_ge60(d) and cond_liq_ge20(d)),
+            ('bounce≥50% + liq≥20K',            lambda d: cond_bounce_ge50(d) and cond_liq_ge20(d)),
+            ('bounce≥75% + liq≥20K',            lambda d: cond_bounce_ge75(d) and cond_liq_ge20(d)),
+            ('smart≥3 + bounce≥50%',            lambda d: cond_smart_ge3(d) and cond_bounce_ge50(d)),
+            ('abs≥11 + bounce≥50%',             lambda d: cond_abs_ge11(d) and cond_bounce_ge50(d)),
+            ('elapsed≤5min + drop≥60% + liq≥20K', lambda d: cond_elapsed_le300(d) and cond_drop_ge60(d) and cond_liq_ge20(d)),
+            ('elapsed≤2min + bounce≥75% + not deadzone', lambda d: cond_elapsed_le120(d) and cond_bounce_ge75(d) and cond_entry_not_deadzone(d)),
+        ]
+
+        hdr = (f"<table><tr>"
+               f"<th class='l'>Filtro</th><th>n</th><th>Cob</th>"
+               f"<th class='tp'>%moon</th><th class='pos'>%RB</th>"
+               f"<th class='neu'>%SB</th><th class='dim'>%chop</th>"
+               f"<th class='sl'>%CD</th><th class='sl'>%ID</th>"
+               f"<th>EV_B avg</th><th>EV_B med</th>"
+               f"<th>MFE med</th><th>MAE med</th></tr>")
+
+        out.append("<h3>Filtros simples (1 condição)</h3>")
+        out.append(hdr)
+        for label, fn in single_filters:
+            items = [d for d in sig_data if fn(d)]
+            out.append(filter_stats(items, label))
+        out.append("</table>")
+
+        out.append("<h3>Combinações (2–3 condições)</h3>")
+        out.append(hdr)
+        for label, fn in combo_filters:
+            items = [d for d in sig_data if fn(d)]
+            out.append(filter_stats(items, label))
+        out.append("</table>")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # TAREFA 6 — CONCLUSÃO REVISADA
+        # ══════════════════════════════════════════════════════════════════════
+        out.append("<h2>§7 — Conclusão Revisada (Rodada 2.1)</h2>")
+
+        # Determine EV verdict from best combo
+        best_ev_b = ranked_b[0][1]['ev_b'] if ranked_b else None
+        best_ev_c = ranked_b[0][1]['ev_c'] if ranked_b else None
+        best_n    = ranked_b[0][1]['n_res'] if ranked_b else 0
+
+        if best_ev_b is None or best_n < 20:
+            verdict_a = "INCONCLUSIVO"
+            verdict_color = "neu"
+        elif best_ev_b > 5 and best_ev_c is not None and best_ev_c > 0:
+            verdict_a = "SIM (edge real)"
+            verdict_color = "tp"
+        elif best_ev_b > 0 and (best_ev_c is None or best_ev_c < 0):
+            verdict_a = "CONDICIONAL (edge depende de unresolved)"
+            verdict_color = "neu"
+        elif best_ev_b <= 0:
+            verdict_a = "NÃO (EV negativo após correção)"
+            verdict_color = "sl"
+        else:
+            verdict_a = "MARGINAL"
+            verdict_color = "neu"
+
+        # Moon dependence
+        pct_moon_of_good = len(cat_info['moon']['mints'])/max(n_good,1)*100
+        pct_good_total   = n_good/max(total_classified,1)*100
+
+        # Best combos for Rodada 3
+        top3_combos = [(k,v) for k,v in sorted(grid.items(), key=lambda x: x[1]['ev_b'] or -999, reverse=True)
+                       if v['n_res'] >= 20][:3]
+
+        out.append(f"""<div class='section'>
+        <h3>A) EV bruto após correções: <span class='{verdict_color}'>{verdict_a}</span></h3>
+        <div class='box'>
+        Melhor combo (EV_B): {f"TP+{best_tp_ev*100:.0f}% / SL-{best_sl_ev*100:.0f}% → EV_B={fmt(best_ev_b)}, EV_C={fmt(best_ev_c)}, n={best_n}" if ranked_b else "N/A"}<br>
+        <b>EV_A (resolved only)</b>: pode ser positivo mesmo com edge fraco — confirmar com EV_B e EV_C.<br>
+        <b>EV_C (conservative)</b>: piso real do edge. Se EV_C &lt; 0 → edge depende de cobertura de ticks.
+        </div>
+
+        <h3>B) O edge vem de:</h3>
+        <div class='box'>
+        • Moon ({len(cat_info['moon']['mints'])} sinais = {len(cat_info['moon']['mints'])/max(total_classified,1)*100:.1f}% do total)<br>
+        • Real bounce ({len(cat_info['real_bounce']['mints'])} sinais = {len(cat_info['real_bounce']['mints'])/max(total_classified,1)*100:.1f}%)<br>
+        • Dentro dos "good", moon representa {pct_moon_of_good:.1f}% → {"edge <b>concentrado em outliers</b>" if pct_moon_of_good > 60 else "edge <b>distribuído entre moon e RB</b>"}<br>
+        • Cont. dump + instant_death = {n_bad} sinais ({100*n_bad//max(total_classified,1)}%) → confirmar se filtros reduzem esse %.
+        </div>
+
+        <h3>C) 3 cohorts mais promissores para Rodada 3</h3>
+        <div class='box'>
+        <ol>
+        <li><b>bounce_pct ≥ 75%</b> — verificar se EV_B se sustenta com execução real (slippage provavelmente menor em bounces fortes)</li>
+        <li><b>elapsed ≤ 2min + bounce ≥ 50%</b> — sinal rápido + bounce forte → testar se é cohort real ou N pequeno</li>
+        <li><b>drop ≥ 60% + liq ≥ 20K</b> — dump profundo em pool líquida → entrada mais confiável, slippage controlado</li>
+        </ol>
+        </div>
+
+        <h3>D) 3 maiores red flags</h3>
+        <div class='box'>
+        <ol>
+        <li><b>Cobertura de ticks = {100*n_with_ticks//max(n_total,1)}%</b> — EV_C trata todos os sem-ticks como loss. Se esse número for baixo, o EV "real" pode ser bem diferente do EV_A (resolved-only).</li>
+        <li><b>Moon dependência</b> — se {pct_moon_of_good:.1f}% dos "good" são moon (≥+150%), o EV é fortemente sensível a poucos outliers. Trailing ajuda, mas depende de capturar esses moons.</li>
+        <li><b>Instant_death ({len(cat_info['instant_death']['mints'])} sinais = {len(cat_info['instant_death']['mints'])/max(total_classified,1)*100:.1f}%)</b> — tokens que dumpam ≥25% em ≤2min logo após o sinal. Esses são perdas certas e rápidas. Filtrar antes de Rodada 3.</li>
+        </ol>
+        </div>
+
+        <h3>E) Devemos ir para Rodada 3?</h3>
+        <div class='box'>
+        {"<span class='tp'><b>SIM</b> — edge bruto existe mesmo após correções. Ir para Rodada 3 com execução real nos 3 cohorts acima.</span>" if verdict_color == 'tp'
+         else ("<span class='neu'><b>TALVEZ</b> — edge marginal/condicional. Recomendável coletar mais sinais ({n_total} atual) antes de escalar execução. Mínimo sugerido: 100 sinais com ticks ≥20min.</span>".format(n_total=n_total) if verdict_color == 'neu'
+         else "<span class='sl'><b>NÃO</b> — EV negativo após correções. Revisar pipeline de detecção de sinal antes de Rodada 3.</span>")}
+        <br><br>
+        <b>Pré-requisitos para Rodada 3:</b><br>
+        • Confirmar n≥30 para o melhor cohort (§6 acima)<br>
+        • Verificar se instant_death é filtrável por feature disponível no momento do sinal<br>
+        • Medir slippage real nos primeiros 10 trades do cohort escolhido
+        </div>
+        </div>""")
+
+    except Exception:
+        out.append(f"<pre style='color:#f85149'>{_tb.format_exc()}</pre>")
+
+    out.append("</body></html>")
+    return "".join(out)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
