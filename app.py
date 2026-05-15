@@ -24066,5 +24066,432 @@ td.L{text-align:left}
     return H
 
 
+# ==============================================================================
+# /analise/caso-b  — dissecção tick-a-tick dos trades Caso B
+# Determina se cada "missed opportunity" é artefato pAMM ou oportunidade real.
+# ==============================================================================
+
+@app.route("/analise/caso-b")
+def analise_caso_b():
+    import psycopg2
+    import psycopg2.extras
+
+    PUMP_SUPPLY = 1_000_000_000
+    REAL_WR     = float(request.args.get("wr",      "0.28"))
+    REAL_N_TP   = int(request.args.get("n_tp",      "17"))
+    REAL_N      = int(request.args.get("n",         "60"))
+    since_days  = int(request.args.get("since_days", "30"))
+    limit       = min(int(request.args.get("limit",  "150")), 400)
+    # Threshold: spike_ratio (mc_high / mc_close) acima do qual é suspeito de artefato pAMM
+    SPIKE_RATIO_THRESHOLD = float(request.args.get("spike_thr", "2.5"))
+
+    conn = psycopg2.connect(db.DATABASE_URL)
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    # Verifica colunas disponíveis
+    cur.execute("""SELECT column_name FROM information_schema.columns
+        WHERE table_name='trades'
+          AND column_name IN ('mc_at_signal','exit_ts','exit_type',
+                              'tokens_received','entry_price_usd','fill_source')""")
+    avail = {r["column_name"] for r in cur.fetchall()}
+    sig_col     = "t.mc_at_signal" if "mc_at_signal" in avail else "NULL::float"
+    exit_ts_col = "t.exit_ts"      if "exit_ts"      in avail else "NULL::timestamptz"
+
+    cur.execute(f"""
+        SELECT t.id, t.symbol, t.mint, t.status,
+               t.ts_signal, t.ts_order_sent, t.ts_order_confirmed,
+               t.mc_bottom, t.entry_expected, t.mc_migration,
+               t.entry_price_usd, t.tokens_received, t.fill_source,
+               t.amount_usd, t.pnl_pct_real, t.sl_pct, t.tp_pct,
+               {sig_col}     AS mc_at_signal,
+               {exit_ts_col} AS exit_ts,
+               COALESCE(bs.mc_at_signal, {sig_col}) AS signal_mc
+        FROM trades t
+        LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+        WHERE t.created_at > NOW() - INTERVAL '{since_days} days'
+          AND t.status NOT IN ('error','pending','cancelled')
+          AND t.order_id IS NOT NULL
+        ORDER BY t.created_at DESC
+        LIMIT {limit}
+    """)
+    trades_raw = cur.fetchall()
+
+    # ── Identifica trades Caso B ──────────────────────────────────────────────
+    case_b_records = []
+    n_fill_real    = 0
+
+    for tr in trades_raw:
+        mint     = tr["mint"]
+        entry_ts = tr["ts_order_confirmed"] or tr["ts_order_sent"] or tr["ts_signal"]
+        exit_ts  = tr["exit_ts"]
+        if not entry_ts or not exit_ts:
+            continue
+
+        sl_pct = tr["sl_pct"] or 0.25
+        tp_pct = tr["tp_pct"] or 0.75
+
+        # entry_mc hierarquia
+        if tr["entry_price_usd"] and tr["tokens_received"] and tr["tokens_received"] > 0:
+            entry_mc  = (tr["entry_price_usd"] / tr["tokens_received"]) * PUMP_SUPPLY
+            entry_src = "real_fill"
+            n_fill_real += 1
+        elif tr["mc_at_signal"] and tr["mc_at_signal"] > 0:
+            entry_mc  = tr["mc_at_signal"]
+            entry_src = "mc_at_signal"
+        elif tr["entry_expected"] and tr["entry_expected"] > 0:
+            entry_mc  = tr["entry_expected"]
+            entry_src = "entry_expected*"
+        else:
+            continue
+
+        sl_floor = entry_mc * (1 - sl_pct)
+        tp_thr   = entry_mc * (1 + tp_pct)   # 75% activation threshold
+
+        # ticks pré-exit
+        cur.execute("""
+            SELECT tick_ts, mc,
+                   COALESCE(mc_high, mc) AS mc_high,
+                   COALESCE(mc_low,  mc) AS mc_low,
+                   mc_open, source
+            FROM token_ticks
+            WHERE mint=%s AND tick_ts>=%s AND tick_ts<=%s
+              AND mc IS NOT NULL AND mc>0
+            ORDER BY tick_ts ASC
+        """, (mint, entry_ts, exit_ts))
+        ticks_pre = [dict(r) for r in cur.fetchall()]
+
+        # Verificação caso B: precisa ter pelo menos um tick com mc_high >= tp_thr
+        hit_75_pre = any(t["mc_high"] >= tp_thr for t in ticks_pre)
+        pnl_db     = tr["pnl_pct_real"]
+        status     = tr["status"] or ""
+        is_sl      = status == "sl" or (pnl_db is not None and pnl_db < -0.10)
+
+        if not (hit_75_pre and is_sl):
+            continue  # não é caso B
+
+        # ── Localiza peak tick e sl tick ──────────────────────────────────────
+        peak_tick = None  # tick com mc_high >= tp_thr e o mais alto
+        sl_tick   = None  # primeiro tick onde mc_low <= sl_floor
+
+        for t in ticks_pre:
+            mc_h = t["mc_high"]
+            mc_l = t["mc_low"]
+
+            if mc_h >= tp_thr:
+                if peak_tick is None or mc_h > peak_tick["mc_high"]:
+                    peak_tick = t
+
+            if sl_tick is None and mc_l > 0 and mc_l <= sl_floor:
+                sl_tick = t
+
+        if peak_tick is None:
+            continue  # não deveria acontecer
+
+        # ── Métricas do peak tick ─────────────────────────────────────────────
+        pk_mc_h  = peak_tick["mc_high"]
+        pk_mc_c  = peak_tick["mc"] or 1
+        pk_src   = peak_tick["source"] or "?"
+        # spike_ratio: quanto o high supera o close na mesma vela
+        spike_ratio = pk_mc_h / max(pk_mc_c, 1)
+        is_spike    = (pk_src == "kline" and spike_ratio >= SPIKE_RATIO_THRESHOLD)
+
+        # ── Classificação B1 / B2 / B3 ───────────────────────────────────────
+        if sl_tick is None:
+            # SL foi executado pelo GMGN mas nenhum tick capturou mc_low <= sl_floor
+            # Pode ser: (a) gap entre ticks, (b) SL antes do primeiro tick, (c) tick esparso
+            if is_spike:
+                bclass = "B3"        # spike sem SL tick → artefato
+            else:
+                bclass = "B_gap"     # peak real mas SL entre ticks → dado incompleto
+        elif peak_tick["tick_ts"] == sl_tick["tick_ts"]:
+            # Mesma vela: high ≥ +75% E low ≤ SL → clássico spike pAMM intra-candle
+            bclass = "B1_spike" if is_spike else "B1_ambig"
+        elif peak_tick["tick_ts"] < sl_tick["tick_ts"]:
+            # Peak em vela ANTERIOR ao SL → preço sustentou +75% por ao menos 1 vela
+            bclass = "B2_spike" if is_spike else "B2_real"
+        else:
+            # SL veio antes do peak (peak_ts > sl_ts): SL disparou, depois price subiu
+            # Isso implica que o tick com mc_high >= tp_thr é POSTERIOR ao SL tick
+            # → Não é oportunidade perdida, é recuperação pós-SL capturada nos ticks pré-exit
+            bclass = "B_sl_first"
+
+        # Gap de tempo entre peak e sl tick (em minutos)
+        time_gap_min = None
+        if sl_tick and peak_tick["tick_ts"] != sl_tick["tick_ts"]:
+            td = sl_tick["tick_ts"] - peak_tick["tick_ts"]
+            time_gap_min = td.total_seconds() / 60
+
+        # Todas as velas com mc_high >= tp_thr (para análise de sustentação)
+        peak_ticks_all = [t for t in ticks_pre if t["mc_high"] >= tp_thr]
+        n_peak_candles = len(peak_ticks_all)
+
+        duration_min = (exit_ts - entry_ts).total_seconds() / 60 if exit_ts else None
+
+        case_b_records.append({
+            "id": tr["id"], "symbol": tr["symbol"], "mint": mint,
+            "status": status, "entry_src": entry_src,
+            "entry_mc": entry_mc, "pnl_db": pnl_db,
+            "sl_pct": sl_pct, "tp_pct": tp_pct,
+            "sl_floor": sl_floor, "tp_thr": tp_thr,
+            "n_pre": len(ticks_pre),
+            "peak_tick": peak_tick,
+            "sl_tick": sl_tick,
+            "spike_ratio": spike_ratio,
+            "is_spike": is_spike,
+            "bclass": bclass,
+            "time_gap_min": time_gap_min,
+            "n_peak_candles": n_peak_candles,
+            "duration_min": duration_min,
+            "max_gain_pre": max((t["mc_high"] - entry_mc)/entry_mc for t in ticks_pre) if ticks_pre else 0,
+        })
+
+    conn.close()
+
+    # ── Contagem por sub-classe ───────────────────────────────────────────────
+    from collections import Counter
+    bclass_counts = Counter(r["bclass"] for r in case_b_records)
+
+    n_B1 = bclass_counts.get("B1_spike",0) + bclass_counts.get("B1_ambig",0)
+    n_B2 = bclass_counts.get("B2_real",0)  + bclass_counts.get("B2_spike",0)
+    n_B3 = bclass_counts.get("B3",0)
+    n_gap = bclass_counts.get("B_gap",0)
+    n_sl_first = bclass_counts.get("B_sl_first",0)
+    n_total_b  = len(case_b_records)
+
+    # "Oportunidades reais": B2_real e B_gap com spike_ratio baixo
+    n_real_opp = bclass_counts.get("B2_real",0)
+    n_artifact  = bclass_counts.get("B1_spike",0) + bclass_counts.get("B2_spike",0) + bclass_counts.get("B3",0)
+
+    # ── HTML ──────────────────────────────────────────────────────────────────
+    def pct(v, d=1):
+        if v is None: return "<span style='color:#555'>—</span>"
+        c = "#4f4" if v > 0.01 else ("#f44" if v < -0.01 else "#888")
+        return f"<span style='color:{c}'>{v*100:+.{d}f}%</span>"
+    def ratio_badge(r):
+        c = "#f44" if r >= SPIKE_RATIO_THRESHOLD else ("#fa0" if r >= 1.5 else "#4f4")
+        return f"<span style='color:{c}'>{r:.1f}x</span>"
+    def ts_fmt(ts):
+        if ts is None: return "—"
+        return ts.strftime("%H:%M:%S")
+
+    BCLASS_META = {
+        "B1_spike":  ("#f44","#1a0000","B1-spike",  "Mesmo minuto, spike pAMM (high>>close) — artefato"),
+        "B1_ambig":  ("#fa0","#1a0a00","B1-ambig",  "Mesmo minuto, spike plausível — ambíguo"),
+        "B2_real":   ("#4f4","#001a00","B2-real",   "Peak em vela anterior ao SL — possível oportunidade real"),
+        "B2_spike":  ("#fa0","#0a1a00","B2-spike",  "Peak em vela anterior mas spike_ratio alto — suspeito"),
+        "B3":        ("#888","#0a0a0a","B3",         "Spike sem SL tick capturado — artefato"),
+        "B_gap":     ("#8af","#001018","B_gap",      "Peak real mas SL entre ticks — dado incompleto"),
+        "B_sl_first":("#f8f","#18001a","B_sl-first", "SL disparou antes do peak — SL foi executado primeiro"),
+    }
+
+    H = """<!DOCTYPE html><html><head><meta charset='utf-8'><title>Caso B Analysis</title>
+<style>
+body{font-family:monospace;font-size:12px;background:#0e0e0e;color:#ddd;padding:16px}
+h2{color:#f90}h3{color:#8cf;margin-top:20px}h4{color:#fc8;margin-top:14px}
+table{border-collapse:collapse;margin-bottom:12px;width:100%}
+th{background:#1a1a2e;color:#8cf;padding:4px 8px;border:1px solid #333;text-align:right;white-space:nowrap}
+th.L{text-align:left}
+td{padding:3px 8px;border:1px solid #1a1a1a;text-align:right;white-space:nowrap}
+td.L{text-align:left;max-width:260px;overflow:hidden;text-overflow:ellipsis}
+.pos{color:#4f4}.neg{color:#f44}.warn{color:#fa0}.null{color:#555}
+.box{background:#111;border:1px solid #333;padding:10px;margin:8px 0;border-radius:4px}
+</style></head><body>"""
+
+    H += f"<h2>🔬 Caso B — Dissecção tick-a-tick ({n_total_b} trades)</h2>"
+    H += f"<div class='box'>"
+    H += f"<b>WR real GMGN:</b> {REAL_WR*100:.0f}% ({REAL_N_TP} TP / {REAL_N-REAL_N_TP} SL / {REAL_N} trades)<br>"
+    H += f"<b>Trades Caso B identificados:</b> {n_total_b} (com exit_ts real + hit_75_pre=True + status=SL)<br>"
+    H += f"<b>fill_real:</b> {n_fill_real} | entry_mc bias: {'ok' if n_fill_real > n_total_b//2 else 'entry subestimado → tp_thr subestimado → mais falsos B'}"
+    if n_fill_real == 0:
+        H += "<br><span class='neg'>⚠️ fill_real=0 — entry_mc usa mc_at_signal ou entry_expected*. tp_thr pode estar subestimado em ~10-15%.</span>"
+    H += f"<br><b>spike_thr configurado:</b> {SPIKE_RATIO_THRESHOLD}x (mc_high/mc_close) &nbsp;|&nbsp; "
+    H += f"<a href='?spike_thr=2.0'>2.0x</a> | <a href='?spike_thr=2.5'>2.5x</a> | <a href='?spike_thr=3.0'>3.0x</a> | <a href='?spike_thr=5.0'>5.0x</a>"
+    H += "</div>"
+
+    # ── Seção 1: Resumo por sub-classe ────────────────────────────────────────
+    H += "<h3>1 — Distribuição por sub-classe</h3>"
+    H += "<table><tr><th class='L'>Sub-classe</th><th>n</th><th>%</th><th>avg spike_ratio</th><th>avg pnl_db</th><th class='L'>Significado</th></tr>"
+    for bk, (bc, bg, blbl, bdesc) in BCLASS_META.items():
+        recs = [r for r in case_b_records if r["bclass"] == bk]
+        if not recs and bclass_counts.get(bk,0) == 0:
+            continue
+        n = len(recs)
+        pct_n = n / n_total_b * 100 if n_total_b else 0
+        avg_sr  = sum(r["spike_ratio"] for r in recs)/n if n else None
+        pdb_vals= [r["pnl_db"] for r in recs if r["pnl_db"] is not None]
+        avg_pdb = sum(pdb_vals)/len(pdb_vals) if pdb_vals else None
+        H += f"<tr style='background:{bg}'>"
+        H += f"<td class='L'><b style='color:{bc}'>{blbl}</b></td>"
+        H += f"<td>{n}</td><td>{pct_n:.0f}%</td>"
+        H += f"<td>{f'{avg_sr:.1f}x' if avg_sr else '—'}</td>"
+        H += f"<td>{pct(avg_pdb)}</td>"
+        H += f"<td class='L' style='color:#999;font-size:11px'>{bdesc}</td>"
+        H += "</tr>"
+    H += "</table>"
+
+    # Diagnóstico imediato
+    H += "<div class='box'>"
+    H += f"<b>Artefatos confirmados (B1-spike + B2-spike + B3):</b> {n_artifact} / {n_total_b} ({n_artifact/n_total_b*100:.0f}%)<br>"
+    H += f"<b>Oportunidades reais (B2-real):</b> {n_real_opp} / {n_total_b} ({n_real_opp/n_total_b*100:.0f}%)<br>"
+    H += f"<b>Ambíguos (B1-ambig + B_gap + B_sl_first):</b> {n_total_b - n_artifact - n_real_opp} / {n_total_b}<br>"
+    if n_real_opp > n_total_b // 2:
+        H += "<span class='warn'>⚠️ Maioria são B2-real — evidência para revisar estratégia de saída.</span>"
+    elif n_real_opp <= 2:
+        H += "<span class='pos'>✓ Apenas {n_real_opp} B2-real — Caso B é predominantemente artefato pAMM. Não mudar TTP/SL.</span>"
+    else:
+        H += f"<span class='warn'>Misto: {n_real_opp} B2-real vs {n_artifact} artefatos. Insuficiente para mudar config.</span>"
+    H += "</div>"
+
+    # ── Seção 2: Detalhe por trade ────────────────────────────────────────────
+    H += "<h3>2 — Trade-by-trade Caso B</h3>"
+    H += "<p style='color:#888;font-size:11px'>src: f=real_fill | s=mc_at_signal | *=entry_expected* &nbsp;|&nbsp; "
+    H += "spike_ratio = mc_high / mc_close da peak candle (source=kline). Trenches não têm OHLC separado.</p>"
+
+    H += "<table><tr>"
+    H += "<th class='L'>#</th><th class='L'>symbol</th><th>src</th><th>class</th>"
+    H += "<th>n_pre</th><th>n_peaks</th><th>max_pre</th><th>pnl_db</th><th>dur(m)</th>"
+    H += "<th>peak_ts</th><th>peak_src</th><th>peak_high</th><th>peak_close</th><th>spike_ratio</th>"
+    H += "<th>sl_ts</th><th>sl_low</th><th>gap(m)</th><th class='L'>conclusão</th>"
+    H += "</tr>"
+
+    for r in sorted(case_b_records, key=lambda x: -x["id"]):
+        bk  = r["bclass"]
+        bc, bg, blbl, _ = BCLASS_META.get(bk, ("#888","","?",""))
+        pt  = r["peak_tick"]
+        st  = r["sl_tick"]
+        src_badge = {"real_fill":"<span style='color:#4f4'>f</span>",
+                     "mc_at_signal":"<span style='color:#fa0'>s</span>",
+                     "entry_expected*":"<span style='color:#f44'>*</span>"}.get(r["entry_src"],"?")
+
+        # Conclusão por trade
+        if bk == "B1_spike":
+            concl = "spike intra-candle pAMM — artefato"
+        elif bk == "B1_ambig":
+            concl = "high+low mesmo minuto — ambíguo"
+        elif bk == "B2_real":
+            concl = "peak sustentado antes do SL — possível oportunidade"
+        elif bk == "B2_spike":
+            concl = "peak em candle anterior mas spike (high>>close)"
+        elif bk == "B3":
+            concl = "spike sem SL tick — artefato"
+        elif bk == "B_gap":
+            concl = "SL entre ticks, peak real — dado incompleto"
+        elif bk == "B_sl_first":
+            concl = "SL tick veio antes do peak — SL executado primeiro"
+        else:
+            concl = "?"
+
+        pt_high  = pt["mc_high"] if pt else None
+        pt_close = pt["mc"]      if pt else None
+        pt_src   = pt["source"]  if pt else "—"
+        sl_low   = st["mc_low"]  if st else None
+
+        def mc_fmt(v, ref):
+            if v is None: return "<span class='null'>—</span>"
+            g = (v - ref) / ref if ref else 0
+            c = "#4f4" if g > 0.5 else ("#fa0" if g > 0.1 else ("#f44" if g < -0.1 else "#ddd"))
+            return f"<span style='color:{c}'>${v/1000:.1f}k ({g*100:+.0f}%)</span>"
+
+        H += f"<tr style='background:{bg}'>"
+        H += f"<td class='L'>{r['id']}</td><td class='L'><b>{r['symbol']}</b></td>"
+        H += f"<td>{src_badge}</td>"
+        H += f"<td><b style='color:{bc}'>{blbl}</b></td>"
+        H += f"<td>{r['n_pre']}</td><td>{r['n_peak_candles']}</td>"
+        H += f"<td>{pct(r['max_gain_pre'])}</td><td>{pct(r['pnl_db'])}</td>"
+        H += f"<td>{'%.0f'%r['duration_min'] if r['duration_min'] is not None else '—'}</td>"
+        H += f"<td style='font-size:10px'>{ts_fmt(pt['tick_ts']) if pt else '—'}</td>"
+        H += f"<td style='font-size:10px'>{pt_src}</td>"
+        H += f"<td>{mc_fmt(pt_high, r['entry_mc'])}</td>"
+        H += f"<td>{mc_fmt(pt_close, r['entry_mc'])}</td>"
+        H += f"<td>{ratio_badge(r['spike_ratio'])}</td>"
+        H += f"<td style='font-size:10px'>{ts_fmt(st['tick_ts']) if st else '<span class=null>—</span>'}</td>"
+        H += f"<td>{mc_fmt(sl_low, r['entry_mc'])}</td>"
+        H += f"<td>{'%.1f'%r['time_gap_min'] if r['time_gap_min'] is not None else ('—' if st else '<span class=null>n/a</span>')}</td>"
+        H += f"<td class='L' style='color:#aaa;font-size:11px'>{concl}</td>"
+        H += "</tr>"
+    H += "</table>"
+
+    # ── Seção 3: Análise dos B2-real ──────────────────────────────────────────
+    b2_real_recs = [r for r in case_b_records if r["bclass"] == "B2_real"]
+    H += f"<h3>3 — Análise B2-real ({len(b2_real_recs)} trades)</h3>"
+    if not b2_real_recs:
+        H += "<div class='box'><span class='pos'>Nenhum B2-real — Caso B é inteiramente artefato/ambíguo. "
+        H += "Não há evidência para mudar TTP/SL com base no Caso B.</span></div>"
+    else:
+        avg_gap  = sum(r["time_gap_min"] for r in b2_real_recs if r["time_gap_min"] is not None)
+        cnt_gap  = sum(1 for r in b2_real_recs if r["time_gap_min"] is not None)
+        avg_gap /= cnt_gap if cnt_gap else 1
+        avg_gain  = sum(r["max_gain_pre"] for r in b2_real_recs) / len(b2_real_recs)
+        avg_npeaks = sum(r["n_peak_candles"] for r in b2_real_recs) / len(b2_real_recs)
+        H += "<div class='box'>"
+        H += f"B2-real: n={len(b2_real_recs)} | avg_gap peak→SL: {avg_gap:.1f} min | avg_n_peak_candles: {avg_npeaks:.1f} | avg_max_gain_pre: {avg_gain*100:.0f}%<br>"
+        H += f"<small>avg_gap = tempo médio entre a vela do peak e a vela do SL. "
+        H += f"Se > 1 min, o TTP 75% teve tempo de ativar mas GMGN não executou.</small><br><br>"
+        if avg_gap >= 2.0 and len(b2_real_recs) >= 3:
+            H += f"<span class='warn'>⚠️ avg_gap={avg_gap:.1f}min em {len(b2_real_recs)} trades — "
+            H += "GMGN teve tempo de ativar TTP mas não fez. Possíveis causas: "
+            H += "(1) preço real < tick high (kline), (2) slippage no TTP sell, (3) condition_order bug.</span><br>"
+        elif avg_gap < 1.0:
+            H += f"<span class='pos'>avg_gap={avg_gap:.1f}min — peak e SL quase simultâneos mesmo em candles diferentes. "
+            H += "Provavelmente intra-minuto, classificação B2 pode ser imprecisa.</span><br>"
+        else:
+            H += f"avg_gap={avg_gap:.1f}min — misto. Alguns podem ter sido oportunidades reais.<br>"
+        H += "</div>"
+
+        H += "<table><tr><th class='L'>#</th><th class='L'>symbol</th><th>max_pre</th><th>pnl_db</th>"
+        H += "<th>peak_ts</th><th>peak_high</th><th>peak_close</th><th>spike_ratio</th>"
+        H += "<th>sl_ts</th><th>gap(m)</th><th>n_peak_candles</th></tr>"
+        for r in sorted(b2_real_recs, key=lambda x: -(x["time_gap_min"] or 0)):
+            pt = r["peak_tick"]
+            st = r["sl_tick"]
+            H += f"<tr style='background:#001a00'>"
+            H += f"<td class='L'>{r['id']}</td><td class='L'><b>{r['symbol']}</b></td>"
+            H += f"<td>{pct(r['max_gain_pre'])}</td><td>{pct(r['pnl_db'])}</td>"
+            H += f"<td style='font-size:10px'>{ts_fmt(pt['tick_ts'])}</td>"
+            H += f"<td>{pct((pt['mc_high']-r['entry_mc'])/r['entry_mc'])}</td>"
+            H += f"<td>{pct((pt['mc']-r['entry_mc'])/r['entry_mc'])}</td>"
+            H += f"<td>{ratio_badge(r['spike_ratio'])}</td>"
+            H += f"<td style='font-size:10px'>{ts_fmt(st['tick_ts']) if st else '—'}</td>"
+            H += f"<td>{'%.1f'%r['time_gap_min'] if r['time_gap_min'] else '—'}</td>"
+            H += f"<td>{r['n_peak_candles']}</td>"
+            H += "</tr>"
+        H += "</table>"
+
+    # ── Seção 4: Recomendação ─────────────────────────────────────────────────
+    H += "<h3>4 — Recomendação baseada no Caso B</h3>"
+    H += "<div class='box'>"
+
+    pct_artifact  = n_artifact / n_total_b * 100  if n_total_b else 0
+    pct_real      = n_real_opp / n_total_b * 100  if n_total_b else 0
+    conf_tag = " <span class='neg'>(fraca — fill_real=0)</span>" if n_fill_real == 0 else ""
+
+    H += f"<b>Diagnóstico final{conf_tag}:</b><br>"
+    H += f"• Artefatos pAMM confirmados: {n_artifact} ({pct_artifact:.0f}%)<br>"
+    H += f"• Possíveis oportunidades reais (B2-real): {n_real_opp} ({pct_real:.0f}%)<br>"
+    H += f"• Ambíguos/inconclusivos: {n_total_b - n_artifact - n_real_opp}<br><br>"
+
+    H += "<b>Regra de decisão:</b> mudar TTP/SL apenas se B2-real for maioria do Caso B.<br><br>"
+    if n_real_opp > n_total_b // 2:
+        H += f"<span class='warn'>B2-real ({n_real_opp}) é maioria → TTP pode estar deixando dinheiro na mesa. "
+        H += "Investigar se avg_gap ≥ 2min. Se sim, candidato a testar TTP 100/30.</span><br>"
+    elif pct_artifact >= 60:
+        H += f"<span class='pos'>✓ {pct_artifact:.0f}% do Caso B é artefato pAMM (B1-spike + B2-spike + B3). "
+        H += "<b>NÃO mudar TTP/SL com base no Caso B.</b> "
+        H += "O kline high não representa preço real sustentado nessas pools.</span><br>"
+    else:
+        H += f"<span class='warn'>Misto — {n_real_opp} oportunidades reais vs {n_artifact} artefatos. "
+        H += "Coletar mais dados antes de mudar config.</span><br>"
+
+    H += "<br><b>Conclusão sobre os 26% de trades Caso B:</b><br>"
+    if pct_artifact >= 60:
+        H += "O Caso B NÃO é dinheiro deixado na mesa — é o kline registrando spikes pAMM que o GMGN nunca viu. "
+        H += "O problema real continua sendo o Caso A (65%): tokens que nunca chegam a +75%.<br>"
+        H += "Ação recomendada: melhorar qualidade do sinal (BOUNCE_MIN_PCT, FILTER_SMART_MIN), não TTP."
+    H += "</div>"
+
+    H += "</body></html>"
+    return H
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
