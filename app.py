@@ -24762,5 +24762,210 @@ td.L{text-align:left}
     return H
 
 
+# /analise/real-entries — onde compramos de verdade (apenas fill_real)
+@app.route("/analise/real-entries")
+def analise_real_entries():
+    """
+    Mostra APENAS trades com fill real (entry_price_usd + tokens_received populados).
+    Calcula entry_mc_real e compara com mc_migration.
+    Inclui raw values para validar a fórmula contra o GMGN.
+    """
+    PUMP_SUPPLY = 1_000_000_000
+
+    css = """
+    <style>
+    body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+    h2{color:#58a6ff}h3{color:#79c0ff}
+    table{border-collapse:collapse;width:100%;margin-bottom:20px}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:right}
+    th:first-child,th:nth-child(2),th:nth-child(3){text-align:left}
+    td{padding:5px 10px;border:1px solid #21262d;text-align:right;white-space:nowrap}
+    td:first-child,td:nth-child(2),td:nth-child(3){text-align:left}
+    .tp{color:#3fb950}.sl{color:#f85149}.warn{color:#d29922}.dim{color:#6e7681}
+    .hi{background:#1f2d1f}.lo{background:#2d1f1f}.mid{background:#1e2a3a}
+    .box{background:#161b22;border:1px solid #30363d;padding:12px 16px;margin-bottom:16px;border-radius:6px}
+    .raw{color:#8b949e;font-size:11px}
+    </style>
+    """
+
+    with db._cursor() as cur:
+        # Busca todos os trades com fill real
+        cur.execute("""
+            SELECT t.id, t.mint, t.symbol, t.ts_signal, t.status, t.pnl_pct_real,
+                   t.entry_price_usd, t.tokens_received, t.entry_price_sol,
+                   t.fill_source, t.exit_type,
+                   m.mc_migration, m.mc_migration_source, m.exchange
+            FROM trades t
+            LEFT JOIN migrations m ON t.mint = m.mint
+            WHERE t.entry_price_usd IS NOT NULL
+              AND t.tokens_received IS NOT NULL
+              AND t.tokens_received > 0
+            ORDER BY t.ts_signal DESC
+            LIMIT 200
+        """)
+        trades = cur.fetchall()
+
+    H = f"<!DOCTYPE html><html><head><title>Real Entries</title>{css}</head><body>"
+    H += "<h2>📍 Entradas Reais — Onde Compramos de Verdade</h2>"
+    H += f"<p class='dim'>Apenas trades com fill confirmado (entry_price_usd + tokens_received). Fórmula: entry_mc = (entry_price_usd / tokens_received) × 1B</p>"
+
+    if not trades:
+        H += "<div class='box warn'>Nenhum trade com fill real encontrado.</div>"
+        H += "</body></html>"
+        return H
+
+    MC_MIGRATION = 37_000.0  # referência teórica pump.fun
+
+    rows = []
+    for r in trades:
+        entry_usd = float(r["entry_price_usd"])
+        tokens    = float(r["tokens_received"])
+
+        if tokens <= 0:
+            continue
+
+        price_per_tok = entry_usd / tokens          # USD por token (display)
+        entry_mc      = price_per_tok * PUMP_SUPPLY  # MC implícita
+
+        # mc_migration do banco (ou usar constante se NULL)
+        mc_mig = float(r["mc_migration"]) if r["mc_migration"] else MC_MIGRATION
+        ratio  = entry_mc / mc_mig if mc_mig > 0 else None
+
+        status = r["status"] or ""
+        pnl    = float(r["pnl_pct_real"]) if r["pnl_pct_real"] is not None else None
+
+        rows.append({
+            "id":         r["id"],
+            "symbol":     r["symbol"] or r["mint"][:8],
+            "ts":         r["ts_signal"],
+            "status":     status,
+            "pnl":        pnl,
+            "entry_usd":  entry_usd,
+            "tokens":     tokens,
+            "price_tok":  price_per_tok,
+            "entry_mc":   entry_mc,
+            "mc_mig":     mc_mig,
+            "mc_mig_src": r["mc_migration_source"] or "?",
+            "ratio":      ratio,
+            "fill_src":   r["fill_source"] or "?",
+        })
+
+    n_total = len(rows)
+    n_above = sum(1 for r in rows if r["ratio"] and r["ratio"] > 1.0)
+    n_tp    = sum(1 for r in rows if r["status"] in ("tp", "trailing_active"))
+    n_sl    = sum(1 for r in rows if r["status"] == "sl")
+
+    # Medians
+    ratios_tp = sorted([r["ratio"] for r in rows if r["ratio"] and r["status"] in ("tp","trailing_active")])
+    ratios_sl = sorted([r["ratio"] for r in rows if r["ratio"] and r["status"] == "sl"])
+    med_tp = ratios_tp[len(ratios_tp)//2] if ratios_tp else None
+    med_sl = ratios_sl[len(ratios_sl)//2] if ratios_sl else None
+
+    H += f"""<div class='box'>
+    <b>Resumo: {n_total} trades com fill real</b><br>
+    Compras acima da migração (ratio &gt; 1.0x): <b>{n_above}/{n_total} ({n_above/n_total*100:.0f}%)</b><br>
+    TP ratio mediano: <b>{'%.2fx' % med_tp if med_tp else 'N/A'}</b> &nbsp;|&nbsp;
+    SL ratio mediano: <b>{'%.2fx' % med_sl if med_sl else 'N/A'}</b><br>
+    MC migração referência: ~$37k (MIGRATION_SOL_UNITS × SOL/USD)
+    </div>"""
+
+    # Tabela principal
+    H += "<h3>Detalhamento por trade</h3>"
+    H += "<table><tr>"
+    H += "<th>#</th><th>Token</th><th>Data</th>"
+    H += "<th>Entry $USD</th><th>Tokens receb.</th><th>$/token</th>"
+    H += "<th>entry_mc</th><th>mc_mig</th><th>ratio</th>"
+    H += "<th>Status</th><th>PnL%</th><th>fill_src</th>"
+    H += "</tr>"
+
+    for r in rows:
+        ratio = r["ratio"]
+        if ratio is None:
+            ratio_s = "?"
+            row_cls = ""
+        elif ratio > 1.5:
+            ratio_s = f"<span class='sl'>{ratio:.2f}x ↑</span>"
+            row_cls = " class='lo'"
+        elif ratio > 1.0:
+            ratio_s = f"<span class='warn'>{ratio:.2f}x</span>"
+            row_cls = " class='mid'"
+        else:
+            ratio_s = f"<span class='tp'>{ratio:.2f}x</span>"
+            row_cls = " class='hi'"
+
+        status = r["status"]
+        if status in ("tp", "trailing_active"):
+            st_s = f"<span class='tp'>TP</span>"
+        elif status == "sl":
+            st_s = f"<span class='sl'>SL</span>"
+        else:
+            st_s = f"<span class='dim'>{status}</span>"
+
+        pnl_s = f"{r['pnl']:+.1f}%" if r["pnl"] is not None else "-"
+
+        ts_s  = r["ts"].strftime("%m/%d %H:%M") if r["ts"] else "-"
+
+        # Format large numbers
+        entry_mc_s = f"${r['entry_mc']:,.0f}"
+        mc_mig_s   = f"${r['mc_mig']:,.0f}"
+        entry_usd_s = f"${r['entry_usd']:.4f}"
+        tokens_s    = f"{r['tokens']:,.1f}"
+        price_tok_s = f"${r['price_tok']:.8f}"
+
+        H += f"<tr{row_cls}>"
+        H += f"<td>{r['id']}</td>"
+        H += f"<td><b>{r['symbol']}</b></td>"
+        H += f"<td>{ts_s}</td>"
+        H += f"<td>{entry_usd_s}</td>"
+        H += f"<td>{tokens_s}</td>"
+        H += f"<td class='raw'>{price_tok_s}</td>"
+        H += f"<td><b>{entry_mc_s}</b></td>"
+        H += f"<td>{mc_mig_s}</td>"
+        H += f"<td>{ratio_s}</td>"
+        H += f"<td>{st_s}</td>"
+        H += f"<td>{pnl_s}</td>"
+        H += f"<td class='raw'>{r['fill_src']}</td>"
+        H += "</tr>"
+
+    H += "</table>"
+
+    # Distribuição por faixa de ratio
+    H += "<h3>Distribuição por faixa de entry_mc / mc_migration</h3>"
+    bins = [
+        ("<0.5x", 0, 0.5),
+        ("0.5-0.75x", 0.5, 0.75),
+        ("0.75-1.0x", 0.75, 1.0),
+        ("1.0-1.5x", 1.0, 1.5),
+        ("1.5-2.0x", 1.5, 2.0),
+        (">2.0x", 2.0, 999),
+    ]
+    H += "<table><tr><th>Faixa</th><th>Total</th><th>TPs</th><th>SLs</th><th>WR</th><th>Comprado ACIMA da migração?</th></tr>"
+    for label, lo, hi in bins:
+        subset = [r for r in rows if r["ratio"] and lo <= r["ratio"] < hi]
+        n = len(subset)
+        tp = sum(1 for r in subset if r["status"] in ("tp","trailing_active"))
+        sl = sum(1 for r in subset if r["status"] == "sl")
+        wr = tp/n*100 if n > 0 else 0
+        above = "🔴 SIM — acima da migração" if lo >= 1.0 else ("🟡 PARCIAL" if hi > 1.0 else "🟢 Abaixo")
+        H += f"<tr><td><b>{label}</b></td><td>{n}</td><td>{tp}</td><td>{sl}</td>"
+        H += f"<td>{'%.0f%%' % wr if n >= 3 else '—'}</td><td>{above}</td></tr>"
+    H += "</table>"
+
+    # Nota sobre a fórmula
+    H += "<div class='box'>"
+    H += "<b>Como validar a fórmula:</b><br>"
+    H += "Para VIRUS (GMGN = compra $78k):<br>"
+    H += "&nbsp;&nbsp;entry_price_usd deve ser ~$1.0 (tamanho do trade)<br>"
+    H += "&nbsp;&nbsp;tokens_received deve ser ~12,821 (display units, 6 decimals pump.fun)<br>"
+    H += "&nbsp;&nbsp;price_per_token = $1 / 12,821 = $0.000078<br>"
+    H += "&nbsp;&nbsp;entry_mc = $0.000078 × 1B = $78,000 ✓<br><br>"
+    H += "Se entry_mc mostrar $8,400 para VIRUS, tokens_received provavelmente está errado.<br>"
+    H += "Procurar o ID do VIRUS na tabela e verificar a coluna 'Tokens receb.'<br>"
+    H += "</div>"
+
+    H += "</body></html>"
+    return H
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
