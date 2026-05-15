@@ -20361,5 +20361,837 @@ def analise_rodada3():
     return "".join(out)
 
 
+@app.route("/analise/rodada31")
+def analise_rodada31():
+    """Rodada 3.1 — Execução Real corrigida.
+    Fix: entry_ts_primary = COALESCE(ts_order_confirmed, ts_order_sent, ts_signal).
+    Fix: outlier audit + winsorized slippage stats.
+    """
+    import traceback as _tb
+    import statistics as _st
+
+    CSS = """<style>
+    body{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:20px;max-width:1600px;margin:0 auto}
+    h1{color:#58a6ff;border-bottom:1px solid #30363d;padding-bottom:8px}
+    h2{color:#79c0ff;margin-top:32px;margin-bottom:6px;border-bottom:1px solid #21262d;padding-bottom:4px}
+    h3{color:#8b949e;margin:14px 0 4px}
+    table{border-collapse:collapse;width:100%;margin-bottom:14px;font-size:12px}
+    th{background:#161b22;color:#8b949e;padding:5px 8px;text-align:right;border:1px solid #30363d;white-space:nowrap}
+    th.l{text-align:left} td{padding:4px 8px;border:1px solid #21262d;text-align:right;white-space:nowrap}
+    td.l{text-align:left}
+    tr:hover td{background:#1c2128}
+    .tp{color:#3fb950;font-weight:bold}.sl{color:#f85149;font-weight:bold}
+    .neu{color:#e3b341}.dim{color:#6e7681}.hi{color:#58a6ff}
+    .pos{color:#3fb950}.neg{color:#f85149}.amb{color:#bb8009}
+    .box{background:#161b22;border:1px solid #30363d;padding:12px 16px;margin:10px 0;border-radius:6px;font-size:13px}
+    .warn{background:#1c1400;border:1px solid #bb8009;padding:8px 12px;border-radius:4px;margin:6px 0;font-size:12px}
+    .fix{background:#001a0e;border:1px solid #238636;padding:8px 12px;border-radius:4px;margin:6px 0;font-size:12px}
+    .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:10px 0}
+    .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:10px 0}
+    .kpi{background:#161b22;border:1px solid #30363d;padding:10px;border-radius:6px;text-align:center}
+    .kpi-val{font-size:20px;font-weight:bold;display:block}
+    .kpi-lbl{font-size:11px;color:#8b949e;margin-top:3px}
+    a{color:#58a6ff}
+    pre{background:#0d1117;padding:8px;overflow:auto;font-size:11px;border:1px solid #21262d;border-radius:4px}
+    .section{margin-top:20px;padding:14px;background:#0d1117;border:1px solid #21262d;border-radius:6px}
+    </style>"""
+
+    NAV = ("<p style='margin-bottom:16px'>"
+           "<a href='/analise/signal-edge'>Signal Edge v1</a> · "
+           "<a href='/analise/signal-edge-v2'>Signal Edge v2</a> · "
+           "<a href='/analise/rodada3'>Rodada 3</a> · "
+           "<a href='/analise/rodada31'><b>Rodada 3.1 ✓</b></a> · "
+           "<a href='/analise/correlacao'>Correlação</a></p>")
+
+    out = [f"<!DOCTYPE html><html><head><title>Rodada 3.1 — Execução Real Corrigida</title>{CSS}</head><body>",
+           NAV, "<h1>⚡ Rodada 3.1 — Execução Real (entry_ts_primary + outlier fix)</h1>",
+           "<div class='fix'>✅ Fix 1: <code>entry_ts_primary = COALESCE(ts_order_confirmed, ts_order_sent, ts_signal)</code> — helius_recovery não descartado.<br>"
+           "✅ Fix 2: Outlier audit top-20 + winsorized p1/p99 para slippage.<br>"
+           "Fill confiável: <code>entry_price_usd > 0 AND tokens_received > 0</code></div>"]
+
+    def _f(v, d=0.0): return float(v) if v is not None else d
+    def _pct(v): return f"{v*100:+.1f}%" if v is not None else "—"
+    def _avg(lst):
+        lst = [x for x in lst if x is not None]
+        return _st.mean(lst) if lst else None
+    def _med(lst):
+        lst = [x for x in lst if x is not None]
+        return _st.median(lst) if lst else None
+    def _p(lst, p):
+        lst = sorted(x for x in lst if x is not None)
+        if not lst: return None
+        return lst[min(int(len(lst)*p/100), len(lst)-1)]
+    def _winsor(vals, lo_pct=1, hi_pct=99):
+        vals = sorted(v for v in vals if v is not None)
+        if not vals: return None
+        lo = vals[min(int(len(vals)*lo_pct/100), len(vals)-1)]
+        hi = vals[min(int(len(vals)*hi_pct/100), len(vals)-1)]
+        clipped = [max(lo, min(hi, v)) for v in vals]
+        return _st.mean(clipped)
+    def _c(v, pos='pos', neg='neg'):
+        if v is None: return "<span class='dim'>—</span>"
+        css = pos if v >= 0 else neg
+        return f"<span class='{css}'>{v*100:+.1f}%</span>"
+    def _n(n):
+        return f"<span class='warn' style='padding:1px 4px'>⚠️ n={n}</span>" if n < 30 else f"n={n}"
+
+    try:
+        with db._cursor() as cur:
+            # ── Load trades with fill data ──
+            cur.execute("""
+                SELECT t.id, t.mint, t.ts_signal AS trade_ts_signal,
+                       t.ts_order_sent, t.ts_order_confirmed,
+                       t.entry_price_usd, t.tokens_received,
+                       t.pnl_pct_real, t.status, t.exit_type, t.fill_source,
+                       t.exit_ts,
+                       bs.mc_at_signal, bs.ts_signal AS bs_ts_signal,
+                       bs.bounce_pct, bs.drop_pct, bs.time_to_bottom,
+                       m.liq_migration, m.exchange, m.smart_wallets,
+                       m.mc_migration, m.is_wash_trading, m.rug_ratio,
+                       m.top10_holder_rate
+                FROM trades t
+                LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+                LEFT JOIN migrations m ON m.mint = t.mint
+                WHERE t.entry_price_usd IS NOT NULL AND t.entry_price_usd > 0
+                  AND t.tokens_received IS NOT NULL AND t.tokens_received > 0
+                ORDER BY t.id
+            """)
+            raw_trades = cur.fetchall()
+
+            # ── Load token_ticks (batch) ──
+            if raw_trades:
+                mints = list({r['mint'] for r in raw_trades})
+                cur.execute("""
+                    SELECT mint, tick_ts, mc, mc_high, mc_low, mc_open, source
+                    FROM token_ticks
+                    WHERE mint = ANY(%s)
+                    ORDER BY mint, tick_ts
+                """, (mints,))
+                tick_rows = cur.fetchall()
+            else:
+                tick_rows = []
+
+        # ── Index ticks by mint ──
+        from collections import defaultdict
+        ticks_by_mint = defaultdict(list)
+        for r in tick_rows:
+            ticks_by_mint[r['mint']].append(r)
+
+        def tick_hilo(t):
+            if t['source'] == 'kline' and t['mc_high'] and t['mc_low']:
+                return float(t['mc_high']), float(t['mc_low']), float(t['mc'] or t['mc_high'])
+            mc = float(t['mc']) if t['mc'] else None
+            return mc, mc, mc
+
+        def get_ticks_after(mint, ref_ts, window_sec=1800):
+            if ref_ts is None:
+                return []
+            result = []
+            for t in ticks_by_mint.get(mint, []):
+                dt = (t['tick_ts'] - ref_ts).total_seconds() if hasattr(t['tick_ts'], 'total_seconds') else (t['tick_ts'] - ref_ts).total_seconds()
+                if 0 <= dt <= window_sec:
+                    result.append({**t, 'secs_after': dt})
+            return result
+
+        def sim_tpsl(entry, ticks, tp_pct, sl_pct, window_sec=1800):
+            if not ticks or entry is None or entry <= 0:
+                return None, None, None
+            tp_target = entry * (1 + tp_pct)
+            sl_floor = entry * (1 - sl_pct)
+            for t in ticks:
+                hi, lo, cl = tick_hilo(t)
+                if hi is None: continue
+                tp_hit = hi >= tp_target
+                sl_hit = lo <= sl_floor
+                if tp_hit and sl_hit:
+                    op = float(t['mc_open']) if t['mc_open'] else (hi + lo) / 2
+                    if op >= (tp_target + sl_floor) / 2:
+                        return 'tp', t['secs_after'], tp_pct
+                    return 'sl', t['secs_after'], -sl_pct
+                if tp_hit:
+                    return 'tp', t['secs_after'], tp_pct
+                if sl_hit:
+                    return 'sl', t['secs_after'], -sl_pct
+            if ticks:
+                _, _, cl = tick_hilo(ticks[-1])
+                if cl and entry > 0:
+                    return 'timeout', ticks[-1]['secs_after'], cl / entry - 1
+            return 'timeout', None, None
+
+        def sim_trailing(entry, ticks, act_pct, dd_pct, stop_pct, window_sec=1800):
+            if not ticks or entry is None or entry <= 0:
+                return None, None, False, None
+            act_mc = entry * (1 + act_pct)
+            stop_mc = entry * (1 - stop_pct)
+            activated = False
+            peak = entry
+            for t in ticks:
+                hi, lo, cl = tick_hilo(t)
+                if hi is None: continue
+                if not activated:
+                    if lo <= stop_mc:
+                        return 'stop_before_act', -stop_pct, False, t['secs_after']
+                    if hi >= act_mc:
+                        activated = True
+                        peak = hi
+                if activated:
+                    if hi > peak:
+                        peak = hi
+                    trail_floor = peak * (1 - dd_pct)
+                    if lo <= trail_floor:
+                        pnl = trail_floor / entry - 1
+                        return 'trailing_exit', pnl, True, t['secs_after']
+            if activated and ticks:
+                _, _, cl = tick_hilo(ticks[-1])
+                pnl = (cl / entry - 1) if cl else None
+                return 'timeout_trailing', pnl, True, ticks[-1]['secs_after']
+            if ticks:
+                _, _, cl = tick_hilo(ticks[-1])
+                pnl = (cl / entry - 1) if cl else None
+                return 'timeout_no_act', pnl, False, ticks[-1]['secs_after']
+            return None, None, False, None
+
+        # ── Build trade records ──
+        trades = []
+        for r in raw_trades:
+            ep = float(r['entry_price_usd'])
+            tr = float(r['tokens_received'])
+            real_entry_mc = (ep / tr) * 1e9
+            sig_mc = float(r['mc_at_signal']) if r['mc_at_signal'] else None
+            slippage = (real_entry_mc / sig_mc - 1) if sig_mc and sig_mc > 0 else None
+
+            # entry_ts_primary with fallback
+            if r['ts_order_confirmed']:
+                entry_ts = r['ts_order_confirmed']
+                ts_src = 'confirmed'
+            elif r['ts_order_sent']:
+                entry_ts = r['ts_order_sent']
+                ts_src = 'sent_fallback'
+            elif r['trade_ts_signal']:
+                entry_ts = r['trade_ts_signal']
+                ts_src = 'signal_fallback'
+            else:
+                entry_ts = None
+                ts_src = 'none'
+
+            # cohort classification
+            liq = float(r['liq_migration']) if r['liq_migration'] else None
+            drop = float(r['drop_pct']) if r['drop_pct'] else None
+            bpct = float(r['bounce_pct']) if r['bounce_pct'] else None
+            ttb = float(r['time_to_bottom']) if r['time_to_bottom'] else None
+
+            cohort = 'Other'
+            if liq is not None and liq >= 20000 and liq < 50000:
+                cohort = 'A: liq 20K-50K'
+            elif liq is not None and liq >= 50000:
+                cohort = 'B: liq ≥50K'
+            elif drop is not None and drop >= 0.70:
+                cohort = 'C: drop≥70%'
+            elif bpct is not None and bpct >= 0.75 and liq is not None and liq >= 20000:
+                cohort = 'D: bounce≥75%+liq≥20K'
+            elif ttb is not None and ttb < 15:
+                cohort = 'E: TTB<15min'
+            elif ttb is not None and ttb < 25:
+                cohort = 'F: TTB<25min'
+            elif r['smart_wallets'] and int(r['smart_wallets']) >= 5:
+                cohort = 'G: smart≥5'
+            elif bpct is not None and bpct >= 0.50:
+                cohort = 'H: bounce≥50%'
+            elif bpct is not None and bpct >= 0.30:
+                cohort = 'I: bounce 30-50%'
+
+            trades.append({
+                'id': r['id'],
+                'mint': r['mint'],
+                'real_entry_mc': real_entry_mc,
+                'sig_mc': sig_mc,
+                'slippage': slippage,
+                'entry_ts': entry_ts,
+                'ts_src': ts_src,
+                'fill_source': r['fill_source'] or 'unknown',
+                'pnl_real': float(r['pnl_pct_real']) if r['pnl_pct_real'] is not None else None,
+                'status': r['status'],
+                'exit_type': r['exit_type'],
+                'cohort': cohort,
+                'bounce_pct': bpct,
+                'drop_pct': drop,
+                'ttb': ttb,
+                'liq': liq,
+                'exchange': r['exchange'],
+            })
+
+        n_total = len(trades)
+
+        # ── §1 Outlier Audit ──
+        out.append("<h2>§1 — Outlier Audit: Slippage</h2>")
+        slippages = [(t['id'], t['mint'][:8], t['slippage'], t['fill_source'], t['ts_src'], t['real_entry_mc'], t['sig_mc'])
+                     for t in trades if t['slippage'] is not None]
+        slippages.sort(key=lambda x: abs(x[2]), reverse=True)
+
+        all_slip = [x[2] for x in slippages]
+        slip_with = [x for x in all_slip if x <= 5.0]  # exclude >500%
+        slip_win = all_slip[:]
+
+        out.append(f"<div class='box'>Universe: <b>{n_total}</b> fill-reliable trades &nbsp;|&nbsp; "
+                   f"<b>{len(all_slip)}</b> with slippage computable &nbsp;|&nbsp; "
+                   f"<b>{sum(1 for x in all_slip if x > 5.0)}</b> outliers >500%</div>")
+
+        def slip_stats(lst, label):
+            if not lst: return f"<tr><td class='l'>{label}</td>" + "<td>—</td>"*8 + "</tr>"
+            mn = _avg(lst)
+            md = _med(lst)
+            p25 = _p(lst, 25)
+            p75 = _p(lst, 75)
+            p99 = _p(lst, 99)
+            wn = _winsor(lst)
+            neg = sum(1 for x in lst if x < 0)
+            return (f"<tr><td class='l'>{label}</td><td>{len(lst)}</td>"
+                    f"<td>{mn*100:+.1f}%</td><td>{md*100:+.1f}%</td>"
+                    f"<td>{p25*100:+.1f}%</td><td>{p75*100:+.1f}%</td>"
+                    f"<td>{p99*100:+.1f}%</td><td>{wn*100:+.1f}%</td>"
+                    f"<td>{neg}</td></tr>")
+
+        out.append("<table><tr><th class='l'>Filter</th><th>n</th><th>Avg</th><th>Median</th>"
+                   "<th>P25</th><th>P75</th><th>P99</th><th>Winsor</th><th>Neg</th></tr>")
+        out.append(slip_stats(all_slip, "All"))
+        out.append(slip_stats(slip_with, "Excl >500%"))
+        out.append(slip_stats(_winsor.__class__ and [x for x in all_slip if _p(all_slip,1) is not None and _p(all_slip,99) is not None and _p(all_slip,1) <= x <= _p(all_slip,99)], "P1-P99 range"))
+        out.append("</table>")
+
+        # Top-20 outliers
+        out.append("<h3>Top-20 outliers por slippage absoluto</h3>")
+        out.append("<table><tr><th>Rank</th><th class='l'>ID</th><th class='l'>Mint</th>"
+                   "<th>Slippage</th><th>RealMC</th><th>SigMC</th><th class='l'>fill_source</th><th class='l'>ts_src</th></tr>")
+        for i, (tid, mint8, slip, fsrc, tsrc, rmc, smc) in enumerate(slippages[:20], 1):
+            c = 'neg' if slip > 0.1 else ('pos' if slip < 0 else '')
+            out.append(f"<tr><td>{i}</td><td class='l'>{tid}</td><td class='l'>{mint8}</td>"
+                       f"<td class='{c}'>{slip*100:+.1f}%</td>"
+                       f"<td>${rmc:,.0f}</td><td>${smc:,.0f}</td>"
+                       f"<td class='l'>{fsrc}</td><td class='l'>{tsrc}</td></tr>")
+        out.append("</table>")
+
+        # ── §2 Robust Entry Stats ──
+        out.append("<h2>§2 — Slippage Robusto por Coorte (Winsorized p1/p99)</h2>")
+        out.append("<div class='warn'>Slippage positivo = entrou MAS CARO que o sinal. "
+                   "Negativo = entrou mais barato (raro). Colunas: n / avg / median / winsor / P25 / P75</div>")
+
+        by_cohort = defaultdict(list)
+        for t in trades:
+            by_cohort[t['cohort']].append(t)
+
+        out.append("<table><tr><th class='l'>Coorte</th><th>n</th>"
+                   "<th>Slip avg</th><th>Slip med</th><th>Slip win</th>"
+                   "<th>P25</th><th>P75</th><th>% neg</th></tr>")
+
+        cohort_order = ['A: liq 20K-50K','B: liq ≥50K','C: drop≥70%','D: bounce≥75%+liq≥20K',
+                        'E: TTB<15min','F: TTB<25min','G: smart≥5','H: bounce≥50%','I: bounce 30-50%','Other']
+
+        for cname in cohort_order:
+            clist = by_cohort.get(cname, [])
+            if not clist: continue
+            slips = [t['slippage'] for t in clist if t['slippage'] is not None]
+            if not slips:
+                out.append(f"<tr><td class='l'>{cname}</td><td>{len(clist)}</td>"
+                           + "<td colspan='6' class='dim'>sem dados</td></tr>")
+                continue
+            flag = " ⚠️" if len(slips) < 30 else ""
+            out.append(f"<tr><td class='l'>{cname}{flag}</td><td>{len(clist)}</td>"
+                       f"<td>{_pct(_avg(slips))}</td><td>{_pct(_med(slips))}</td>"
+                       f"<td>{_pct(_winsor(slips))}</td>"
+                       f"<td>{_pct(_p(slips,25))}</td><td>{_pct(_p(slips,75))}</td>"
+                       f"<td>{sum(1 for x in slips if x<0)/len(slips)*100:.0f}%</td></tr>")
+
+        # Also by fill_source
+        out.append("</table><h3>Por fill_source</h3>")
+        out.append("<table><tr><th class='l'>fill_source</th><th>n</th>"
+                   "<th>Slip avg</th><th>Slip med</th><th>Slip win</th><th>P25</th><th>P75</th></tr>")
+        by_fs = defaultdict(list)
+        for t in trades:
+            by_fs[t['fill_source']].append(t)
+        for fsrc, flist in sorted(by_fs.items()):
+            slips = [t['slippage'] for t in flist if t['slippage'] is not None]
+            if not slips:
+                out.append(f"<tr><td class='l'>{fsrc}</td><td>{len(flist)}</td>"
+                           + "<td colspan='5' class='dim'>sem dados</td></tr>")
+                continue
+            out.append(f"<tr><td class='l'>{fsrc}</td><td>{len(flist)}</td>"
+                       f"<td>{_pct(_avg(slips))}</td><td>{_pct(_med(slips))}</td>"
+                       f"<td>{_pct(_winsor(slips))}</td>"
+                       f"<td>{_pct(_p(slips,25))}</td><td>{_pct(_p(slips,75))}</td></tr>")
+
+        # By ts_src
+        out.append("</table><h3>Por ts_source</h3>")
+        out.append("<table><tr><th class='l'>ts_source</th><th>n</th>"
+                   "<th>Slip avg</th><th>Slip med</th><th>Slip win</th><th>P25</th><th>P75</th></tr>")
+        by_ts = defaultdict(list)
+        for t in trades:
+            by_ts[t['ts_src']].append(t)
+        for tsrc, tlist in sorted(by_ts.items()):
+            slips = [t['slippage'] for t in tlist if t['slippage'] is not None]
+            if not slips:
+                out.append(f"<tr><td class='l'>{tsrc}</td><td>{len(tlist)}</td>"
+                           + "<td colspan='5' class='dim'>sem dados</td></tr>")
+                continue
+            out.append(f"<tr><td class='l'>{tsrc}</td><td>{len(tlist)}</td>"
+                       f"<td>{_pct(_avg(slips))}</td><td>{_pct(_med(slips))}</td>"
+                       f"<td>{_pct(_winsor(slips))}</td>"
+                       f"<td>{_pct(_p(slips,25))}</td><td>{_pct(_p(slips,75))}</td></tr>")
+        out.append("</table>")
+
+        # ── §3 Capture Ratio ──
+        out.append("<h2>§3 — Capture Ratio (real_entry / signal_entry)</h2>")
+        out.append("<div class='box'>Capture ratio = quão acima do sinal entrou na realidade. "
+                   "1.0 = perfeito. 1.10 = 10% mais caro. Ideal: &lt;1.05</div>")
+
+        trades_with_ts = [t for t in trades if t['entry_ts'] is not None and t['sig_mc'] and t['real_entry_mc']]
+        capture_ratios = [t['real_entry_mc'] / t['sig_mc'] for t in trades_with_ts if t['sig_mc'] > 0]
+
+        if capture_ratios:
+            out.append(f"<div class='box'>"
+                       f"n={len(capture_ratios)} &nbsp;|&nbsp; "
+                       f"avg={_avg(capture_ratios):.3f} &nbsp;|&nbsp; "
+                       f"median={_med(capture_ratios):.3f} &nbsp;|&nbsp; "
+                       f"winsor={_winsor(capture_ratios):.3f} &nbsp;|&nbsp; "
+                       f"P25={_p(capture_ratios,25):.3f} &nbsp;|&nbsp; "
+                       f"P75={_p(capture_ratios,75):.3f} &nbsp;|&nbsp; "
+                       f"P99={_p(capture_ratios,99):.3f}"
+                       f"</div>")
+
+        out.append("<table><tr><th class='l'>Grupo</th><th>n</th>"
+                   "<th>avg ratio</th><th>median</th><th>winsor</th><th>P25</th><th>P75</th></tr>")
+
+        groups_3 = [
+            ('fill_source', by_fs),
+            ('ts_source', by_ts),
+        ]
+        for glabel, gdict in groups_3:
+            for gname, glist in sorted(gdict.items()):
+                crs = [t['real_entry_mc']/t['sig_mc'] for t in glist
+                       if t['sig_mc'] and t['sig_mc'] > 0 and t['real_entry_mc']]
+                if not crs: continue
+                flag = " ⚠️" if len(crs) < 30 else ""
+                out.append(f"<tr><td class='l'>{glabel}={gname}{flag}</td><td>{len(crs)}</td>"
+                           f"<td>{_avg(crs):.3f}</td><td>{_med(crs):.3f}</td>"
+                           f"<td>{_winsor(crs):.3f}</td>"
+                           f"<td>{_p(crs,25):.3f}</td><td>{_p(crs,75):.3f}</td></tr>")
+
+        for cname in cohort_order:
+            clist = by_cohort.get(cname, [])
+            if not clist: continue
+            crs = [t['real_entry_mc']/t['sig_mc'] for t in clist
+                   if t['sig_mc'] and t['sig_mc'] > 0 and t['real_entry_mc']]
+            if not crs: continue
+            flag = " ⚠️" if len(crs) < 30 else ""
+            out.append(f"<tr><td class='l'>cohort={cname}{flag}</td><td>{len(crs)}</td>"
+                       f"<td>{_avg(crs):.3f}</td><td>{_med(crs):.3f}</td>"
+                       f"<td>{_winsor(crs):.3f}</td>"
+                       f"<td>{_p(crs,25):.3f}</td><td>{_p(crs,75):.3f}</td></tr>")
+        out.append("</table>")
+
+        # ── §4 Movement signal → entry_ts ──
+        out.append("<h2>§4 — Movimento entre sinal e entry_ts_primary</h2>")
+        out.append("<div class='box'>Quanto o preço já se moveu entre o sinal de bounce e o momento real de entrada. "
+                   "Ticks dentro da janela sinal→entry_ts.</div>")
+
+        move_data = []
+        for t in trades:
+            if t['entry_ts'] is None or t['sig_mc'] is None: continue
+            sig_ts = None
+            for r in raw_trades:
+                if r['id'] == t['id']:
+                    sig_ts = r['bs_ts_signal'] or r['trade_ts_signal']
+                    break
+            if sig_ts is None: continue
+            if hasattr(t['entry_ts'], 'total_seconds'):
+                gap_sec = t['entry_ts'].total_seconds()
+            else:
+                try:
+                    gap_sec = (t['entry_ts'] - sig_ts).total_seconds()
+                except:
+                    continue
+            if gap_sec < 0: continue
+
+            # ticks between sig_ts and entry_ts
+            window_ticks = [tk for tk in ticks_by_mint.get(t['mint'], [])
+                            if sig_ts <= tk['tick_ts'] <= t['entry_ts']]
+            if window_ticks:
+                last_mc_vals = [float(tk['mc']) for tk in window_ticks if tk['mc']]
+                if last_mc_vals and t['sig_mc'] > 0:
+                    last_mc = last_mc_vals[-1]
+                    move = last_mc / t['sig_mc'] - 1
+                    move_data.append({'gap_sec': gap_sec, 'move': move, 'n_ticks': len(window_ticks), 'ts_src': t['ts_src']})
+
+        if move_data:
+            moves = [d['move'] for d in move_data]
+            gaps = [d['gap_sec'] for d in move_data]
+            out.append(f"<div class='box'>"
+                       f"Pares com ticks na janela: <b>{len(move_data)}</b> &nbsp;|&nbsp; "
+                       f"Gap median: <b>{_med(gaps):.0f}s</b> &nbsp;|&nbsp; "
+                       f"Gap avg: <b>{_avg(gaps):.0f}s</b><br>"
+                       f"Move median: <b>{_pct(_med(moves))}</b> &nbsp;|&nbsp; "
+                       f"Move avg: <b>{_pct(_avg(moves))}</b> &nbsp;|&nbsp; "
+                       f"Winsor: <b>{_pct(_winsor(moves))}</b>"
+                       f"</div>")
+
+            thresholds = [0.05, 0.10, 0.20, 0.30]
+            out.append("<table><tr><th class='l'>Threshold</th><th>Já subiu &gt;X%</th><th>%</th>"
+                       "<th>Já caiu &gt;X%</th><th>%</th><th>Plano</th></tr>")
+            for thr in thresholds:
+                up = sum(1 for m in moves if m > thr)
+                dn = sum(1 for m in moves if m < -thr)
+                flat = len(moves) - up - dn
+                out.append(f"<tr><td class='l'>±{thr*100:.0f}%</td>"
+                           f"<td class='neg'>{up}</td><td class='neg'>{up/len(moves)*100:.0f}%</td>"
+                           f"<td class='pos'>{dn}</td><td class='pos'>{dn/len(moves)*100:.0f}%</td>"
+                           f"<td>{flat}</td></tr>")
+            out.append("</table>")
+
+            # Breakdown by ts_src
+            out.append("<h3>Por ts_source (gap médio)</h3>")
+            out.append("<table><tr><th class='l'>ts_src</th><th>n</th><th>Gap med (s)</th>"
+                       "<th>Gap avg (s)</th><th>Move med</th><th>Move win</th></tr>")
+            by_ts_move = defaultdict(list)
+            for d in move_data:
+                by_ts_move[d['ts_src']].append(d)
+            for tsrc, dlist in sorted(by_ts_move.items()):
+                gs = [d['gap_sec'] for d in dlist]
+                ms = [d['move'] for d in dlist]
+                out.append(f"<tr><td class='l'>{tsrc}</td><td>{len(dlist)}</td>"
+                           f"<td>{_med(gs):.0f}s</td><td>{_avg(gs):.0f}s</td>"
+                           f"<td>{_pct(_med(ms))}</td><td>{_pct(_winsor(ms))}</td></tr>")
+            out.append("</table>")
+        else:
+            out.append("<div class='warn'>⚠️ Sem pares com ticks na janela sinal→entry_ts.</div>")
+
+        # ── §5 TP/SL Grid from real entry ──
+        out.append("<h2>§5 — Grid TP×SL desde real_entry_mc</h2>")
+        out.append("<div class='box'>Simulação usando real_entry_mc como ponto de entrada. "
+                   "3 tratamentos: EV_A (resolved only) / EV_B (timeout_close) / EV_C (unresolved=−SL%).<br>"
+                   "Ticks: após entry_ts_primary (ou ts_signal como fallback).</div>")
+
+        tp_vals = [0.30, 0.50, 0.75, 1.00, 1.50, 2.00]
+        sl_vals = [0.10, 0.15, 0.20, 0.25, 0.30]
+
+        # Compute outcomes for all trades
+        trade_ticks = {}
+        for t in trades:
+            ref_ts = t['entry_ts']
+            if ref_ts is None:
+                for r in raw_trades:
+                    if r['id'] == t['id']:
+                        ref_ts = r['trade_ts_signal']
+                        break
+            trade_ticks[t['id']] = get_ticks_after(t['mint'], ref_ts)
+
+        def grid_ev(tlist, tp_pct, sl_pct):
+            res = {'tp':0,'sl':0,'timeout':0,'none':0,'pnl_a':[],'pnl_b':[],'pnl_c':[]}
+            for t in tlist:
+                tks = trade_ticks.get(t['id'], [])
+                outcome, secs, pnl = sim_tpsl(t['real_entry_mc'], tks, tp_pct, sl_pct)
+                if outcome == 'tp':
+                    res['tp'] += 1
+                    res['pnl_a'].append(tp_pct); res['pnl_b'].append(tp_pct); res['pnl_c'].append(tp_pct)
+                elif outcome == 'sl':
+                    res['sl'] += 1
+                    res['pnl_a'].append(-sl_pct); res['pnl_b'].append(-sl_pct); res['pnl_c'].append(-sl_pct)
+                elif outcome == 'timeout':
+                    res['timeout'] += 1
+                    if pnl is not None:
+                        res['pnl_b'].append(pnl)
+                    res['pnl_c'].append(-sl_pct)
+                else:
+                    res['none'] += 1
+                    res['pnl_c'].append(-sl_pct)
+            n_res = res['tp'] + res['sl']
+            res['wr'] = res['tp']/n_res if n_res > 0 else None
+            res['ev_a'] = _avg(res['pnl_a'])
+            res['ev_b'] = _avg(res['pnl_b'])
+            res['ev_c'] = _avg(res['pnl_c'])
+            return res
+
+        # Full grid table
+        out.append("<h3>Full universe (n={})</h3>".format(n_total))
+        out.append("<table><tr><th class='l'>TP / SL</th>")
+        for sl in sl_vals:
+            out.append(f"<th>SL {sl*100:.0f}% (EV_A/B/C)</th>")
+        out.append("</tr>")
+        for tp in tp_vals:
+            out.append(f"<tr><td class='l'>TP {tp*100:.0f}%</td>")
+            for sl in sl_vals:
+                g = grid_ev(trades, tp, sl)
+                ev_a = f"{g['ev_a']*100:+.1f}%" if g['ev_a'] is not None else "—"
+                ev_b = f"{g['ev_b']*100:+.1f}%" if g['ev_b'] is not None else "—"
+                ev_c = f"{g['ev_c']*100:+.1f}%" if g['ev_c'] is not None else "—"
+                ca = 'pos' if g['ev_a'] and g['ev_a'] > 0 else 'neg'
+                cb = 'pos' if g['ev_b'] and g['ev_b'] > 0 else 'neg'
+                cc = 'pos' if g['ev_c'] and g['ev_c'] > 0 else 'neg'
+                wr = f"{g['wr']*100:.0f}%" if g['wr'] is not None else "—"
+                out.append(f"<td><span class='{ca}'>{ev_a}</span> / "
+                           f"<span class='{cb}'>{ev_b}</span> / "
+                           f"<span class='{cc}'>{ev_c}</span><br>"
+                           f"<span class='dim'>WR={wr} tp={g['tp']} sl={g['sl']}</span></td>")
+            out.append("</tr>")
+        out.append("</table>")
+
+        # Grid by cohort (best TP=75/SL=20)
+        out.append("<h3>Por Coorte — TP=75%/SL=20% (referência)</h3>")
+        out.append("<table><tr><th class='l'>Coorte</th><th>n</th><th>WR</th>"
+                   "<th>EV_A</th><th>EV_B</th><th>EV_C</th><th>tp</th><th>sl</th><th>timeout</th></tr>")
+        for cname in cohort_order:
+            clist = by_cohort.get(cname, [])
+            if not clist: continue
+            g = grid_ev(clist, 0.75, 0.20)
+            flag = " ⚠️" if len(clist) < 30 else ""
+            wr = f"{g['wr']*100:.0f}%" if g['wr'] is not None else "—"
+            out.append(f"<tr><td class='l'>{cname}{flag}</td><td>{len(clist)}</td>"
+                       f"<td>{wr}</td>"
+                       f"<td>{_c(g['ev_a'])}</td><td>{_c(g['ev_b'])}</td><td>{_c(g['ev_c'])}</td>"
+                       f"<td>{g['tp']}</td><td>{g['sl']}</td><td>{g['timeout']}</td></tr>")
+        out.append("</table>")
+
+        # ── §6 Trailing from real entry ──
+        out.append("<h2>§6 — Trailing desde real_entry_mc</h2>")
+
+        trail_configs = [
+            (0.50, 0.20, 0.15, "Act50/DD20/Stop15"),
+            (0.75, 0.25, 0.15, "Act75/DD25/Stop15"),
+            (0.75, 0.30, 0.20, "Act75/DD30/Stop20"),
+            (1.00, 0.25, 0.20, "Act100/DD25/Stop20"),
+            (1.50, 0.30, 0.25, "Act150/DD30/Stop25"),
+        ]
+
+        out.append("<table><tr><th class='l'>Config</th><th>n</th><th>Activated</th>"
+                   "<th>Avg PnL act</th><th>Avg PnL all</th><th>Winsor PnL</th>"
+                   "<th>stop_before_act</th><th>trailing_exit</th><th>timeout</th></tr>")
+        for act, dd, stop, cfg_name in trail_configs:
+            outcomes = []
+            pnl_act = []
+            pnl_all = []
+            cnt = defaultdict(int)
+            for t in trades:
+                tks = trade_ticks.get(t['id'], [])
+                outcome, pnl, activated, tt = sim_trailing(t['real_entry_mc'], tks, act, dd, stop)
+                if outcome is None: continue
+                outcomes.append(outcome)
+                cnt[outcome] += 1
+                if pnl is not None:
+                    pnl_all.append(pnl)
+                    if activated:
+                        pnl_act.append(pnl)
+            n_out = len(outcomes)
+            if not n_out:
+                out.append(f"<tr><td class='l'>{cfg_name}</td><td>0</td>"
+                           + "<td colspan='7' class='dim'>sem dados</td></tr>")
+                continue
+            avg_act = _avg(pnl_act)
+            avg_all = _avg(pnl_all)
+            win_all = _winsor(pnl_all)
+            pct_act = cnt['trailing_exit'] + cnt['timeout_trailing']
+            out.append(f"<tr><td class='l'>{cfg_name}</td><td>{n_out}</td>"
+                       f"<td>{pct_act}/{n_out} ({pct_act/n_out*100:.0f}%)</td>"
+                       f"<td>{_pct(avg_act)}</td><td>{_pct(avg_all)}</td><td>{_pct(win_all)}</td>"
+                       f"<td>{cnt['stop_before_act']}</td><td>{cnt['trailing_exit']}</td>"
+                       f"<td>{cnt['timeout_trailing']+cnt['timeout_no_act']}</td></tr>")
+        out.append("</table>")
+
+        # By cohort for best trailing config
+        out.append("<h3>Por Coorte — Act75/DD30/Stop20</h3>")
+        out.append("<table><tr><th class='l'>Coorte</th><th>n</th><th>Activated</th>"
+                   "<th>Avg PnL all</th><th>Winsor PnL</th><th>stop_b_act</th><th>trail_exit</th></tr>")
+        for cname in cohort_order:
+            clist = by_cohort.get(cname, [])
+            if not clist: continue
+            pnl_all = []
+            pnl_act = []
+            cnt = defaultdict(int)
+            for t in clist:
+                tks = trade_ticks.get(t['id'], [])
+                outcome, pnl, activated, tt = sim_trailing(t['real_entry_mc'], tks, 0.75, 0.30, 0.20)
+                if outcome is None: continue
+                cnt[outcome] += 1
+                if pnl is not None:
+                    pnl_all.append(pnl)
+                    if activated: pnl_act.append(pnl)
+            n_out = sum(cnt.values())
+            if not n_out: continue
+            flag = " ⚠️" if len(clist) < 30 else ""
+            pct_act = cnt['trailing_exit'] + cnt['timeout_trailing']
+            out.append(f"<tr><td class='l'>{cname}{flag}</td><td>{len(clist)}</td>"
+                       f"<td>{pct_act}</td>"
+                       f"<td>{_pct(_avg(pnl_all))}</td><td>{_pct(_winsor(pnl_all))}</td>"
+                       f"<td>{cnt['stop_before_act']}</td><td>{cnt['trailing_exit']}</td></tr>")
+        out.append("</table>")
+
+        # ── §7 Real PnL vs Simulated ──
+        out.append("<h2>§7 — PnL Real vs Simulado desde real_entry_mc</h2>")
+        out.append("<div class='box'>PnL real = <code>pnl_pct_real</code> (blockchain). "
+                   "Simulado = sim_tpsl(real_entry_mc, ticks_após_entry_ts, TP=75%, SL=20%).</div>")
+
+        paired = []
+        for t in trades:
+            if t['pnl_real'] is None: continue
+            tks = trade_ticks.get(t['id'], [])
+            outcome, secs, sim_pnl = sim_tpsl(t['real_entry_mc'], tks, 0.75, 0.20)
+            if sim_pnl is None: continue
+            paired.append({
+                'real': t['pnl_real'], 'sim': sim_pnl,
+                'diff': t['pnl_real'] - sim_pnl,
+                'status': t['status'], 'fill_source': t['fill_source'],
+                'cohort': t['cohort'], 'exit_type': t['exit_type']
+            })
+
+        if paired:
+            reals = [p['real'] for p in paired]
+            sims = [p['sim'] for p in paired]
+            diffs = [p['diff'] for p in paired]
+            out.append(f"<div class='box'>"
+                       f"Pares com ambos: <b>{len(paired)}</b><br>"
+                       f"PnL real — avg={_pct(_avg(reals))} | med={_pct(_med(reals))} | win={_pct(_winsor(reals))}<br>"
+                       f"PnL sim  — avg={_pct(_avg(sims))} | med={_pct(_med(sims))} | win={_pct(_winsor(sims))}<br>"
+                       f"Diff(real−sim) — avg={_pct(_avg(diffs))} | med={_pct(_med(diffs))}"
+                       f"</div>")
+
+            out.append("<table><tr><th class='l'>Grupo</th><th>n</th>"
+                       "<th>PnL real avg</th><th>PnL sim avg</th><th>Diff avg</th>"
+                       "<th>PnL real win</th><th>PnL sim win</th></tr>")
+
+            def pnl_row(label, plist):
+                if not plist: return ""
+                r = [p['real'] for p in plist]
+                s = [p['sim'] for p in plist]
+                d = [p['diff'] for p in plist]
+                flag = " ⚠️" if len(plist) < 30 else ""
+                return (f"<tr><td class='l'>{label}{flag}</td><td>{len(plist)}</td>"
+                        f"<td>{_c(_avg(r))}</td><td>{_c(_avg(s))}</td><td>{_c(_avg(d))}</td>"
+                        f"<td>{_c(_winsor(r))}</td><td>{_c(_winsor(s))}</td></tr>")
+
+            out.append(pnl_row("All", paired))
+            # by exit_type
+            by_exit = defaultdict(list)
+            for p in paired:
+                by_exit[p['exit_type'] or 'unknown'].append(p)
+            for k, v in sorted(by_exit.items()):
+                out.append(pnl_row(f"exit={k}", v))
+            # by fill_source
+            by_fsp = defaultdict(list)
+            for p in paired:
+                by_fsp[p['fill_source']].append(p)
+            for k, v in sorted(by_fsp.items()):
+                out.append(pnl_row(f"fill={k}", v))
+            # by cohort
+            for cname in cohort_order:
+                cp = [p for p in paired if p['cohort'] == cname]
+                if cp: out.append(pnl_row(f"cohort={cname}", cp))
+
+            out.append("</table>")
+        else:
+            out.append("<div class='warn'>⚠️ Nenhum trade com pnl_pct_real E ticks após entry_ts.</div>")
+
+        # ── §8 Diagnosis ──
+        out.append("<h2>§8 — Diagnóstico Final</h2>")
+
+        ts_src_counts = defaultdict(int)
+        for t in trades: ts_src_counts[t['ts_src']] += 1
+        fill_counts = defaultdict(int)
+        for t in trades: fill_counts[t['fill_source']] += 1
+
+        out.append("<div class='grid3'>")
+        out.append(f"<div class='kpi'><span class='kpi-val hi'>{n_total}</span>"
+                   f"<div class='kpi-lbl'>Trades fill-confiável</div></div>")
+        out.append(f"<div class='kpi'><span class='kpi-val'>{ts_src_counts['confirmed']}</span>"
+                   f"<div class='kpi-lbl'>ts=confirmed</div></div>")
+        out.append(f"<div class='kpi'><span class='kpi-val neu'>{ts_src_counts['sent_fallback']}</span>"
+                   f"<div class='kpi-lbl'>ts=sent_fallback</div></div>")
+        out.append(f"<div class='kpi'><span class='kpi-val amb'>{ts_src_counts['signal_fallback']}</span>"
+                   f"<div class='kpi-lbl'>ts=signal_fallback</div></div>")
+        out.append(f"<div class='kpi'><span class='kpi-val'>{fill_counts.get('helius',0)+fill_counts.get('helius_recovery',0)}</span>"
+                   f"<div class='kpi-lbl'>helius fills</div></div>")
+        out.append(f"<div class='kpi'><span class='kpi-val'>{fill_counts.get('gmgn',0)+fill_counts.get('gmgn_recovery',0)}</span>"
+                   f"<div class='kpi-lbl'>gmgn fills</div></div>")
+        out.append("</div>")
+
+        # Find best cohort (by EV_C TP=75/SL=20)
+        best_cohort = None
+        best_ev = None
+        for cname in cohort_order:
+            clist = by_cohort.get(cname, [])
+            if len(clist) < 5: continue
+            g = grid_ev(clist, 0.75, 0.20)
+            if g['ev_c'] is not None and (best_ev is None or g['ev_c'] > best_ev):
+                best_ev = g['ev_c']
+                best_cohort = (cname, len(clist), g)
+
+        # Overall EV
+        g_all = grid_ev(trades, 0.75, 0.20)
+
+        out.append("<div class='section'>")
+        out.append(f"<b>A. EV Overall (TP=75%/SL=20%, real_entry_mc)</b><br>"
+                   f"EV_A={_pct(g_all['ev_a'])} | EV_B={_pct(g_all['ev_b'])} | EV_C={_pct(g_all['ev_c'])}<br>"
+                   f"WR={_pct(g_all['wr'])} | tp={g_all['tp']} sl={g_all['sl']} timeout={g_all['timeout']}")
+        if g_all['ev_c'] and g_all['ev_c'] > 0:
+            out.append("<br><span class='pos'>✅ EV_C positivo — estratégia lucrativa mesmo no cenário conservador.</span>")
+        elif g_all['ev_b'] and g_all['ev_b'] > 0:
+            out.append("<br><span class='neu'>⚠️ EV_B positivo mas EV_C negativo — unresolveds determinantes.</span>")
+        else:
+            out.append("<br><span class='neg'>❌ EV negativo em todos os tratamentos.</span>")
+        out.append("</div>")
+
+        out.append("<div class='section'>")
+        out.append("<b>B. Slippage real vs esperado</b><br>")
+        if all_slip:
+            med_s = _med(all_slip)
+            win_s = _winsor(all_slip)
+            out.append(f"Median slippage: {_pct(med_s)} | Winsorized avg: {_pct(win_s)}<br>")
+            if win_s and win_s > 0.10:
+                out.append("<span class='neg'>❌ Slippage winsorizado >10% — execução sistematicamente atrás do sinal.</span>")
+            elif win_s and win_s > 0.05:
+                out.append("<span class='neu'>⚠️ Slippage moderado (5-10%). Monitorar com mais dados.</span>")
+            else:
+                out.append("<span class='pos'>✅ Slippage controlado (&lt;5% winsorizado).</span>")
+        out.append("</div>")
+
+        out.append("<div class='section'>")
+        out.append("<b>C. Cobertura de ticks pós-entrada</b><br>")
+        n_with_ticks = sum(1 for t in trades if trade_ticks.get(t['id']))
+        out.append(f"{n_with_ticks}/{n_total} trades com ticks após entry_ts ({n_with_ticks/n_total*100:.0f}%)<br>")
+        if n_with_ticks / n_total < 0.5:
+            out.append("<span class='neg'>❌ Cobertura &lt;50% — simulações pós-entrada não representativas.</span>")
+        elif n_with_ticks / n_total < 0.8:
+            out.append("<span class='neu'>⚠️ Cobertura 50-80% — usar resultados com cautela.</span>")
+        else:
+            out.append("<span class='pos'>✅ Cobertura ≥80% — simulações representativas.</span>")
+        out.append("</div>")
+
+        out.append("<div class='section'>")
+        out.append("<b>D. Coorte com EV mais alto</b><br>")
+        if best_cohort:
+            cname, cn, g = best_cohort
+            flag = " ⚠️ HIPÓTESE" if cn < 30 else ""
+            out.append(f"<b>{cname}</b> (n={cn}{flag})<br>"
+                       f"EV_A={_pct(g['ev_a'])} | EV_B={_pct(g['ev_b'])} | EV_C={_pct(g['ev_c'])}<br>"
+                       f"WR={_pct(g['wr'])} | tp={g['tp']} sl={g['sl']}")
+        else:
+            out.append("Nenhuma coorte com n≥5.")
+        out.append("</div>")
+
+        out.append("<div class='section'>")
+        out.append("<b>E. Playbook executável existe?</b><br>")
+        playbook_exists = best_cohort and best_cohort[2]['ev_c'] and best_cohort[2]['ev_c'] > 0 and best_cohort[1] >= 15
+        if playbook_exists:
+            cname, cn, g = best_cohort
+            out.append(f"<span class='pos'>✅ Sim. Coorte '{cname}' (n={cn}) tem EV_C={_pct(g['ev_c'])} positivo. "
+                       f"Gate para produção: n≥30 confirmado GMGN.</span>")
+        else:
+            out.append("<span class='neg'>❌ Ainda não. Nenhuma coorte com EV_C>0 e n≥15. "
+                       "Continuar acumulando dados antes de ajustar filtros de produção.</span>")
+        out.append("</div>")
+
+    except Exception:
+        out.append(f"<pre style='color:#f85149'>{_tb.format_exc()}</pre>")
+
+    out.append("</body></html>")
+    return "".join(out)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
