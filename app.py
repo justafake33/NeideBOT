@@ -24493,5 +24493,274 @@ td.L{text-align:left;max-width:260px;overflow:hidden;text-overflow:ellipsis}
     return H
 
 
+# ==============================================================================
+# /analise/entry-ratio  — entry_mc_real / mc_migration: TPs vs SLs
+# Calibra o threshold do filtro ENTRY_RATIO_MAX antes de implementar.
+# ==============================================================================
+
+@app.route("/analise/entry-ratio")
+def analise_entry_ratio():
+    import psycopg2
+    import psycopg2.extras
+
+    PUMP_SUPPLY = 1_000_000_000
+    since_days  = int(request.args.get("since_days", "60"))
+    limit       = min(int(request.args.get("limit", "300")), 500)
+
+    conn = psycopg2.connect(db.DATABASE_URL)
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    # Verifica colunas disponíveis
+    cur.execute("""SELECT column_name FROM information_schema.columns
+        WHERE table_name='trades'
+          AND column_name IN ('mc_at_signal','exit_ts','tokens_received',
+                              'entry_price_usd','fill_source')""")
+    avail       = {r["column_name"] for r in cur.fetchall()}
+    sig_col     = "t.mc_at_signal" if "mc_at_signal" in avail else "NULL::float"
+    exit_ts_col = "t.exit_ts"      if "exit_ts"      in avail else "NULL::timestamptz"
+
+    cur.execute(f"""
+        SELECT t.id, t.symbol, t.mint, t.status,
+               t.entry_price_usd, t.tokens_received, t.fill_source,
+               t.mc_migration, t.mc_bottom, t.entry_expected,
+               t.pnl_pct_real, t.sl_pct, t.tp_pct, t.amount_usd,
+               {sig_col}     AS mc_at_signal,
+               {exit_ts_col} AS exit_ts
+        FROM trades t
+        WHERE t.created_at > NOW() - INTERVAL '{since_days} days'
+          AND t.status NOT IN ('error','pending','cancelled')
+          AND t.order_id IS NOT NULL
+          AND t.mc_migration IS NOT NULL
+          AND t.mc_migration > 0
+        ORDER BY t.created_at DESC
+        LIMIT {limit}
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    # ── Calcula entry_mc e entry_ratio por trade ──────────────────────────────
+    records = []
+    for tr in rows:
+        # entry_mc — hierarquia rigorosa
+        if tr["entry_price_usd"] and tr["tokens_received"] and tr["tokens_received"] > 0:
+            entry_mc  = (tr["entry_price_usd"] / tr["tokens_received"]) * PUMP_SUPPLY
+            src       = "real_fill"
+        elif tr["mc_at_signal"] and tr["mc_at_signal"] > 0:
+            entry_mc  = tr["mc_at_signal"]
+            src       = "mc_at_signal"
+        elif tr["entry_expected"] and tr["entry_expected"] > 0:
+            entry_mc  = tr["entry_expected"]
+            src       = "entry_expected*"
+        else:
+            continue
+
+        mc_mig = tr["mc_migration"]
+        ratio  = entry_mc / mc_mig
+
+        # outcome
+        status  = tr["status"] or ""
+        pnl_db  = tr["pnl_pct_real"]
+        if status == "tp" or (pnl_db is not None and pnl_db > 0.20):
+            outcome = "tp"
+        elif status == "sl" or (pnl_db is not None and pnl_db < -0.10):
+            outcome = "sl"
+        else:
+            outcome = "other"
+
+        records.append({
+            "id": tr["id"], "symbol": tr["symbol"],
+            "entry_mc": entry_mc, "mc_mig": mc_mig, "ratio": ratio,
+            "src": src, "outcome": outcome, "pnl_db": pnl_db,
+            "exit_ts": tr["exit_ts"],
+        })
+
+    # ── Separa TPs e SLs ─────────────────────────────────────────────────────
+    tps  = [r for r in records if r["outcome"] == "tp"]
+    sls  = [r for r in records if r["outcome"] == "sl"]
+    n_real_fill = sum(1 for r in records if r["src"] == "real_fill")
+
+    def bucket_dist(recs, thresholds):
+        """Conta quantos têm ratio <= threshold."""
+        total = len(recs)
+        if not total:
+            return {}
+        return {t: sum(1 for r in recs if r["ratio"] <= t) for t in thresholds}
+
+    thresholds = [0.80, 0.90, 1.00, 1.10, 1.20, 1.30, 1.50, 2.00, 3.00]
+    tp_dist  = bucket_dist(tps,  thresholds)
+    sl_dist  = bucket_dist(sls,  thresholds)
+
+    def avg(lst): return sum(lst)/len(lst) if lst else None
+    tp_ratios  = [r["ratio"] for r in tps]
+    sl_ratios  = [r["ratio"] for r in sls]
+    tp_avg     = avg(tp_ratios)
+    sl_avg     = avg(sl_ratios)
+    tp_med     = sorted(tp_ratios)[len(tp_ratios)//2] if tp_ratios else None
+    sl_med     = sorted(sl_ratios)[len(sl_ratios)//2] if sl_ratios else None
+
+    # ── Encontra threshold ótimo (maximiza separação TP/SL) ──────────────────
+    # Para cada threshold T: "TPs com ratio<=T" vs "SLs com ratio<=T"
+    # Queremos: maioria dos TPs abaixo de T, maioria dos SLs acima de T
+    best_thr = None
+    best_sep = -1
+    n_tp = len(tps)
+    n_sl = len(sls)
+    for t in thresholds:
+        tp_below = tp_dist.get(t, 0) / n_tp  if n_tp else 0
+        sl_above = 1 - (sl_dist.get(t, 0) / n_sl if n_sl else 0)
+        # F1-like: harmonic mean de sensitivity (TPs abaixo) + specificity (SLs acima)
+        sep = 2 * tp_below * sl_above / (tp_below + sl_above) if (tp_below + sl_above) > 0 else 0
+        if sep > best_sep:
+            best_sep = sep
+            best_thr = t
+
+    # ── HTML ──────────────────────────────────────────────────────────────────
+    def pct(v, d=1):
+        if v is None: return "<span style='color:#555'>—</span>"
+        c = "#4f4" if v > 0.01 else ("#f44" if v < -0.01 else "#888")
+        return f"<span style='color:{c}'>{v*100:+.{d}f}%</span>"
+    def ratio_c(r):
+        if r is None: return "—"
+        c = "#4f4" if r <= 1.0 else ("#fa0" if r <= 1.30 else "#f44")
+        return f"<span style='color:{c}'>{r:.2f}x</span>"
+
+    H = """<!DOCTYPE html><html><head><meta charset='utf-8'><title>Entry Ratio</title>
+<style>
+body{font-family:monospace;font-size:12px;background:#0e0e0e;color:#ddd;padding:16px}
+h2{color:#f90}h3{color:#8cf;margin-top:20px}
+table{border-collapse:collapse;margin-bottom:14px}
+th{background:#1a1a2e;color:#8cf;padding:4px 10px;border:1px solid #333;text-align:right;white-space:nowrap}
+th.L{text-align:left}
+td{padding:3px 10px;border:1px solid #1a1a1a;text-align:right;white-space:nowrap}
+td.L{text-align:left}
+.pos{color:#4f4}.neg{color:#f44}.warn{color:#fa0}.null{color:#555}
+.box{background:#111;border:1px solid #333;padding:10px;margin:8px 0;border-radius:4px}
+.bar-tp{display:inline-block;background:#2a5;height:10px;vertical-align:middle}
+.bar-sl{display:inline-block;background:#a22;height:10px;vertical-align:middle}
+</style></head><body>"""
+
+    H += f"<h2>📐 entry_mc / mc_migration — TPs vs SLs</h2>"
+    H += f"<div class='box'>"
+    H += f"<b>Trades analisados:</b> {len(records)} | TPs: {n_tp} | SLs: {n_sl} | outros: {len(records)-n_tp-n_sl}<br>"
+    H += f"<b>fill_real:</b> {n_real_fill} ({n_real_fill/len(records)*100:.0f}%) | "
+    H += f"mc_at_signal: {sum(1 for r in records if r['src']=='mc_at_signal')} | "
+    H += f"entry_expected*: {sum(1 for r in records if r['src']=='entry_expected*')}<br>"
+    if n_real_fill < n_tp:
+        H += "<span class='warn'>⚠️ Alguns TPs sem fill_real — ratios podem estar subestimados (entry_expected* < real fill).</span><br>"
+    H += f"<b>Período:</b> últimos {since_days} dias"
+    H += "</div>"
+
+    # ── Seção 1: Estatísticas ─────────────────────────────────────────────────
+    H += "<h3>1 — Estatísticas por outcome</h3>"
+    H += "<table><tr><th class='L'>Outcome</th><th>n</th><th>avg ratio</th><th>mediana ratio</th><th>min</th><th>max</th><th>% com ratio≤1.0</th><th>% com ratio≤1.2</th></tr>"
+    for label, recs, ratios in [("✅ TP", tps, tp_ratios), ("❌ SL", sls, sl_ratios)]:
+        if not recs: continue
+        n = len(recs)
+        H += f"<tr><td class='L'><b>{label}</b></td><td>{n}</td>"
+        H += f"<td>{ratio_c(avg(ratios))}</td>"
+        H += f"<td>{ratio_c(sorted(ratios)[n//2])}</td>"
+        H += f"<td>{ratio_c(min(ratios))}</td>"
+        H += f"<td>{ratio_c(max(ratios))}</td>"
+        H += f"<td>{sum(1 for r in recs if r['ratio']<=1.0)/n*100:.0f}%</td>"
+        H += f"<td>{sum(1 for r in recs if r['ratio']<=1.2)/n*100:.0f}%</td>"
+        H += "</tr>"
+    H += "</table>"
+
+    # ── Seção 2: Distribuição cumulativa ─────────────────────────────────────
+    H += "<h3>2 — Distribuição cumulativa de entry_ratio</h3>"
+    H += "<p style='color:#888;font-size:11px'>Leitura: '% dos TPs com ratio ≤ X' — quanto maior, melhor a separação nesse threshold.</p>"
+    H += "<table><tr><th>entry_ratio ≤</th>"
+    H += "<th>TPs abaixo (n)</th><th>TPs abaixo (%)</th>"
+    H += "<th>SLs abaixo (n)</th><th>SLs abaixo (%)</th>"
+    H += "<th>SLs ACIMA (%)</th><th>Separação</th></tr>"
+    for t in thresholds:
+        tp_b = tp_dist.get(t, 0)
+        sl_b = sl_dist.get(t, 0)
+        tp_b_pct = tp_b / n_tp * 100 if n_tp else 0
+        sl_b_pct = sl_b / n_sl * 100 if n_sl else 0
+        sl_a_pct = 100 - sl_b_pct
+        # Separação: queremos tp_b_pct alto E sl_a_pct alto
+        sep = (tp_b_pct + sl_a_pct) / 2
+        is_best = (t == best_thr)
+        brd = "border-left:3px solid #4f4" if is_best else ""
+        sep_c = "#4f4" if sep >= 60 else ("#fa0" if sep >= 50 else "#888")
+        tp_bar = f"<span class='bar-tp' style='width:{tp_b_pct:.0f}px'></span> {tp_b_pct:.0f}%"
+        sl_bar = f"<span class='bar-sl' style='width:{sl_b_pct:.0f}px'></span> {sl_b_pct:.0f}%"
+        best_mark = " ← melhor separação" if is_best else ""
+        H += f"<tr style='{brd}{'background:#0a1a0a' if is_best else ''}'>"
+        H += f"<td><b>{'⭐ ' if is_best else ''}{t:.2f}x</b></td>"
+        H += f"<td>{tp_b}</td><td>{tp_bar}</td>"
+        H += f"<td>{sl_b}</td><td>{sl_bar}</td>"
+        H += f"<td>{sl_a_pct:.0f}%</td>"
+        H += f"<td><span style='color:{sep_c}'>{sep:.0f}pts{best_mark}</span></td>"
+        H += "</tr>"
+    H += "</table>"
+
+    # ── Seção 3: Trade-by-trade separado por TP/SL ───────────────────────────
+    H += "<h3>3 — Trade-by-trade</h3>"
+
+    for group_label, group_recs, bg_h in [
+        ("✅ TPs", sorted(tps, key=lambda r: r["ratio"]), "#001a00"),
+        ("❌ SLs", sorted(sls, key=lambda r: r["ratio"]), "#1a0000"),
+    ]:
+        if not group_recs: continue
+        H += f"<h4 style='color:#aaa'>{group_label} — ordenado por ratio crescente</h4>"
+        H += "<table><tr><th class='L'>#</th><th class='L'>symbol</th><th>src</th>"
+        H += "<th>entry_mc</th><th>mc_migration</th><th>ratio</th><th>pnl_db</th></tr>"
+        for r in group_recs:
+            rc = "#4f4" if r["ratio"] <= 1.0 else ("#fa0" if r["ratio"] <= 1.30 else "#f44")
+            src_badge = {"real_fill":"<span style='color:#4f4'>f</span>",
+                         "mc_at_signal":"<span style='color:#fa0'>s</span>",
+                         "entry_expected*":"<span style='color:#f44'>*</span>"}.get(r["src"],"?")
+            H += f"<tr style='background:{bg_h}'>"
+            H += f"<td class='L'>{r['id']}</td><td class='L'><b>{r['symbol']}</b></td>"
+            H += f"<td>{src_badge}</td>"
+            H += f"<td>${r['entry_mc']/1000:.1f}k</td>"
+            H += f"<td>${r['mc_mig']/1000:.1f}k</td>"
+            H += f"<td><b style='color:{rc}'>{r['ratio']:.2f}x</b></td>"
+            H += f"<td>{pct(r['pnl_db'])}</td>"
+            H += "</tr>"
+        H += "</table>"
+
+    # ── Seção 4: Recomendação ─────────────────────────────────────────────────
+    H += "<h3>4 — Recomendação para ENTRY_RATIO_MAX</h3>"
+    H += "<div class='box'>"
+
+    conf = " <span style='color:#fa0'>(baseada em fill_real — confiável)</span>" if n_real_fill >= n_tp // 2 else \
+           " <span style='color:#f44'>(fraca — poucos fill_real)</span>"
+    H += f"<b>Análise{conf}:</b><br>"
+    H += f"TPs: avg_ratio={tp_avg:.2f}x | mediana={tp_med:.2f}x<br>" if tp_avg else ""
+    H += f"SLs: avg_ratio={sl_avg:.2f}x | mediana={sl_med:.2f}x<br>" if sl_avg else ""
+
+    if tp_avg and sl_avg:
+        gap = sl_avg - tp_avg
+        H += f"Gap médio (SL − TP): {gap*100:+.0f}pp<br><br>"
+
+    if best_thr and best_sep > 0:
+        tp_at_best = tp_dist.get(best_thr,0)/n_tp*100 if n_tp else 0
+        sl_at_best = 100-(sl_dist.get(best_thr,0)/n_sl*100 if n_sl else 0)
+        H += f"<b>Threshold com melhor separação: {best_thr:.2f}x</b><br>"
+        H += f"  → {tp_at_best:.0f}% dos TPs têm ratio ≤ {best_thr:.2f}x (entrariam)<br>"
+        H += f"  → {sl_at_best:.0f}% dos SLs têm ratio > {best_thr:.2f}x (seriam bloqueados)<br><br>"
+
+        if tp_at_best >= 60 and sl_at_best >= 40:
+            H += f"<span class='pos'>✓ <b>ENTRY_RATIO_MAX = {best_thr:.2f}</b> é um candidato viável.</span><br>"
+            H += f"Captura {tp_at_best:.0f}% dos TPs históricos e bloqueia {sl_at_best:.0f}% dos SLs.<br>"
+        elif tp_at_best < 40:
+            H += "<span class='warn'>⚠️ Threshold não discrimina bem — TPs e SLs têm distribuição similar.<br>"
+            H += "Entry ratio pode não ser o discriminador principal. Coletar mais fill_real antes de decidir.</span><br>"
+        else:
+            H += f"<span class='warn'>Separação moderada. Testar {best_thr:.2f}x com cautela — monitorar impacto em frequência de trades.</span><br>"
+
+    H += "<br><b>Próximo passo:</b><br>"
+    H += "1. Se separação ≥ 60pts: implementar <code>ENTRY_RATIO_MAX</code> no Railway (env var, zero código).<br>"
+    H += "2. Se separação < 50pts: ratio não discrimina — investigar outro campo (bounce_pct_signal? elapsed?).<br>"
+    H += "3. Lógica: não bloquear o token, manter no HotMonitor aguardando correção para a zona válida.<br>"
+    H += "</div>"
+
+    H += "</body></html>"
+    return H
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
