@@ -17474,5 +17474,979 @@ def analise_config_comparison():
     return "".join(out)
 
 
+@app.route("/analise/signal-edge")
+def analise_signal_edge():
+    """Rodada 2 — Análise de edge do sinal bruto (sem execução).
+    Entry teórica = bounce_signals.mc_at_signal. Zero slippage, zero fee.
+    Testa se o sinal tem EV positivo antes da execução.
+    """
+    import traceback as _tb
+    import statistics as _st
+
+    CSS = """<style>
+    body{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:20px;max-width:1400px;margin:0 auto}
+    h1{color:#58a6ff;border-bottom:1px solid #30363d;padding-bottom:8px}
+    h2{color:#79c0ff;margin-top:32px;margin-bottom:6px;border-bottom:1px solid #21262d;padding-bottom:4px}
+    h3{color:#8b949e;margin:16px 0 4px}
+    table{border-collapse:collapse;width:100%;margin-bottom:16px;font-size:12px}
+    th{background:#161b22;color:#8b949e;padding:5px 8px;text-align:right;border:1px solid #30363d}
+    th.l{text-align:left}
+    td{padding:4px 8px;border:1px solid #21262d;text-align:right}
+    td.l{text-align:left}
+    tr:hover td{background:#1c2128}
+    .tp{color:#3fb950;font-weight:bold}.sl{color:#f85149;font-weight:bold}
+    .neu{color:#e3b341}.dim{color:#6e7681}.hi{color:#58a6ff;font-weight:bold}
+    .pos{color:#3fb950}.neg{color:#f85149}
+    .box{background:#161b22;border:1px solid #30363d;padding:12px 16px;margin:10px 0;border-radius:6px;font-size:13px}
+    .warn{background:#1c1400;border:1px solid #bb8009;padding:8px 12px;border-radius:4px;margin:6px 0;font-size:12px}
+    .grid2{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin:10px 0}
+    .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:10px 0}
+    .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:10px 0}
+    .kpi{background:#161b22;border:1px solid #30363d;padding:12px;border-radius:6px;text-align:center}
+    .kpi-val{font-size:22px;font-weight:bold;display:block}
+    .kpi-lbl{font-size:11px;color:#8b949e;margin-top:4px}
+    a{color:#58a6ff}
+    pre{background:#0d1117;padding:10px;overflow:auto;font-size:12px;border:1px solid #21262d;border-radius:4px}
+    .section{margin-top:24px;padding:16px;background:#0d1117;border:1px solid #21262d;border-radius:6px}
+    </style>"""
+
+    NAV = "<p style='margin-bottom:16px'><a href='/analise'>Análise</a> · <a href='/analise/signal-edge'>Signal Edge (Rodada 2)</a> · <a href='/analise/correlacao'>Correlação</a> · <a href='/analise/backtest'>Backtest</a></p>"
+
+    out = [f"<!DOCTYPE html><html><head><title>Rodada 2 — Signal Edge</title>{CSS}</head><body>", NAV,
+           "<h1>🎯 Rodada 2 — Edge do Sinal Bruto (sem execução)</h1>",
+           "<div class='box'>Entry teórica = <code>bounce_signals.mc_at_signal</code>. Zero slippage, zero fee, zero latência.<br>"
+           "Pergunta central: <b>o sinal tem EV positivo antes da execução?</b><br>"
+           "<span class='dim'>Fontes: bounce_signals + token_ticks + migrations (só contexto). Trades ignorados.</span></div>"]
+
+    def _f(v, default=0.0):
+        return float(v) if v is not None else default
+
+    def _pct(v, default=None):
+        if v is None: return default
+        return float(v) * 100
+
+    def _avg(lst):
+        lst = [x for x in lst if x is not None]
+        return _st.mean(lst) if lst else None
+
+    def _med(lst):
+        lst = [x for x in lst if x is not None]
+        return _st.median(lst) if lst else None
+
+    def _p(lst, p):
+        lst = sorted(x for x in lst if x is not None)
+        if not lst: return None
+        idx = int(len(lst) * p / 100)
+        return lst[min(idx, len(lst)-1)]
+
+    def fmt(v, decimals=1, suffix='%', default='—'):
+        if v is None: return default
+        sign = '+' if v > 0 else ''
+        return f"{sign}{v:.{decimals}f}{suffix}"
+
+    def color_ev(ev):
+        if ev is None: return 'dim'
+        return 'tp' if ev > 3 else ('sl' if ev < -3 else 'neu')
+
+    def flag_n(n):
+        return "⚠️" if n < 30 else ""
+
+    try:
+      with db._cursor() as cur:
+
+        # ── SECTION 1: COVERAGE ──────────────────────────────────────────────
+        out.append("<h2>§1 — Cobertura dos Sinais</h2>")
+
+        cur.execute("""
+            SELECT
+                COUNT(*) AS total,
+                COUNT(mc_at_signal) AS has_entry,
+                COUNT(mc_migration) AS has_mig,
+                COUNT(mc_min) AS has_min,
+                COUNT(CASE WHEN mc_at_signal IS NOT NULL AND mc_migration IS NOT NULL AND mc_min IS NOT NULL THEN 1 END) AS all_three,
+                COUNT(CASE WHEN absorption_events IS NOT NULL THEN 1 END) AS has_absorption,
+                COUNT(CASE WHEN p30s_events IS NOT NULL THEN 1 END) AS has_p30s,
+                COUNT(CASE WHEN p60s_events IS NOT NULL THEN 1 END) AS has_p60s,
+                MIN(ts_signal) AS oldest,
+                MAX(ts_signal) AS newest
+            FROM bounce_signals
+        """)
+        cov = cur.fetchone()
+        total_bs = cov['total']
+
+        out.append(f"""<div class='grid4'>
+          <div class='kpi'><span class='kpi-val'>{cov['total']}</span><span class='kpi-lbl'>Total bounce_signals</span></div>
+          <div class='kpi'><span class='kpi-val {"tp" if cov["has_entry"] > 0 else "sl"}'>{cov['has_entry']}</span><span class='kpi-lbl'>Com mc_at_signal ({100*cov['has_entry']//max(cov['total'],1)}%)</span></div>
+          <div class='kpi'><span class='kpi-val'>{cov['all_three']}</span><span class='kpi-lbl'>Com todos os 3 mc ({100*cov['all_three']//max(cov['total'],1)}%)</span></div>
+          <div class='kpi'><span class='kpi-val'>{cov['has_absorption']}</span><span class='kpi-lbl'>Com absorption H22 ({100*cov['has_absorption']//max(cov['total'],1)}%)</span></div>
+        </div>
+        <div class='box dim'>Janela: {cov['oldest']} → {cov['newest']} | p30s: {cov['has_p30s']} | p60s: {cov['has_p60s']}</div>""")
+
+        # Tick coverage per window
+        cur.execute("""
+            SELECT
+                bs.mint,
+                bs.ts_signal,
+                bs.mc_at_signal,
+                MAX(EXTRACT(EPOCH FROM (tt.tick_ts - bs.ts_signal))) AS max_secs_after,
+                COUNT(tt.id) AS n_ticks,
+                STRING_AGG(DISTINCT tt.source, ',') AS sources
+            FROM bounce_signals bs
+            JOIN token_ticks tt ON tt.mint = bs.mint AND tt.tick_ts > bs.ts_signal
+            WHERE bs.mc_at_signal IS NOT NULL
+            GROUP BY bs.mint, bs.ts_signal, bs.mc_at_signal
+        """)
+        tick_cov_rows = cur.fetchall()
+        n_with_ticks = len(tick_cov_rows)
+        n_5m = sum(1 for r in tick_cov_rows if r['max_secs_after'] >= 300)
+        n_10m = sum(1 for r in tick_cov_rows if r['max_secs_after'] >= 600)
+        n_20m = sum(1 for r in tick_cov_rows if r['max_secs_after'] >= 1200)
+        n_30m = sum(1 for r in tick_cov_rows if r['max_secs_after'] >= 1800)
+        n_60m = sum(1 for r in tick_cov_rows if r['max_secs_after'] >= 3600)
+        source_counts = {}
+        for r in tick_cov_rows:
+            for src in (r['sources'] or '').split(','):
+                source_counts[src] = source_counts.get(src, 0) + 1
+        n_mc_signal = cov['has_entry']
+
+        out.append(f"""<table><tr>
+          <th class='l'>Janela de ticks após sinal</th><th>n sinais</th><th>% dos com mc_at_signal</th></tr>
+          <tr><td class='l'>≥1 tick (qualquer)</td><td>{n_with_ticks}</td><td>{100*n_with_ticks//max(n_mc_signal,1)}%</td></tr>
+          <tr><td class='l'>≥5min de ticks</td><td>{n_5m}</td><td>{100*n_5m//max(n_mc_signal,1)}%</td></tr>
+          <tr><td class='l'>≥10min de ticks</td><td>{n_10m}</td><td>{100*n_10m//max(n_mc_signal,1)}%</td></tr>
+          <tr><td class='l'>≥20min de ticks</td><td>{n_20m}</td><td>{100*n_20m//max(n_mc_signal,1)}%</td></tr>
+          <tr><td class='l'>≥30min de ticks</td><td>{n_30m}</td><td>{100*n_30m//max(n_mc_signal,1)}%</td></tr>
+          <tr><td class='l'>≥60min de ticks</td><td>{n_60m}</td><td>{100*n_60m//max(n_mc_signal,1)}%</td></tr>
+        </table>
+        <div class='box dim'>Fontes de ticks: {source_counts}</div>""")
+
+        # ── BUILD SIGNAL DATASET ─────────────────────────────────────────────
+        # Fetch all signals with ticks
+        cur.execute("""
+            SELECT bs.mint, bs.symbol, bs.ts_signal, bs.elapsed_sec,
+                   bs.mc_migration, bs.mc_min, bs.mc_at_signal,
+                   bs.drop_from_mig, bs.bounce_pct,
+                   bs.absorption_buy_vol, bs.absorption_sell_vol,
+                   bs.absorption_buy_cnt, bs.absorption_sell_cnt,
+                   bs.absorption_lrg_buy, bs.absorption_events,
+                   bs.p30s_buy_vol, bs.p30s_sell_vol, bs.p30s_events,
+                   bs.p60s_buy_vol, bs.p60s_sell_vol, bs.p60s_events
+            FROM bounce_signals bs
+            WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+            ORDER BY bs.ts_signal
+        """)
+        signals = cur.fetchall()
+
+        # Fetch all relevant ticks in one query (avoid N+1)
+        mints_with_signal = [s['mint'] for s in signals]
+        if not mints_with_signal:
+            out.append("<div class='box sl'>Nenhum sinal com mc_at_signal encontrado.</div>")
+            out.append("</body></html>")
+            return "".join(out)
+
+        cur.execute("""
+            SELECT tt.mint, tt.tick_ts, tt.mc, tt.mc_high, tt.mc_low, tt.source,
+                   bs.ts_signal,
+                   EXTRACT(EPOCH FROM (tt.tick_ts - bs.ts_signal)) AS secs_after
+            FROM token_ticks tt
+            JOIN bounce_signals bs ON bs.mint = tt.mint
+            WHERE tt.mint = ANY(%s) AND tt.tick_ts > bs.ts_signal
+            ORDER BY tt.mint, tt.tick_ts
+        """, (mints_with_signal,))
+        all_ticks_raw = cur.fetchall()
+
+        # Index ticks by mint
+        ticks_by_mint = {}
+        for row in all_ticks_raw:
+            m = row['mint']
+            if m not in ticks_by_mint:
+                ticks_by_mint[m] = []
+            ticks_by_mint[m].append(row)
+
+        # Build signal+ticks pairs
+        sig_data = []
+        for s in signals:
+            entry = _f(s['mc_at_signal'])
+            if entry <= 0:
+                continue
+            ticks = ticks_by_mint.get(s['mint'], [])
+            sig_data.append({'signal': s, 'entry': entry, 'ticks': ticks})
+
+        n_with_any_ticks = sum(1 for d in sig_data if d['ticks'])
+
+        # Helper: walk ticks, return outcome for a given TP/SL
+        def eval_tpsl(entry, ticks, tp_pct, sl_pct, window_sec=None):
+            """Returns ('win', secs) | ('loss', secs) | (None, None).
+            Conservative: if same candle hits both, SL wins."""
+            tp_mc = entry * (1 + tp_pct)
+            sl_mc = entry * (1 - sl_pct)
+            for t in ticks:
+                secs = float(t['secs_after'])
+                if window_sec and secs > window_sec:
+                    break
+                src = t['source']
+                if src == 'kline':
+                    hi = _f(t['mc_high']) if t['mc_high'] else _f(t['mc'])
+                    lo = _f(t['mc_low']) if t['mc_low'] else _f(t['mc'])
+                else:
+                    hi = _f(t['mc'])
+                    lo = _f(t['mc'])
+                if hi <= 0 and lo <= 0:
+                    continue
+                tp_hit = hi >= tp_mc
+                sl_hit = lo > 0 and lo <= sl_mc
+                if tp_hit and sl_hit:
+                    return 'loss', secs  # conservative
+                elif tp_hit:
+                    return 'win', secs
+                elif sl_hit:
+                    return 'loss', secs
+            return None, None
+
+        # ── SECTION 2: PRICE PATH ───────────────────────────────────────────
+        out.append("<h2>§2 — Caminho de Preço Pós-Sinal</h2>")
+
+        windows = [('5min', 300), ('10min', 600), ('20min', 1200), ('30min', 1800), ('60min', 3600)]
+        out.append("""<table><tr>
+          <th class='l'>Janela</th><th>n</th>
+          <th>MFE avg</th><th>MFE med</th><th>MFE p75</th>
+          <th>MAE avg</th><th>MAE med</th><th>MAE p25</th>
+          <th>TTmax avg</th><th>TTmin avg</th></tr>""")
+
+        for win_name, win_sec in windows:
+            mfe_list, mae_list, ttmax_list, ttmin_list = [], [], [], []
+            for d in sig_data:
+                entry = d['entry']
+                tw = [t for t in d['ticks'] if float(t['secs_after']) <= win_sec]
+                if not tw:
+                    continue
+                hi_vals = [(_f(t['mc_high']) if t['source']=='kline' and t['mc_high'] else _f(t['mc'])) for t in tw]
+                lo_vals = [(_f(t['mc_low']) if t['source']=='kline' and t['mc_low'] else _f(t['mc'])) for t in tw]
+                hi_vals = [v for v in hi_vals if v > 0]
+                lo_vals = [v for v in lo_vals if v > 0]
+                if not hi_vals or not lo_vals:
+                    continue
+                max_hi = max(hi_vals)
+                min_lo = min(lo_vals)
+                mfe_list.append((max_hi / entry - 1) * 100)
+                mae_list.append((min_lo / entry - 1) * 100)
+                # time to max/min
+                for t in tw:
+                    h = _f(t['mc_high']) if t['source']=='kline' and t['mc_high'] else _f(t['mc'])
+                    if h == max_hi:
+                        ttmax_list.append(float(t['secs_after']) / 60)
+                        break
+                for t in tw:
+                    l = _f(t['mc_low']) if t['source']=='kline' and t['mc_low'] else _f(t['mc'])
+                    if l == min_lo:
+                        ttmin_list.append(float(t['secs_after']) / 60)
+                        break
+            n = len(mfe_list)
+            if n == 0:
+                out.append(f"<tr><td class='l'>{win_name}</td><td colspan='8'>sem dados</td></tr>")
+                continue
+            mfe_avg = _avg(mfe_list)
+            mfe_med = _med(mfe_list)
+            mfe_p75 = _p(mfe_list, 75)
+            mae_avg = _avg(mae_list)
+            mae_med = _med(mae_list)
+            mae_p25 = _p(mae_list, 25)
+            ttmax_avg = _avg(ttmax_list)
+            ttmin_avg = _avg(ttmin_list)
+            fw = flag_n(n)
+            out.append(f"""<tr>
+              <td class='l'>{fw}{win_name}</td><td>{n}</td>
+              <td class='pos'>{fmt(mfe_avg)}</td><td class='pos'>{fmt(mfe_med)}</td><td class='pos'>{fmt(mfe_p75)}</td>
+              <td class='neg'>{fmt(mae_avg)}</td><td class='neg'>{fmt(mae_med)}</td><td class='neg'>{fmt(mae_p25)}</td>
+              <td>{fmt(ttmax_avg,'1','min','—')}</td><td>{fmt(ttmin_avg,'1','min','—')}</td>
+            </tr>""")
+        out.append("</table>")
+
+        # ── SECTION 3: TP/SL GRID ───────────────────────────────────────────
+        out.append("<h2>§3 — Grid TP × SL (entrada = mc_at_signal, modo conservador)</h2>")
+        out.append("<div class='warn'>Regra ambígua: se mesma vela bate TP e SL → SL vence (conservador). Ticks kline: usa mc_high para TP e mc_low para SL.</div>")
+
+        tp_levels = [0.30, 0.50, 0.75, 1.00, 1.50, 2.00]
+        sl_levels = [0.10, 0.15, 0.20, 0.25, 0.30, 0.40]
+
+        # Pre-compute outcomes for all combos
+        grid_results = {}
+        ambiguous_count = 0
+
+        for tp_pct in tp_levels:
+            for sl_pct in sl_levels:
+                tp_mc_mult = 1 + tp_pct
+                sl_mc_mult = 1 - sl_pct
+                wins, losses, unresolved = 0, 0, 0
+                win_secs, loss_secs = [], []
+                ambi = 0
+
+                for d in sig_data:
+                    if not d['ticks']:
+                        unresolved += 1
+                        continue
+                    entry = d['entry']
+                    tp_mc = entry * tp_mc_mult
+                    sl_mc = entry * sl_mc_mult
+                    outcome = None
+                    for t in d['ticks']:
+                        src = t['source']
+                        secs = float(t['secs_after'])
+                        hi = (_f(t['mc_high']) if src == 'kline' and t['mc_high'] else _f(t['mc']))
+                        lo = (_f(t['mc_low']) if src == 'kline' and t['mc_low'] else _f(t['mc']))
+                        tp_hit = hi > 0 and hi >= tp_mc
+                        sl_hit = lo > 0 and lo <= sl_mc
+                        if tp_hit and sl_hit:
+                            ambi += 1
+                            outcome = ('loss', secs)
+                            break
+                        elif tp_hit:
+                            outcome = ('win', secs)
+                            break
+                        elif sl_hit:
+                            outcome = ('loss', secs)
+                            break
+                    if outcome is None:
+                        unresolved += 1
+                    elif outcome[0] == 'win':
+                        wins += 1
+                        win_secs.append(outcome[1])
+                    else:
+                        losses += 1
+                        loss_secs.append(outcome[1])
+
+                n_resolved = wins + losses
+                wr = wins / n_resolved * 100 if n_resolved else 0
+                avg_w = tp_pct * 100
+                avg_l = -sl_pct * 100
+                ev = (wr * avg_w + (100 - wr) * avg_l) / 100 if n_resolved else None
+                tt_tp = _avg([s/60 for s in win_secs])
+                tt_sl = _avg([s/60 for s in loss_secs])
+                grid_results[(tp_pct, sl_pct)] = {
+                    'n': n_resolved, 'wins': wins, 'losses': losses,
+                    'unresolved': unresolved, 'wr': wr, 'ev': ev,
+                    'tt_tp': tt_tp, 'tt_sl': tt_sl, 'ambi': ambi
+                }
+                ambiguous_count = max(ambiguous_count, ambi)
+
+        # Best EV combos
+        ranked = sorted([(k, v) for k, v in grid_results.items() if v['n'] >= 10],
+                        key=lambda x: x[1]['ev'] or -999, reverse=True)
+
+        out.append("""<table><tr>
+          <th class='l'>TP</th><th class='l'>SL</th>
+          <th>n</th><th>Wins</th><th>Loss</th><th>Unres</th>
+          <th>WR</th><th>EV bruto</th>
+          <th>AvgWin</th><th>AvgLoss</th>
+          <th>TTtp</th><th>TTsl</th></tr>""")
+
+        best_ev_combo = None
+        for tp_pct in tp_levels:
+            for sl_pct in sl_levels:
+                r = grid_results[(tp_pct, sl_pct)]
+                n = r['n']
+                if n == 0:
+                    continue
+                ev = r['ev']
+                if best_ev_combo is None and ev is not None and n >= 20:
+                    best_ev_combo = (tp_pct, sl_pct, r)
+                fw = flag_n(n)
+                ec = color_ev(ev)
+                out.append(f"""<tr>
+                  <td class='l'>{fw}+{tp_pct*100:.0f}%</td>
+                  <td class='l'>-{sl_pct*100:.0f}%</td>
+                  <td>{n}</td><td class='tp'>{r['wins']}</td><td class='sl'>{r['losses']}</td><td class='dim'>{r['unresolved']}</td>
+                  <td>{r['wr']:.1f}%</td>
+                  <td class='{ec}'>{fmt(ev,'1','%','—')}</td>
+                  <td class='pos'>+{tp_pct*100:.0f}%</td>
+                  <td class='neg'>-{sl_pct*100:.0f}%</td>
+                  <td class='dim'>{fmt(r['tt_tp'],'1','min','—')}</td>
+                  <td class='dim'>{fmt(r['tt_sl'],'1','min','—')}</td>
+                </tr>""")
+        out.append("</table>")
+        out.append(f"<div class='box dim'>Casos ambíguos (TP+SL mesma vela, contados como SL): {ambiguous_count}</div>")
+
+        # ── TOP 5 combos por EV ──────────────────────────────────────────────
+        out.append("<h3>Top 5 combinações por EV bruto (n≥20)</h3>")
+        out.append("""<table><tr><th class='l'>Rank</th><th>TP</th><th>SL</th><th>n</th><th>WR</th><th>EV bruto</th><th>Payoff (W/L)</th></tr>""")
+        for i, ((tp_pct, sl_pct), r) in enumerate(ranked[:5]):
+            payoff = tp_pct / sl_pct
+            ec = color_ev(r['ev'])
+            out.append(f"<tr><td class='l'>#{i+1}</td><td>+{tp_pct*100:.0f}%</td><td>-{sl_pct*100:.0f}%</td>"
+                       f"<td>{r['n']}</td><td>{r['wr']:.1f}%</td>"
+                       f"<td class='{ec}'>{fmt(r['ev'],'1','%','—')}</td>"
+                       f"<td>{payoff:.1f}×</td></tr>")
+        out.append("</table>")
+
+        # ── SECTION 4: TRAILING ──────────────────────────────────────────────
+        out.append("<h2>§4 — Trailing Stop Bruto</h2>")
+        out.append("<div class='warn'>Saída via drawdown a partir do pico. Sem ativação = usa close do último tick.</div>")
+
+        act_levels = [0.50, 0.75, 1.00, 1.50]
+        dd_levels  = [0.20, 0.30, 0.40, 0.50]
+
+        out.append("""<table><tr>
+          <th class='l'>Ativação</th><th class='l'>Drawdown</th>
+          <th>n</th><th>Ativou</th><th>Não ativou</th>
+          <th>EV méd</th><th>EV med</th><th>MaxWin</th><th>MaxLoss</th>
+          <th>TTativ</th><th>TTsaída</th></tr>""")
+
+        best_trailing = None
+        for act_pct in act_levels:
+            for dd_pct in dd_levels:
+                act_mult = 1 + act_pct
+                results = []
+                tt_act_list, tt_out_list = [], []
+                n_activated = 0
+
+                for d in sig_data:
+                    if not d['ticks']:
+                        continue
+                    entry = d['entry']
+                    peak = entry
+                    trailing_on = False
+                    trail_floor = None
+                    outcome = None
+                    tt_act = None
+
+                    for t in d['ticks']:
+                        src = t['source']
+                        secs = float(t['secs_after'])
+                        hi = (_f(t['mc_high']) if src=='kline' and t['mc_high'] else _f(t['mc']))
+                        lo = (_f(t['mc_low']) if src=='kline' and t['mc_low'] else _f(t['mc']))
+                        cl = _f(t['mc'])
+
+                        if hi > peak:
+                            peak = hi
+                            if trailing_on:
+                                trail_floor = peak * (1 - dd_pct)
+
+                        if not trailing_on and peak >= entry * act_mult:
+                            trailing_on = True
+                            trail_floor = peak * (1 - dd_pct)
+                            tt_act = secs
+                            n_activated += 1
+
+                        if trailing_on and lo > 0 and lo <= trail_floor:
+                            outcome = (trail_floor / entry - 1) * 100
+                            tt_out_list.append(secs)
+                            break
+
+                    if outcome is None:
+                        if trailing_on:
+                            last_cl = _f(d['ticks'][-1]['mc'])
+                            outcome = (last_cl / entry - 1) * 100 if last_cl > 0 else None
+                        # else: never activated — skip from result set
+
+                    if outcome is not None:
+                        results.append(outcome)
+                    if tt_act is not None:
+                        tt_act_list.append(tt_act)
+
+                n_total = sum(1 for d in sig_data if d['ticks'])
+                n_no_act = n_total - n_activated
+                ev_avg = _avg(results)
+                ev_med = _med(results)
+                max_w = max(results) if results else None
+                max_l = min(results) if results else None
+                tt_act_avg = _avg([s/60 for s in tt_act_list])
+                tt_out_avg = _avg([s/60 for s in tt_out_list])
+
+                if best_trailing is None and ev_avg is not None and n_activated >= 20:
+                    best_trailing = (act_pct, dd_pct, ev_avg, n_activated)
+
+                fw = flag_n(n_activated)
+                ec = color_ev(ev_avg)
+                out.append(f"""<tr>
+                  <td class='l'>{fw}+{act_pct*100:.0f}%</td><td class='l'>-{dd_pct*100:.0f}%</td>
+                  <td>{n_total}</td><td class='tp'>{n_activated}</td><td class='dim'>{n_no_act}</td>
+                  <td class='{ec}'>{fmt(ev_avg,'1','%','—')}</td>
+                  <td class='{ec}'>{fmt(ev_med,'1','%','—')}</td>
+                  <td class='pos'>{fmt(max_w,'1','%','—')}</td>
+                  <td class='neg'>{fmt(max_l,'1','%','—')}</td>
+                  <td class='dim'>{fmt(tt_act_avg,'1','min','—')}</td>
+                  <td class='dim'>{fmt(tt_out_avg,'1','min','—')}</td>
+                </tr>""")
+        out.append("</table>")
+
+        # ── SECTION 5: CLASSIFICATION ────────────────────────────────────────
+        out.append("<h2>§5 — Classificação do Comportamento Pós-Sinal (janela 30min)</h2>")
+
+        cat_data = {k: {'mints': [], 'mfe': [], 'mae': [], 'elapsed': [], 'bounce': [], 'entry_ratio': []}
+                    for k in ['moon', 'real_bounce', 'small_bounce', 'chop', 'continuation_dump', 'instant_death', 'no_data']}
+
+        for d in sig_data:
+            entry = d['entry']
+            s = d['signal']
+            ticks_30m = [t for t in d['ticks'] if float(t['secs_after']) <= 1800]
+
+            if not ticks_30m:
+                cat = 'no_data'
+            else:
+                cat = None
+                for t in ticks_30m:
+                    secs = float(t['secs_after'])
+                    src = t['source']
+                    hi = (_f(t['mc_high']) if src=='kline' and t['mc_high'] else _f(t['mc']))
+                    lo = (_f(t['mc_low']) if src=='kline' and t['mc_low'] else _f(t['mc']))
+
+                    tp_moon  = entry * 2.50
+                    tp_real  = entry * 1.75
+                    tp_small = entry * 1.30
+                    sl_lvl   = entry * 0.75
+
+                    if secs <= 120 and lo > 0 and lo <= sl_lvl:
+                        cat = 'instant_death'
+                        break
+                    if hi >= tp_moon and (lo <= 0 or lo > sl_lvl):
+                        cat = 'moon'
+                        break
+                    if hi >= tp_real and (lo <= 0 or lo > sl_lvl):
+                        cat = 'real_bounce'
+                        break
+                    if hi >= tp_small and (lo <= 0 or lo > sl_lvl):
+                        cat = 'small_bounce'
+                        break
+                    if lo > 0 and lo <= sl_lvl and hi < tp_small:
+                        cat = 'continuation_dump'
+                        break
+                    # ambiguous same-candle: use dominant direction
+                    if hi >= tp_moon and lo > 0 and lo <= sl_lvl:
+                        cat = 'moon'
+                        break
+                    if hi >= tp_real and lo > 0 and lo <= sl_lvl:
+                        cat = 'real_bounce'
+                        break
+                    if hi >= tp_small and lo > 0 and lo <= sl_lvl:
+                        cat = 'small_bounce'
+                        break
+
+                if cat is None:
+                    cat = 'chop'
+
+            # MFE/MAE over full ticks
+            hi_vals = [(_f(t['mc_high']) if t['source']=='kline' and t['mc_high'] else _f(t['mc'])) for t in ticks_30m if t['mc']]
+            lo_vals = [(_f(t['mc_low']) if t['source']=='kline' and t['mc_low'] else _f(t['mc'])) for t in ticks_30m if t['mc']]
+            hi_vals = [v for v in hi_vals if v > 0]
+            lo_vals = [v for v in lo_vals if v > 0]
+
+            cd = cat_data[cat]
+            cd['mints'].append(s['mint'])
+            if hi_vals:
+                cd['mfe'].append((max(hi_vals)/entry - 1)*100)
+            if lo_vals:
+                cd['mae'].append((min(lo_vals)/entry - 1)*100)
+            if s['elapsed_sec']:
+                cd['elapsed'].append(float(s['elapsed_sec'])/60)
+            if s['bounce_pct']:
+                cd['bounce'].append(float(s['bounce_pct'])*100)
+            if s['mc_migration'] and entry:
+                cd['entry_ratio'].append(entry / float(s['mc_migration']) * 100)
+
+        total_classified = sum(len(v['mints']) for v in cat_data.values())
+
+        cat_order = ['moon', 'real_bounce', 'small_bounce', 'chop', 'continuation_dump', 'instant_death', 'no_data']
+        cat_labels = {
+            'moon': '🌙 Moon (MFE≥+150%)',
+            'real_bounce': '🟢 Real bounce (MFE≥+75%)',
+            'small_bounce': '🟡 Small bounce (+30% a +75%)',
+            'chop': '⚪ Chop (sem ±25% em 30min)',
+            'continuation_dump': '🔴 Cont. dump (MAE≤-25%)',
+            'instant_death': '💀 Instant death (MAE≤-25% em 2min)',
+            'no_data': '⬜ Sem dados',
+        }
+
+        out.append(f"""<table><tr>
+          <th class='l'>Categoria</th><th>n</th><th>%</th>
+          <th>MFE avg</th><th>MFE med</th>
+          <th>MAE avg</th><th>MAE med</th>
+          <th>Elapsed avg</th><th>Bounce avg</th><th>EntryR avg</th></tr>""")
+
+        for cat in cat_order:
+            cd = cat_data[cat]
+            n = len(cd['mints'])
+            pct = n/total_classified*100 if total_classified else 0
+            fw = flag_n(n)
+            mfe_a = _avg(cd['mfe'])
+            mfe_m = _med(cd['mfe'])
+            mae_a = _avg(cd['mae'])
+            mae_m = _med(cd['mae'])
+            el_a  = _avg(cd['elapsed'])
+            bo_a  = _avg(cd['bounce'])
+            er_a  = _avg(cd['entry_ratio'])
+            out.append(f"""<tr>
+              <td class='l'>{fw}{cat_labels[cat]}</td>
+              <td>{n}</td><td>{pct:.1f}%</td>
+              <td class='pos'>{fmt(mfe_a)}</td><td class='pos'>{fmt(mfe_m)}</td>
+              <td class='neg'>{fmt(mae_a)}</td><td class='neg'>{fmt(mae_m)}</td>
+              <td>{fmt(el_a,'1','min','—')}</td>
+              <td>{fmt(bo_a,'1','%','—')}</td>
+              <td>{fmt(er_a,'1','%','—')}</td>
+            </tr>""")
+        out.append("</table>")
+
+        # ── SECTION 6: COHORTS ───────────────────────────────────────────────
+        out.append("<h2>§6 — Cohorts Brutos (TP75/SL25, conservador)</h2>")
+
+        # Pre-compute TP75/SL25 outcome for each signal
+        sig_outcomes = {}
+        for d in sig_data:
+            entry = d['entry']
+            mint = d['signal']['mint']
+            outcome, secs = eval_tpsl(entry, d['ticks'], 0.75, 0.25)
+            sig_outcomes[mint] = outcome
+
+        def cohort_table(title, groups):
+            """groups = list of (label, list_of_d_items)"""
+            out.append(f"<h3>{title}</h3>")
+            out.append("""<table><tr>
+              <th class='l'>Bucket</th><th>n total</th><th>n resolv.</th>
+              <th>WR</th><th>EV≈</th>
+              <th>% moon</th><th>% real_bounce</th><th>% cont_dump</th>
+              <th>MFE avg</th><th>MAE avg</th></tr>""")
+            for label, items in groups:
+                n_total = len(items)
+                wins = sum(1 for d in items if sig_outcomes.get(d['signal']['mint']) == 'win')
+                losses = sum(1 for d in items if sig_outcomes.get(d['signal']['mint']) == 'loss')
+                n_res = wins + losses
+                wr = wins/n_res*100 if n_res else None
+                ev = (wr*0.75 - (100-wr)*0.25) if wr is not None else None
+
+                # categories
+                n_moon = sum(1 for d in items if d['signal']['mint'] in cat_data['moon']['mints'])
+                n_rb   = sum(1 for d in items if d['signal']['mint'] in cat_data['real_bounce']['mints'])
+                n_cd   = sum(1 for d in items if d['signal']['mint'] in cat_data['continuation_dump']['mints'])
+                pct_moon = n_moon/n_total*100 if n_total else 0
+                pct_rb   = n_rb/n_total*100 if n_total else 0
+                pct_cd   = n_cd/n_total*100 if n_total else 0
+
+                hi_all = []
+                lo_all = []
+                for d in items:
+                    e = d['entry']
+                    tw = [t for t in d['ticks'] if float(t['secs_after']) <= 1800]
+                    his = [(_f(t['mc_high']) if t['source']=='kline' and t['mc_high'] else _f(t['mc'])) for t in tw if t['mc']]
+                    los = [(_f(t['mc_low']) if t['source']=='kline' and t['mc_low'] else _f(t['mc'])) for t in tw if t['mc']]
+                    his = [v for v in his if v > 0]
+                    los = [v for v in los if v > 0]
+                    if his: hi_all.append((max(his)/e-1)*100)
+                    if los: lo_all.append((min(los)/e-1)*100)
+                mfe_a = _avg(hi_all)
+                mae_a = _avg(lo_all)
+
+                fw = flag_n(n_res)
+                ec = color_ev(ev)
+                out.append(f"""<tr>
+                  <td class='l'>{fw}{label}</td>
+                  <td>{n_total}</td><td>{n_res}</td>
+                  <td>{fmt(wr,'1','%','—')}</td>
+                  <td class='{ec}'>{fmt(ev,'1','%','—')}</td>
+                  <td class='tp'>{pct_moon:.0f}%</td>
+                  <td class='pos'>{pct_rb:.0f}%</td>
+                  <td class='neg'>{pct_cd:.0f}%</td>
+                  <td class='pos'>{fmt(mfe_a)}</td>
+                  <td class='neg'>{fmt(mae_a)}</td>
+                </tr>""")
+            out.append("</table>")
+
+        def bucket_group(sig_data, field_fn, bins):
+            result = []
+            for label, lo, hi in bins:
+                items = [d for d in sig_data if field_fn(d) is not None and lo <= field_fn(d) < hi]
+                result.append((label, items))
+            return result
+
+        # elapsed
+        cohort_table("§6a — elapsed_sec (minutos após migração)", bucket_group(sig_data,
+            lambda d: _f(d['signal']['elapsed_sec'])/60 if d['signal']['elapsed_sec'] else None,
+            [('0–2min',0,2),('2–5min',2,5),('5–10min',5,10),('10–15min',10,15),('15–20min',15,20),('20min+',20,9999)]))
+
+        # bounce_pct
+        cohort_table("§6b — bounce_pct", bucket_group(sig_data,
+            lambda d: _f(d['signal']['bounce_pct'])*100 if d['signal']['bounce_pct'] else None,
+            [('30–40%',30,40),('40–50%',40,50),('50–75%',50,75),('75–100%',75,100),('100%+',100,9999)]))
+
+        # drop_from_mig
+        cohort_table("§6c — drop_from_mig", bucket_group(sig_data,
+            lambda d: _f(d['signal']['drop_from_mig'])*100 if d['signal']['drop_from_mig'] else None,
+            [('30–40%',30,40),('40–50%',40,50),('50–60%',50,60),('60–70%',60,70),('70%+',70,9999)]))
+
+        # entry_ratio
+        cohort_table("§6d — mc_at_signal / mc_migration", bucket_group(sig_data,
+            lambda d: d['entry']/float(d['signal']['mc_migration'])*100 if d['signal']['mc_migration'] and float(d['signal']['mc_migration'])>0 else None,
+            [('0–25%',0,25),('25–40%',25,40),('40–50%',40,50),('50–65%',50,65),('65–80%',65,80),('80–100%',80,100)]))
+
+        # bottom_ratio
+        cohort_table("§6e — mc_min / mc_migration", bucket_group(sig_data,
+            lambda d: float(d['signal']['mc_min'])/float(d['signal']['mc_migration'])*100 if d['signal']['mc_min'] and d['signal']['mc_migration'] and float(d['signal']['mc_migration'])>0 else None,
+            [('0–20%',0,20),('20–30%',20,30),('30–40%',30,40),('40–50%',40,50),('50%+',50,9999)]))
+
+        # absorption_events
+        cohort_table("§6f — absorption_events (H22)", [
+            ('NULL (sem Helius)', [d for d in sig_data if d['signal']['absorption_events'] is None]),
+            ('0 events',  [d for d in sig_data if d['signal']['absorption_events'] is not None and d['signal']['absorption_events'] == 0]),
+            ('1–2 events',[d for d in sig_data if d['signal']['absorption_events'] is not None and 1 <= d['signal']['absorption_events'] <= 2]),
+            ('3–5 events',[d for d in sig_data if d['signal']['absorption_events'] is not None and 3 <= d['signal']['absorption_events'] <= 5]),
+            ('6–10 events',[d for d in sig_data if d['signal']['absorption_events'] is not None and 6 <= d['signal']['absorption_events'] <= 10]),
+            ('11+ events',[d for d in sig_data if d['signal']['absorption_events'] is not None and d['signal']['absorption_events'] >= 11]),
+        ])
+
+        # ── SECTION 7: FEATURE COMPARISON ───────────────────────────────────
+        out.append("<h2>§7 — Features: Winners vs Losers (TP75/SL25)</h2>")
+
+        # Fetch migration data
+        cur.execute("""
+            SELECT m.mint, m.smart_wallets, m.renowned_wallets, m.sniper_wallets,
+                   m.rug_ratio, m.top10_holder_rate, m.holders_count,
+                   m.volume_1m, m.volume_5m, m.volume_15m, m.liq_migration,
+                   m.bot_degen_rate, m.top70_sniper_hold_rate, m.dev_team_hold_rate,
+                   m.creator_balance_rate, m.has_social, m.x_follower_count
+            FROM migrations m
+            WHERE m.mint = ANY(%s)
+        """, (mints_with_signal,))
+        mig_by_mint = {r['mint']: r for r in cur.fetchall()}
+
+        def get_mig(mint, field):
+            m = mig_by_mint.get(mint)
+            if not m: return None
+            return m[field]
+
+        wins_d  = [d for d in sig_data if sig_outcomes.get(d['signal']['mint']) == 'win']
+        losses_d = [d for d in sig_data if sig_outcomes.get(d['signal']['mint']) == 'loss']
+
+        def feat_cmp(items, field_fn, multiplier=1.0):
+            vals = [field_fn(d) * multiplier for d in items if field_fn(d) is not None]
+            if not vals: return None, None, 0
+            return _avg(vals), _med(vals), len(vals)
+
+        out.append(f"<div class='box'>Winners: <b class='tp'>{len(wins_d)}</b> &nbsp;|&nbsp; Losers: <b class='sl'>{len(losses_d)}</b> &nbsp;(TP75/SL25, conservador)</div>")
+
+        features = [
+            ('bounce_pct (%)',          lambda d: _pct(d['signal']['bounce_pct'])),
+            ('elapsed (min)',           lambda d: _f(d['signal']['elapsed_sec'])/60 if d['signal']['elapsed_sec'] else None),
+            ('drop_from_mig (%)',       lambda d: _pct(d['signal']['drop_from_mig'])),
+            ('entry_ratio (%)',         lambda d: d['entry']/float(d['signal']['mc_migration'])*100 if d['signal']['mc_migration'] and float(d['signal']['mc_migration'])>0 else None),
+            ('mc_at_signal ($K)',       lambda d: d['entry']/1000),
+            ('smart_wallets',           lambda d: _f(get_mig(d['signal']['mint'],'smart_wallets')) if get_mig(d['signal']['mint'],'smart_wallets') else None),
+            ('renowned_wallets',        lambda d: _f(get_mig(d['signal']['mint'],'renowned_wallets')) if get_mig(d['signal']['mint'],'renowned_wallets') else None),
+            ('sniper_wallets',          lambda d: _f(get_mig(d['signal']['mint'],'sniper_wallets')) if get_mig(d['signal']['mint'],'sniper_wallets') else None),
+            ('rug_ratio (%)',           lambda d: _pct(get_mig(d['signal']['mint'],'rug_ratio'))),
+            ('top10_holder_rate (%)',   lambda d: _pct(get_mig(d['signal']['mint'],'top10_holder_rate'))),
+            ('holders_count',          lambda d: _f(get_mig(d['signal']['mint'],'holders_count')) if get_mig(d['signal']['mint'],'holders_count') else None),
+            ('volume_1m ($)',           lambda d: _f(get_mig(d['signal']['mint'],'volume_1m')) if get_mig(d['signal']['mint'],'volume_1m') else None),
+            ('liq_migration ($K)',      lambda d: _f(get_mig(d['signal']['mint'],'liq_migration'))/1000 if get_mig(d['signal']['mint'],'liq_migration') else None),
+            ('bot_degen_rate (%)',      lambda d: _pct(get_mig(d['signal']['mint'],'bot_degen_rate'))),
+            ('top70_sniper_hold (%)',   lambda d: _pct(get_mig(d['signal']['mint'],'top70_sniper_hold_rate'))),
+            ('dev_team_hold (%)',       lambda d: _pct(get_mig(d['signal']['mint'],'dev_team_hold_rate'))),
+            ('creator_balance (%)',     lambda d: _pct(get_mig(d['signal']['mint'],'creator_balance_rate'))),
+            ('absorption_buy_vol',     lambda d: _f(d['signal']['absorption_buy_vol']) if d['signal']['absorption_buy_vol'] is not None else None),
+            ('absorption_sell_vol',    lambda d: _f(d['signal']['absorption_sell_vol']) if d['signal']['absorption_sell_vol'] is not None else None),
+            ('absorption_events',      lambda d: _f(d['signal']['absorption_events']) if d['signal']['absorption_events'] is not None else None),
+        ]
+
+        out.append("""<table><tr>
+          <th class='l'>Feature</th>
+          <th colspan='3' style='background:#1a2e1a;color:#3fb950'>Winners</th>
+          <th colspan='3' style='background:#2e1a1a;color:#f85149'>Losers</th>
+          <th>Delta avg</th></tr>
+          <tr>
+          <th class='l'></th>
+          <th>avg</th><th>median</th><th>n</th>
+          <th>avg</th><th>median</th><th>n</th>
+          <th></th></tr>""")
+
+        for feat_name, field_fn in features:
+            w_avg, w_med, w_n = feat_cmp(wins_d, field_fn)
+            l_avg, l_med, l_n = feat_cmp(losses_d, field_fn)
+            fw = flag_n(min(w_n, l_n))
+            delta = None
+            delta_str = '—'
+            if w_avg is not None and l_avg is not None:
+                delta = w_avg - l_avg
+                sign = '+' if delta >= 0 else ''
+                ec = 'pos' if delta >= 0 else 'neg'
+                delta_str = f"<span class='{ec}'>{sign}{delta:.2f}</span>"
+            out.append(f"""<tr>
+              <td class='l'>{fw}{feat_name}</td>
+              <td class='tp'>{f"{w_avg:.2f}" if w_avg is not None else "—"}</td>
+              <td class='tp'>{f"{w_med:.2f}" if w_med is not None else "—"}</td>
+              <td class='dim'>{w_n}</td>
+              <td class='sl'>{f"{l_avg:.2f}" if l_avg is not None else "—"}</td>
+              <td class='sl'>{f"{l_med:.2f}" if l_med is not None else "—"}</td>
+              <td class='dim'>{l_n}</td>
+              <td>{delta_str}</td>
+            </tr>""")
+        out.append("</table>")
+
+        # Derived ratios (absorption only where available)
+        out.append("<h3>Métricas derivadas de absorção (H22) — onde absorption_events > 0</h3>")
+        def ratio_feat(items, num_fn, den_fn):
+            vals = []
+            for d in items:
+                n = num_fn(d)
+                de = den_fn(d)
+                if n is not None and de is not None and de > 0:
+                    vals.append(n / de)
+            if not vals: return None, None, 0
+            return _avg(vals), _med(vals), len(vals)
+
+        derived = [
+            ('buy/sell_vol_ratio',
+             lambda d: _f(d['signal']['absorption_buy_vol']) if d['signal']['absorption_buy_vol'] is not None else None,
+             lambda d: _f(d['signal']['absorption_sell_vol']) if d['signal']['absorption_sell_vol'] is not None else None),
+            ('buy/sell_cnt_ratio',
+             lambda d: _f(d['signal']['absorption_buy_cnt']) if d['signal']['absorption_buy_cnt'] is not None else None,
+             lambda d: _f(d['signal']['absorption_sell_cnt']) if d['signal']['absorption_sell_cnt'] is not None else None),
+            ('lrg_buy_concentration',
+             lambda d: _f(d['signal']['absorption_lrg_buy']) if d['signal']['absorption_lrg_buy'] is not None else None,
+             lambda d: _f(d['signal']['absorption_buy_vol']) if d['signal']['absorption_buy_vol'] is not None else None),
+        ]
+        out.append("""<table><tr>
+          <th class='l'>Métrica</th>
+          <th colspan='3' style='background:#1a2e1a;color:#3fb950'>Winners</th>
+          <th colspan='3' style='background:#2e1a1a;color:#f85149'>Losers</th></tr>
+          <tr><th class='l'></th><th>avg</th><th>med</th><th>n</th><th>avg</th><th>med</th><th>n</th></tr>""")
+        for label, nfn, dfn in derived:
+            wa, wm, wn = ratio_feat(wins_d, nfn, dfn)
+            la, lm, ln = ratio_feat(losses_d, nfn, dfn)
+            fw = flag_n(min(wn, ln))
+            out.append(f"""<tr>
+              <td class='l'>{fw}{label}</td>
+              <td class='tp'>{f"{wa:.3f}" if wa is not None else "—"}</td>
+              <td class='tp'>{f"{wm:.3f}" if wm is not None else "—"}</td><td class='dim'>{wn}</td>
+              <td class='sl'>{f"{la:.3f}" if la is not None else "—"}</td>
+              <td class='sl'>{f"{lm:.3f}" if lm is not None else "—"}</td><td class='dim'>{ln}</td>
+            </tr>""")
+        out.append("</table>")
+
+        # ── SECTION 8: MIGRATION CONTEXT COHORTS ────────────────────────────
+        out.append("<h2>§8 — Context de Migration (TP75/SL25)</h2>")
+
+        def mig_cohort(title, key, bins, pct=False, mult=1.0):
+            out.append(f"<h3>{title}</h3>")
+            out.append("""<table><tr><th class='l'>Bucket</th><th>n resolv.</th><th>WR</th><th>EV≈</th></tr>""")
+            for label, lo, hi in bins:
+                items = []
+                for d in sig_data:
+                    m = mig_by_mint.get(d['signal']['mint'])
+                    if not m: continue
+                    raw = m[key]
+                    if raw is None: continue
+                    val = float(raw) * (100 if pct else mult)
+                    if lo <= val < hi:
+                        items.append(d)
+                wins = sum(1 for d in items if sig_outcomes.get(d['signal']['mint']) == 'win')
+                losses = sum(1 for d in items if sig_outcomes.get(d['signal']['mint']) == 'loss')
+                n_res = wins + losses
+                wr = wins/n_res*100 if n_res else None
+                ev = (wr*0.75 - (100-wr)*0.25) if wr is not None else None
+                fw = flag_n(n_res)
+                ec = color_ev(ev)
+                out.append(f"<tr><td class='l'>{fw}{label}</td><td>{n_res}</td>"
+                           f"<td>{fmt(wr,'1','%','—')}</td>"
+                           f"<td class='{ec}'>{fmt(ev,'1','%','—')}</td></tr>")
+            out.append("</table>")
+
+        mig_cohort("smart_wallets", "smart_wallets", [('1',1,2),('2',2,3),('3',3,4),('4',4,5),('5+',5,999)])
+        mig_cohort("renowned_wallets", "renowned_wallets", [('0',0,1),('1',1,2),('2+',2,999)])
+        mig_cohort("liq_migration ($K)", "liq_migration", [('<10K',0,10000),('10–20K',10000,20000),('20–50K',20000,50000),('50K+',50000,999999)])
+        mig_cohort("top10_holder_rate", "top10_holder_rate", [('<40%',0,0.4),('40–60%',0.4,0.6),('60–80%',0.6,0.8),('>80%',0.8,2)], pct=False)
+        mig_cohort("bot_degen_rate", "bot_degen_rate", [('<30%',0,0.3),('30–50%',0.3,0.5),('50–70%',0.5,0.7),('>70%',0.7,2)], pct=False)
+        mig_cohort("rug_ratio", "rug_ratio", [('<5%',0,0.05),('5–10%',0.05,0.10),('10–20%',0.10,0.20),('>20%',0.20,2)], pct=False)
+
+        # ── SECTION 10: FINAL ASSESSMENT ─────────────────────────────────────
+        out.append("<h2>§10 — Avaliação Final</h2>")
+
+        # Find best EV combo for summary
+        best_ev = ranked[0] if ranked else None
+        best_ev_str = "N/A"
+        best_ev_val = None
+        if best_ev:
+            (tp_b, sl_b), rb = best_ev
+            best_ev_val = rb['ev']
+            best_ev_str = f"TP+{tp_b*100:.0f}% / SL-{sl_b*100:.0f}% → WR={rb['wr']:.1f}%, EV={fmt(rb['ev'])}, n={rb['n']}"
+
+        # % signals that are moon or real_bounce
+        n_winners_cat = len(cat_data['moon']['mints']) + len(cat_data['real_bounce']['mints'])
+        pct_high_value = n_winners_cat/total_classified*100 if total_classified else 0
+
+        # EV assessment
+        if best_ev_val is None:
+            ev_verdict = "INCONCLUSIVO"
+            ev_color = "neu"
+        elif best_ev_val > 5:
+            ev_verdict = "SIM"
+            ev_color = "tp"
+        elif best_ev_val > 0:
+            ev_verdict = "SIM (marginal)"
+            ev_color = "neu"
+        else:
+            ev_verdict = "NÃO"
+            ev_color = "sl"
+
+        # Check if edge is concentrated in moons
+        n_moon = len(cat_data['moon']['mints'])
+        edge_note = ""
+        if n_moon > 0 and total_classified > 0:
+            moon_pct = n_moon/total_classified*100
+            if moon_pct < 15:
+                edge_note = f"Edge potencialmente dependente de outliers (moon = {moon_pct:.1f}% dos sinais)."
+            else:
+                edge_note = f"Moon events ({moon_pct:.1f}%) distribuídos o suficiente para não ser puro outlier."
+
+        out.append(f"""<div class='section'>
+        <h3>A) EV bruto do sinal: <span class='{ev_color}'>{ev_verdict}</span></h3>
+        <div class='box'>
+        Melhor combo: <b>{best_ev_str}</b><br>
+        {edge_note}<br>
+        Total sinais analisados: {total_classified} | Com ticks: {n_with_any_ticks} | Cobertura: {100*n_with_any_ticks//max(total_classified,1)}%
+        </div>
+
+        <h3>B) Melhor configuração TP/SL ou Trailing</h3>
+        <div class='box'>
+        TP/SL fixo: <b>{best_ev_str}</b><br>
+        Trailing: {'TP+'+str(int(best_trailing[0]*100))+'% ativ / DD-'+str(int(best_trailing[1]*100))+'% → EV≈'+fmt(best_trailing[2])+f', n={best_trailing[3]} ativações' if best_trailing else 'dados insuficientes'}
+        </div>
+
+        <h3>C) Distribuição do edge</h3>
+        <div class='box'>
+        Moon ({len(cat_data['moon']['mints'])} sinais = {len(cat_data['moon']['mints'])/max(total_classified,1)*100:.1f}%)<br>
+        Real bounce ({len(cat_data['real_bounce']['mints'])} sinais = {len(cat_data['real_bounce']['mints'])/max(total_classified,1)*100:.1f}%)<br>
+        Small bounce ({len(cat_data['small_bounce']['mints'])} sinais = {len(cat_data['small_bounce']['mints'])/max(total_classified,1)*100:.1f}%)<br>
+        Chop ({len(cat_data['chop']['mints'])} sinais = {len(cat_data['chop']['mints'])/max(total_classified,1)*100:.1f}%)<br>
+        Cont. dump ({len(cat_data['continuation_dump']['mints'])} sinais = {len(cat_data['continuation_dump']['mints'])/max(total_classified,1)*100:.1f}%)<br>
+        <b>% de sinais com valor real (moon + real_bounce): {pct_high_value:.1f}%</b>
+        </div>
+
+        <h3>D) Diagnóstico</h3>
+        <div class='box'>
+        Os dados devem responder a isso. Verifique §3 (EV grid), §5 (categorias) e §6 (cohorts) para concluir:
+        <ul>
+        <li>Se EV &gt; 0 em &gt;3 combos TP/SL → sinal tem edge real</li>
+        <li>Se edge só em TP alto (200%) → dependente de outliers/moons</li>
+        <li>Se edge em cohort de bounce_pct específico → filtro óbvio</li>
+        <li>Se n_resolved &lt; 50 → dados ainda insuficientes para conclusão</li>
+        </ul>
+        </div>
+
+        <h3>E) 5 perguntas para Rodada 3 (execução real)</h3>
+        <div class='box'>
+        <ol>
+        <li><b>Qual o slippage real médio</b> na entrada (mc_at_signal vs entry_price_usd)?  Quantos % o sinal perde antes mesmo do trade abrir?</li>
+        <li><b>O trailing GMGN executa no preço simulado?</b> O drawdown real de saída coincide com os 30% configurados ou o GMGN vende com atraso?</li>
+        <li><b>Qual cohort de sinal tem menor slippage?</b>  Tokens com mais liquidez (liq_migration alto) têm menos slippage — confirmar com dados reais.</li>
+        <li><b>A latência entre sinal e execução consome o edge?</b>  Se mediana TTtp=6min e latência=90s, quanto do MFE o bot captura?</li>
+        <li><b>Os moons são recorrentes no mesmo horário/contexto de mercado?</b>  Se moon só aparece em janelas específicas de atividade, podemos condicionar o bot.</li>
+        </ol>
+        </div>
+        </div>""")
+
+    except Exception:
+        out.append(f"<pre style='color:#f85149'>{_tb.format_exc()}</pre>")
+
+    out.append("</body></html>")
+    return "".join(out)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
