@@ -22191,5 +22191,471 @@ LIMIT 50;
     return "".join(out)
 
 
+# ==============================================================================
+# /debug/price-chain  — decompõe desvio sinal→ordem→fill
+# ==============================================================================
+
+@app.route("/debug/price-chain")
+def debug_price_chain():
+    import psycopg2
+    import psycopg2.extras
+
+    conn  = psycopg2.connect(db.DATABASE_URL)
+    conn.autocommit = True
+    cur   = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    # ── check se colunas audit existem ──────────────────────────────────────
+    cur.execute("""
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'trades'
+          AND column_name IN ('mc_at_signal','bounce_pct_signal',
+                              'drop_from_mig_signal','signal_elapsed_sec')
+    """)
+    audit_cols = {r["column_name"] for r in cur.fetchall()}
+    has_audit  = "mc_at_signal" in audit_cols
+
+    # ── TASK 1: últimos 30 trades com fill ─────────────────────────────────
+    signal_expr = "t.mc_at_signal" if has_audit else "NULL::float"
+    bpct_expr   = "t.bounce_pct_signal" if has_audit else "NULL::float"
+    drop_expr   = "t.drop_from_mig_signal" if has_audit else "NULL::float"
+    elap_expr   = "t.signal_elapsed_sec" if has_audit else "NULL::int"
+
+    cur.execute(f"""
+        SELECT
+            t.id, t.symbol, t.status, t.fill_source, t.order_id,
+            t.created_at,
+            t.ts_signal           AS trade_signal_ts,
+            t.ts_order_sent,
+            t.ts_order_confirmed,
+            -- Signal
+            t.mc_bottom,
+            t.entry_expected,
+            COALESCE({signal_expr}, bs.mc_at_signal)   AS signal_mc,
+            COALESCE({bpct_expr},   bs.bounce_pct)     AS bounce_pct,
+            COALESCE({drop_expr},   bs.drop_from_mig)  AS drop_from_mig,
+            COALESCE({elap_expr},   bs.elapsed_sec)    AS elapsed_sec,
+            -- bounce_signals reference
+            bs.ts_signal   AS bs_ts_signal,
+            bs.mc_at_signal AS bs_signal_mc,
+            bs.mc_min      AS bs_mc_min,
+            -- Fill
+            t.entry_price_usd,
+            t.tokens_received,
+            CASE WHEN t.tokens_received > 0 AND t.entry_price_usd IS NOT NULL
+                 THEN (t.entry_price_usd / t.tokens_received) * 1000000000
+                 ELSE NULL END AS real_entry_mc,
+            -- Config (if patch deployed)
+            {'t.config_trade_sl_pct, t.config_trailing_activation_pct, t.config_bounce_min_pct, t.git_sha,' if has_audit else ''}
+            -- Timing
+            EXTRACT(EPOCH FROM (t.ts_order_sent      - t.ts_signal)) AS signal_to_order_sec,
+            EXTRACT(EPOCH FROM (t.ts_order_confirmed - t.ts_order_sent)) AS order_to_confirm_sec,
+            EXTRACT(EPOCH FROM (t.ts_order_confirmed - t.ts_signal)) AS signal_to_confirm_sec
+        FROM trades t
+        LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+        WHERE t.entry_price_usd IS NOT NULL OR t.order_id IS NOT NULL
+        ORDER BY t.created_at DESC
+        LIMIT 30
+    """)
+    trades = cur.fetchall()
+
+    # ── TASK 2+4: ticks na janela sinal→ordem para cada trade ──────────────
+    tick_windows = {}
+    for tr in trades:
+        mint  = None
+        cur.execute("SELECT mint FROM trades WHERE id = %s", (tr["id"],))
+        row = cur.fetchone()
+        if row:
+            mint = row["mint"]
+        if not mint or not tr["trade_signal_ts"]:
+            continue
+        t_sig   = tr["trade_signal_ts"]
+        t_order = tr["ts_order_sent"] or t_sig
+        t_fill  = tr["ts_order_confirmed"] or t_order
+
+        # Ticks em janela ampla em torno do sinal
+        cur.execute("""
+            SELECT tick_ts, source, mc, mc_open, mc_high, mc_low
+            FROM token_ticks
+            WHERE mint = %s
+              AND tick_ts BETWEEN %s - INTERVAL '2 minutes' AND %s + INTERVAL '10 minutes'
+            ORDER BY tick_ts
+        """, (mint, t_sig, t_sig))
+        ticks = cur.fetchall()
+
+        if not ticks:
+            tick_windows[tr["id"]] = {"ticks": [], "window_ticks": [], "note": "no_ticks"}
+            continue
+
+        # Tick mais próximo de cada evento
+        def nearest(ts, rows):
+            if not rows:
+                return None
+            return min(rows, key=lambda r: abs((r["tick_ts"] - ts).total_seconds()))
+
+        def last_before(ts, rows):
+            b = [r for r in rows if r["tick_ts"] <= ts]
+            return b[-1] if b else None
+
+        def first_after(ts, rows):
+            a = [r for r in rows if r["tick_ts"] > ts]
+            return a[0] if a else None
+
+        # Ticks dentro da janela sinal→ordem
+        window = [r for r in ticks if t_sig <= r["tick_ts"] <= t_order]
+
+        tick_windows[tr["id"]] = {
+            "ticks": ticks,
+            "near_signal":       nearest(t_sig,   ticks),
+            "before_signal":     last_before(t_sig, ticks),
+            "after_signal":      first_after(t_sig, ticks),
+            "near_order":        nearest(t_order, ticks),
+            "before_order":      last_before(t_order, ticks),
+            "after_order":       first_after(t_order, ticks),
+            "near_fill":         nearest(t_fill,  ticks),
+            "window_ticks":      window,
+            "max_mc_in_window":  max((r["mc_high"] or r["mc"] or 0) for r in window) if window else None,
+            "min_mc_in_window":  min((r["mc_low"]  or r["mc"] or 0) for r in window) if window else None,
+            "last_mc_before_order": (last_before(t_order, ticks) or {}).get("mc"),
+            "note": "ok",
+        }
+
+    conn.close()
+
+    # ── Render HTML ─────────────────────────────────────────────────────────
+    def fmt(v, pct=False, decimals=1):
+        if v is None:
+            return "<span style='color:#888'>NULL</span>"
+        if pct:
+            color = "green" if v > 0 else ("red" if v < 0 else "#888")
+            return f"<span style='color:{color}'>{v*100:+.{decimals}f}%</span>"
+        return f"{v:,.0f}"
+
+    def delta_color(v):
+        if v is None:
+            return "<span style='color:#888'>—</span>"
+        color = "red" if v > 10 else ("orange" if v > 3 else "green")
+        return f"<span style='color:{color}'>{v:.1f}s</span>"
+
+    H = """<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>price-chain</title>
+<style>
+body{font-family:monospace;font-size:12px;background:#0e0e0e;color:#ddd;padding:16px}
+h2{color:#f90}h3{color:#8cf;margin-top:24px}
+table{border-collapse:collapse;margin-bottom:24px;width:100%}
+th{background:#222;color:#aaa;padding:4px 8px;text-align:left;border:1px solid #333;white-space:nowrap}
+td{padding:3px 8px;border:1px solid #222;white-space:nowrap}
+tr:nth-child(even){background:#111}
+.pos{color:#4f4}.neg{color:#f44}.warn{color:#fa0}.null{color:#555}
+.section{background:#1a1a2e;padding:12px;margin:16px 0;border-left:3px solid #f90}
+</style></head><body>"""
+
+    H += "<h2>🔍 Price Chain Decomposition</h2>"
+    H += f"<p>Audit columns present: <b>{'YES' if has_audit else 'NO (pre-patch)'}</b> — "
+    H += f"signal_mc source: <b>{'trades.mc_at_signal' if has_audit else 'bounce_signals.mc_at_signal ONLY'}</b></p>"
+
+    # ── TASK 1 table ─────────────────────────────────────────────────────────
+    H += "<h3>Task 1 — Últimos trades com fill (signal → expected → real)</h3>"
+    H += """<table><tr>
+    <th>#</th><th>symbol</th><th>status</th><th>fill_src</th>
+    <th>bottom_mc</th><th>expected_entry</th><th>signal_mc</th><th>bounce_pct</th>
+    <th>real_entry_mc</th>
+    <th>real/signal-1</th><th>real/expected-1</th><th>real/bottom-1</th>
+    <th>sig/expected-1</th><th>sig/bottom-1</th>
+    <th>sig→order s</th><th>order→confirm s</th><th>sig→confirm s</th>
+    </tr>"""
+
+    for tr in trades:
+        sig_mc   = tr["signal_mc"]
+        real_mc  = tr["real_entry_mc"]
+        exp      = tr["entry_expected"]
+        bot      = tr["mc_bottom"]
+
+        r_vs_sig = (real_mc / sig_mc - 1)   if (real_mc and sig_mc)  else None
+        r_vs_exp = (real_mc / exp - 1)       if (real_mc and exp)     else None
+        r_vs_bot = (real_mc / bot - 1)       if (real_mc and bot)     else None
+        s_vs_exp = (sig_mc  / exp - 1)       if (sig_mc  and exp)     else None
+        s_vs_bot = (sig_mc  / bot - 1)       if (sig_mc  and bot)     else None
+
+        bg = ""
+        if real_mc and sig_mc:
+            prem = real_mc / sig_mc - 1
+            if prem > 0.15:
+                bg = "background:#2a1010"
+            elif prem > 0.05:
+                bg = "background:#2a1a00"
+
+        H += f"""<tr style='{bg}'>
+        <td>{tr['id']}</td>
+        <td><b>{tr['symbol']}</b></td>
+        <td>{tr['status']}</td>
+        <td>{tr['fill_source'] or '—'}</td>
+        <td>{fmt(bot)}</td>
+        <td>{fmt(exp)}</td>
+        <td>{fmt(sig_mc)}</td>
+        <td>{fmt(tr['bounce_pct'], pct=True) if tr['bounce_pct'] else '—'}</td>
+        <td>{fmt(real_mc)}</td>
+        <td>{fmt(r_vs_sig, pct=True)}</td>
+        <td>{fmt(r_vs_exp, pct=True)}</td>
+        <td>{fmt(r_vs_bot, pct=True)}</td>
+        <td>{fmt(s_vs_exp, pct=True)}</td>
+        <td>{fmt(s_vs_bot, pct=True)}</td>
+        <td>{delta_color(tr['signal_to_order_sec'])}</td>
+        <td>{delta_color(tr['order_to_confirm_sec'])}</td>
+        <td>{delta_color(tr['signal_to_confirm_sec'])}</td>
+        </tr>"""
+    H += "</table>"
+
+    # ── TASK 3+4+2: trade-by-trade breakdown ─────────────────────────────────
+    H += "<h3>Tasks 2, 3, 4 — Decomposição por trade</h3>"
+
+    for tr in trades:
+        mint_cur = None
+        import psycopg2 as _p2; import psycopg2.extras as _pe
+        conn2 = _p2.connect(db.DATABASE_URL)
+        c2    = conn2.cursor(cursor_factory=_pe.RealDictCursor)
+        c2.execute("SELECT mint FROM trades WHERE id = %s", (tr["id"],))
+        row = c2.fetchone()
+        if row:
+            mint_cur = row["mint"]
+        conn2.close()
+
+        sig_mc  = tr["signal_mc"]
+        real_mc = tr["real_entry_mc"]
+        tw      = tick_windows.get(tr["id"], {})
+        near_order_tick = tw.get("near_order")
+        near_order_mc   = near_order_tick["mc"] if near_order_tick else None
+
+        # Classification
+        if real_mc and sig_mc and near_order_mc:
+            sig_to_order = near_order_mc / sig_mc - 1
+            order_to_fill = real_mc / near_order_mc - 1
+            total_prem   = real_mc / sig_mc - 1
+            if total_prem > 0.005:
+                pct_market = sig_to_order / total_prem if total_prem != 0 else 0
+                pct_exec   = order_to_fill / total_prem if total_prem != 0 else 0
+                if pct_market > 0.70:
+                    cause = "📈 preço já moveu antes da ordem"
+                elif pct_exec > 0.70:
+                    cause = "🔧 execução/rota comprou caro"
+                else:
+                    cause = "⚖️ ambos"
+            else:
+                cause = "✅ fill ≈ signal"
+        elif real_mc is None:
+            cause = "❓ sem fill real"
+        else:
+            cause = "❓ dados insuficientes (sem ticks)"
+
+        # Signal→Order window
+        wt    = tw.get("window_ticks", [])
+        wmax  = tw.get("max_mc_in_window")
+        wmin  = tw.get("min_mc_in_window")
+        wlast = tw.get("last_mc_before_order")
+        gap   = tr["signal_to_order_sec"]
+
+        H += f"""<div class='section'>
+<b>#{tr['id']} {tr['symbol']}</b> — {tr['status']} | fill_src: {tr['fill_source'] or '—'}
+| <b>Causa: {cause}</b><br>
+mint: <code>{mint_cur or '?'}</code><br>
+ts_signal={tr['trade_signal_ts']} | ts_order_sent={tr['ts_order_sent']} | ts_confirmed={tr['ts_order_confirmed']}<br>
+<br>
+<b>Signal chain:</b><br>
+bottom_mc = {fmt(tr['mc_bottom'])} &nbsp;|&nbsp;
+expected_entry = {fmt(tr['entry_expected'])} (+15% do fundo) &nbsp;|&nbsp;
+signal_mc = {fmt(sig_mc)} &nbsp;|&nbsp;
+real_entry_mc = {fmt(real_mc)}<br>
+<br>
+<b>Ratios:</b> &nbsp;
+signal/bottom = {fmt(sig_mc/tr['mc_bottom']-1 if sig_mc and tr['mc_bottom'] else None, pct=True)} &nbsp;|&nbsp;
+real/signal = {fmt(real_mc/sig_mc-1 if real_mc and sig_mc else None, pct=True)} &nbsp;|&nbsp;
+real/bottom = {fmt(real_mc/tr['mc_bottom']-1 if real_mc and tr['mc_bottom'] else None, pct=True)}<br>
+<br>
+<b>Janela sinal→ordem ({gap:.1f}s se disponível):</b>
+{len(wt)} ticks | max_mc={fmt(wmax)} | min_mc={fmt(wmin)} | último_antes_ordem={fmt(wlast)}<br>"""
+
+        # surge in window
+        if sig_mc and wmax:
+            H += f"Preço subiu {fmt(wmax/sig_mc-1, pct=True)} do sinal até pico na janela<br>"
+        if sig_mc and wlast:
+            H += f"Preço no tick pré-ordem: {fmt(wlast/sig_mc-1, pct=True)} vs sinal<br>"
+
+        if real_mc and sig_mc and near_order_mc:
+            H += f"""<b>Decomposição:</b>
+sinal→tick_ordem = {fmt(near_order_mc/sig_mc-1, pct=True)} &nbsp;|&nbsp;
+tick_ordem→fill = {fmt(real_mc/near_order_mc-1, pct=True)} &nbsp;|&nbsp;
+total = {fmt(real_mc/sig_mc-1, pct=True)}<br>"""
+
+        H += "</div>"
+
+    # ── TASK 5: signal coherence ──────────────────────────────────────────────
+    H += "<h3>Task 5 — Coerência sinal (trades vs bounce_signals)</h3>"
+    conn3 = psycopg2.connect(db.DATABASE_URL)
+    c3    = conn3.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    sc_expr = "t.mc_at_signal" if has_audit else "NULL::float"
+    c3.execute(f"""
+        SELECT
+            t.id, t.symbol,
+            t.ts_signal AS trade_ts,
+            bs.ts_signal AS bounce_ts,
+            EXTRACT(EPOCH FROM (t.ts_signal - bs.ts_signal)) AS signal_age_sec,
+            {sc_expr} AS trade_signal_mc,
+            bs.mc_at_signal AS bs_signal_mc,
+            {'t.bounce_pct_signal,' if has_audit else ''}
+            bs.bounce_pct AS bs_bounce_pct,
+            t.mc_bottom,
+            bs.mc_min AS bs_mc_min,
+            (SELECT COUNT(*) FROM trades t2 WHERE t2.mint = t.mint) AS trades_per_mint
+        FROM trades t
+        LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+        ORDER BY t.created_at DESC
+        LIMIT 20
+    """)
+    sig_rows = c3.fetchall()
+    conn3.close()
+
+    H += """<table><tr>
+    <th>#</th><th>symbol</th><th>trade_ts</th><th>bounce_ts</th><th>age_sec</th>
+    <th>trade_signal_mc</th><th>bs_signal_mc</th><th>match?</th>
+    <th>trade_mc_bottom</th><th>bs_mc_min</th><th>trades/mint</th>
+    </tr>"""
+    for r in sig_rows:
+        t_mc = r.get("trade_signal_mc")
+        b_mc = r.get("bs_signal_mc")
+        match = "✅" if (t_mc and b_mc and abs(t_mc - b_mc) / max(t_mc, b_mc) < 0.01) else \
+                ("⚠️ sem audit col" if not t_mc else "❌ mismatch")
+        age   = r.get("signal_age_sec")
+        age_s = f"{age:.0f}s" if age is not None else "—"
+        multi = int(r.get("trades_per_mint") or 1)
+        multi_flag = f"<span class='warn'>⚠️ {multi}×</span>" if multi > 1 else str(multi)
+        H += f"""<tr>
+        <td>{r['id']}</td><td>{r['symbol']}</td>
+        <td style='font-size:10px'>{str(r.get('trade_ts',''))[:19]}</td>
+        <td style='font-size:10px'>{str(r.get('bounce_ts',''))[:19]}</td>
+        <td>{age_s}</td>
+        <td>{fmt(t_mc)}</td><td>{fmt(b_mc)}</td><td>{match}</td>
+        <td>{fmt(r.get('mc_bottom'))}</td><td>{fmt(r.get('bs_mc_min'))}</td>
+        <td>{multi_flag}</td>
+        </tr>"""
+    H += "</table>"
+
+    # ── TASK 6: expected_entry clarity ───────────────────────────────────────
+    H += "<h3>Task 6 — expected_entry nunca é o sinal (clarificação)</h3>"
+    H += """<div class='section'>
+<b>expected_entry = mc_bottom × 1.15</b> — é o "ideal teórico", calculado no momento do sinal.<br>
+<b>signal_mc = mc_at_signal</b> — onde o preço estava quando _check_bounce() disparou.<br>
+<br>
+Como BOUNCE_MIN_PCT=0.30, o sinal dispara quando mc >= mc_bottom × 1.30.<br>
+Logo: signal_mc / expected_entry >= 1.30 / 1.15 = <b>1.130 (+13% mínimo garantido)</b>.<br>
+Com bounce de 70%: signal_mc = mc_bottom × 1.70 → signal_mc / expected_entry = 1.70/1.15 = <b>+48%</b>.<br>
+<br>
+O "real/expected - 1" que aparece no dashboard inclui essa diferença estrutural.<br>
+Para medir custo real de execução, usar <b>real/signal - 1</b> (não real/expected - 1).
+</div>"""
+
+    # ── TASK 9: casos específicos ─────────────────────────────────────────────
+    H += "<h3>Task 9 — Casos específicos: SLOPPER, IOM, TWM</h3>"
+    conn4 = psycopg2.connect(db.DATABASE_URL)
+    c4    = conn4.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    for sym in ("SLOPPER", "IOM", "TWM"):
+        c4.execute("SELECT * FROM trades WHERE symbol = %s ORDER BY created_at DESC LIMIT 3", (sym,))
+        sym_trades = c4.fetchall()
+        if not sym_trades:
+            H += f"<p class='null'>Nenhum trade encontrado para {sym}</p>"
+            continue
+
+        for st in sym_trades:
+            mint = st["mint"]
+            sig_mc_v = st.get("mc_at_signal") if has_audit else None
+            c4.execute("SELECT mc_at_signal, mc_min, bounce_pct, ts_signal FROM bounce_signals WHERE mint = %s", (mint,))
+            bs_row = c4.fetchone()
+            if not sig_mc_v and bs_row:
+                sig_mc_v = bs_row["mc_at_signal"]
+
+            real_mc_v = None
+            if st.get("tokens_received") and st.get("entry_price_usd"):
+                real_mc_v = (st["entry_price_usd"] / st["tokens_received"]) * 1_000_000_000
+
+            c4.execute("""
+                SELECT tick_ts, source, mc, mc_open, mc_high, mc_low
+                FROM token_ticks WHERE mint = %s ORDER BY tick_ts
+            """, (mint,))
+            sym_ticks = c4.fetchall()
+
+            H += f"<h4>{sym} #{st['id']} — {st['status']}</h4>"
+            H += f"""<table><tr>
+            <th>Evento</th><th>Timestamp</th><th>MC</th><th>Notas</th></tr>"""
+
+            bot = st.get("mc_bottom")
+            mig = st.get("mc_migration")
+            exp = st.get("entry_expected")
+
+            # Timeline rows
+            events = []
+            if bs_row:
+                events.append(("Fundo detectado (bs)", str(bs_row.get("ts_signal","?"))[:19], bs_row.get("mc_min"), "bounce_signals.mc_min"))
+            events.append(("Sinal gerado (trade)", str(st.get("ts_signal","?"))[:19], sig_mc_v, "mc_at_signal"))
+            events.append(("Trade criado (insert_trade)", str(st.get("created_at","?"))[:19], exp, "entry_expected = bottom×1.15"))
+            events.append(("Ordem enviada", str(st.get("ts_order_sent","?"))[:19], None, "ts_order_sent"))
+            events.append(("Fill confirmado", str(st.get("ts_order_confirmed","?"))[:19], real_mc_v, "real_entry_mc (helius/gmgn)"))
+
+            for ev_name, ev_ts, ev_mc, ev_note in events:
+                H += f"<tr><td>{ev_name}</td><td>{ev_ts}</td><td>{fmt(ev_mc)}</td><td>{ev_note}</td></tr>"
+
+            H += "</table>"
+
+            # ratios
+            if sig_mc_v and real_mc_v:
+                H += f"<p><b>real/signal = {fmt(real_mc_v/sig_mc_v-1, pct=True)}</b> &nbsp;|&nbsp; "
+                H += f"real/bottom = {fmt(real_mc_v/bot-1 if bot else None, pct=True)} &nbsp;|&nbsp; "
+                H += f"real/expected = {fmt(real_mc_v/exp-1 if exp else None, pct=True)}</p>"
+            elif real_mc_v is None:
+                H += "<p class='warn'>⚠️ fill real não disponível (entry_price_usd ou tokens_received NULL)</p>"
+
+            # ticks
+            if sym_ticks:
+                H += f"<details><summary>{len(sym_ticks)} ticks disponíveis (clique para expandir)</summary>"
+                H += "<table><tr><th>tick_ts</th><th>source</th><th>mc</th><th>mc_low</th><th>mc_high</th></tr>"
+                for tk in sym_ticks:
+                    vs_sig = fmt(tk["mc"]/sig_mc_v-1 if sig_mc_v and tk["mc"] else None, pct=True)
+                    H += f"<tr><td>{str(tk['tick_ts'])[:19]}</td><td>{tk['source']}</td>"
+                    H += f"<td>{fmt(tk['mc'])} ({vs_sig} vs sinal)</td>"
+                    H += f"<td>{fmt(tk.get('mc_low'))}</td><td>{fmt(tk.get('mc_high'))}</td></tr>"
+                H += "</table></details>"
+            else:
+                H += "<p class='null'>Sem ticks para este token</p>"
+
+    conn4.close()
+
+    # ── TASK 10: conclusões ───────────────────────────────────────────────────
+    H += "<h3>Task 10 — Conclusões objetivas</h3>"
+    H += """<div class='section'>
+<b>A — expected_entry ≠ signal_mc</b><br>
+expected_entry = bottom × 1.15 é referência teórica, sempre ≥13% abaixo do sinal.<br>
+Métrica de custo real de execução: <b>real_entry_mc / signal_mc - 1</b> (não /expected).<br><br>
+
+<b>B — De onde vem o desvio?</b><br>
+Ver coluna "Causa" e "Decomposição" por trade acima.<br>
+Caso signal_to_order_move explique >70% → mercado seguiu subindo entre sinal e fill.<br>
+Caso order_to_fill_premium >70% → GMGN/rota/slippage.<br><br>
+
+<b>C — mc_at_signal é executável?</b><br>
+Não é garantido. É o MC do tick ou candle que disparou o bounce — GMGN só recebe a ordem milissegundos depois,
+e o fill acontece na blockchain segundos depois. Em tokens com recuperação rápida, 10-15% de premium é esperado.<br><br>
+
+<b>D — Campos que faltam para nunca mais ter dúvida:</b><br>
+✅ mc_at_signal (patch d481ec9) — MC quando sinal disparou<br>
+✅ bounce_pct_signal (patch) — quanto já tinha subido ao disparar<br>
+✅ signal_elapsed_sec (patch) — minutos desde a migração<br>
+⬜ entry_price_sol_at_fill — preço SOL/USD usado para calcular entry_price_usd<br>
+⬜ quote_mc_at_order — preço cotado pelo GMGN antes do swap (quando query_order retornar esse dado)<br>
+⬜ block_time_fill — timestamp on-chain do fill (da tx Helius)<br>
+⬜ tick_mc_at_order_sent — MC do tick mais próximo de ts_order_sent (derived, não precisa salvar)<br>
+</div>"""
+
+    H += "</body></html>"
+    return H
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
