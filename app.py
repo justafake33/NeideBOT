@@ -25593,5 +25593,267 @@ def analise_feature_scan():
     return H
 
 
+# /analise/feature-scan-recente — feature scan apenas dos trades recentes (id 338-446)
+@app.route("/analise/feature-scan-recente")
+def analise_feature_scan_recente():
+    """
+    Igual ao feature-scan, mas filtrado apenas para os trades recentes
+    onde o WR real é 29%. Parâmetros: ?from_id=338&to_id=446
+    """
+    from_id = int(request.args.get("from_id", 338))
+    to_id   = int(request.args.get("to_id",   999999))
+    PUMP_SUPPLY = 1_000_000_000
+
+    css = """
+    <style>
+    body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+    h2{color:#58a6ff}h3{color:#79c0ff}h4{color:#d2a679}
+    table{border-collapse:collapse;width:100%;margin-bottom:20px}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:right}
+    th:first-child,th:nth-child(2){text-align:left}
+    td{padding:5px 10px;border:1px solid #21262d;text-align:right}
+    td:first-child,td:nth-child(2){text-align:left}
+    .tp{color:#3fb950}.sl{color:#f85149}.warn{color:#d29922}.dim{color:#6e7681}
+    .pos{color:#3fb950}.neg{color:#f85149}
+    .hi{background:#1f3a1f}.lo{background:#3a1f1f}
+    .box{background:#161b22;border:1px solid #30363d;padding:12px 16px;margin-bottom:16px;border-radius:6px}
+    .sep-high{background:#1a3a1a}.sep-mid{background:#2a2a1a}.sep-low{background:#161b22}
+    .badge-strong{color:#3fb950;font-weight:bold}.badge-mid{color:#d29922}.badge-weak{color:#6e7681}
+    </style>
+    """
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                t.id, t.mint, t.symbol, t.ts_signal, t.status,
+                t.entry_price_usd, t.tokens_received,
+                bs.bounce_pct, bs.drop_from_mig, bs.elapsed_sec,
+                bs.mc_migration AS bs_mc_mig, bs.mc_min, bs.mc_at_signal,
+                bs.absorption_events, bs.absorption_buy_vol, bs.absorption_sell_vol,
+                bs.absorption_buy_cnt, bs.absorption_sell_cnt, bs.absorption_lrg_buy,
+                m.mc_migration, m.mc_bottom, m.time_to_bottom, m.pct_drop,
+                m.smart_wallets, m.renowned_wallets, m.sniper_wallets,
+                m.rug_ratio, m.top10_holder_rate, m.rat_trader_rate,
+                m.creator_token_status, m.cto_flag, m.has_social,
+                m.x_follower_count, m.exchange, m.burn_status,
+                m.bot_degen_rate, m.entrapment_ratio,
+                m.suspected_insider_rate, m.top70_sniper_hold_rate
+            FROM trades t
+            LEFT JOIN bounce_signals bs ON t.mint = bs.mint
+            LEFT JOIN migrations m      ON t.mint = m.mint
+            WHERE t.status IN ('tp','sl','trailing_active')
+              AND t.id >= %s AND t.id <= %s
+            ORDER BY t.id DESC
+        """, (from_id, to_id))
+        rows = cur.fetchall()
+
+        cur.execute("""
+            SELECT DISTINCT ts.mint
+            FROM token_signals ts
+            JOIN migrations m ON ts.mint = m.mint
+            WHERE ts.trigger_mc < m.mc_migration * 0.80
+              AND m.mc_migration IS NOT NULL
+        """)
+        h9_mints = {r["mint"] for r in cur.fetchall()}
+
+    def is_tp(r):
+        return r["status"] in ("tp", "trailing_active")
+
+    trades = []
+    for r in rows:
+        elapsed_min = (r["elapsed_sec"] or 0) / 60.0
+        entry_mc    = None
+        entry_ratio = None
+        mc_mig      = float(r["mc_migration"]) if r["mc_migration"] else None
+        if r["entry_price_usd"] and r["tokens_received"] and float(r["tokens_received"]) > 0:
+            tok = float(r["tokens_received"])
+            if tok < 1_000_000:
+                entry_mc = (float(r["entry_price_usd"]) / tok) * PUMP_SUPPLY
+                if mc_mig and mc_mig > 0:
+                    entry_ratio = entry_mc / mc_mig
+
+        bvol = r["absorption_buy_vol"] or 0
+        svol = r["absorption_sell_vol"] or 0
+        abs_ratio = (bvol / svol) if svol > 0 else (999.0 if bvol > 0 else None)
+
+        trades.append({
+            "id":           r["id"],
+            "mint":         r["mint"],
+            "symbol":       r["symbol"] or r["mint"][:8],
+            "is_tp":        is_tp(r),
+            "bounce_pct":   r["bounce_pct"],
+            "drop_from_mig": r["drop_from_mig"],
+            "elapsed_min":  elapsed_min,
+            "time_to_bottom": float(r["time_to_bottom"]) if r["time_to_bottom"] else None,
+            "smart":        r["smart_wallets"],
+            "renowned":     r["renowned_wallets"],
+            "top10":        r["top10_holder_rate"],
+            "rat":          r["rat_trader_rate"],
+            "bot_degen":    r["bot_degen_rate"],
+            "entrapment":   r["entrapment_ratio"],
+            "cto":          r["cto_flag"],
+            "creator_hold": 1 if r["creator_token_status"] == "creator_hold" else 0,
+            "entry_ratio":  entry_ratio,
+            "abs_events":   r["absorption_events"],
+            "abs_ratio":    abs_ratio,
+            "abs_lrg_buy":  r["absorption_lrg_buy"],
+            "h9":           1 if r["mint"] in h9_mints else 0,
+            "exchange":     r["exchange"] or "?",
+        })
+
+    n_total = len(trades)
+    n_tp    = sum(1 for t in trades if t["is_tp"])
+    n_sl    = n_total - n_tp
+    wr_base = n_tp / n_total * 100 if n_total else 0
+
+    H = f"<!DOCTYPE html><html><head><title>Feature Scan Recente</title>{css}</head><body>"
+    H += f"<h2>🔬 Feature Scan — Trades #{from_id} a #{to_id}</h2>"
+    H += f"<div class='box'><b>{n_total} trades | {n_tp} TP / {n_sl} SL | WR: {wr_base:.1f}%</b><br>"
+    H += f"Filtro: id >= {from_id} AND id <= {to_id} &nbsp;|&nbsp; "
+    H += f"Ajustar: <a href='?from_id={from_id}&to_id={to_id}' style='color:#58a6ff'>?from_id=X&to_id=Y</a></div>"
+
+    def wr_table(buckets):
+        results = []
+        for label, fn in buckets:
+            subset = [t for t in trades if fn(t)]
+            n  = len(subset)
+            tp = sum(1 for t in subset if t["is_tp"])
+            wr = tp / n * 100 if n >= 3 else None
+            results.append((label, n, tp, wr))
+        wrs = [r[3] for r in results if r[3] is not None]
+        delta = max(wrs) - min(wrs) if len(wrs) >= 2 else 0
+        return results, delta
+
+    features = []
+
+    r, d = wr_table([
+        ("55-70%",  lambda t: t["bounce_pct"] and 0.55 <= t["bounce_pct"] < 0.70),
+        ("70-100%", lambda t: t["bounce_pct"] and 0.70 <= t["bounce_pct"] < 1.0),
+        ("100-150%",lambda t: t["bounce_pct"] and 1.0  <= t["bounce_pct"] < 1.5),
+        (">150%",   lambda t: t["bounce_pct"] and t["bounce_pct"] >= 1.5),
+    ])
+    features.append(("bounce_pct", r, d))
+
+    r, d = wr_table([
+        ("<40%",   lambda t: t["drop_from_mig"] and t["drop_from_mig"] < 0.40),
+        ("40-60%", lambda t: t["drop_from_mig"] and 0.40 <= t["drop_from_mig"] < 0.60),
+        ("60-80%", lambda t: t["drop_from_mig"] and 0.60 <= t["drop_from_mig"] < 0.80),
+        (">80%",   lambda t: t["drop_from_mig"] and t["drop_from_mig"] >= 0.80),
+    ])
+    features.append(("drop_from_mig (% dump da migração)", r, d))
+
+    r, d = wr_table([
+        ("0-3min",  lambda t: t["elapsed_min"] < 3),
+        ("3-8min",  lambda t: 3  <= t["elapsed_min"] < 8),
+        ("8-15min", lambda t: 8  <= t["elapsed_min"] < 15),
+        (">15min",  lambda t: t["elapsed_min"] >= 15),
+    ])
+    features.append(("elapsed_min (tempo migração→sinal)", r, d))
+
+    r, d = wr_table([
+        ("<5min",    lambda t: t["time_to_bottom"] and t["time_to_bottom"] < 5),
+        ("5-15min",  lambda t: t["time_to_bottom"] and 5  <= t["time_to_bottom"] < 15),
+        ("15-30min", lambda t: t["time_to_bottom"] and 15 <= t["time_to_bottom"] < 30),
+        (">30min",   lambda t: t["time_to_bottom"] and t["time_to_bottom"] >= 30),
+    ])
+    features.append(("time_to_bottom (H10)", r, d))
+
+    r, d = wr_table([
+        ("3",   lambda t: t["smart"] == 3),
+        ("4-5", lambda t: t["smart"] and 4 <= t["smart"] <= 5),
+        ("6-9", lambda t: t["smart"] and 6 <= t["smart"] <= 9),
+        ("≥10", lambda t: t["smart"] and t["smart"] >= 10),
+    ])
+    features.append(("smart_wallets", r, d))
+
+    r, d = wr_table([
+        ("H9 presente", lambda t: t["h9"] == 1),
+        ("H9 ausente",  lambda t: t["h9"] == 0),
+    ])
+    features.append(("H9 (signal type12 < 0.80×mig)", r, d))
+
+    r, d = wr_table([
+        ("creator_hold",  lambda t: t["creator_hold"] == 1),
+        ("creator_close", lambda t: t["creator_hold"] == 0),
+    ])
+    features.append(("creator_token_status", r, d))
+
+    r, d = wr_table([
+        ("CTO=1", lambda t: t["cto"] == 1),
+        ("CTO=0", lambda t: t["cto"] == 0),
+    ])
+    features.append(("cto_flag", r, d))
+
+    r, d = wr_table([
+        ("0 eventos", lambda t: (t["abs_events"] or 0) == 0),
+        ("1-50",      lambda t: t["abs_events"] and 1  <= t["abs_events"] <= 50),
+        ("51-150",    lambda t: t["abs_events"] and 51 <= t["abs_events"] <= 150),
+        (">150",      lambda t: t["abs_events"] and t["abs_events"] > 150),
+    ])
+    features.append(("absorption_events (H22)", r, d))
+
+    r, d = wr_table([
+        ("<0.75x",  lambda t: t["entry_ratio"] and t["entry_ratio"] < 0.75),
+        ("0.75-1x", lambda t: t["entry_ratio"] and 0.75 <= t["entry_ratio"] < 1.0),
+        ("1-1.5x",  lambda t: t["entry_ratio"] and 1.0  <= t["entry_ratio"] < 1.5),
+        (">1.5x",   lambda t: t["entry_ratio"] and t["entry_ratio"] >= 1.5),
+    ])
+    features.append(("entry_ratio (entry_mc / mc_mig)", r, d))
+
+    features.sort(key=lambda x: x[2], reverse=True)
+
+    # Ranking
+    H += "<h3>Ranking por poder discriminador</h3>"
+    H += "<table><tr><th>#</th><th>Feature</th><th>Delta WR</th><th>Força</th></tr>"
+    for i, (name, buckets, delta) in enumerate(features):
+        wrs = [b[3] for b in buckets if b[3] is not None]
+        if not wrs: continue
+        badge = "badge-strong" if delta >= 15 else "badge-mid" if delta >= 8 else "badge-weak"
+        txt   = "🔥 FORTE" if delta >= 15 else "⚡ MÉDIO" if delta >= 8 else "· fraco"
+        H += f"<tr><td>{i+1}</td><td><b>{name}</b></td><td>{delta:.0f}pp</td>"
+        H += f"<td class='{badge}'>{txt}</td></tr>"
+    H += "</table>"
+
+    # Detalhe por feature
+    H += "<h3>Detalhe por feature</h3>"
+    for name, buckets, delta in features:
+        cls = "sep-high" if delta >= 15 else "sep-mid" if delta >= 8 else "sep-low"
+        H += f"<h4 class='{cls}'>▸ {name} &nbsp;<span class='dim'>(delta={delta:.0f}pp)</span></h4>"
+        H += "<table><tr><th>Bucket</th><th>N</th><th>TP</th><th>SL</th><th>WR</th><th>vs base</th></tr>"
+        for label, n, tp, wr in buckets:
+            sl   = n - tp
+            wr_s = f"{wr:.0f}%" if wr is not None else f"<span class='dim'>— (n={n})</span>"
+            if wr is not None:
+                dv  = wr - wr_base
+                ds  = f"<span class='{'pos' if dv>0 else 'neg'}'>{dv:+.0f}pp</span>"
+                rc  = " class='hi'" if wr >= wr_base+10 else " class='lo'" if wr <= wr_base-10 else ""
+            else:
+                ds, rc = "—", ""
+            H += f"<tr{rc}><td>{label}</td><td>{n}</td><td class='tp'>{tp}</td>"
+            H += f"<td class='sl'>{sl}</td><td><b>{wr_s}</b></td><td>{ds}</td></tr>"
+        H += "</table>"
+
+    # Tabela individual
+    H += "<h3>Todos os trades</h3>"
+    H += "<table><tr><th>#</th><th>Token</th><th>Status</th>"
+    H += "<th>bounce%</th><th>drop%</th><th>elapsed</th><th>ttb</th>"
+    H += "<th>smart</th><th>creator</th><th>H9</th><th>abs_ev</th><th>entry_r</th></tr>"
+    for t in trades:
+        st  = "<span class='tp'>TP</span>" if t["is_tp"] else "<span class='sl'>SL</span>"
+        bp  = f"{t['bounce_pct']*100:.0f}%" if t["bounce_pct"] else "?"
+        dp  = f"{t['drop_from_mig']*100:.0f}%" if t["drop_from_mig"] else "?"
+        el  = f"{t['elapsed_min']:.1f}m"
+        ttb = f"{t['time_to_bottom']:.1f}m" if t["time_to_bottom"] else "?"
+        cr  = "hold" if t["creator_hold"] else "close"
+        h9  = "<span class='tp'>✓</span>" if t["h9"] else "<span class='dim'>—</span>"
+        ae  = str(t["abs_events"] or 0)
+        er  = f"{t['entry_ratio']:.2f}x" if t["entry_ratio"] else "?"
+        H += f"<tr><td>{t['id']}</td><td><b>{t['symbol']}</b></td><td>{st}</td>"
+        H += f"<td>{bp}</td><td>{dp}</td><td>{el}</td><td>{ttb}</td>"
+        H += f"<td>{t['smart'] or '?'}</td><td>{cr}</td><td>{h9}</td><td>{ae}</td><td>{er}</td></tr>"
+    H += "</table></body></html>"
+    return H
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
