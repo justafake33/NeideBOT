@@ -23551,5 +23551,520 @@ e o fill acontece na blockchain segundos depois. Em tokens com recuperação rá
     return H
 
 
+# ==============================================================================
+# /analise/ttp-reality  — análise com ticks cortados no exit_ts real do GMGN
+# Classifica cada trade em caso A/B/C e compara estratégias plausíveis.
+# ==============================================================================
+
+@app.route("/analise/ttp-reality")
+def analise_ttp_reality():
+    import psycopg2
+    import psycopg2.extras
+
+    PUMP_SUPPLY  = 1_000_000_000
+    REAL_WR      = float(request.args.get("wr",      "0.28"))
+    REAL_N       = int(request.args.get("n",         "60"))
+    REAL_N_TP    = int(request.args.get("n_tp",      "17"))
+    limit        = min(int(request.args.get("limit", "100")), 300)
+    since_days   = int(request.args.get("since_days", "30"))
+
+    conn = psycopg2.connect(db.DATABASE_URL)
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    # ── Verifica colunas disponíveis ──────────────────────────────────────────
+    cur.execute("""SELECT column_name FROM information_schema.columns
+        WHERE table_name='trades'
+          AND column_name IN ('mc_at_signal','exit_ts','exit_type',
+                              'tokens_received','entry_price_usd','fill_source')""")
+    avail_cols = {r["column_name"] for r in cur.fetchall()}
+    has_signal  = "mc_at_signal" in avail_cols
+    has_exit_ts = "exit_ts"      in avail_cols
+
+    sig_col     = "t.mc_at_signal" if has_signal  else "NULL::float"
+    exit_ts_col = "t.exit_ts"      if has_exit_ts else "NULL::timestamptz"
+
+    cur.execute(f"""
+        SELECT t.id, t.symbol, t.mint, t.status, t.exit_type,
+               t.ts_signal, t.ts_order_sent, t.ts_order_confirmed,
+               t.mc_bottom, t.entry_expected, t.mc_migration,
+               t.entry_price_usd, t.tokens_received, t.fill_source,
+               t.amount_usd, t.pnl_pct_real, t.sl_pct, t.tp_pct,
+               {sig_col}     AS mc_at_signal,
+               {exit_ts_col} AS exit_ts,
+               COALESCE(bs.mc_at_signal, {sig_col}) AS signal_mc,
+               bs.bounce_pct AS bs_bounce_pct
+        FROM trades t
+        LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+        WHERE t.created_at > NOW() - INTERVAL '{since_days} days'
+          AND t.status NOT IN ('error','pending','cancelled')
+          AND t.order_id IS NOT NULL
+        ORDER BY t.created_at DESC
+        LIMIT {limit}
+    """)
+    trades_raw = cur.fetchall()
+
+    # ── Por trade: busca ticks separados em pré/pós exit ─────────────────────
+    records = []
+    n_fill_real = 0
+
+    for tr in trades_raw:
+        mint       = tr["mint"]
+        entry_ts   = tr["ts_order_confirmed"] or tr["ts_order_sent"] or tr["ts_signal"]
+        exit_ts    = tr["exit_ts"]
+        if not entry_ts:
+            continue
+
+        sl_pct = tr["sl_pct"] or 0.25
+        tp_pct = tr["tp_pct"] or 0.75
+
+        # entry_mc — hierarquia: real fill > mc_at_signal > entry_expected
+        if tr["entry_price_usd"] and tr["tokens_received"] and tr["tokens_received"] > 0:
+            entry_mc  = (tr["entry_price_usd"] / tr["tokens_received"]) * PUMP_SUPPLY
+            entry_src = "real_fill"
+            n_fill_real += 1
+        elif tr["mc_at_signal"] and tr["mc_at_signal"] > 0:
+            entry_mc  = tr["mc_at_signal"]
+            entry_src = "mc_at_signal"
+        elif tr["entry_expected"] and tr["entry_expected"] > 0:
+            entry_mc  = tr["entry_expected"]
+            entry_src = "entry_expected*"
+        else:
+            continue
+
+        sl_floor = entry_mc * (1 - sl_pct)
+        tp_thr   = entry_mc * (1 + tp_pct)
+
+        # ticks ANTES do exit_ts
+        if exit_ts:
+            cur.execute("""
+                SELECT tick_ts, mc,
+                       COALESCE(mc_high, mc) AS mc_high,
+                       COALESCE(mc_low,  mc) AS mc_low,
+                       mc_open, source
+                FROM token_ticks
+                WHERE mint=%s AND tick_ts>=%s AND tick_ts<=%s
+                  AND mc IS NOT NULL AND mc>0
+                ORDER BY tick_ts ASC
+            """, (mint, entry_ts, exit_ts))
+        else:
+            cur.execute("""
+                SELECT tick_ts, mc,
+                       COALESCE(mc_high, mc) AS mc_high,
+                       COALESCE(mc_low,  mc) AS mc_low,
+                       mc_open, source
+                FROM token_ticks
+                WHERE mint=%s AND tick_ts>=%s AND mc IS NOT NULL AND mc>0
+                ORDER BY tick_ts ASC
+            """, (mint, entry_ts))
+        ticks_pre = [dict(r) for r in cur.fetchall()]
+
+        # ticks APÓS exit_ts (para caso C — TTP saiu, token continuou)
+        ticks_post = []
+        if exit_ts:
+            cur.execute("""
+                SELECT tick_ts, mc,
+                       COALESCE(mc_high, mc) AS mc_high,
+                       COALESCE(mc_low,  mc) AS mc_low
+                FROM token_ticks
+                WHERE mint=%s AND tick_ts>%s AND mc IS NOT NULL AND mc>0
+                ORDER BY tick_ts ASC LIMIT 120
+            """, (mint, exit_ts))
+            ticks_post = [dict(r) for r in cur.fetchall()]
+
+        # ── Métricas sobre ticks pré-exit ─────────────────────────────────────
+        max_gain_pre   = 0.0
+        hit_75_pre     = False
+        hit_100_pre    = False
+        sl_before_75   = False
+        first_sl_tick  = None
+        first_75_tick  = None
+
+        for t in ticks_pre:
+            g_high = (t["mc_high"] - entry_mc) / entry_mc if t["mc_high"] else 0
+            g_low  = (t["mc_low"]  - entry_mc) / entry_mc if t["mc_low"]  else 0
+            max_gain_pre = max(max_gain_pre, g_high)
+
+            if not hit_75_pre and g_high >= 0.75:
+                hit_75_pre    = True
+                first_75_tick = t["tick_ts"]
+            if not hit_100_pre and g_high >= 1.00:
+                hit_100_pre = True
+            if not sl_before_75 and not hit_75_pre and g_low <= -sl_pct:
+                sl_before_75  = True
+                first_sl_tick = t["tick_ts"]
+
+        # max_gain APÓS exit (para detectar caso C)
+        max_gain_post = 0.0
+        for t in ticks_post:
+            g = (t["mc_high"] - entry_mc) / entry_mc if t["mc_high"] else 0
+            max_gain_post = max(max_gain_post, g)
+
+        # Duração em minutos (entry → exit)
+        duration_min = None
+        if exit_ts and entry_ts:
+            duration_min = (exit_ts - entry_ts).total_seconds() / 60
+
+        # ── Classificação A/B/C ───────────────────────────────────────────────
+        status     = tr["status"] or ""
+        is_sl      = status in ("sl",) or (tr["pnl_pct_real"] is not None and tr["pnl_pct_real"] < -0.10)
+        is_tp      = status in ("tp", "trailing_active") or (tr["pnl_pct_real"] is not None and tr["pnl_pct_real"] > 0.30)
+        pnl_db     = tr["pnl_pct_real"]
+
+        if not hit_75_pre:
+            case = "A"          # nunca atingiu +75% antes do exit → SL/entrada problem
+        elif hit_75_pre and is_sl:
+            case = "B"          # bateu +75% mas DB diz SL → execução/dados inconsistente
+        elif hit_75_pre and is_tp and max_gain_post >= 0.50:
+            case = "C+"         # TTP saiu mas token subiu ≥50% mais → TTP pode estar cedo
+        elif hit_75_pre and is_tp:
+            case = "C"          # TTP saiu normalmente
+        else:
+            case = "A"          # fallback
+
+        records.append({
+            "id": tr["id"], "symbol": tr["symbol"], "mint": mint,
+            "status": status, "entry_src": entry_src,
+            "entry_mc": entry_mc, "pnl_db": pnl_db,
+            "sl_pct": sl_pct, "tp_pct": tp_pct,
+            "n_pre": len(ticks_pre), "n_post": len(ticks_post),
+            "max_gain_pre": max_gain_pre, "max_gain_post": max_gain_post,
+            "hit_75_pre": hit_75_pre, "hit_100_pre": hit_100_pre,
+            "sl_before_75": sl_before_75,
+            "first_sl_tick": first_sl_tick, "first_75_tick": first_75_tick,
+            "exit_ts": exit_ts, "duration_min": duration_min,
+            "case": case, "ticks_pre": ticks_pre,
+            "signal_mc": tr["signal_mc"], "bs_bounce_pct": tr["bs_bounce_pct"],
+        })
+
+    conn.close()
+
+    # ── Agrega por caso ───────────────────────────────────────────────────────
+    cases = {"A": [], "B": [], "C": [], "C+": []}
+    for r in records:
+        cases[r["case"]].append(r)
+
+    # Estratégias plausíveis — simula APENAS sobre ticks_pre (cortados no exit)
+    STRATS = [
+        ("ATUAL TTP 75/30/SL25", "ttp",  0.75, 0.30, 0.25),
+        ("TTP 100/30/SL25",      "ttp",  1.00, 0.30, 0.25),
+        ("TTP 75/SL30",          "ttp",  0.75, 0.30, 0.30),
+        ("TTP 75/SL35",          "ttp",  0.75, 0.30, 0.35),
+        ("MovSL 100/SL25",       "movsl",1.00, 0.25, 0),
+    ]
+
+    def sim_pre(ticks, entry_mc, strat):
+        """Simula sobre ticks pré-exit apenas."""
+        label, tipo, p1, p2, p3 = strat
+        sl_pct   = p3 if tipo == "ttp" else p2
+        act_pct  = p1
+        dd_pct   = p2 if tipo == "ttp" else None
+
+        sl_floor     = entry_mc * (1 - sl_pct)
+        activated    = False
+        peak_mc      = entry_mc
+        mov_sl_floor = sl_floor
+        max_gain     = 0.0
+
+        for t in ticks:
+            mc_h = t.get("mc_high") or t.get("mc") or 0
+            mc_l = t.get("mc_low")  or t.get("mc") or 0
+            if mc_h <= 0 and mc_l <= 0:
+                continue
+            max_gain = max(max_gain, (mc_h - entry_mc) / entry_mc if mc_h else 0)
+
+            eff_sl = mov_sl_floor if tipo == "movsl" else sl_floor
+            if mc_l > 0 and mc_l <= eff_sl:
+                return (eff_sl - entry_mc) / entry_mc, "sl"
+
+            if tipo == "ttp":
+                if not activated and mc_h >= entry_mc * (1 + act_pct):
+                    activated = True
+                if activated:
+                    peak_mc  = max(peak_mc, mc_h)
+                    trail_sl = peak_mc * (1 - dd_pct)
+                    if mc_l > 0 and mc_l <= trail_sl:
+                        return (trail_sl - entry_mc) / entry_mc, "ttp_exit"
+            elif tipo == "movsl":
+                if mc_h >= entry_mc * (1 + act_pct):
+                    activated = True
+                if activated:
+                    peak_mc      = max(peak_mc, mc_h)
+                    mov_sl_floor = max(entry_mc, peak_mc * (1 - sl_pct))
+
+        last = ticks[-1].get("mc") or entry_mc if ticks else entry_mc
+        return (last - entry_mc) / entry_mc, "time_exit"
+
+    strat_results = {s[0]: [] for s in STRATS}
+    for rec in records:
+        for s in STRATS:
+            if rec["n_pre"] < 2:
+                strat_results[s[0]].append(None)
+            else:
+                pnl, etype = sim_pre(rec["ticks_pre"], rec["entry_mc"], s)
+                strat_results[s[0]].append({
+                    "pnl": pnl, "etype": etype,
+                    "symbol": rec["symbol"], "case": rec["case"],
+                })
+
+    def strat_agg(sims):
+        v = [s for s in sims if s]
+        if not v: return {}
+        tps  = [s for s in v if s["etype"] in ("ttp_exit",)]
+        sls  = [s for s in v if s["etype"] == "sl"]
+        pnls = [s["pnl"] for s in v]
+        return {
+            "n": len(v), "n_tp": len(tps), "n_sl": len(sls),
+            "n_time": len(v)-len(tps)-len(sls),
+            "wr_sim": len(tps)/len(v) if v else 0,
+            "avg_pnl": sum(pnls)/len(pnls) if pnls else 0,
+            "avg_tp_pnl": sum(s["pnl"] for s in tps)/len(tps) if tps else None,
+            "avg_sl_pnl": sum(s["pnl"] for s in sls)/len(sls) if sls else None,
+        }
+
+    grid = [(s[0], strat_agg(strat_results[s[0]])) for s in STRATS]
+
+    # ── Break-even com WR real ────────────────────────────────────────────────
+    # EV = REAL_WR × avg_tp - (1-REAL_WR) × sl_pct > 0
+    # avg_tp_needed = (1-REAL_WR) × sl_pct / REAL_WR
+    sl_25_needed = (1 - REAL_WR) * 0.25 / REAL_WR
+    sl_30_needed = (1 - REAL_WR) * 0.30 / REAL_WR
+    sl_35_needed = (1 - REAL_WR) * 0.35 / REAL_WR
+
+    # ── HTML ──────────────────────────────────────────────────────────────────
+    def pct(v, d=1):
+        if v is None: return "<span style='color:#555'>—</span>"
+        c = "#4f4" if v > 0.01 else ("#f44" if v < -0.01 else "#888")
+        return f"<span style='color:{c}'>{v*100:+.{d}f}%</span>"
+    def pp(v):
+        if v is None: return "—"
+        return f"{v*100:.0f}%"
+
+    H = """<!DOCTYPE html><html><head><meta charset='utf-8'><title>TTP Reality</title>
+<style>
+body{font-family:monospace;font-size:12px;background:#0e0e0e;color:#ddd;padding:16px}
+h2{color:#f90}h3{color:#8cf;margin-top:24px}h4{color:#fc8;margin-top:16px}
+table{border-collapse:collapse;margin-bottom:16px;width:100%}
+th{background:#1a1a2e;color:#8cf;padding:4px 8px;border:1px solid #333;text-align:right;white-space:nowrap}
+th.L{text-align:left}
+td{padding:3px 8px;border:1px solid #1a1a1a;text-align:right;white-space:nowrap}
+td.L{text-align:left}
+.A{background:#1a1a00!important}.B{background:#1a001a!important}
+.C{background:#001a0a!important}.Cp{background:#002a1a!important}
+.pos{color:#4f4}.neg{color:#f44}.warn{color:#fa0}.null{color:#555}
+.box{background:#111;border:1px solid #333;padding:10px;margin:8px 0;border-radius:4px}
+.tag{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;margin-right:4px}
+.tA{background:#333;color:#ff0}.tB{background:#300;color:#f88}
+.tC{background:#030;color:#8f8}.tCp{background:#050;color:#4f4}
+</style></head><body>"""
+
+    n_total  = len(records)
+    n_A      = len(cases["A"])
+    n_B      = len(cases["B"])
+    n_C      = len(cases["C"])
+    n_Cp     = len(cases["C+"])
+    n_exit   = sum(1 for r in records if r["exit_ts"])
+    n_pre_ok = sum(1 for r in records if r["n_pre"] >= 2)
+
+    H += f"<h2>📊 TTP Reality Analysis — ticks cortados no exit_ts real</h2>"
+    H += f"<div class='box'>"
+    H += f"<b>WR real (GMGN, usuário):</b> {REAL_WR*100:.0f}% ({REAL_N_TP} TP / {REAL_N - REAL_N_TP} SL / {REAL_N} trades)<br>"
+    H += f"<b>Trades no DB:</b> {n_total} | com exit_ts: {n_exit} | com ≥2 ticks pré-exit: {n_pre_ok} | fill_real: {n_fill_real}<br>"
+    H += f"<b>Entradas:</b> real_fill={n_fill_real} | mc_at_signal={sum(1 for r in records if r['entry_src']=='mc_at_signal')} | entry_expected*={sum(1 for r in records if r['entry_src']=='entry_expected*')}"
+    if n_fill_real == 0:
+        H += "<br><span class='neg'><b>⚠️ fill_real=0 — recomendações são fracas. Execute /debug/sell-recovery para preencher.</b></span>"
+    H += "</div>"
+
+    # ── Seção 1: Break-even com WR real ─────────────────────────────────────
+    H += "<h3>1 — Break-even com WR real 28%</h3>"
+    H += "<div class='box'>"
+    H += f"<b>Para EV > 0 com WR={REAL_WR*100:.0f}%:</b><br>"
+    H += f"<table style='width:auto'><tr><th>SL configurado</th><th>avg_TP necessário (mínimo)</th><th>EV se TP=100%</th><th>EV se TP=75%</th></tr>"
+    for sl_lbl, sl_v, needed in [("SL 25%",0.25,sl_25_needed),("SL 30%",0.30,sl_30_needed),("SL 35%",0.35,sl_35_needed)]:
+        ev100 = REAL_WR*1.00 - (1-REAL_WR)*sl_v
+        ev75  = REAL_WR*0.75 - (1-REAL_WR)*sl_v
+        c_n   = "#4f4" if needed < 0.80 else ("#fa0" if needed < 1.20 else "#f44")
+        H += f"<tr><td>{sl_lbl}</td><td><span style='color:{c_n}'>{needed*100:.0f}%</span></td><td>{pct(ev100)}</td><td>{pct(ev75)}</td></tr>"
+    H += "</table>"
+    H += f"<small>Com SL=25% e WR=28%: avg_TP real precisa ser ≥{sl_25_needed*100:.0f}% para ser lucrativo. "
+    H += f"Com TP médio real=100%: EV = {(REAL_WR*1.00-(1-REAL_WR)*0.25)*100:+.1f}%/trade.</small>"
+    H += "</div>"
+
+    # ── Seção 2: Classificação A/B/C ─────────────────────────────────────────
+    H += "<h3>2 — Classificação por caso</h3>"
+
+    case_defs = [
+        ("A",  "A — Nunca bateu +75% antes do exit",
+         "Problema é filtro de entrada, bounce_pct ou qualidade do token. TTP não é o issue.",
+         "#ff0", "#1a1a00"),
+        ("B",  "B — Bateu +75% pré-exit mas DB diz SL",
+         "Inconsistência: tick mostra +75% mas GMGN executou SL. Pode ser: (1) volatilidade pAMM (spike intra-candle), (2) tick high != preço real, (3) fill_source errado.",
+         "#f88", "#1a001a"),
+        ("C",  "C — TTP saiu, post-exit normal",
+         "TTP funcionou corretamente. Token não subiu muito mais depois.",
+         "#8f8", "#001a0a"),
+        ("C+", "C+ — TTP saiu, token subiu ≥50% pós-exit",
+         "TTP pode estar sendo acionado cedo. Evidência para activation mais alto ou drawdown maior.",
+         "#4f4", "#002a1a"),
+    ]
+
+    H += "<table><tr><th class='L'>Caso</th><th>n</th><th>%</th><th>avg max_gain_pre</th><th>avg pnl_db</th><th class='L'>Diagnóstico</th></tr>"
+    for ckey, clabel, cdiag, ccolor, cbg in case_defs:
+        recs = cases[ckey]
+        n    = len(recs)
+        pct_total = n / n_total * 100 if n_total else 0
+        avg_mg    = sum(r["max_gain_pre"] for r in recs) / n if n else None
+        avg_pdb   = sum(r["pnl_db"] for r in recs if r["pnl_db"] is not None)
+        cnt_pdb   = sum(1 for r in recs if r["pnl_db"] is not None)
+        avg_pdb_v = avg_pdb / cnt_pdb if cnt_pdb else None
+        H += f"<tr style='background:{cbg}'>"
+        H += f"<td class='L'><b style='color:{ccolor}'>{clabel}</b></td>"
+        H += f"<td>{n}</td><td>{pct_total:.0f}%</td>"
+        H += f"<td>{pct(avg_mg)}</td><td>{pct(avg_pdb_v)}</td>"
+        H += f"<td class='L' style='font-size:11px;color:#aaa'>{cdiag}</td></tr>"
+    H += "</table>"
+
+    # ── Seção 3: Trade-by-trade com ticks cortados ────────────────────────────
+    H += "<h3>3 — Trade-by-trade (ticks cortados no exit_ts)</h3>"
+    H += "<table><tr>"
+    H += "<th class='L'>#</th><th class='L'>symbol</th><th>caso</th><th>status</th><th>src</th>"
+    H += "<th>ticks_pre</th><th>ticks_post</th><th>max_pre</th><th>max_post</th>"
+    H += "<th>hit75?</th><th>hit100?</th><th>SL&lt;75?</th>"
+    H += "<th>pnl_db</th><th>dur(min)</th><th>exit_ts?</th></tr>"
+    for r in sorted(records, key=lambda x: -x["id"]):
+        ckey  = r["case"]
+        cinfo = {"A":("#ff0","#1a1a00"),"B":("#f88","#1a001a"),
+                 "C":("#8f8","#001a0a"),"C+":("#4f4","#002a1a")}.get(ckey,("#888",""))
+        tag_c, row_bg = cinfo
+        src_badge = {"real_fill":"<span style='color:#4f4'>f</span>",
+                     "mc_at_signal":"<span style='color:#fa0'>s</span>",
+                     "entry_expected*":"<span style='color:#f44'>*</span>"}.get(r["entry_src"],"?")
+        ets = "✓" if r["exit_ts"] else "<span class='warn'>✗</span>"
+        H += f"<tr style='background:{row_bg}'>"
+        H += f"<td class='L'>{r['id']}</td>"
+        H += f"<td class='L'><b>{r['symbol']}</b></td>"
+        H += f"<td><b style='color:{tag_c}'>{ckey}</b></td>"
+        H += f"<td style='font-size:10px'>{r['status']}</td>"
+        H += f"<td>{src_badge}</td>"
+        H += f"<td>{r['n_pre']}</td><td>{r['n_post']}</td>"
+        H += f"<td>{pct(r['max_gain_pre'])}</td><td>{pct(r['max_gain_post'])}</td>"
+        H += f"<td>{'<span class=pos>✓</span>' if r['hit_75_pre'] else '<span class=null>✗</span>'}</td>"
+        H += f"<td>{'<span class=pos>✓</span>' if r['hit_100_pre'] else '<span class=null>✗</span>'}</td>"
+        H += f"<td>{'<span class=neg>✓</span>' if r['sl_before_75'] else '<span class=null>✗</span>'}</td>"
+        H += f"<td>{pct(r['pnl_db'])}</td>"
+        H += f"<td>{'%.0f'%r['duration_min'] if r['duration_min'] is not None else '—'}</td>"
+        H += f"<td>{ets}</td></tr>"
+    H += "</table>"
+
+    # ── Seção 4: Estratégias (ticks pré-exit apenas) ──────────────────────────
+    H += "<h3>4 — Estratégias plausíveis (ticks cortados no exit_ts)</h3>"
+    H += "<div class='box'><span class='warn'>⚠️ Simulação sobre ticks pré-exit: sem inflação pós-saída. "
+    if n_fill_real == 0:
+        H += "entry_expected* ainda subestima entrada em ~10-15% → gains ligeiramente inflados.</span></div>"
+    else:
+        H += "entry_real usada onde disponível.</span></div>"
+
+    H += "<table><tr><th class='L'>Estratégia</th><th>n</th><th>WR_sim</th><th>TP_exits</th><th>SL</th><th>TimeExit</th><th>avg_PnL</th><th>avg_TP_pnl</th><th>avg_SL_pnl</th></tr>"
+    for label, st in sorted(grid, key=lambda x: x[1].get("avg_pnl",-99), reverse=True):
+        if not st: continue
+        is_curr = (label == STRATS[0][0])
+        brd     = "border-left:3px solid #f90" if is_curr else ""
+        H += f"<tr style='{brd}'>"
+        H += f"<td class='L'>{'⚡' if is_curr else ''}<b>{label}</b></td>"
+        H += f"<td>{st.get('n','—')}</td>"
+        H += f"<td>{pct(st.get('wr_sim'))}</td>"
+        H += f"<td>{st.get('n_tp','—')}</td><td>{st.get('n_sl','—')}</td><td>{st.get('n_time','—')}</td>"
+        H += f"<td>{pct(st.get('avg_pnl'))}</td>"
+        H += f"<td>{pct(st.get('avg_tp_pnl'))}</td>"
+        H += f"<td>{pct(st.get('avg_sl_pnl'))}</td>"
+        H += "</tr>"
+    H += "</table>"
+
+    # Detalhe por caso nos resultados da estratégia ATUAL
+    H += "<h4>Resultado da estratégia ATUAL por caso A/B/C</h4>"
+    curr_sims = strat_results[STRATS[0][0]]
+    H += "<table><tr><th class='L'>Caso</th><th>n</th><th>avg_PnL_sim</th><th>avg_pnl_db</th><th>Diferença (sim-db)</th><th class='L'>Interpretação</th></tr>"
+    for ckey in ["A","B","C","C+"]:
+        recs_c = [(r, s) for r, s in zip(records, curr_sims) if r["case"] == ckey and s]
+        if not recs_c: continue
+        avg_sim = sum(s["pnl"] for _,s in recs_c) / len(recs_c)
+        pdb_vals = [r["pnl_db"] for r,_ in recs_c if r["pnl_db"] is not None]
+        avg_db  = sum(pdb_vals)/len(pdb_vals) if pdb_vals else None
+        diff    = (avg_sim - avg_db) if avg_db is not None else None
+        intps   = {"A": "Sim ≈ DB esperado — SLs reais dominam",
+                   "B": "Sim alto, DB negativo → spike pAMM ou tick ruim",
+                   "C": "Sim e DB compatíveis → TTP funcionou",
+                   "C+": "Sim bom, token continuou → TTP pode estar cedo"}
+        ccolors = {"A":"#ff0","B":"#f88","C":"#8f8","C+":"#4f4"}
+        H += f"<tr><td class='L'><b style='color:{ccolors.get(ckey)}'>{ckey}</b></td>"
+        H += f"<td>{len(recs_c)}</td><td>{pct(avg_sim)}</td><td>{pct(avg_db)}</td>"
+        H += f"<td>{pct(diff)}</td><td class='L' style='font-size:11px;color:#aaa'>{intps.get(ckey,'')}</td></tr>"
+    H += "</table>"
+
+    # ── Seção 5: Recomendação baseada em WR real ──────────────────────────────
+    H += "<h3>5 — Recomendação baseada no WR real</h3>"
+    H += "<div class='box'>"
+
+    conf_note = " <span class='neg'>(fraca — fill_real=0)</span>" if n_fill_real == 0 else " <span class='pos'>(baseada em dados reais)</span>"
+
+    H += f"<b>Premissa{conf_note}:</b> WR={REAL_WR*100:.0f}% com SL=25% exige avg_TP ≥ {sl_25_needed*100:.0f}% para EV positivo.<br><br>"
+
+    n_Cp_pct = n_Cp / n_total * 100 if n_total else 0
+    n_B_pct  = n_B  / n_total * 100 if n_total else 0
+    n_A_pct  = n_A  / n_total * 100 if n_total else 0
+
+    # Q1: TTP está sendo acionado cedo?
+    H += "<b>Q1 — TTP está sendo acionado cedo (caso C+)?</b><br>"
+    if n_Cp >= 5:
+        avg_post_Cp = sum(r["max_gain_post"] for r in cases["C+"]) / n_Cp
+        H += f"<span class='warn'>{n_Cp} trades caso C+ ({n_Cp_pct:.0f}%) — avg_max_post={avg_post_Cp*100:.0f}%. "
+        H += "TTP pode estar saindo antes do fim da corrida. Candidato a testar TTP 100/30.</span><br>"
+    elif n_Cp >= 2:
+        H += f"<span class='warn'>{n_Cp} trades C+ — amostra pequena, hipótese fraca.</span><br>"
+    else:
+        H += f"<span class='pos'>Apenas {n_Cp} trades C+ — TTP 75/30 não está claramente matando runners.</span><br>"
+
+    # Q2: Caso B sugere dados ruins ou execução?
+    H += f"<br><b>Q2 — Caso B (bateu +75 mas DB=SL): {n_B} trades ({n_B_pct:.0f}%)</b><br>"
+    if n_B >= 5:
+        H += "<span class='warn'>Múltiplos trades com inconsistência tick/GMGN — provavelmente spike pAMM intra-candle. "
+        H += "O kline high não é preço real sustentado. Não mudar TTP com base nesses casos.</span><br>"
+    else:
+        H += f"<span class='pos'>{n_B} casos B — inconsistência pequena, noise esperado.</span><br>"
+
+    # Q3: Qual SL faz sentido
+    H += f"<br><b>Q3 — SL ótimo com WR=28%?</b><br>"
+    H += f"SL 25%: precisa avg_TP ≥ {sl_25_needed*100:.0f}% &nbsp;|&nbsp; "
+    H += f"SL 30%: precisa avg_TP ≥ {sl_30_needed*100:.0f}% &nbsp;|&nbsp; "
+    H += f"SL 35%: precisa avg_TP ≥ {sl_35_needed*100:.0f}%<br>"
+    H += "<span class='warn'>SL maior reduz a perda por operação, mas precisa de TP médio maior para compensar. "
+    H += "Sem avg_TP real dos 17 TPs, qualquer mudança de SL é blind.</span><br>"
+
+    # Q4: MovSL
+    H += "<br><b>Q4 — Evidência para MovSL?</b><br>"
+    movsl_st = dict(grid).get("MovSL 100/SL25", {})
+    curr_st  = dict(grid).get(STRATS[0][0], {})
+    if movsl_st.get("avg_pnl") and curr_st.get("avg_pnl"):
+        diff_movsl = movsl_st["avg_pnl"] - curr_st["avg_pnl"]
+        if diff_movsl > 0.10:
+            H += f"<span class='warn'>MovSL avg_pnl {diff_movsl*100:+.0f}pp acima do ATUAL — hipótese fraca, monitorar.</span><br>"
+        else:
+            H += "MovSL não supera TTP ATUAL nos ticks pré-exit.<br>"
+
+    # Q5: Ação imediata
+    H += "<br><b>Q5 — Ação imediata recomendada:</b><br>"
+    H += "<div style='margin-left:12px;margin-top:4px'>"
+    H += "1. <b>Não mudar TTP/SL</b> até ter avg_TP real dos 17 TPs (execute <code>/debug/sell-recovery</code>).<br>"
+    H += f"2. <b>Verificar caso B</b> ({n_B} trades): são spikes pAMM? Se sim, confirma que tick high ≠ preço real.<br>"
+    if n_Cp >= 3:
+        H += f"3. <b>Monitorar C+</b> ({n_Cp} casos): se avg_post≥100%, testar TTP 100/30 em paralelo em próximos 30 trades.<br>"
+    else:
+        H += "3. <b>TTP 75/30 parece adequado</b> — sem evidência forte para subir activation.<br>"
+    H += f"4. Com fill_real=0, qualquer mudança de config é{'  <span class=neg>fraca</span>' if n_fill_real==0 else ' <span class=pos>informada</span>'}.<br>"
+    H += "</div>"
+
+    H += "</div></body></html>"
+    return H
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
