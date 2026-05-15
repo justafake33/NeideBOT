@@ -206,8 +206,8 @@ class TradeExecutor:
         # Estratégia em camadas:
         #   a) GMGN query_order: tenta filled_output_amount (histórico: não retorna)
         #   b) Helius getTransaction: lê o fill diretamente da blockchain (fonte primária)
-        # Timeout de 120s para GMGN; Helius fica tentando enquanto state=confirmed.
-        FILL_TIMEOUT_SEC = int(os.getenv("FILL_TIMEOUT_SEC", "120"))
+        # Timeout padrão 300s — GMGN pode demorar mais que 120s para confirmar em congestionamento.
+        FILL_TIMEOUT_SEC = int(os.getenv("FILL_TIMEOUT_SEC", "300"))
         deadline         = time.time() + FILL_TIMEOUT_SEC
         confirmed_qr     = None  # guarda última resposta query_order confirmada
 
@@ -248,22 +248,27 @@ class TradeExecutor:
                     if tx_sig and helius_rpc.available():
                         fill = helius_rpc.get_swap_fill(tx_sig, mint)
                         if fill:
-                            sol_spent = fill["sol_spent"] or amount_sol
-                            tokens    = fill["tokens_received"]
-                            fee_sol   = fill["fee_sol"]
-                            slippage  = (sol_spent - amount_sol) / amount_sol if amount_sol else 0.0
+                            sol_spent  = fill["sol_spent"] or amount_sol
+                            tokens     = fill["tokens_received"]
+                            fee_sol    = fill["fee_sol"]
+                            block_time = fill.get("block_time")
+                            slippage   = (sol_spent - amount_sol) / amount_sol if amount_sol else 0.0
+                            ts_confirm = (
+                                datetime.fromtimestamp(block_time, tz=timezone.utc)
+                                if block_time else datetime.now(timezone.utc)
+                            )
                             db.update_trade(trade_id, {
-                                "ts_order_confirmed": datetime.now(timezone.utc),
+                                "ts_order_confirmed": ts_confirm,
                                 "tokens_received":    tokens,
                                 "entry_price_sol":    sol_spent / tokens,
                                 "entry_price_usd":    sol_spent * sol_usd,
                                 "fee_sol":            fee_sol,
-                                "latency_sec":        (datetime.now(timezone.utc) - ts_signal).total_seconds(),
+                                "latency_sec":        (ts_confirm - ts_signal).total_seconds(),
                                 "slippage_pct":       slippage,
                                 "fill_source":        "helius",
                             })
-                            logger.info("Fill(Helius) #%d %s — %.2f tokens @ %.10f SOL | slip=%.2f%% fee=%.6f SOL",
-                                        trade_id, symbol, tokens, sol_spent / tokens, slippage * 100, fee_sol)
+                            logger.info("Fill(Helius) #%d %s — %.2f tokens @ %.10f SOL | slip=%.2f%% fee=%.6f SOL | block_time=%s",
+                                        trade_id, symbol, tokens, sol_spent / tokens, slippage * 100, fee_sol, block_time)
                             return
             except Exception as e:
                 logger.debug("poll fill #%d: %s", trade_id, e)
@@ -408,21 +413,29 @@ class TradeMonitor:
             if tx_sig and helius_rpc.available():
                 fill = helius_rpc.get_swap_fill(tx_sig, mint)
                 if fill:
-                    sol_spent = fill["sol_spent"] or amount_sol
-                    tokens    = fill["tokens_received"]
-                    fee_sol   = fill["fee_sol"]
-                    slippage  = (sol_spent - amount_sol) / amount_sol if amount_sol else 0.0
-                    db.update_trade(trade_id, {
+                    sol_spent  = fill["sol_spent"] or amount_sol
+                    tokens     = fill["tokens_received"]
+                    fee_sol    = fill["fee_sol"]
+                    block_time = fill.get("block_time")
+                    slippage   = (sol_spent - amount_sol) / amount_sol if amount_sol else 0.0
+                    ts_confirm = (
+                        datetime.fromtimestamp(block_time, tz=timezone.utc)
+                        if block_time else None
+                    )
+                    update = {
                         "tokens_received": tokens,
                         "entry_price_sol": sol_spent / tokens,
                         "entry_price_usd": sol_spent * sol_usd,
                         "fee_sol":         fee_sol,
                         "slippage_pct":    slippage,
                         "fill_source":     "helius_recovery",
-                    })
+                    }
+                    if ts_confirm and not trade.get("ts_order_confirmed"):
+                        update["ts_order_confirmed"] = ts_confirm
+                    db.update_trade(trade_id, update)
                     logger.info(
-                        "_recover_fill(Helius) #%d %s — %.2f tokens @ %.10f SOL",
-                        trade_id, symbol, tokens, sol_spent / tokens,
+                        "_recover_fill(Helius) #%d %s — %.2f tokens @ %.10f SOL | block_time=%s",
+                        trade_id, symbol, tokens, sol_spent / tokens, block_time,
                     )
                     return True
 
@@ -464,14 +477,27 @@ class TradeMonitor:
     def _check_all(self):
         sol_usd = get_sol_usd() or 0
         now = datetime.now(timezone.utc)
+
+        # Recupera fill para QUALQUER trade com order_id mas sem entry_price_usd,
+        # independente do status — o bug anterior limitava a status='open' e perdia
+        # fills de trades que foram para trailing_active/sl/tp antes do recovery rodar.
+        try:
+            fill_missing = db.get_trades_missing_fill()
+            for trade in fill_missing:
+                try:
+                    self._recover_fill(trade, sol_usd)
+                except Exception as e:
+                    logger.debug("TradeMonitor recover_fill (missing) #%s: %s", trade.get("id"), e)
+        except Exception as e:
+            logger.debug("TradeMonitor get_trades_missing_fill: %s", e)
+
         trades = db.get_open_trades()
         for trade in trades:
-            # Recupera fill data se ausente — _execute() pode ter expirado antes de GMGN popular os amounts
+            # Segunda chance de fill recovery para trades ainda abertos
             if not trade.get("entry_price_usd") and trade.get("order_id"):
                 try:
                     recovered = self._recover_fill(trade, sol_usd)
                     if recovered:
-                        # Re-lê o trade com fill atualizado antes de checar TP/SL
                         fresh = db.get_trade_by_id(trade["id"])
                         if fresh:
                             trade = fresh
@@ -543,6 +569,15 @@ class TradeMonitor:
         balance = helius_rpc.get_token_balance(mint)
         if balance > 0:
             return False  # posição ainda aberta
+
+        # Sem fill real, não conseguimos calcular PnL nem SL/TP threshold correto.
+        # Tenta recuperar fill antes de marcar o fechamento.
+        if not trade.get("entry_price_usd") and trade.get("order_id"):
+            try:
+                self._recover_fill(trade, sol_usd)
+                trade = db.get_trade_by_id(trade["id"]) or trade
+            except Exception:
+                pass
 
         # Saldo zero — GMGN executou TP ou SL. Inferir qual.
         entry_price_usd = trade.get("entry_price_usd")

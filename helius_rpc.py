@@ -81,6 +81,8 @@ def get_swap_fill(tx_signature: str, token_mint: str, wallet: str = None) -> dic
           "tokens_received": float,  # tokens em unidades display (÷ 10^decimals)
           "sol_spent":       float,  # SOL gasto (inclui fee)
           "fee_sol":         float,  # fee da tx em SOL
+          "block_time":      int,    # unix timestamp do bloco (para medir latência)
+          "decimals":        int,    # decimals do token (para validação)
         }
         None se tx não encontrada, não confirmada, ou não parseável.
     """
@@ -160,20 +162,37 @@ def get_swap_fill(tx_signature: str, token_mint: str, wallet: str = None) -> dic
                 break
 
     if tokens_received <= 0:
-        logger.debug(
-            "get_swap_fill %s: tokens_received=0 para mint=%s",
-            tx_signature[:16], token_mint[:16],
+        # Log de warning com contexto para diagnóstico — owners reais e mints na tx
+        owners_for_mint = [
+            post_tok[idx].get("owner") for idx in post_tok
+            if post_tok[idx].get("mint") == token_mint
+        ]
+        logger.warning(
+            "get_swap_fill %s: tokens_received=0 para mint=%s wallet=%s "
+            "owners_encontrados=%s total_post_tok=%d",
+            tx_signature[:16], token_mint[:16], wallet[:16] if wallet else "?",
+            owners_for_mint[:3], len(post_tok),
         )
         return None
 
+    decimals_found = None
+    for idx in post_tok:
+        if post_tok[idx].get("mint") == token_mint and post_tok[idx].get("owner") == wallet:
+            decimals_found = (post_tok[idx].get("uiTokenAmount") or {}).get("decimals")
+            break
+
+    block_time = result.get("blockTime")
+
     logger.info(
-        "get_swap_fill %s: %.2f tokens | %.6f SOL gasto | fee=%.6f SOL",
-        tx_signature[:16], tokens_received, sol_spent, fee_sol,
+        "get_swap_fill %s: %.2f tokens (dec=%s) | %.6f SOL gasto | fee=%.6f SOL | block_time=%s",
+        tx_signature[:16], tokens_received, decimals_found, sol_spent, fee_sol, block_time,
     )
     return {
         "tokens_received": tokens_received,
         "sol_spent":       sol_spent,
         "fee_sol":         fee_sol,
+        "block_time":      block_time,
+        "decimals":        decimals_found,
     }
 
 
@@ -212,23 +231,52 @@ def get_token_balance(token_mint: str, wallet: str = None) -> float:
 def extract_tx_signature(query_order_response: dict) -> str | None:
     """Tenta extrair a assinatura da tx Solana de uma resposta query_order do GMGN.
 
-    GMGN não documenta onde coloca o tx hash, então tentamos múltiplos campos.
+    GMGN não documenta onde coloca o tx hash, então tentamos múltiplos campos em ordem
+    de prioridade e, como fallback, fazemos scan regex em toda a resposta JSON.
     """
+    import re
+    import json
+
     if not query_order_response:
         return None
     data = query_order_response.get("data") or query_order_response
     conf = data.get("confirmation") or {}
 
+    # Campos nomeados — ordem de prioridade
     candidates = [
-        conf.get("signature"),
-        conf.get("tx_hash"),
-        conf.get("hash"),
-        data.get("signature"),
-        data.get("tx_hash"),
-        data.get("tx_signature"),
-        data.get("hash"),
+        ("confirmation.signature",    conf.get("signature")),
+        ("confirmation.tx_hash",      conf.get("tx_hash")),
+        ("confirmation.hash",         conf.get("hash")),
+        ("confirmation.tx_signature", conf.get("tx_signature")),
+        ("data.signature",            data.get("signature")),
+        ("data.tx_hash",              data.get("tx_hash")),
+        ("data.tx_signature",         data.get("tx_signature")),
+        ("data.hash",                 data.get("hash")),
     ]
-    for c in candidates:
-        if c and isinstance(c, str) and len(c) >= 44:  # tx sig Solana = 88 chars base58
-            return c
+    for field, val in candidates:
+        if val and isinstance(val, str) and len(val) >= 44:
+            logger.debug("extract_tx_signature: encontrada em %s", field)
+            return val
+
+    # Fallback: scan regex em todo o JSON — base58 com 87-90 chars (tx sig Solana)
+    try:
+        raw = json.dumps(query_order_response)
+        matches = re.findall(r'[1-9A-HJ-NP-Za-km-z]{87,90}', raw)
+        # Exclui o próprio wallet address e mints (também são base58 longos)
+        wallet = WALLET_ADDRESS
+        for m in matches:
+            if m != wallet and len(m) >= 87:
+                logger.info("extract_tx_signature: encontrada via regex (%d chars): %s...", len(m), m[:20])
+                return m
+    except Exception:
+        pass
+
+    # Log de warning para diagnóstico quando state=confirmed mas sig não encontrada
+    state = conf.get("state") or data.get("state") or ""
+    if state in ("processed", "confirmed"):
+        logger.warning(
+            "extract_tx_signature: state=%s mas sig não encontrada. "
+            "Keys em data: %s | Keys em confirmation: %s",
+            state, list(data.keys()), list(conf.keys()),
+        )
     return None
