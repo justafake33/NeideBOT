@@ -24967,5 +24967,295 @@ def analise_real_entries():
     return H
 
 
+# /analise/dip-wait — e se tivéssemos aguardado correção nas entradas acima da migração?
+@app.route("/analise/dip-wait")
+def analise_dip_wait():
+    """
+    Para trades onde entry_mc > mc_migration (compramos acima do preço de migração):
+    1. Confirma se são tokens "jovens" (primeiros minutos pós-migração)
+    2. Simula: se tivéssemos aguardado o preço cair para X × mc_migration antes de entrar,
+       qual teria sido o resultado?
+    """
+    PUMP_SUPPLY   = 1_000_000_000
+    MC_MIG_REF    = 37_000.0
+    THRESHOLDS    = [1.2, 1.1, 1.0, 0.9]   # targets de entrada como fração de mc_migration
+    TP_PCT        = 0.75
+    SL_PCT        = 0.25
+
+    css = """
+    <style>
+    body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+    h2{color:#58a6ff}h3{color:#79c0ff}h4{color:#d2a679}
+    table{border-collapse:collapse;width:100%;margin-bottom:24px}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:right}
+    th:first-child,th:nth-child(2){text-align:left}
+    td{padding:5px 10px;border:1px solid #21262d;text-align:right;white-space:nowrap}
+    td:first-child,td:nth-child(2){text-align:left}
+    .tp{color:#3fb950}.sl{color:#f85149}.warn{color:#d29922}.dim{color:#6e7681}
+    .pos{color:#3fb950}.neg{color:#f85149}
+    .box{background:#161b22;border:1px solid #30363d;padding:12px 16px;margin-bottom:16px;border-radius:6px}
+    .hi{background:#1f2d1f}.lo{background:#2d1f1f}.mid{background:#1e2a3a}
+    </style>
+    """
+
+    with db._cursor() as cur:
+        # Trades com fill real — precisa de entry_price_usd + tokens_received
+        cur.execute("""
+            SELECT t.id, t.mint, t.symbol, t.ts_signal, t.status, t.pnl_pct_real,
+                   t.entry_price_usd, t.tokens_received, t.fill_source,
+                   m.mc_migration, m.ts_migration
+            FROM trades t
+            LEFT JOIN migrations m ON t.mint = m.mint
+            WHERE t.entry_price_usd IS NOT NULL
+              AND t.tokens_received IS NOT NULL
+              AND t.tokens_received > 0
+              AND t.tokens_received < 1000000   -- exclui outliers com unidade errada (LOOP etc)
+            ORDER BY t.ts_signal DESC
+            LIMIT 200
+        """)
+        all_trades = cur.fetchall()
+
+    # Calcula entry_mc e ratio para cada trade
+    trades_with_ratio = []
+    for r in all_trades:
+        tokens = float(r["tokens_received"])
+        if tokens <= 0:
+            continue
+        entry_usd = float(r["entry_price_usd"])
+        entry_mc  = (entry_usd / tokens) * PUMP_SUPPLY
+        mc_mig    = float(r["mc_migration"]) if r["mc_migration"] else MC_MIG_REF
+        ratio     = entry_mc / mc_mig if mc_mig > 0 else None
+
+        elapsed_min = None
+        if r["ts_migration"] and r["ts_signal"]:
+            elapsed_min = (r["ts_signal"] - r["ts_migration"]).total_seconds() / 60.0
+
+        trades_with_ratio.append({
+            "id":          r["id"],
+            "mint":        r["mint"],
+            "symbol":      r["symbol"] or r["mint"][:8],
+            "ts_signal":   r["ts_signal"],
+            "status":      r["status"] or "",
+            "entry_mc":    entry_mc,
+            "mc_mig":      mc_mig,
+            "ratio":       ratio,
+            "elapsed_min": elapsed_min,
+        })
+
+    # Separa: acima vs abaixo da migração
+    above = [t for t in trades_with_ratio if t["ratio"] and t["ratio"] > 1.0]
+    below = [t for t in trades_with_ratio if t["ratio"] and t["ratio"] <= 1.0]
+
+    H = f"<!DOCTYPE html><html><head><title>Dip Wait</title>{css}</head><body>"
+    H += "<h2>⏳ Dip Wait — E se tivéssemos aguardado correção?</h2>"
+
+    # ── PARTE 1: Confirmar padrão de tempo ───────────────────────────────────
+    H += "<h3>Parte 1 — Entradas acima da migração são tokens jovens?</h3>"
+
+    bins_above = {"0-3min": 0, "3-10min": 0, "10-20min": 0, ">20min": 0}
+    bins_below = {"0-3min": 0, "3-10min": 0, "10-20min": 0, ">20min": 0}
+
+    def elapsed_bin(e):
+        if e is None: return None
+        if e <= 3:    return "0-3min"
+        if e <= 10:   return "3-10min"
+        if e <= 20:   return "10-20min"
+        return ">20min"
+
+    for t in above:
+        b = elapsed_bin(t["elapsed_min"])
+        if b: bins_above[b] += 1
+    for t in below:
+        b = elapsed_bin(t["elapsed_min"])
+        if b: bins_below[b] += 1
+
+    n_above = len(above)
+    n_below = len(below)
+
+    H += f"<div class='box'>Fill real disponível: <b>{len(trades_with_ratio)}</b> trades &nbsp;|&nbsp; "
+    H += f"Acima da migração (ratio &gt; 1.0x): <b>{n_above}</b> &nbsp;|&nbsp; "
+    H += f"Abaixo/igual: <b>{n_below}</b></div>"
+
+    H += "<table><tr><th>Elapsed pós-migração</th>"
+    H += f"<th>Acima migração ({n_above})</th><th>%</th>"
+    H += f"<th>Abaixo migração ({n_below})</th><th>%</th></tr>"
+    for b in ["0-3min", "3-10min", "10-20min", ">20min"]:
+        na = bins_above[b]
+        nb = bins_below[b]
+        pct_a = na / n_above * 100 if n_above else 0
+        pct_b = nb / n_below * 100 if n_below else 0
+        flag = " <span class='warn'>◄ padrão</span>" if b == "0-3min" and pct_a > pct_b + 15 else ""
+        H += f"<tr><td><b>{b}</b></td><td>{na}</td><td>{pct_a:.0f}%{flag}</td>"
+        H += f"<td>{nb}</td><td>{pct_b:.0f}%</td></tr>"
+    H += "</table>"
+
+    # ── PARTE 2: Simulação dip-wait ──────────────────────────────────────────
+    H += "<h3>Parte 2 — Simulação: aguardar correção para X × mc_migration antes de entrar</h3>"
+    H += "<p class='dim'>Para cada trade acima da migração: busca ticks após ts_signal onde mc caiu até o target. "
+    H += "Se chegou: simula entrada nesse tick e caminha para frente para detectar TP (+75%) ou SL (-25%). "
+    H += "TP usa mc_high do tick (kline) ou mc (trenches). SL usa mc_low ou mc.</p>"
+
+    # Busca ticks de todos os mints do grupo "above"
+    above_mints = list({t["mint"] for t in above})
+
+    ticks_by_mint = {}
+    if above_mints:
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT mint, tick_ts, mc, mc_high, mc_low, source
+                FROM token_ticks
+                WHERE mint = ANY(%s)
+                ORDER BY mint, tick_ts ASC
+            """, (above_mints,))
+            for row in cur.fetchall():
+                m = row["mint"]
+                if m not in ticks_by_mint:
+                    ticks_by_mint[m] = []
+                ticks_by_mint[m].append(row)
+
+    # Para cada threshold, simula
+    sim_results = {}   # threshold → {reached, tp, sl, no_exit}
+    trade_detail = []  # para a tabela por trade
+
+    for thr in THRESHOLDS:
+        sim_results[thr] = {"reached": 0, "tp": 0, "sl": 0, "no_exit": 0}
+
+    for trade in above:
+        mint      = trade["mint"]
+        ts_signal = trade["ts_signal"]
+        mc_mig    = trade["mc_mig"]
+        real_status = trade["status"]
+
+        all_ticks = ticks_by_mint.get(mint, [])
+        # Ticks após o sinal (janela de 60min)
+        post_ticks = [
+            tk for tk in all_ticks
+            if tk["tick_ts"] and ts_signal and tk["tick_ts"] > ts_signal
+            and (tk["tick_ts"] - ts_signal).total_seconds() <= 3600
+        ]
+
+        row_thrs = {}
+
+        for thr in THRESHOLDS:
+            target_mc = mc_mig * thr
+            entry_tick_idx = None
+
+            # Encontra primeiro tick onde mc caiu até target
+            for i, tk in enumerate(post_ticks):
+                mc_check = float(tk["mc_low"]) if tk["source"] == "kline" and tk["mc_low"] else float(tk["mc"])
+                if mc_check <= target_mc:
+                    entry_tick_idx = i
+                    break
+
+            if entry_tick_idx is None:
+                row_thrs[thr] = "não chegou"
+                continue
+
+            sim_results[thr]["reached"] += 1
+            entry_mc_sim = target_mc
+            tp_target    = entry_mc_sim * (1 + TP_PCT)
+            sl_floor     = entry_mc_sim * (1 - SL_PCT)
+
+            outcome = "sem_exit"
+            for tk in post_ticks[entry_tick_idx + 1:]:
+                mc_hi = float(tk["mc_high"]) if tk["source"] == "kline" and tk["mc_high"] else float(tk["mc"])
+                mc_lo = float(tk["mc_low"])  if tk["source"] == "kline" and tk["mc_low"]  else float(tk["mc"])
+
+                if mc_hi >= tp_target:
+                    outcome = "tp"
+                    break
+                if mc_lo <= sl_floor:
+                    outcome = "sl"
+                    break
+
+            if outcome == "tp":
+                sim_results[thr]["tp"] += 1
+                row_thrs[thr] = "<span class='tp'>TP</span>"
+            elif outcome == "sl":
+                sim_results[thr]["sl"] += 1
+                row_thrs[thr] = "<span class='sl'>SL</span>"
+            else:
+                sim_results[thr]["no_exit"] += 1
+                row_thrs[thr] = "<span class='dim'>sem exit</span>"
+
+        trade_detail.append({
+            "trade": trade,
+            "thrs":  row_thrs,
+            "n_post_ticks": len(post_ticks),
+        })
+
+    # Tabela de resumo por threshold
+    H += "<h4>Resumo: WR simulado por threshold de espera</h4>"
+    H += "<table><tr><th>Target entrada</th><th>Chegou ao target</th><th>%</th>"
+    H += "<th>TPs</th><th>SLs</th><th>Sem exit</th><th>WR simulado</th>"
+    H += f"<th>vs WR real ({sum(1 for t in above if t['status'] in ('tp','trailing_active'))}/{n_above} = "
+    wr_real_above = sum(1 for t in above if t["status"] in ("tp","trailing_active")) / n_above * 100 if n_above else 0
+    H += f"{wr_real_above:.0f}%)</th></tr>"
+
+    for thr in THRESHOLDS:
+        r = sim_results[thr]
+        reached = r["reached"]
+        tp      = r["tp"]
+        sl      = r["sl"]
+        no_exit = r["no_exit"]
+        decided = tp + sl
+        wr_sim  = tp / decided * 100 if decided > 0 else 0
+        pct_reached = reached / n_above * 100 if n_above else 0
+        delta   = wr_sim - wr_real_above
+
+        thr_label = f"≤ {thr:.1f}× migração (~${mc_mig_label(thr, MC_MIG_REF)})"
+        delta_s = f"<span class='{'pos' if delta > 0 else 'neg'}'>{delta:+.0f}pp</span>" if decided > 0 else "—"
+
+        H += f"<tr><td><b>{thr:.1f}× mig.</b> (~${int(MC_MIG_REF*thr):,})</td>"
+        H += f"<td>{reached}/{n_above}</td><td>{pct_reached:.0f}%</td>"
+        H += f"<td class='tp'>{tp}</td><td class='sl'>{sl}</td><td class='dim'>{no_exit}</td>"
+        H += f"<td>{'%.0f%%' % wr_sim if decided >= 3 else '— (n<3)'}</td>"
+        H += f"<td>{delta_s}</td></tr>"
+
+    H += "</table>"
+
+    # Tabela detalhada por trade
+    H += "<h4>Detalhamento por trade</h4>"
+    H += "<table><tr><th>#</th><th>Token</th><th>elapsed</th><th>ratio real</th><th>entry_mc real</th>"
+    H += "<th>ticks pós</th><th>Real</th>"
+    for thr in THRESHOLDS:
+        H += f"<th>Se ≤{thr:.1f}×</th>"
+    H += "</tr>"
+
+    for d in trade_detail:
+        t   = d["trade"]
+        ths = d["thrs"]
+        elapsed_s = f"{t['elapsed_min']:.1f}m" if t["elapsed_min"] is not None else "?"
+        ratio_s   = f"{t['ratio']:.2f}x"
+        entry_mc_s = f"${t['entry_mc']:,.0f}"
+
+        real_s = "<span class='tp'>TP</span>" if t["status"] in ("tp","trailing_active") else \
+                 "<span class='sl'>SL</span>" if t["status"] == "sl" else \
+                 f"<span class='dim'>{t['status']}</span>"
+
+        H += f"<tr><td>{t['id']}</td><td><b>{t['symbol']}</b></td>"
+        H += f"<td>{elapsed_s}</td><td>{ratio_s}</td><td>{entry_mc_s}</td>"
+        H += f"<td>{d['n_post_ticks']}</td><td>{real_s}</td>"
+        for thr in THRESHOLDS:
+            H += f"<td>{ths.get(thr, '<span class=dim>—</span>')}</td>"
+        H += "</tr>"
+
+    H += "</table>"
+
+    H += "<div class='box'>"
+    H += "<b>Como ler:</b> 'não chegou' = token nunca voltou para esse nível após o sinal → trade seria perdido. "
+    H += "'sem exit' = chegou ao target mas ticks acabaram antes de TP ou SL — janela de 60min expirou. "
+    H += "WR simulado exclui 'sem exit' (conta apenas TP e SL com dados completos).<br><br>"
+    H += f"<b>Acima da migração = tokens &lt; {round(sum(t['elapsed_min'] for t in above if t['elapsed_min'] is not None)/max(1,sum(1 for t in above if t['elapsed_min'] is not None)), 1)}min pós-migração em média</b>"
+    H += "</div>"
+
+    H += "</body></html>"
+    return H
+
+
+def mc_mig_label(thr, ref):
+    return f"{int(ref * thr):,}"
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
