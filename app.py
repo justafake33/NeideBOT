@@ -22558,8 +22558,8 @@ Verificar: <code>strategy_id</code> salvo na tabela trades — deve diferir do o
     H += """<div class='box'>
 <b>Razões possíveis identificadas no código:</b><br><br>
 
-<b>1. state nunca virou "processed/confirmed" em 120s:</b><br>
-&nbsp;&nbsp;_execute() faz poll por FILL_TIMEOUT_SEC=120s. Se GMGN demorou mais, fill fica NULL.<br>
+<b>1. state nunca virou "processed/confirmed" dentro do timeout:</b><br>
+&nbsp;&nbsp;_execute() faz poll por FILL_TIMEOUT_SEC (default atual: 300s). Se GMGN demorar mais, fill fica NULL até recovery posterior.<br>
 &nbsp;&nbsp;Verificar: ts_order_confirmed NULL + order_id presente → timeout aconteceu.<br><br>
 
 <b>2. extract_tx_signature retornou None:</b><br>
@@ -22585,14 +22585,14 @@ Verificar: <code>strategy_id</code> salvo na tabela trades — deve diferir do o
 </div>"""
 
     # ── Task 10: summary ───────────────────────────────────────────────────────
-    H += "<h3>Task 10 — Patch proposto (ver /debug/fill-pipeline#patch)</h3>"
+    H += "<h3>Task 10 — Patch aplicado (ver /debug/fill-pipeline#patch)</h3>"
     H += """<div class='box' id='patch'>
-<b>1. extract_tx_signature — busca regex em toda a resposta:</b> já implementado neste endpoint como extract_tx_sig_extended.<br>
-<b>2. get_swap_fill — retornar block_time:</b> adicionar campo ao dict de retorno.<br>
-<b>3. _recover_fill para qualquer status:</b> chamar também para trailing_active/tp/sl sem fill.<br>
-<b>4. Impedir trailing_active sem fill:</b> _check_position_closed() só marca trailing_active se entry_price_usd != NULL.<br>
-<b>5. save_raw_qr:</b> log de warning com raw response quando state=confirmed mas sem sig extraída.<br>
-<b>6. FILL_TIMEOUT_SEC aumentar de 120 para 300s</b> — GMGN pode demorar mais para confirmar.<br>
+<b>1. extract_tx_signature — busca regex em toda a resposta:</b> implementado em helius_rpc.extract_tx_signature.<br>
+<b>2. get_swap_fill — retornar block_time:</b> campo adicionado ao dict de retorno.<br>
+<b>3. _recover_fill para qualquer status:</b> TradeMonitor chama recovery também para trades sem fill fora de status='open'.<br>
+<b>4. Impedir trailing_active sem fill:</b> _check_position_closed() tenta recovery e adia fechamento se entry_price_usd continuar NULL.<br>
+<b>5. save_raw_qr:</b> warning com chaves da resposta quando state=confirmed mas sem sig extraída.<br>
+<b>6. FILL_TIMEOUT_SEC default 300s</b> — GMGN pode demorar mais para confirmar.<br>
 <b>7. Dashboard PnL:</b> exibir asterisco ou "sem fill" quando pnl_pct_real calculado sem entry real.<br>
 </div>"""
 
