@@ -20445,7 +20445,8 @@ def analise_rodada31():
                        t.pnl_pct_real, t.status, t.exit_type, t.fill_source,
                        t.exit_ts,
                        bs.mc_at_signal, bs.ts_signal AS bs_ts_signal,
-                       bs.bounce_pct, bs.drop_pct, bs.time_to_bottom,
+                       bs.bounce_pct, bs.drop_from_mig AS drop_pct,
+                       m.time_to_bottom,
                        m.liq_migration, m.exchange, m.smart_wallets,
                        m.mc_migration, m.is_wash_trading, m.rug_ratio,
                        m.top10_holder_rate
