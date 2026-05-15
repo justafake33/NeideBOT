@@ -378,6 +378,12 @@ class HotMonitor:
                     mc_bottom=mc_min,
                     mc_migration=mc_migration,
                     elapsed_sec=elapsed_sec,
+                    mc_at_signal=mc,
+                    bounce_pct=bounce_pct,
+                    drop_from_mig=drop_from_mig,
+                    config_bounce_min_pct=self.BOUNCE_MIN_PCT,
+                    config_bounce_max_pct=self.BOUNCE_MAX_PCT,
+                    config_bounce_drop_min=self.BOUNCE_DROP_MIN,
                 )
             except Exception as e:
                 logger.error("executor.on_bounce %s: %s", symbol, e)
@@ -1109,7 +1115,8 @@ class Scanner:
             "smart_wallets":          _int(token.get("smart_degen_count")),
             "renowned_wallets":       _int(token.get("renowned_count")),
             "sniper_wallets":         _int(token.get("sniper_count")),
-            "rug_ratio":              _float(token.get("bundler_trader_amount_rate")),
+            "rug_ratio":              _float(token.get("rug_ratio")),
+            "bundler_trader_amount_rate": _float(token.get("bundler_trader_amount_rate")),
             "top10_holder_rate":      _float(token.get("top_10_holder_rate")),
             "holders_count":          _int(token.get("holder_count")),
             "volume_1m":              _float(token.get("volume_1m")),

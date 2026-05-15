@@ -51,6 +51,18 @@ PERSISTENCE_MIN_TICKS  = 0
 PUMP_FUN_SUPPLY    = 1_000_000_000  # supply padrão Pump.fun
 SPL_TOKEN_DECIMALS = int(os.getenv("SPL_TOKEN_DECIMALS", "6"))  # casas decimais do token SPL (Pump.fun = 6)
 
+def _get_git_sha() -> str:
+    try:
+        import subprocess
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except Exception:
+        return ""
+
+_GIT_SHA = _get_git_sha()
+
 
 class TradeExecutor:
     """
@@ -75,7 +87,11 @@ class TradeExecutor:
     # ------------------------------------------------------------------
 
     def on_bounce(self, mint: str, symbol: str, mc_bottom: float,
-                  mc_migration: float, elapsed_sec: int):
+                  mc_migration: float, elapsed_sec: int,
+                  mc_at_signal: float = 0.0, bounce_pct: float = 0.0,
+                  drop_from_mig: float = 0.0,
+                  config_bounce_min_pct: float = 0.0, config_bounce_max_pct: float = 0.0,
+                  config_bounce_drop_min: float = 0.0):
         if not TRADING_ENABLED:
             logger.info("DRY-RUN bounce %s mc_bottom=$%.0f (TRADING_ENABLED=false)", symbol, mc_bottom)
             return
@@ -111,6 +127,20 @@ class TradeExecutor:
                 "tp_pct":         TRAILING_ACTIVATION_PCT / 100,  # activation level — sem TP fixo
                 "sl_pct":         TRADE_SL_PCT,
                 "status":         "pending",
+                # Audit: estado do bounce no momento do sinal
+                "mc_at_signal":                   mc_at_signal or None,
+                "bounce_pct_signal":               bounce_pct or None,
+                "drop_from_mig_signal":            drop_from_mig or None,
+                "signal_elapsed_sec":              elapsed_sec or None,
+                # Audit: config ativa neste deploy
+                "config_bounce_min_pct":           config_bounce_min_pct or None,
+                "config_bounce_max_pct":           config_bounce_max_pct or None,
+                "config_bounce_drop_min":          config_bounce_drop_min or None,
+                "config_trade_sl_pct":             TRADE_SL_PCT,
+                "config_trailing_activation_pct":  TRAILING_ACTIVATION_PCT,
+                "config_trailing_drawdown_pct":    TRAILING_DRAWDOWN_PCT,
+                "config_slippage_bps":             SLIPPAGE_BPS,
+                "git_sha":                         _GIT_SHA or None,
             })
         except Exception as e:
             logger.error("insert_trade %s: %s", symbol, e)

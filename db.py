@@ -55,6 +55,7 @@ def init_db():
                 renowned_wallets          INT,
                 sniper_wallets            INT,
                 rug_ratio                 FLOAT,
+                bundler_trader_amount_rate FLOAT,
                 top10_holder_rate         FLOAT,
                 holders_count             INT,
                 volume_1m                 FLOAT,
@@ -121,7 +122,8 @@ def init_db():
             "ADD COLUMN IF NOT EXISTS rat_trader_rate         FLOAT",
             "ADD COLUMN IF NOT EXISTS total_fee_sol           FLOAT",
             "ADD COLUMN IF NOT EXISTS bc_progress_migration   FLOAT",
-            "ADD COLUMN IF NOT EXISTS complete_timestamp      BIGINT",
+            "ADD COLUMN IF NOT EXISTS complete_timestamp           BIGINT",
+            "ADD COLUMN IF NOT EXISTS bundler_trader_amount_rate  FLOAT",
         ]:
             cur.execute(f"ALTER TABLE migrations {col}")
 
@@ -257,6 +259,20 @@ def init_db():
                 -- Config
                 tp_pct              FLOAT        DEFAULT 0.75,
                 sl_pct              FLOAT        DEFAULT 0.15,
+                -- Audit: estado do bounce no momento do sinal
+                mc_at_signal                  FLOAT,
+                bounce_pct_signal             FLOAT,
+                drop_from_mig_signal          FLOAT,
+                signal_elapsed_sec            INT,
+                -- Audit: config ativa no momento do trade
+                config_bounce_min_pct         FLOAT,
+                config_bounce_max_pct         FLOAT,
+                config_bounce_drop_min        FLOAT,
+                config_trade_sl_pct           FLOAT,
+                config_trailing_activation_pct FLOAT,
+                config_trailing_drawdown_pct   FLOAT,
+                config_slippage_bps           INT,
+                git_sha                       TEXT,
                 -- Estado
                 status              TEXT         DEFAULT 'pending',
                 error_msg           TEXT,
@@ -268,7 +284,19 @@ def init_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts     ON trades (created_at DESC)")
         # Colunas adicionadas progressivamente
         for col in [
-            "ADD COLUMN IF NOT EXISTS fill_source TEXT",  # gmgn | helius | helius_recovery | gmgn_recovery
+            "ADD COLUMN IF NOT EXISTS fill_source TEXT",
+            "ADD COLUMN IF NOT EXISTS mc_at_signal                   FLOAT",
+            "ADD COLUMN IF NOT EXISTS bounce_pct_signal              FLOAT",
+            "ADD COLUMN IF NOT EXISTS drop_from_mig_signal           FLOAT",
+            "ADD COLUMN IF NOT EXISTS signal_elapsed_sec             INT",
+            "ADD COLUMN IF NOT EXISTS config_bounce_min_pct          FLOAT",
+            "ADD COLUMN IF NOT EXISTS config_bounce_max_pct          FLOAT",
+            "ADD COLUMN IF NOT EXISTS config_bounce_drop_min         FLOAT",
+            "ADD COLUMN IF NOT EXISTS config_trade_sl_pct            FLOAT",
+            "ADD COLUMN IF NOT EXISTS config_trailing_activation_pct FLOAT",
+            "ADD COLUMN IF NOT EXISTS config_trailing_drawdown_pct   FLOAT",
+            "ADD COLUMN IF NOT EXISTS config_slippage_bps            INT",
+            "ADD COLUMN IF NOT EXISTS git_sha                        TEXT",
         ]:
             try:
                 cur.execute(f"ALTER TABLE trades {col}")
@@ -369,7 +397,7 @@ def upsert_migration(data: dict):
                 ts_migration, mc_migration,
                 mc_migration_observed, mc_migration_bc_ref, mc_migration_source,
                 smart_wallets, renowned_wallets, sniper_wallets,
-                rug_ratio, top10_holder_rate, holders_count,
+                rug_ratio, bundler_trader_amount_rate, top10_holder_rate, holders_count,
                 volume_1m, volume_5m, volume_15m,
                 is_wash_trading, liq_migration, is_honeypot,
                 capture_delay_sec, token_created_at, time_to_migrate_sec,
@@ -384,7 +412,7 @@ def upsert_migration(data: dict):
                 %(ts_migration)s, %(mc_migration)s,
                 %(mc_migration_observed)s, %(mc_migration_bc_ref)s, %(mc_migration_source)s,
                 %(smart_wallets)s, %(renowned_wallets)s, %(sniper_wallets)s,
-                %(rug_ratio)s, %(top10_holder_rate)s, %(holders_count)s,
+                %(rug_ratio)s, %(bundler_trader_amount_rate)s, %(top10_holder_rate)s, %(holders_count)s,
                 %(volume_1m)s, %(volume_5m)s, %(volume_15m)s,
                 %(is_wash_trading)s, %(liq_migration)s, %(is_honeypot)s,
                 %(capture_delay_sec)s, %(token_created_at)s, %(time_to_migrate_sec)s,
@@ -413,6 +441,7 @@ def upsert_migration(data: dict):
                 renowned_wallets       = COALESCE(migrations.renowned_wallets, EXCLUDED.renowned_wallets),
                 sniper_wallets         = COALESCE(migrations.sniper_wallets, EXCLUDED.sniper_wallets),
                 rug_ratio              = COALESCE(migrations.rug_ratio, EXCLUDED.rug_ratio),
+                bundler_trader_amount_rate = COALESCE(migrations.bundler_trader_amount_rate, EXCLUDED.bundler_trader_amount_rate),
                 top10_holder_rate      = COALESCE(migrations.top10_holder_rate, EXCLUDED.top10_holder_rate),
                 holders_count          = COALESCE(migrations.holders_count, EXCLUDED.holders_count),
                 volume_1m              = COALESCE(migrations.volume_1m, EXCLUDED.volume_1m),
@@ -448,6 +477,7 @@ def upsert_migration(data: dict):
             "renowned_wallets":       data.get("renowned_wallets"),
             "sniper_wallets":         data.get("sniper_wallets"),
             "rug_ratio":              data.get("rug_ratio"),
+            "bundler_trader_amount_rate": data.get("bundler_trader_amount_rate"),
             "top10_holder_rate":      data.get("top10_holder_rate"),
             "holders_count":          data.get("holders_count"),
             "volume_1m":              data.get("volume_1m"),
@@ -863,11 +893,21 @@ def insert_trade(data: dict) -> int:
         cur.execute("""
             INSERT INTO trades
                 (mint, symbol, ts_signal, mc_bottom, mc_migration, entry_expected,
-                 amount_sol, amount_usd, tp_pct, sl_pct, status)
+                 amount_sol, amount_usd, tp_pct, sl_pct, status,
+                 mc_at_signal, bounce_pct_signal, drop_from_mig_signal, signal_elapsed_sec,
+                 config_bounce_min_pct, config_bounce_max_pct, config_bounce_drop_min,
+                 config_trade_sl_pct, config_trailing_activation_pct,
+                 config_trailing_drawdown_pct, config_slippage_bps, git_sha)
             VALUES
                 (%(mint)s, %(symbol)s, %(ts_signal)s, %(mc_bottom)s, %(mc_migration)s,
                  %(entry_expected)s, %(amount_sol)s, %(amount_usd)s,
-                 %(tp_pct)s, %(sl_pct)s, %(status)s)
+                 %(tp_pct)s, %(sl_pct)s, %(status)s,
+                 %(mc_at_signal)s, %(bounce_pct_signal)s, %(drop_from_mig_signal)s,
+                 %(signal_elapsed_sec)s,
+                 %(config_bounce_min_pct)s, %(config_bounce_max_pct)s,
+                 %(config_bounce_drop_min)s, %(config_trade_sl_pct)s,
+                 %(config_trailing_activation_pct)s, %(config_trailing_drawdown_pct)s,
+                 %(config_slippage_bps)s, %(git_sha)s)
             RETURNING id
         """, data)
         return cur.fetchone()["id"]
