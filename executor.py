@@ -579,6 +579,14 @@ class TradeMonitor:
             except Exception:
                 pass
 
+        if not trade.get("entry_price_usd"):
+            logger.warning(
+                "TradeMonitor Helius-balance #%d %s — saldo=0, mas fill ainda NULL; "
+                "adiando fechamento para evitar trailing_active sem fill",
+                trade_id, symbol,
+            )
+            return False
+
         # Saldo zero — GMGN executou TP ou SL. Inferir qual.
         entry_price_usd = trade.get("entry_price_usd")
         tokens_received = trade.get("tokens_received")
