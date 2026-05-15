@@ -21194,5 +21194,1002 @@ def analise_rodada31():
     return "".join(out)
 
 
+# ==============================================================================
+# /audit/purchases — Auditoria operacional das últimas 50 compras
+# Verifica conformidade com filtros, bounce, slippage, TP/SL configurados.
+# Acesse em: /audit/purchases
+# ==============================================================================
+
+@app.route("/audit/purchases")
+def audit_purchases():
+    import traceback as _tb
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    import math
+
+    # ── Config esperada (Railway) passada via query param ou hardcoded ──────
+    cfg = {
+        "BOUNCE_MIN_PCT":          float(request.args.get("bounce_min",    "0.55")),
+        "BOUNCE_MAX_PCT":          float(request.args.get("bounce_max",    "9.99")),
+        "BOUNCE_DROP_MIN":         float(request.args.get("drop_min",      "0.30")),
+        "BOUNCE_TIME_MAX":         float(request.args.get("time_max",      "20.0")),
+        "BOTTOM_FRESHNESS_SEC":    int(  request.args.get("freshness",     "300")),
+        "FILTER_RUG_MAX":          float(request.args.get("rug_max",       "0.50")),
+        "FILTER_BUNDLER_MAX":      float(request.args.get("bundler_max",   "0.60")),
+        "FILTER_BOT_MAX":          float(request.args.get("bot_max",       "0.80")),
+        "FILTER_SNIPER_MAX":       float(request.args.get("sniper_max",    "0.05")),
+        "FILTER_RAT_MAX":          float(request.args.get("rat_max",       "0.40")),
+        "FILTER_TOP10_MAX":        float(request.args.get("top10_max",     "0.50")),
+        "FILTER_SMART_MIN":        int(  request.args.get("smart_min",     "1")),
+        "FILTER_LIQ_MIN":          float(request.args.get("liq_min",       "10000")),
+        "FILTER_MC_MAX":           float(request.args.get("mc_max",        "85000")),
+        "FILTER_PUMP_ONLY":        request.args.get("pump_only", "true").lower() == "true",
+        "TRADE_SL_PCT":            float(request.args.get("sl_pct",        "0.25")),
+        "TRADE_SLIPPAGE_BPS":      int(  request.args.get("slippage_bps",  "500")),
+        "TRAILING_ACTIVATION_PCT": float(request.args.get("trailing_act",  "75")),
+        "TRAILING_DRAWDOWN_PCT":   float(request.args.get("trailing_dd",   "30")),
+        "CALIBRATION_AMOUNT_USD":  float(request.args.get("amount_usd",    "1.0")),
+        "PERSISTENCE_WAIT_SEC":    int(  request.args.get("persist_wait",  "90")),   # config órfã
+        "PERSISTENCE_MIN_TICKS":   int(  request.args.get("persist_ticks", "3")),    # config órfã
+    }
+    SUPPLY = 1_000_000_000
+
+    def _pf(v, decimals=2):
+        if v is None:
+            return "NULL"
+        try:
+            return f"{float(v):.{decimals}f}"
+        except Exception:
+            return str(v)
+
+    def _pp(v):
+        if v is None:
+            return "NULL"
+        try:
+            return f"{float(v)*100:.1f}%"
+        except Exception:
+            return str(v)
+
+    def _pu(v):
+        if v is None:
+            return "NULL"
+        try:
+            return f"${float(v):,.0f}"
+        except Exception:
+            return str(v)
+
+    def _ok(flag):
+        if flag is None:
+            return "<span class='neu'>?</span>"
+        return "<span class='pos'>✅ SIM</span>" if flag else "<span class='neg'>❌ NÃO</span>"
+
+    def _chk(val, threshold, mode="max"):
+        """Verifica filtro — retorna (passed, label)."""
+        if val is None:
+            return None, "null"
+        try:
+            v = float(val)
+            if mode == "max":
+                passed = v <= threshold
+            else:
+                passed = v >= threshold
+            return passed, f"{v:.4f}"
+        except Exception:
+            return None, "err"
+
+    def _safe(v, default=None):
+        try:
+            return float(v) if v is not None else default
+        except Exception:
+            return default
+
+    out = []
+    CSS = """
+<style>
+body{font-family:monospace;background:#0d1117;color:#e6edf3;padding:16px;font-size:13px}
+h1{color:#58a6ff;font-size:18px}
+h2{color:#79c0ff;font-size:15px;border-bottom:1px solid #30363d;padding-bottom:4px;margin-top:24px}
+h3{color:#d2a8ff;font-size:13px;margin-top:16px}
+table{border-collapse:collapse;width:100%;margin:8px 0;font-size:11px}
+th{background:#161b22;color:#8b949e;padding:4px 8px;border:1px solid #30363d;text-align:left}
+td{padding:3px 8px;border:1px solid #21262d;vertical-align:top}
+tr:nth-child(even){background:#0d1117}
+tr:nth-child(odd){background:#111820}
+.pos{color:#3fb950}
+.neg{color:#f85149}
+.neu{color:#d29922}
+.warn{color:#e3b341}
+.label{background:#1f6feb;color:#fff;padding:1px 6px;border-radius:3px;font-size:10px}
+.badge-ok{background:#196f2d;color:#fff;padding:1px 5px;border-radius:3px;font-size:10px}
+.badge-fail{background:#6e2020;color:#fff;padding:1px 5px;border-radius:3px;font-size:10px}
+.badge-null{background:#333;color:#aaa;padding:1px 5px;border-radius:3px;font-size:10px}
+.trade-card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;margin:12px 0}
+.trade-card.A{border-left:4px solid #3fb950}
+.trade-card.B{border-left:4px solid #f85149}
+.trade-card.C{border-left:4px solid #e3b341}
+.trade-card.D{border-left:4px solid #f85149}
+.trade-card.E{border-left:4px solid #8b949e}
+.trade-card.F{border-left:4px solid #d29922}
+.trade-card.G{border-left:4px solid #9ecbff}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.box{background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:8px;font-size:11px}
+.box b{display:block;color:#8b949e;margin-bottom:2px;font-size:10px;text-transform:uppercase}
+a{color:#58a6ff;text-decoration:none}
+a:hover{text-decoration:underline}
+.section-hdr{background:#1c2128;padding:6px 10px;border-radius:4px;margin:8px 0;font-weight:bold;color:#cdd9e5}
+pre{background:#0d1117;border:1px solid #30363d;padding:8px;border-radius:4px;overflow-x:auto;font-size:11px}
+.collapse-btn{cursor:pointer;color:#58a6ff;font-size:11px;margin-left:8px}
+details>summary{cursor:pointer;color:#79c0ff}
+</style>
+"""
+    out.append(f"<html><head><meta charset='utf-8'><title>Audit Purchases</title>{CSS}</head><body>")
+    out.append("<h1>🔍 Auditoria Operacional — Últimas 50 Compras</h1>")
+    out.append(f"<p style='color:#8b949e'>Gerado em {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC</p>")
+
+    try:
+        conn = psycopg2.connect(db.DATABASE_URL)
+        cur  = conn.cursor(cursor_factory=RealDictCursor)
+
+        # ── 1. Busca os 50 trades com fill válido ─────────────────────────────
+        cur.execute("""
+            SELECT t.*
+            FROM trades t
+            WHERE t.entry_price_usd IS NOT NULL
+              AND t.tokens_received  IS NOT NULL
+              AND t.entry_price_usd  > 0
+              AND t.tokens_received  > 0
+            ORDER BY t.created_at DESC
+            LIMIT 50
+        """)
+        trades = [dict(r) for r in cur.fetchall()]
+
+        if not trades:
+            out.append("<p class='neg'>Nenhum trade com fill válido encontrado.</p>")
+            out.append("</body></html>")
+            cur.close(); conn.close()
+            return "".join(out)
+
+        mints = [t["mint"] for t in trades]
+        mints_sql = tuple(mints) if len(mints) > 1 else f"('{mints[0]}')"
+
+        # ── 2. Bounce signals ──────────────────────────────────────────────────
+        cur.execute(f"""
+            SELECT * FROM bounce_signals WHERE mint IN {mints_sql}
+        """)
+        bounce_map = {r["mint"]: dict(r) for r in cur.fetchall()}
+
+        # ── 3. Migrations ──────────────────────────────────────────────────────
+        cur.execute(f"""
+            SELECT * FROM migrations WHERE mint IN {mints_sql}
+        """)
+        mig_map = {r["mint"]: dict(r) for r in cur.fetchall()}
+
+        # ── 4. Token signals (H9) ──────────────────────────────────────────────
+        cur.execute(f"""
+            SELECT mint, trigger_at, trigger_mc, first_trigger_mc, signal_times, wallets_json
+            FROM token_signals
+            WHERE mint IN {mints_sql}
+            ORDER BY trigger_at ASC
+        """)
+        sig_raw = cur.fetchall()
+        sig_map = {}  # mint → list of signals
+        for r in sig_raw:
+            sig_map.setdefault(r["mint"], []).append(dict(r))
+
+        # ── 5. Ticks: pré e pós bounce (por mint, narrow window) ──────────────
+        cur.execute(f"""
+            SELECT mint, tick_ts, elapsed_sec, mc, mc_high, mc_low, source
+            FROM token_ticks
+            WHERE mint IN {mints_sql}
+            ORDER BY mint, tick_ts ASC
+        """)
+        ticks_raw = cur.fetchall()
+        ticks_map = {}
+        for r in ticks_raw:
+            ticks_map.setdefault(r["mint"], []).append(dict(r))
+
+        # ── 6. trade_absorption_ticks ──────────────────────────────────────────
+        trade_ids = tuple(t["id"] for t in trades) if len(trades) > 1 else f"({trades[0]['id']})"
+        cur.execute(f"""
+            SELECT trade_id, COUNT(*) as n_ticks,
+                   AVG(buy_vol) as avg_bvol, AVG(sell_vol) as avg_svol,
+                   SUM(events)  as sum_events
+            FROM trade_absorption_ticks
+            WHERE trade_id IN {trade_ids}
+            GROUP BY trade_id
+        """)
+        tat_map = {r["trade_id"]: dict(r) for r in cur.fetchall()}
+
+        cur.close(); conn.close()
+
+        # ── Métricas derivadas por trade ───────────────────────────────────────
+        trade_data = []
+        for t in trades:
+            mint  = t["mint"]
+            bs    = bounce_map.get(mint, {})
+            m     = mig_map.get(mint, {})
+            sigs  = sig_map.get(mint, [])
+            ticks = ticks_map.get(mint, [])
+            tat   = tat_map.get(t["id"], {})
+
+            sym = t.get("symbol") or m.get("token_nome") or mint[:8]
+
+            # Bounce metrics
+            mc_min       = _safe(bs.get("mc_min"))
+            mc_at_signal = _safe(bs.get("mc_at_signal"))
+            mc_mig_bs    = _safe(bs.get("mc_migration"))
+            mc_mig_t     = _safe(t.get("mc_migration"))
+            mc_mig       = mc_mig_t or mc_mig_bs or _safe(m.get("mc_migration"))
+            bounce_pct_stored = _safe(bs.get("bounce_pct"))
+            elapsed_sec  = _safe(bs.get("elapsed_sec"))
+            elapsed_min  = elapsed_sec / 60 if elapsed_sec else None
+            drop_from_mig = _safe(bs.get("drop_from_mig"))
+
+            calc_bounce_pct = (mc_at_signal / mc_min - 1) if mc_min and mc_at_signal and mc_min > 0 else None
+            entry_ratio_signal = mc_at_signal / mc_mig if mc_at_signal and mc_mig and mc_mig > 0 else None
+
+            # Real entry metrics
+            ep_usd  = _safe(t.get("entry_price_usd"))
+            tok_rcv = _safe(t.get("tokens_received"))
+            real_entry_mc = (ep_usd / tok_rcv * SUPPLY) if ep_usd and tok_rcv and tok_rcv > 0 else None
+            real_bounce_vs_bottom  = (real_entry_mc / mc_min - 1) if real_entry_mc and mc_min and mc_min > 0 else None
+            real_premium_vs_signal = (real_entry_mc / mc_at_signal - 1) if real_entry_mc and mc_at_signal and mc_at_signal > 0 else None
+            real_ratio_vs_migration = (real_entry_mc / mc_mig) if real_entry_mc and mc_mig and mc_mig > 0 else None
+
+            # Filter checks (from migrations table)
+            rug_val     = _safe(m.get("rug_ratio"))
+            bot_val     = _safe(m.get("bot_degen_rate"))
+            sniper_val  = _safe(m.get("top70_sniper_hold_rate"))
+            rat_val     = _safe(m.get("rat_trader_rate"))
+            top10_val   = _safe(m.get("top10_holder_rate"))
+            smart_val   = m.get("smart_wallets")
+            liq_val     = _safe(m.get("liq_migration"))
+            mc_mig_filt = _safe(m.get("mc_migration"))
+
+            filt_rug    = _chk(rug_val,    cfg["FILTER_RUG_MAX"],    "max")
+            filt_bot    = _chk(bot_val,    cfg["FILTER_BOT_MAX"],    "max")
+            filt_sniper = _chk(sniper_val, cfg["FILTER_SNIPER_MAX"], "max")
+            filt_rat    = _chk(rat_val,    cfg["FILTER_RAT_MAX"],    "max")
+            filt_top10  = _chk(top10_val,  cfg["FILTER_TOP10_MAX"],  "max")
+            filt_smart  = _chk(smart_val,  cfg["FILTER_SMART_MIN"],  "min")
+            filt_liq    = _chk(liq_val,    cfg["FILTER_LIQ_MIN"],    "min")
+            filt_mc     = _chk(mc_mig_filt,cfg["FILTER_MC_MAX"],     "max")
+            exchange    = m.get("exchange") or bs.get("exchange") or ""
+            filt_pump   = exchange and "pump" in exchange.lower()
+
+            # Bounce pass/fail
+            pass_bounce_min   = bounce_pct_stored is not None and bounce_pct_stored >= cfg["BOUNCE_MIN_PCT"]
+            pass_drop_min     = drop_from_mig is not None and drop_from_mig >= cfg["BOUNCE_DROP_MIN"]
+            pass_time_max     = elapsed_min is not None and elapsed_min <= cfg["BOUNCE_TIME_MAX"]
+            dead_zone_ok      = entry_ratio_signal is None or not (0.50 <= entry_ratio_signal <= 0.65)
+
+            # Ticks around signal
+            ts_signal = t.get("ts_signal")
+            pre_ticks  = [tk for tk in ticks if ts_signal and tk["tick_ts"] < ts_signal]
+            post_ticks = [tk for tk in ticks if ts_signal and tk["tick_ts"] >= ts_signal]
+            last_pre   = pre_ticks[-1]  if pre_ticks  else None
+            first_post = post_ticks[0]  if post_ticks else None
+
+            # Ticks around order
+            ts_order = t.get("ts_order_sent")
+            pre_order_ticks = [tk for tk in ticks if ts_order and tk["tick_ts"] <= ts_order]
+            nearest_order_tick = pre_order_ticks[-1] if pre_order_ticks else None
+
+            # H9 signals
+            sigs_before = []
+            sigs_after  = []
+            if ts_signal and sigs:
+                for s in sigs:
+                    ta = s.get("trigger_at")
+                    if ta is None:
+                        continue
+                    try:
+                        ta_dt = datetime.fromtimestamp(ta, tz=timezone.utc)
+                    except Exception:
+                        continue
+                    if ta_dt < ts_signal:
+                        sigs_before.append(s)
+                    else:
+                        sigs_after.append(s)
+
+            # Classification
+            filter_violations = []
+            if not filt_rug[0]    and rug_val    is not None: filter_violations.append(f"rug_ratio={rug_val:.2f}")
+            if not filt_bot[0]    and bot_val    is not None: filter_violations.append(f"bot_degen={bot_val:.2f}")
+            if not filt_sniper[0] and sniper_val is not None: filter_violations.append(f"sniper={sniper_val:.2f}")
+            if not filt_rat[0]    and rat_val    is not None: filter_violations.append(f"rat={rat_val:.2f}")
+            if not filt_top10[0]  and top10_val  is not None: filter_violations.append(f"top10={top10_val:.2f}")
+            if not filt_smart[0]  and smart_val  is not None: filter_violations.append(f"smart={smart_val}")
+            if not filt_liq[0]    and liq_val    is not None: filter_violations.append(f"liq=${liq_val:,.0f}")
+            if not filt_mc[0]     and mc_mig_filt is not None: filter_violations.append(f"mc=${mc_mig_filt:,.0f}")
+            if cfg["FILTER_PUMP_ONLY"] and not filt_pump:     filter_violations.append(f"exchange={exchange}")
+
+            # Classify
+            data_ok = mc_min is not None and mc_at_signal is not None and mc_mig is not None
+            real_mc_ok = real_entry_mc is not None
+
+            if not data_ok:
+                category = "E"
+                cat_label = "E — CONFIG NÃO AUDITÁVEL"
+            elif real_entry_mc and (real_entry_mc <= 0 or real_entry_mc > 10_000_000):
+                category = "F"
+                cat_label = "F — DADOS SUSPEITOS"
+            elif filter_violations:
+                category = "D"
+                cat_label = f"D — FILTRO VIOLADO ({', '.join(filter_violations[:2])})"
+            elif bounce_pct_stored is not None and bounce_pct_stored < cfg["BOUNCE_MIN_PCT"]:
+                # Check if it might be old config (0.30)
+                if bounce_pct_stored >= 0.30:
+                    category = "G"
+                    cat_label = f"G — CONFIG ANTIGA? bounce={_pp(bounce_pct_stored)} (min atual={_pp(cfg['BOUNCE_MIN_PCT'])})"
+                else:
+                    category = "B"
+                    cat_label = f"B — SINAL ABAIXO DO BOUNCE_MIN (bounce={_pp(bounce_pct_stored)})"
+            elif real_bounce_vs_bottom is not None and real_bounce_vs_bottom < cfg["BOUNCE_MIN_PCT"]:
+                category = "C"
+                cat_label = f"C — SINAL OK, MAS ENTRADA VIROU RUIM (real_bounce={_pp(real_bounce_vs_bottom)})"
+            else:
+                category = "A"
+                cat_label = "A — COMPRA OK"
+
+            trade_data.append({
+                "t": t, "bs": bs, "m": m, "sigs": sigs,
+                "sigs_before": sigs_before, "sigs_after": sigs_after,
+                "ticks": ticks, "tat": tat,
+                "sym": sym, "mint": mint,
+                "mc_min": mc_min, "mc_at_signal": mc_at_signal, "mc_mig": mc_mig,
+                "bounce_pct_stored": bounce_pct_stored,
+                "calc_bounce_pct": calc_bounce_pct,
+                "elapsed_min": elapsed_min, "drop_from_mig": drop_from_mig,
+                "entry_ratio_signal": entry_ratio_signal,
+                "real_entry_mc": real_entry_mc,
+                "real_bounce_vs_bottom": real_bounce_vs_bottom,
+                "real_premium_vs_signal": real_premium_vs_signal,
+                "real_ratio_vs_migration": real_ratio_vs_migration,
+                "pass_bounce_min": pass_bounce_min,
+                "pass_drop_min": pass_drop_min,
+                "pass_time_max": pass_time_max,
+                "dead_zone_ok": dead_zone_ok,
+                "filt_rug": filt_rug, "filt_bot": filt_bot, "filt_sniper": filt_sniper,
+                "filt_rat": filt_rat, "filt_top10": filt_top10, "filt_smart": filt_smart,
+                "filt_liq": filt_liq, "filt_mc": filt_mc, "filt_pump": filt_pump,
+                "exchange": exchange,
+                "filter_violations": filter_violations,
+                "category": category, "cat_label": cat_label,
+                "last_pre": last_pre, "first_post": first_post,
+                "nearest_order_tick": nearest_order_tick,
+            })
+
+        # ── SQL PRINCIPAL (exibido no topo) ────────────────────────────────────
+        out.append("<h2>📋 SQL Principal</h2>")
+        out.append("""<details><summary>Mostrar SQL</summary><pre>
+-- Busca as últimas 50 compras com fill válido
+SELECT t.*, bs.*, m.*
+FROM trades t
+LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+LEFT JOIN migrations m ON m.mint = t.mint
+WHERE t.entry_price_usd IS NOT NULL
+  AND t.tokens_received  IS NOT NULL
+  AND t.entry_price_usd  > 0
+  AND t.tokens_received  > 0
+ORDER BY t.created_at DESC
+LIMIT 50;
+
+-- Campos não auditáveis pelo banco:
+-- bundler_trader_amount_rate: filtrado no scanner mas NÃO salvo na tabela migrations
+--   (migrations.rug_ratio = token["rug_ratio"] do GMGN, não bundler_trader_amount_rate)
+-- is_wash_trading: salvo em migrations.is_wash_trading ✓
+-- PERSISTENCE_WAIT_SEC / PERSISTENCE_MIN_TICKS: hardcoded = 0 no executor.py (não lê env)
+-- BOUNCE_SLOPE_MIN / BOUNCE_SLOPE_MIN_TICKS: NÃO existem no código atual (config órfã)
+-- TRADE_TP_PCT: mapeado como TRAILING_ACTIVATION_PCT/100 = tp_pct na tabela trades
+</pre></details>""")
+
+        # ── RESUMO ESTATÍSTICO ────────────────────────────────────────────────
+        out.append("<h2>📊 Resumo Estatístico</h2>")
+        n = len(trade_data)
+        tp_list    = [d for d in trade_data if d["t"]["status"] in ("tp",)]
+        sl_list    = [d for d in trade_data if d["t"]["status"] in ("sl",)]
+        trail_list = [d for d in trade_data if d["t"]["status"] == "trailing_active"]
+        exp_list   = [d for d in trade_data if d["t"]["status"] == "expired"]
+        other_list = [d for d in trade_data if d["t"]["status"] not in ("tp","sl","trailing_active","expired")]
+
+        pnls = [_safe(d["t"]["pnl_pct_real"]) for d in trade_data if _safe(d["t"]["pnl_pct_real"]) is not None]
+        wins = [p for p in pnls if p > 0]
+        loss = [p for p in pnls if p <= 0]
+        wr   = len(wins) / n if n else 0
+        ev   = sum(pnls) / len(pnls) if pnls else None
+        med  = statistics.median(pnls) if pnls else None
+
+        out.append(f"""<div class='grid4'>
+<div class='box'><b>N Trades</b>{n}</div>
+<div class='box'><b>TP</b><span class='pos'>{len(tp_list)}</span></div>
+<div class='box'><b>SL</b><span class='neg'>{len(sl_list)}</span></div>
+<div class='box'><b>Trailing</b>{len(trail_list)}</div>
+<div class='box'><b>Expired</b>{len(exp_list)}</div>
+<div class='box'><b>Outros/Pendente</b>{len(other_list)}</div>
+<div class='box'><b>WR (TP/total)</b>{"N/A" if not n else f"{wr:.1%}"}</div>
+<div class='box'><b>EV médio P&L</b>{"N/A" if ev is None else f"{ev:.1%}"}</div>
+<div class='box'><b>Mediana P&L</b>{"N/A" if med is None else f"{med:.1%}"}</div>
+<div class='box'><b>Avg win</b>{"N/A" if not wins else f"{sum(wins)/len(wins):.1%}"}</div>
+<div class='box'><b>Avg loss</b>{"N/A" if not loss else f"{sum(loss)/len(loss):.1%}"}</div>
+<div class='box'><b>Max win</b>{"N/A" if not wins else f"{max(wins):.1%}"}</div>
+<div class='box'><b>Max loss</b>{"N/A" if not loss else f"{min(loss):.1%}"}</div>
+</div>""")
+
+        # Tabela 1: Categorias
+        cats = {}
+        for d in trade_data:
+            cats.setdefault(d["category"], []).append(d)
+        out.append("<h3>Categorias</h3>")
+        out.append("<table><tr><th>Cat</th><th>Label</th><th>N</th><th>TP</th><th>SL</th><th>WR</th></tr>")
+        for cat in sorted(cats.keys()):
+            grp  = cats[cat]
+            g_tp = sum(1 for d in grp if d["t"]["status"]=="tp")
+            g_sl = sum(1 for d in grp if d["t"]["status"]=="sl")
+            g_n  = len(grp)
+            g_wr = f"{g_tp/g_n:.0%}" if g_n else "-"
+            lbl  = grp[0]["cat_label"] if grp else cat
+            out.append(f"<tr><td><b>{cat}</b></td><td>{lbl.split('—',1)[-1].strip()}</td>"
+                       f"<td>{g_n}</td><td class='pos'>{g_tp}</td><td class='neg'>{g_sl}</td><td>{g_wr}</td></tr>")
+        out.append("</table>")
+
+        # Tabela 2: Conformidade BOUNCE_MIN
+        pass_bounce = [d for d in trade_data if d["bounce_pct_stored"] is not None and d["bounce_pct_stored"] >= cfg["BOUNCE_MIN_PCT"]]
+        fail_bounce = [d for d in trade_data if d["bounce_pct_stored"] is not None and d["bounce_pct_stored"] < cfg["BOUNCE_MIN_PCT"]]
+        null_bounce = [d for d in trade_data if d["bounce_pct_stored"] is None]
+        real_pass   = [d for d in trade_data if d["real_bounce_vs_bottom"] is not None and d["real_bounce_vs_bottom"] >= cfg["BOUNCE_MIN_PCT"]]
+        real_fail   = [d for d in trade_data if d["real_bounce_vs_bottom"] is not None and d["real_bounce_vs_bottom"] < cfg["BOUNCE_MIN_PCT"]]
+        sig_ok_real_fail = [d for d in pass_bounce if d["real_bounce_vs_bottom"] is not None and d["real_bounce_vs_bottom"] < cfg["BOUNCE_MIN_PCT"]]
+
+        out.append("<h3>Conformidade BOUNCE_MIN_PCT</h3>")
+        out.append(f"""<table>
+<tr><th>Métrica</th><th>N</th><th>%</th></tr>
+<tr><td>Sinal stored &ge; {cfg['BOUNCE_MIN_PCT']:.0%} (BOUNCE_MIN)</td><td>{len(pass_bounce)}</td><td>{len(pass_bounce)/n:.0%}</td></tr>
+<tr><td>Sinal stored &lt; {cfg['BOUNCE_MIN_PCT']:.0%}</td><td>{len(fail_bounce)}</td><td>{len(fail_bounce)/n:.0%}</td></tr>
+<tr><td>Sinal NULL (sem bounce_signal)</td><td>{len(null_bounce)}</td><td>{len(null_bounce)/n:.0%}</td></tr>
+<tr><td>Entrada real bounce &ge; {cfg['BOUNCE_MIN_PCT']:.0%}</td><td>{len(real_pass)}</td><td>{len(real_pass)/n:.0%}</td></tr>
+<tr><td>Entrada real bounce &lt; {cfg['BOUNCE_MIN_PCT']:.0%}</td><td>{len(real_fail)}</td><td>{len(real_fail)/n:.0%}</td></tr>
+<tr><td>Sinal OK mas entrada real &lt; {cfg['BOUNCE_MIN_PCT']:.0%} (degradou)</td><td>{len(sig_ok_real_fail)}</td><td>{len(sig_ok_real_fail)/n:.0%}</td></tr>
+</table>""")
+
+        # Tabela 3: Conformidade filtros de qualidade
+        filt_cols = [
+            ("FILTER_RUG_MAX",    "rug_ratio",             "filt_rug"),
+            ("FILTER_BOT_MAX",    "bot_degen_rate",        "filt_bot"),
+            ("FILTER_SNIPER_MAX", "top70_sniper_hold_rate","filt_sniper"),
+            ("FILTER_RAT_MAX",    "rat_trader_rate",       "filt_rat"),
+            ("FILTER_TOP10_MAX",  "top10_holder_rate",     "filt_top10"),
+            ("FILTER_SMART_MIN",  "smart_wallets",         "filt_smart"),
+            ("FILTER_LIQ_MIN",    "liq_migration",         "filt_liq"),
+            ("FILTER_MC_MAX",     "mc_migration",          "filt_mc"),
+        ]
+        out.append("<h3>Conformidade Filtros de Qualidade (auditável pelo banco)</h3>")
+        out.append("<table><tr><th>Filtro</th><th>Campo DB</th><th>Threshold</th><th>Auditável</th><th>Passou</th><th>Falhou</th><th>NULL</th></tr>")
+        for cfg_key, col, fk in filt_cols:
+            auditaveis = [d for d in trade_data if d[fk][0] is not None]
+            passed     = [d for d in auditaveis if d[fk][0]]
+            failed     = [d for d in auditaveis if not d[fk][0]]
+            nulled     = [d for d in trade_data if d[fk][0] is None]
+            thr        = f"{cfg[cfg_key]:.0%}" if cfg_key not in ("FILTER_SMART_MIN","FILTER_LIQ_MIN","FILTER_MC_MAX") else str(cfg[cfg_key])
+            out.append(f"<tr><td>{cfg_key}</td><td>{col}</td><td>{thr}</td>"
+                       f"<td>{len(auditaveis)}</td>"
+                       f"<td class='pos'>{len(passed)}</td>"
+                       f"<td class='neg'>{len(failed)}</td>"
+                       f"<td class='neu'>{len(nulled)}</td></tr>")
+        # bundler_trader_amount_rate — não auditável
+        out.append("<tr><td>FILTER_BUNDLER_MAX</td><td><i>bundler_trader_amount_rate</i></td>"
+                   f"<td>{cfg['FILTER_BUNDLER_MAX']:.0%}</td>"
+                   "<td><span class='neg'>0 — NÃO SALVO NO DB</span></td><td>-</td><td>-</td>"
+                   f"<td>{n}</td></tr>")
+        out.append("</table>")
+        out.append("<p style='color:#8b949e;font-size:11px'>⚠️ <b>bundler_trader_amount_rate</b>: filtrado no scanner mas nunca salvo em <code>migrations</code>. "
+                   "Não auditável pelo banco. Campo <code>migrations.rug_ratio</code> = token[\"rug_ratio\"] interno GMGN (diferente do bundler rate).</p>")
+
+        # Tabela 4: Slippage / premium
+        premiums = [d["real_premium_vs_signal"] for d in trade_data if d["real_premium_vs_signal"] is not None]
+        out.append("<h3>Slippage / Premium vs Sinal</h3>")
+        out.append("<p style='color:#8b949e;font-size:11px'>real_entry_premium = (real_entry_mc / mc_at_signal - 1) — mede quanto a entrada ficou acima do preço do sinal.<br>"
+                   "TRADE_SLIPPAGE_BPS=500 (5%) é slippage máximo configurado no swap, mas não mede premium vs sinal (que inclui latência + movimento de preço + slippage).</p>")
+        if premiums:
+            premiums_s = sorted(premiums)
+            p25  = premiums_s[int(len(premiums_s)*0.25)]
+            p75  = premiums_s[int(len(premiums_s)*0.75)]
+            med_p = statistics.median(premiums)
+            out.append(f"""<div class='grid4'>
+<div class='box'><b>N com dados</b>{len(premiums)}</div>
+<div class='box'><b>Mediana premium</b>{med_p:.1%}</div>
+<div class='box'><b>P25</b>{p25:.1%}</div>
+<div class='box'><b>P75</b>{p75:.1%}</div>
+</div>""")
+            top10_prem = sorted([(d["sym"], d["real_premium_vs_signal"]) for d in trade_data if d["real_premium_vs_signal"] is not None],
+                                key=lambda x: x[1], reverse=True)[:10]
+            out.append("<table><tr><th>Token</th><th>Premium vs sinal</th></tr>")
+            for sym, pr in top10_prem:
+                cls = "neg" if pr > 0.05 else "pos"
+                out.append(f"<tr><td>{sym}</td><td class='{cls}'>{pr:.1%}</td></tr>")
+            out.append("</table>")
+        else:
+            out.append("<p class='neu'>Sem dados de premium (mc_at_signal NULL em todos).</p>")
+
+        # Tabela 5: Config antiga vs atual (por dia)
+        out.append("<h3>Config Histórica — Bounce Mediano por Data</h3>")
+        by_day = {}
+        for d in trade_data:
+            if d["t"]["created_at"]:
+                day = d["t"]["created_at"].strftime("%Y-%m-%d")
+                by_day.setdefault(day, []).append(d)
+        out.append("<table><tr><th>Data</th><th>N</th><th>Bounce mediano stored</th><th>% abaixo 55%</th><th>% abaixo 30%</th></tr>")
+        for day in sorted(by_day.keys()):
+            grp = by_day[day]
+            bounces = [d["bounce_pct_stored"] for d in grp if d["bounce_pct_stored"] is not None]
+            if bounces:
+                med_b = statistics.median(bounces)
+                pct55 = sum(1 for b in bounces if b < 0.55) / len(bounces)
+                pct30 = sum(1 for b in bounces if b < 0.30) / len(bounces)
+                cls55 = "neg" if pct55 > 0.5 else "pos"
+                out.append(f"<tr><td>{day}</td><td>{len(grp)}</td><td>{med_b:.1%}</td>"
+                            f"<td class='{cls55}'>{pct55:.0%}</td><td class='neg'>{pct30:.0%}</td></tr>")
+            else:
+                out.append(f"<tr><td>{day}</td><td>{len(grp)}</td><td>NULL</td><td>-</td><td>-</td></tr>")
+        out.append("</table>")
+
+        # Tabela 6: Duplicidade de mints
+        mint_counts = {}
+        for d in trade_data:
+            mint_counts[d["mint"]] = mint_counts.get(d["mint"], 0) + 1
+        dup_mints = {m: c for m, c in mint_counts.items() if c > 1}
+        out.append("<h3>Duplicidade de Mints</h3>")
+        if dup_mints:
+            out.append("<table><tr><th>Mint</th><th>Symbol</th><th>N trades</th></tr>")
+            for mint, cnt in sorted(dup_mints.items(), key=lambda x: -x[1]):
+                syms = [d["sym"] for d in trade_data if d["mint"] == mint]
+                out.append(f"<tr><td>{mint[:16]}…</td><td>{syms[0]}</td><td class='warn'>{cnt}</td></tr>")
+            out.append("</table>")
+        else:
+            out.append("<p class='pos'>✅ Sem mints duplicados.</p>")
+
+        # ── RELATÓRIO TRADE A TRADE ───────────────────────────────────────────
+        out.append("<h2>🗂️ Relatório Trade a Trade</h2>")
+        out.append("<p style='color:#8b949e;font-size:11px'>Ordenado por created_at DESC. Clique no token para expandir detalhes.</p>")
+
+        for idx, d in enumerate(trade_data, 1):
+            t  = d["t"]
+            bs = d["bs"]
+            m  = d["m"]
+
+            tid  = t.get("id")
+            sym  = d["sym"]
+            mint = d["mint"]
+            cat  = d["category"]
+
+            status = t.get("status","?")
+            pnl    = _safe(t.get("pnl_pct_real"))
+            pnl_s  = f"<span class='{'pos' if pnl and pnl>0 else 'neg'}'>{pnl:.1%}</span>" if pnl is not None else "NULL"
+
+            created_brt = (t["created_at"] + BRT).strftime("%m-%d %H:%M") if t.get("created_at") else "?"
+
+            badge_cat = f"<span class='{'badge-ok' if cat=='A' else 'badge-fail'}'>{cat}</span>"
+
+            # Links
+            gmgn_link  = f"<a href='https://gmgn.ai/sol/token/{mint}' target='_blank'>GMGN</a>"
+            dex_link   = f"<a href='https://dexscreener.com/solana/{mint}' target='_blank'>DexScreener</a>"
+            sol_link   = f"<a href='https://solscan.io/token/{mint}' target='_blank'>Solscan</a>"
+
+            out.append(f"<div class='trade-card {cat}'>")
+            out.append(f"<details>")
+            out.append(f"<summary><b>#{idx} [{created_brt}] {sym}</b> — Trade #{tid} — {badge_cat} {d['cat_label']} — Status: <b>{status}</b> P&L: {pnl_s} — {gmgn_link} {dex_link} {sol_link}</summary>")
+
+            # Seção: Identificação
+            out.append("<div class='section-hdr'>📌 Identificação</div>")
+            out.append(f"<div class='grid4'>")
+            out.append(f"<div class='box'><b>trade_id</b>{tid}</div>")
+            out.append(f"<div class='box'><b>mint</b><span style='font-size:9px'>{mint}</span></div>")
+            out.append(f"<div class='box'><b>symbol</b>{sym}</div>")
+            out.append(f"<div class='box'><b>status</b>{status}</div>")
+            out.append(f"<div class='box'><b>exit_type</b>{t.get('exit_type') or 'NULL'}</div>")
+            out.append(f"<div class='box'><b>fill_source</b>{t.get('fill_source') or 'NULL'}</div>")
+            out.append(f"<div class='box'><b>order_id</b><span style='font-size:9px'>{str(t.get('order_id') or 'NULL')[:20]}</span></div>")
+            out.append(f"<div class='box'><b>strategy_id</b><span style='font-size:9px'>{str(t.get('strategy_id') or 'NULL')[:24]}</span></div>")
+            ts_sig_s  = t["ts_signal"].strftime("%H:%M:%S")  if t.get("ts_signal")  else "NULL"
+            ts_bs_s   = bs["ts_signal"].strftime("%H:%M:%S") if bs.get("ts_signal") else "NULL"
+            ts_ord_s  = t["ts_order_sent"].strftime("%H:%M:%S") if t.get("ts_order_sent") else "NULL"
+            ts_conf_s = t["ts_order_confirmed"].strftime("%H:%M:%S") if t.get("ts_order_confirmed") else "NULL"
+            out.append(f"<div class='box'><b>ts_signal (trade)</b>{ts_sig_s}</div>")
+            out.append(f"<div class='box'><b>ts_signal (bounce)</b>{ts_bs_s}</div>")
+            out.append(f"<div class='box'><b>ts_order_sent</b>{ts_ord_s}</div>")
+            out.append(f"<div class='box'><b>ts_order_confirmed</b>{ts_conf_s}</div>")
+            out.append("</div>")
+
+            # Seção: Motivo da compra / sinal
+            out.append("<div class='section-hdr'>📡 Motivo da Compra / Sinal</div>")
+            out.append("<table>")
+            out.append("<tr><th>Métrica</th><th>Valor</th><th>Config</th><th>Passou?</th></tr>")
+
+            def row(label, val_s, cfg_s="", ok=None):
+                if ok is None:
+                    ok_s = "<td>—</td>"
+                elif ok:
+                    ok_s = "<td><span class='badge-ok'>✅ SIM</span></td>"
+                else:
+                    ok_s = "<td><span class='badge-fail'>❌ NÃO</span></td>"
+                return f"<tr><td>{label}</td><td>{val_s}</td><td>{cfg_s}</td>{ok_s}</tr>"
+
+            out.append(row("mc_min (fundo)", _pu(d["mc_min"])))
+            out.append(row("mc_at_signal", _pu(d["mc_at_signal"])))
+            out.append(row("mc_migration", _pu(d["mc_mig"])))
+            out.append(row("bounce_pct (stored)", _pp(d["bounce_pct_stored"]), f"BOUNCE_MIN={cfg['BOUNCE_MIN_PCT']:.0%}", d["pass_bounce_min"] if d["bounce_pct_stored"] is not None else None))
+            out.append(row("calc_bounce_pct (mc_at_sig/mc_min-1)", _pp(d["calc_bounce_pct"])))
+            out.append(row("drop_from_mig", _pp(d["drop_from_mig"]), f"BOUNCE_DROP_MIN={cfg['BOUNCE_DROP_MIN']:.0%}", d["pass_drop_min"] if d["drop_from_mig"] is not None else None))
+            out.append(row("elapsed (min)", _pf(d["elapsed_min"]), f"BOUNCE_TIME_MAX={cfg['BOUNCE_TIME_MAX']}min", d["pass_time_max"] if d["elapsed_min"] is not None else None))
+            out.append(row("entry_ratio_signal (mc_signal/mc_mig)", _pp(d["entry_ratio_signal"]),
+                           "dead zone 50-65%", d["dead_zone_ok"] if d["entry_ratio_signal"] is not None else None))
+            ex_ok = d["filt_pump"] if d["exchange"] else None
+            out.append(row("exchange (PUMP_ONLY)", d["exchange"] or "NULL", "FILTER_PUMP_ONLY=true", ex_ok))
+            out.append("</table>")
+
+            # Seção: Entrada real
+            out.append("<div class='section-hdr'>💰 Entrada Real</div>")
+            out.append("<table>")
+            out.append("<tr><th>Métrica</th><th>Valor</th><th>Notas</th></tr>")
+            out.append(f"<tr><td>entry_price_usd</td><td>{_pf(t.get('entry_price_usd'), 4)}</td><td>SOL gasto × SOL/USD no momento</td></tr>")
+            out.append(f"<tr><td>tokens_received</td><td>{_pf(t.get('tokens_received'), 0)}</td><td>tokens recebidos do fill</td></tr>")
+            out.append(f"<tr><td>real_entry_mc</td><td>{_pu(d['real_entry_mc'])}</td><td>(entry_price_usd / tokens_received) × 1B</td></tr>")
+            out.append(f"<tr><td>real_bounce_vs_bottom</td><td>{_pp(d['real_bounce_vs_bottom'])}</td><td>real_entry_mc / mc_min - 1</td></tr>")
+            out.append(f"<tr><td>real_premium_vs_signal</td><td>{_pp(d['real_premium_vs_signal'])}</td><td>real_entry_mc / mc_at_signal - 1</td></tr>")
+            out.append(f"<tr><td>real_ratio_vs_migration</td><td>{_pp(d['real_ratio_vs_migration'])}</td><td>real_entry_mc / mc_migration</td></tr>")
+            out.append(f"<tr><td>amount_usd</td><td>${_pf(t.get('amount_usd'),2)}</td><td>CALIBRATION_AMOUNT_USD={cfg['CALIBRATION_AMOUNT_USD']}</td></tr>")
+            out.append(f"<tr><td>amount_sol</td><td>{_pf(t.get('amount_sol'),6)} SOL</td><td></td></tr>")
+            out.append(f"<tr><td>fee_sol</td><td>{_pf(t.get('fee_sol'),6)} SOL</td><td>taxa on-chain</td></tr>")
+            slip = _safe(t.get("slippage_pct"))
+            slip_s = f"{slip:.2%}" if slip is not None else "NULL"
+            slip_note = "(sol_spent - amount_sol) / amount_sol — mede excesso vs estimativa, não vs preço de mercado"
+            out.append(f"<tr><td>slippage_pct (salvo)</td><td>{slip_s}</td><td>{slip_note}</td></tr>")
+            out.append(f"<tr><td>latency_sec</td><td>{_pf(t.get('latency_sec'),1)}s</td><td>ts_signal → fill confirmado</td></tr>")
+            out.append("</table>")
+
+            # Seção: Saída
+            out.append("<div class='section-hdr'>🚪 Saída</div>")
+            tp_pct_s  = t.get("tp_pct")
+            sl_pct_s  = t.get("sl_pct")
+            exit_ts_s = t["exit_ts"].strftime("%H:%M:%S") if t.get("exit_ts") else "NULL"
+            trade_dur = None
+            if t.get("ts_order_sent") and t.get("exit_ts"):
+                trade_dur = (t["exit_ts"] - t["ts_order_sent"]).total_seconds() / 60
+            # Check coherence
+            pnl_v = _safe(t.get("pnl_pct_real"))
+            status_ok = None
+            if pnl_v is not None and t.get("status"):
+                if t["status"] == "tp" and pnl_v < 0:
+                    status_ok = False
+                elif t["status"] == "sl" and pnl_v > 0:
+                    status_ok = False
+                else:
+                    status_ok = True
+
+            out.append("<table>")
+            out.append(f"<tr><td>tp_pct (salvo)</td><td>{_pp(tp_pct_s)}</td><td>TRAILING_ACTIVATION_PCT={cfg['TRAILING_ACTIVATION_PCT']}% (config Railway) — mapeado como trailing activation, não TP fixo</td></tr>")
+            out.append(f"<tr><td>sl_pct (salvo)</td><td>{_pp(sl_pct_s)}</td><td>TRADE_SL_PCT={cfg['TRADE_SL_PCT']:.0%} (config Railway)</td></tr>")
+            sl_match = None
+            if sl_pct_s is not None:
+                sl_match = abs(_safe(sl_pct_s) - cfg["TRADE_SL_PCT"]) < 0.01
+            out.append(f"<tr><td>SL salvo = config?</td><td>{_ok(sl_match)}</td><td>salvo={_pp(sl_pct_s)} config={cfg['TRADE_SL_PCT']:.0%}</td></tr>")
+            out.append(f"<tr><td>status</td><td><b>{t.get('status','?')}</b></td><td>Coerência com P&L: {_ok(status_ok)}</td></tr>")
+            out.append(f"<tr><td>exit_type</td><td>{t.get('exit_type') or 'NULL'}</td><td></td></tr>")
+            out.append(f"<tr><td>exit_ts</td><td>{exit_ts_s}</td><td></td></tr>")
+            out.append(f"<tr><td>pnl_pct_real</td><td>{'NULL' if pnl_v is None else f'{pnl_v:.2%}'}</td><td></td></tr>")
+            out.append(f"<tr><td>exit_price_usd</td><td>{_pf(t.get('exit_price_usd'),4)}</td><td></td></tr>")
+            out.append(f"<tr><td>Tempo em trade</td><td>{'NULL' if trade_dur is None else f'{trade_dur:.1f}min'}</td><td></td></tr>")
+            out.append("</table>")
+
+            # Seção: Dados da migração
+            out.append("<div class='section-hdr'>🌐 Dados de Migrations</div>")
+            out.append("<div class='grid4'>")
+            mig_fields = [
+                ("token_nome", "Nome"), ("ts_migration", "ts_migration"),
+                ("mc_migration", "mc_mig"), ("mc_migration_source", "mc_source"),
+                ("mc_migration_bc_ref", "mc_bc_ref"), ("mc_migration_observed", "mc_obs"),
+                ("mc_peak", "mc_peak"), ("time_to_peak", "ttp(min)"),
+                ("pct_gain", "pct_gain"), ("mc_bottom", "mc_bottom"),
+                ("time_to_bottom", "ttb(min)"), ("pct_drop", "pct_drop"),
+                ("mc_1h", "mc_1h"), ("var_1h", "var_1h"),
+                ("liq_migration", "liq_mig"), ("is_honeypot", "honeypot"),
+                ("is_wash_trading", "wash"), ("recovery", "recovery"),
+                ("capture_delay_sec", "capture_delay"),
+                ("total_fee_sol", "fee_sol"), ("exchange", "exchange"),
+            ]
+            for col, lbl in mig_fields:
+                v = m.get(col)
+                if v is None:
+                    vs = "NULL"
+                elif isinstance(v, bool):
+                    vs = str(v)
+                elif isinstance(v, float) and abs(v) < 100:
+                    vs = _pp(v)
+                elif isinstance(v, (int, float)):
+                    vs = _pu(v) if v > 1000 else _pf(v)
+                else:
+                    vs = str(v)[:30]
+                out.append(f"<div class='box'><b>{lbl}</b>{vs}</div>")
+            out.append("</div>")
+
+            # Seção: Verificação filtros de qualidade
+            out.append("<div class='section-hdr'>🔎 Verificação Filtros de Qualidade</div>")
+            out.append("<table><tr><th>Filtro</th><th>Campo DB</th><th>Valor</th><th>Config</th><th>Passou?</th></tr>")
+            filt_rows = [
+                ("FILTER_RUG_MAX",    "rug_ratio",             rug_val,    d["filt_rug"],    cfg["FILTER_RUG_MAX"],    "max"),
+                ("FILTER_BOT_MAX",    "bot_degen_rate",        bot_val,    d["filt_bot"],    cfg["FILTER_BOT_MAX"],    "max"),
+                ("FILTER_SNIPER_MAX", "top70_sniper_hold_rate",sniper_val, d["filt_sniper"], cfg["FILTER_SNIPER_MAX"], "max"),
+                ("FILTER_RAT_MAX",    "rat_trader_rate",       rat_val,    d["filt_rat"],    cfg["FILTER_RAT_MAX"],    "max"),
+                ("FILTER_TOP10_MAX",  "top10_holder_rate",     top10_val,  d["filt_top10"],  cfg["FILTER_TOP10_MAX"],  "max"),
+                ("FILTER_SMART_MIN",  "smart_wallets",         smart_val,  d["filt_smart"],  cfg["FILTER_SMART_MIN"],  "min"),
+                ("FILTER_LIQ_MIN",    "liq_migration",         liq_val,    d["filt_liq"],    cfg["FILTER_LIQ_MIN"],    "min"),
+                ("FILTER_MC_MAX",     "mc_migration",          mc_mig_filt,d["filt_mc"],     cfg["FILTER_MC_MAX"],     "max"),
+            ]
+            for cfg_key, col, val, flt, threshold, mode in filt_rows:
+                if val is None:
+                    badge = "<span class='badge-null'>campo NULL</span>"
+                elif flt[0]:
+                    badge = "<span class='badge-ok'>✅ PASSOU</span>"
+                else:
+                    badge = "<span class='badge-fail'>❌ FALHOU</span>"
+                thr_s = f"{threshold:.0%}" if threshold < 10 else str(int(threshold))
+                out.append(f"<tr><td>{cfg_key}</td><td>{col}</td><td>{_pf(val)}</td><td>{thr_s}</td><td>{badge}</td></tr>")
+            # FILTER_BUNDLER_MAX — não auditável
+            out.append(f"<tr><td>FILTER_BUNDLER_MAX</td><td>bundler_trader_amount_rate</td><td>NÃO SALVO NO DB</td>"
+                       f"<td>{cfg['FILTER_BUNDLER_MAX']:.0%}</td><td><span class='badge-null'>não auditável</span></td></tr>")
+            # FILTER_PUMP_ONLY
+            pump_badge = "<span class='badge-ok'>✅ pump</span>" if d["filt_pump"] else "<span class='badge-fail'>❌ NÃO pump</span>"
+            out.append(f"<tr><td>FILTER_PUMP_ONLY</td><td>exchange</td><td>{d['exchange'] or 'NULL'}</td>"
+                       f"<td>true</td><td>{pump_badge}</td></tr>")
+
+            # Quality fields (additional)
+            q_fields = [
+                ("creator_token_status", "creator_token_status"),
+                ("creator_balance_rate", "creator_balance_rate"),
+                ("dev_team_hold_rate", "dev_team_hold_rate"),
+                ("suspected_insider_rate", "suspected_insider_rate"),
+                ("bluechip_owner_pct", "bluechip_owner_pct"),
+                ("bot_degen_rate", "bot_degen_rate"),
+                ("entrapment_ratio", "entrapment_ratio"),
+                ("burn_status", "burn_status"),
+                ("cto_flag", "cto_flag"),
+                ("has_social", "has_social"),
+                ("x_follower_count", "x_follower_count"),
+            ]
+            out.append("</table>")
+            out.append("<table><tr><th>Campo qualidade</th><th>Valor DB</th></tr>")
+            for col, lbl in q_fields:
+                v = m.get(col)
+                vs = "NULL" if v is None else str(v)
+                out.append(f"<tr><td>{lbl}</td><td>{vs}</td></tr>")
+            out.append("</table>")
+
+            # Seção: Absorção / H22
+            out.append("<div class='section-hdr'>🌊 Absorção / H22</div>")
+            abs_ev = bs.get("absorption_events")
+            has_abs = abs_ev is not None and abs_ev > 0
+            helius_badge = "<span class='pos'>✅ SIM</span>" if has_abs else "<span class='neg'>SEM DADOS</span>"
+            out.append(f"<p>Dados Helius: {helius_badge}</p>")
+            out.append("<div class='grid4'>")
+            abs_fields = [
+                ("absorption_buy_vol", "buy_vol (SOL)"),
+                ("absorption_sell_vol", "sell_vol (SOL)"),
+                ("absorption_buy_cnt", "buy_cnt"),
+                ("absorption_sell_cnt", "sell_cnt"),
+                ("absorption_lrg_buy", "lrg_buy (SOL)"),
+                ("absorption_events", "events"),
+                ("p30s_buy_vol", "p30s_buy_vol"),
+                ("p30s_sell_vol", "p30s_sell_vol"),
+                ("p30s_events", "p30s_events"),
+                ("p60s_buy_vol", "p60s_buy_vol"),
+                ("p60s_sell_vol", "p60s_sell_vol"),
+                ("p60s_events", "p60s_events"),
+            ]
+            for col, lbl in abs_fields:
+                v = bs.get(col)
+                out.append(f"<div class='box'><b>{lbl}</b>{'NULL' if v is None else _pf(v, 4)}</div>")
+            # Ratios
+            bv = _safe(bs.get("absorption_buy_vol"))
+            sv = _safe(bs.get("absorption_sell_vol"))
+            bc = _safe(bs.get("absorption_buy_cnt"))
+            sc = _safe(bs.get("absorption_sell_cnt"))
+            lb = _safe(bs.get("absorption_lrg_buy"))
+            if bv is not None and sv is not None and sv > 0:
+                out.append(f"<div class='box'><b>buy/sell vol ratio</b>{bv/sv:.2f}×</div>")
+            elif bv is not None and sv == 0 and bv > 0:
+                out.append(f"<div class='box'><b>buy/sell vol ratio</b>∞ (no sells)</div>")
+            if bc is not None and sc is not None and sc > 0:
+                out.append(f"<div class='box'><b>buy/sell cnt ratio</b>{bc/sc:.2f}×</div>")
+            if bv and lb and bv > 0:
+                out.append(f"<div class='box'><b>lrg_buy concentration</b>{lb/bv:.2%}</div>")
+            out.append("</div>")
+            if d["tat"]:
+                out.append(f"<p style='font-size:11px'>trade_absorption_ticks: {d['tat']['n_ticks']} ticks | avg_bvol={_pf(d['tat']['avg_bvol'],4)} | avg_svol={_pf(d['tat']['avg_svol'],4)}</p>")
+
+            # Seção: H9 — Token Signals
+            out.append("<div class='section-hdr'>🤖 Token Signals / H9</div>")
+            if d["sigs"]:
+                out.append(f"<p>{len(d['sigs'])} sinais totais | {len(d['sigs_before'])} antes do bounce | {len(d['sigs_after'])} depois</p>")
+                out.append("<table><tr><th>trigger_at</th><th>trigger_mc</th><th>first_mc</th><th>signal_times</th><th>lead/lag vs bounce</th><th>trigger/mc_signal</th></tr>")
+                for s in d["sigs"][:5]:
+                    ta = s.get("trigger_at")
+                    try:
+                        ta_dt = datetime.fromtimestamp(ta, tz=timezone.utc)
+                        ta_s  = ta_dt.strftime("%H:%M:%S")
+                    except Exception:
+                        ta_s = str(ta)
+                    lead_lag = None
+                    if t.get("ts_signal") and ta:
+                        try:
+                            lead_lag = (datetime.fromtimestamp(ta, tz=timezone.utc) - t["ts_signal"]).total_seconds()
+                        except Exception:
+                            pass
+                    ll_s = f"{lead_lag:.0f}s" if lead_lag is not None else "?"
+                    tmc  = _safe(s.get("trigger_mc"))
+                    ratio_s = f"{tmc/d['mc_at_signal']:.2f}" if tmc and d["mc_at_signal"] and d["mc_at_signal"] > 0 else "?"
+                    out.append(f"<tr><td>{ta_s}</td><td>{_pu(tmc)}</td><td>{_pu(s.get('first_trigger_mc'))}</td>"
+                               f"<td>{s.get('signal_times')}</td><td>{ll_s}</td><td>{ratio_s}</td></tr>")
+                out.append("</table>")
+            else:
+                out.append("<p class='neg'>Sem token_signals para este mint.</p>")
+
+            # Seção: Ticks ao redor do sinal e entrada
+            out.append("<div class='section-hdr'>📈 Ticks ao Redor do Sinal/Entrada</div>")
+            lp = d["last_pre"]
+            fp = d["first_post"]
+            nt = d["nearest_order_tick"]
+            out.append("<table><tr><th>Referência</th><th>tick_ts</th><th>mc (close)</th><th>mc_high</th><th>mc_low</th><th>source</th><th>Diferença vs sinal</th></tr>")
+            def tick_row(label, tk, ref_mc):
+                if tk is None:
+                    return f"<tr><td>{label}</td><td colspan=6>NULL</td></tr>"
+                mc_t = _safe(tk.get("mc"))
+                diff = f"{(mc_t/ref_mc - 1):.1%}" if mc_t and ref_mc and ref_mc > 0 else "?"
+                return (f"<tr><td>{label}</td><td>{tk['tick_ts'].strftime('%H:%M:%S')}</td>"
+                        f"<td>{_pu(mc_t)}</td><td>{_pu(tk.get('mc_high'))}</td>"
+                        f"<td>{_pu(tk.get('mc_low'))}</td><td>{tk.get('source','?')}</td><td>{diff}</td></tr>")
+            ref = d["mc_at_signal"] or 1
+            out.append(tick_row("Último tick antes do sinal", lp, ref))
+            out.append(tick_row("Primeiro tick após o sinal", fp, ref))
+            out.append(tick_row("Tick mais próximo da ordem", nt, ref))
+            out.append("</table>")
+            out.append(f"<p style='font-size:11px'>Total ticks disponíveis para este mint: {len(d['ticks'])}</p>")
+
+            out.append("</details></div>")  # fecha details e trade-card
+
+        # ── CONCLUSÃO EXECUTIVA ────────────────────────────────────────────────
+        out.append("<h2>📝 Conclusão Executiva</h2>")
+        out.append("<div style='background:#161b22;border:1px solid #30363d;border-radius:6px;padding:16px'>")
+
+        pct_bounce_ok = len(pass_bounce) / n if n else 0
+        pct_real_fail = len(real_fail) / len(real_pass + real_fail) if (real_pass + real_fail) else 0
+
+        # Q1
+        out.append(f"<p><b>1. As últimas {n} compras respeitaram BOUNCE_MIN={cfg['BOUNCE_MIN_PCT']:.0%}?</b><br>")
+        out.append(f"Sinal stored OK: {len(pass_bounce)}/{n} ({pct_bounce_ok:.0%}). "
+                   f"Sinal abaixo: {len(fail_bounce)} ({len(fail_bounce)/n:.0%}). "
+                   f"NULL (sem bounce_signal): {len(null_bounce)}.</p>")
+
+        # Q2
+        out.append(f"<p><b>2. Quando não respeitaram, foi por quê?</b><br>")
+        config_antiga = [d for d in fail_bounce if d["bounce_pct_stored"] and d["bounce_pct_stored"] >= 0.30]
+        abaixo30 = [d for d in fail_bounce if d["bounce_pct_stored"] and d["bounce_pct_stored"] < 0.30]
+        out.append(f"• Sinal entre 30-55% (possível config antiga BOUNCE_MIN=0.30): {len(config_antiga)}<br>")
+        out.append(f"• Sinal &lt;30% (abaixo de qualquer config histórica): {len(abaixo30)}<br>")
+        out.append(f"• Sinal OK mas entrada real degradou: {len(sig_ok_real_fail)}</p>")
+
+        # Q3: filtros auditáveis
+        out.append("<p><b>3. Quais filtros do Railway são auditáveis pelo banco?</b><br>")
+        out.append("✅ Auditáveis: FILTER_RUG_MAX (rug_ratio), FILTER_BOT_MAX (bot_degen_rate), "
+                   "FILTER_SNIPER_MAX (top70_sniper_hold_rate), FILTER_RAT_MAX (rat_trader_rate), "
+                   "FILTER_TOP10_MAX (top10_holder_rate), FILTER_SMART_MIN (smart_wallets), "
+                   "FILTER_LIQ_MIN (liq_migration), FILTER_MC_MAX (mc_migration), "
+                   "FILTER_PUMP_ONLY (exchange).<br>"
+                   "❌ NÃO auditável: FILTER_BUNDLER_MAX — <code>bundler_trader_amount_rate</code> "
+                   "é filtrado no scanner mas nunca salvo na tabela migrations.</p>")
+
+        # Q4: filtros não aplicados
+        out.append("<p><b>4. Quais filtros parecem não estar sendo aplicados pelo código?</b><br>")
+        out.append("⚠️ <b>PERSISTENCE_WAIT_SEC</b> e <b>PERSISTENCE_MIN_TICKS</b>: "
+                   "hardcoded como 0 em executor.py (linhas 48-49). O código NÃO lê as env vars. "
+                   "Mesmo com Railway configurado (90/3), a entrada é imediata ao sinal.<br>"
+                   "⚠️ <b>BOUNCE_SLOPE_MIN</b> e <b>BOUNCE_SLOPE_MIN_TICKS</b>: "
+                   "NÃO existem no código atual (scanner.py). H13 foi refutada e A.1 foi removido. "
+                   "Estas env vars são configuradas no Railway mas não têm efeito algum.<br>"
+                   "⚠️ <b>TRADE_TP_PCT</b>: no código, o campo tp_pct da tabela trades é preenchido "
+                   "com TRAILING_ACTIVATION_PCT/100 (não existe TRADE_TP_PCT no executor). "
+                   "Se a config Railway chama de TRADE_TP_PCT, pode estar mapeada para o campo errado.</p>")
+
+        # Q5: vars órfãs
+        out.append("<p><b>5. Quais variáveis do Railway parecem órfãs/não usadas?</b><br>")
+        out.append("<code>BOUNCE_SLOPE_MIN</code>, <code>BOUNCE_SLOPE_MIN_TICKS</code> — sem correspondência no código.<br>")
+        out.append("<code>PERSISTENCE_WAIT_SEC</code>, <code>PERSISTENCE_MIN_TICKS</code> — env var ignorada, hardcoded=0.<br>")
+        out.append("<code>TRADE_TP_PCT</code> — executor não lê esta var. Usa TRAILING_ACTIVATION_PCT como tp_pct.<br>")
+        out.append("</p>")
+
+        # Q6: trades bloqueados com config estrita
+        n_would_block = sum(1 for d in trade_data if filter_violations or not d["pass_bounce_min"])
+        n_filter_viol = sum(1 for d in trade_data if d["filter_violations"])
+        n_bounce_fail = sum(1 for d in trade_data if not d["pass_bounce_min"] and d["bounce_pct_stored"] is not None)
+        out.append(f"<p><b>6. Quantos trades seriam bloqueados com config atual estrita?</b><br>")
+        out.append(f"Filtros de qualidade violados: {n_filter_viol}<br>")
+        out.append(f"Bounce abaixo do mínimo: {n_bounce_fail}<br>")
+        out.append(f"Total aproximado (com overlap): a verificar trade a trade acima.</p>")
+
+        # Q7: executor compra sem revalidar
+        out.append("<p><b>7. Existe evidência de que o executor compra sem revalidar o bounce?</b><br>")
+        out.append("SIM — o código do executor.py mostra que <code>on_bounce()</code> é chamado pelo "
+                   "_check_bounce() do HotMonitor, que já aplicou os filtros A.2, A.3, A.5, A.6. "
+                   "O executor NÃO revalida os filtros de qualidade da migration (rug, top10, smart, etc.) "
+                   "— ele confia que o scanner já filtrou na entrada da watchlist. "
+                   "Se uma configuração muda entre a entrada na watchlist e o bounce, o trade ocorre "
+                   "com a config antiga.</p>")
+
+        # Q8: slippage
+        slips = [_safe(d["t"]["slippage_pct"]) for d in trade_data if _safe(d["t"]["slippage_pct"]) is not None]
+        out.append(f"<p><b>8. Existe evidência de slippage/entrada fora do esperado?</b><br>")
+        if slips:
+            med_slip = statistics.median(slips)
+            max_slip = max(slips)
+            out.append(f"slippage_pct mediano: {med_slip:.2%}, máximo: {max_slip:.2%}. "
+                       f"TRADE_SLIPPAGE_BPS=500 (5% max). "
+                       f"⚠️ Atenção: slippage_pct no banco = (sol_spent - amount_sol) / amount_sol — "
+                       f"mede desvio vs estimativa, NÃO vs preço do sinal. "
+                       f"O premium vs sinal (latência + mov. preço + slip) é mais relevante e "
+                       f"mediou {_pp(statistics.median(premiums) if premiums else None)}.</p>")
+        else:
+            out.append("Dados insuficientes de slippage_pct.</p>")
+
+        # Q9: 10 trades mais suspeitos
+        out.append("<p><b>9. Os 10 trades mais suspeitos e por quê:</b></p>")
+        suspicion = []
+        for d in trade_data:
+            reasons = []
+            if d["filter_violations"]:
+                reasons.append(f"Filtros violados: {', '.join(d['filter_violations'][:2])}")
+            if d["bounce_pct_stored"] is not None and d["bounce_pct_stored"] < cfg["BOUNCE_MIN_PCT"]:
+                reasons.append(f"Bounce={_pp(d['bounce_pct_stored'])} < BOUNCE_MIN={_pp(cfg['BOUNCE_MIN_PCT'])}")
+            if d["real_premium_vs_signal"] is not None and d["real_premium_vs_signal"] > 0.15:
+                reasons.append(f"Premium vs sinal={_pp(d['real_premium_vs_signal'])} (alto)")
+            if d["real_entry_mc"] and (d["real_entry_mc"] <= 0 or d["real_entry_mc"] > 10_000_000):
+                reasons.append(f"real_entry_mc suspeito=${d['real_entry_mc']:,.0f}")
+            if d["t"]["status"] == "tp" and d["t"].get("pnl_pct_real") and _safe(d["t"]["pnl_pct_real"]) < 0:
+                reasons.append("Status=TP mas P&L negativo (incoerente)")
+            if d["t"]["status"] == "sl" and d["t"].get("pnl_pct_real") and _safe(d["t"]["pnl_pct_real"]) > 0:
+                reasons.append("Status=SL mas P&L positivo (incoerente)")
+            if reasons:
+                suspicion.append((d, reasons))
+
+        suspicion.sort(key=lambda x: -len(x[1]))
+        out.append("<table><tr><th>#</th><th>Token</th><th>Trade#</th><th>Cat</th><th>Status</th><th>Motivos</th></tr>")
+        for i, (d, reasons) in enumerate(suspicion[:10], 1):
+            out.append(f"<tr><td>{i}</td><td>{d['sym']}</td><td>{d['t']['id']}</td>"
+                       f"<td>{d['category']}</td><td>{d['t']['status']}</td>"
+                       f"<td>{'<br>'.join(reasons)}</td></tr>")
+        if not suspicion:
+            out.append("<tr><td colspan=6 class='pos'>Nenhum trade claramente suspeito.</td></tr>")
+        out.append("</table>")
+
+        # Q10: instrumentação mínima recomendada
+        out.append("<p><b>10. Mudança mínima de instrumentação para nunca mais ter dúvida:</b></p>")
+        out.append("""<ol style='color:#e6edf3;font-size:12px'>
+<li><b>Salvar <code>bundler_trader_amount_rate</code> em migrations</b> — o único filtro de qualidade não auditável. Adicionar coluna e populá-la no upsert_migration.</li>
+<li><b>Salvar timestamp de quando cada filtro foi avaliado</b> (ou a hash da config ativa no momento do bounce) — hoje não dá pra saber se o bounce usou config Railway atual ou antiga.</li>
+<li><b>Salvar <code>bounce_pct_at_trade</code> na tabela trades</b> — hoje bounce_pct está apenas em bounce_signals. Se o sinal de bounce for reutilizado, o campo vira ambíguo.</li>
+<li><b>Resolver <code>PERSISTENCE_WAIT_SEC</code>/<code>PERSISTENCE_MIN_TICKS</code></b>: ou implementar leitura das env vars no executor, ou remover as vars do Railway (config órfã confunde).</li>
+<li><b>Adicionar <code>mc_at_order_sent</code> na tabela trades</b> — hoje não há como saber o preço de mercado no momento exato da ordem, só o preço do sinal (mc_at_signal) e o fill real.</li>
+<li><b>Remover <code>BOUNCE_SLOPE_MIN</code>/<code>BOUNCE_SLOPE_MIN_TICKS</code> do Railway</b> — não têm efeito no código. Ou reimplementar se quiser A.1 de volta.</li>
+</ol>""")
+
+        out.append("</div>")  # conclusão box
+
+    except Exception:
+        out.append(f"<pre style='color:#f85149'>{_tb.format_exc()}</pre>")
+
+    out.append("</body></html>")
+    return "".join(out)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
