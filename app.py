@@ -1,7 +1,7 @@
 import os
 import logging
 import statistics
-from datetime import timezone, timedelta
+from datetime import datetime, timezone, timedelta
 
 import csv
 import io
@@ -22109,7 +22109,7 @@ LIMIT 50;
         out.append("</p>")
 
         # Q6: trades bloqueados com config estrita
-        n_would_block = sum(1 for d in trade_data if filter_violations or not d["pass_bounce_min"])
+        n_would_block = sum(1 for d in trade_data if d["filter_violations"] or not d["pass_bounce_min"])
         n_filter_viol = sum(1 for d in trade_data if d["filter_violations"])
         n_bounce_fail = sum(1 for d in trade_data if not d["pass_bounce_min"] and d["bounce_pct_stored"] is not None)
         out.append(f"<p><b>6. Quantos trades seriam bloqueados com config atual estrita?</b><br>")
