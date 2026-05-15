@@ -25257,5 +25257,341 @@ def mc_mig_label(thr, ref):
     return f"{int(ref * thr):,}"
 
 
+# /analise/feature-scan — varre todas as métricas disponíveis vs WR (TPs vs SLs)
+@app.route("/analise/feature-scan")
+def analise_feature_scan():
+    """
+    Para os trades com outcome conhecido (tp/sl), extrai todas as métricas
+    disponíveis (bounce_signals + migrations + token_signals + fill_real)
+    e mostra WR por bucket para cada feature.
+    Ranqueia features por poder discriminador (max_wr_bucket - min_wr_bucket).
+    """
+    PUMP_SUPPLY = 1_000_000_000
+
+    css = """
+    <style>
+    body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+    h2{color:#58a6ff}h3{color:#79c0ff}h4{color:#d2a679}
+    table{border-collapse:collapse;width:100%;margin-bottom:20px}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:right}
+    th:first-child,th:nth-child(2){text-align:left}
+    td{padding:5px 10px;border:1px solid #21262d;text-align:right}
+    td:first-child,td:nth-child(2){text-align:left}
+    .tp{color:#3fb950}.sl{color:#f85149}.warn{color:#d29922}.dim{color:#6e7681}
+    .pos{color:#3fb950}.neg{color:#f85149}.hi{background:#1f3a1f}.lo{background:#3a1f1f}
+    .box{background:#161b22;border:1px solid #30363d;padding:12px 16px;margin-bottom:16px;border-radius:6px}
+    .sep-high{background:#1a3a1a}.sep-mid{background:#2a2a1a}.sep-low{background:#161b22}
+    .badge-strong{color:#3fb950;font-weight:bold}.badge-mid{color:#d29922}.badge-weak{color:#6e7681}
+    </style>
+    """
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                t.id, t.mint, t.symbol, t.ts_signal, t.status,
+                t.entry_price_usd, t.tokens_received,
+                bs.bounce_pct, bs.drop_from_mig, bs.elapsed_sec,
+                bs.mc_migration AS bs_mc_mig, bs.mc_min, bs.mc_at_signal,
+                bs.absorption_events, bs.absorption_buy_vol, bs.absorption_sell_vol,
+                bs.absorption_buy_cnt, bs.absorption_sell_cnt, bs.absorption_lrg_buy,
+                m.mc_migration, m.mc_bottom, m.time_to_bottom, m.pct_drop,
+                m.smart_wallets, m.renowned_wallets, m.sniper_wallets,
+                m.rug_ratio, m.top10_holder_rate, m.rat_trader_rate,
+                m.creator_token_status, m.cto_flag, m.has_social,
+                m.x_follower_count, m.exchange, m.burn_status,
+                m.bot_degen_rate, m.entrapment_ratio,
+                m.suspected_insider_rate, m.top70_sniper_hold_rate
+            FROM trades t
+            LEFT JOIN bounce_signals bs ON t.mint = bs.mint
+            LEFT JOIN migrations m      ON t.mint = m.mint
+            WHERE t.status IN ('tp','sl','trailing_active')
+            ORDER BY t.ts_signal DESC
+        """)
+        rows = cur.fetchall()
+
+        # H9: mints com sinal type12 com trigger_mc < mc_migration × 0.80
+        cur.execute("""
+            SELECT DISTINCT ts.mint
+            FROM token_signals ts
+            JOIN migrations m ON ts.mint = m.mint
+            WHERE ts.trigger_mc < m.mc_migration * 0.80
+              AND m.mc_migration IS NOT NULL
+        """)
+        h9_mints = {r["mint"] for r in cur.fetchall()}
+
+    def is_tp(r):
+        return r["status"] in ("tp", "trailing_active")
+
+    # Enriquece cada row com features derivadas
+    trades = []
+    for r in rows:
+        is_win = is_tp(r)
+
+        elapsed_min = (r["elapsed_sec"] or 0) / 60.0
+
+        # entry_mc via fill_real
+        entry_mc = None
+        entry_ratio = None
+        mc_mig = float(r["mc_migration"]) if r["mc_migration"] else None
+        if r["entry_price_usd"] and r["tokens_received"] and float(r["tokens_received"]) > 0:
+            tok = float(r["tokens_received"])
+            if tok < 1_000_000:  # exclui outliers com unidade errada
+                entry_mc = (float(r["entry_price_usd"]) / tok) * PUMP_SUPPLY
+                if mc_mig and mc_mig > 0:
+                    entry_ratio = entry_mc / mc_mig
+
+        # absorção ratio
+        abs_ratio = None
+        bvol = r["absorption_buy_vol"] or 0
+        svol = r["absorption_sell_vol"] or 0
+        if svol > 0:
+            abs_ratio = bvol / svol
+        elif bvol > 0:
+            abs_ratio = 999.0  # compra pura, sem venda
+
+        trades.append({
+            "id":           r["id"],
+            "mint":         r["mint"],
+            "symbol":       r["symbol"] or r["mint"][:8],
+            "is_tp":        is_win,
+            "bounce_pct":   r["bounce_pct"],
+            "drop_from_mig": r["drop_from_mig"],
+            "elapsed_min":  elapsed_min,
+            "time_to_bottom": float(r["time_to_bottom"]) if r["time_to_bottom"] else None,
+            "smart":        r["smart_wallets"],
+            "renowned":     r["renowned_wallets"],
+            "top10":        r["top10_holder_rate"],
+            "rat":          r["rat_trader_rate"],
+            "bot_degen":    r["bot_degen_rate"],
+            "rug_ratio":    r["rug_ratio"],
+            "entrapment":   r["entrapment_ratio"],
+            "insider":      r["suspected_insider_rate"],
+            "sniper70":     r["top70_sniper_hold_rate"],
+            "cto":          r["cto_flag"],
+            "creator_hold": 1 if r["creator_token_status"] == "creator_hold" else 0,
+            "has_social":   r["has_social"],
+            "entry_ratio":  entry_ratio,
+            "abs_events":   r["absorption_events"],
+            "abs_ratio":    abs_ratio,
+            "abs_lrg_buy":  r["absorption_lrg_buy"],
+            "h9":           1 if r["mint"] in h9_mints else 0,
+            "exchange":     r["exchange"] or "?",
+        })
+
+    n_total = len(trades)
+    n_tp    = sum(1 for t in trades if t["is_tp"])
+    n_sl    = n_total - n_tp
+    wr_base = n_tp / n_total * 100 if n_total else 0
+
+    H = f"<!DOCTYPE html><html><head><title>Feature Scan</title>{css}</head><body>"
+    H += "<h2>🔬 Feature Scan — Discriminadores de WR</h2>"
+    H += f"<div class='box'><b>Base: {n_total} trades com outcome ({n_tp} TP / {n_sl} SL) — WR base: {wr_base:.1f}%</b><br>"
+    H += f"Bounce mínimo atual: 55%. Break-even com SL=25% TP=75%: ~25%.</div>"
+
+    # ── Função para calcular WR por bucket ──────────────────────────────────
+    def wr_table(feature_name, buckets):
+        """
+        buckets = lista de (label, predicate_fn)
+        Retorna lista de (label, n, tp, wr) e max_delta
+        """
+        results = []
+        for label, fn in buckets:
+            subset = [t for t in trades if fn(t)]
+            n  = len(subset)
+            tp = sum(1 for t in subset if t["is_tp"])
+            wr = tp / n * 100 if n >= 3 else None
+            results.append((label, n, tp, wr))
+        wrs = [r[3] for r in results if r[3] is not None]
+        delta = max(wrs) - min(wrs) if len(wrs) >= 2 else 0
+        return results, delta
+
+    # ── Define todas as features ────────────────────────────────────────────
+    features = []
+
+    # 1. bounce_pct
+    r, d = wr_table("bounce_pct", [
+        ("0.55-0.70", lambda t: t["bounce_pct"] and 0.55 <= t["bounce_pct"] < 0.70),
+        ("0.70-1.0",  lambda t: t["bounce_pct"] and 0.70 <= t["bounce_pct"] < 1.0),
+        ("1.0-1.5",   lambda t: t["bounce_pct"] and 1.0  <= t["bounce_pct"] < 1.5),
+        (">1.5",      lambda t: t["bounce_pct"] and t["bounce_pct"] >= 1.5),
+    ])
+    features.append(("bounce_pct (% bounce do fundo)", r, d))
+
+    # 2. drop_from_mig (dump da migração até o fundo)
+    r, d = wr_table("drop_from_mig", [
+        ("<40%",   lambda t: t["drop_from_mig"] and t["drop_from_mig"] < 0.40),
+        ("40-60%", lambda t: t["drop_from_mig"] and 0.40 <= t["drop_from_mig"] < 0.60),
+        ("60-80%", lambda t: t["drop_from_mig"] and 0.60 <= t["drop_from_mig"] < 0.80),
+        (">80%",   lambda t: t["drop_from_mig"] and t["drop_from_mig"] >= 0.80),
+    ])
+    features.append(("drop_from_mig (dump % da migração)", r, d))
+
+    # 3. elapsed_min (tempo migração → sinal)
+    r, d = wr_table("elapsed_min", [
+        ("0-3min",   lambda t: t["elapsed_min"] < 3),
+        ("3-8min",   lambda t: 3 <= t["elapsed_min"] < 8),
+        ("8-15min",  lambda t: 8 <= t["elapsed_min"] < 15),
+        (">15min",   lambda t: t["elapsed_min"] >= 15),
+    ])
+    features.append(("elapsed_min (tempo migração→sinal)", r, d))
+
+    # 4. time_to_bottom (H10)
+    r, d = wr_table("time_to_bottom", [
+        ("<5min",    lambda t: t["time_to_bottom"] and t["time_to_bottom"] < 5),
+        ("5-15min",  lambda t: t["time_to_bottom"] and 5 <= t["time_to_bottom"] < 15),
+        ("15-25min", lambda t: t["time_to_bottom"] and 15 <= t["time_to_bottom"] < 25),
+        (">25min",   lambda t: t["time_to_bottom"] and t["time_to_bottom"] >= 25),
+    ])
+    features.append(("time_to_bottom (H10 — minutos até o fundo)", r, d))
+
+    # 5. smart_wallets
+    r, d = wr_table("smart", [
+        ("3",    lambda t: t["smart"] == 3),
+        ("4-5",  lambda t: t["smart"] and 4 <= t["smart"] <= 5),
+        ("6-9",  lambda t: t["smart"] and 6 <= t["smart"] <= 9),
+        ("≥10",  lambda t: t["smart"] and t["smart"] >= 10),
+    ])
+    features.append(("smart_wallets (FILTER_SMART_MIN=3)", r, d))
+
+    # 6. top10_holder_rate
+    r, d = wr_table("top10", [
+        ("<50%",   lambda t: t["top10"] and t["top10"] < 0.50),
+        ("50-65%", lambda t: t["top10"] and 0.50 <= t["top10"] < 0.65),
+        ("65-80%", lambda t: t["top10"] and 0.65 <= t["top10"] < 0.80),
+        (">80%",   lambda t: t["top10"] and t["top10"] >= 0.80),
+    ])
+    features.append(("top10_holder_rate (concentração)", r, d))
+
+    # 7. entry_ratio (entry_mc / mc_migration)
+    r, d = wr_table("entry_ratio", [
+        ("<0.75x",  lambda t: t["entry_ratio"] and t["entry_ratio"] < 0.75),
+        ("0.75-1x", lambda t: t["entry_ratio"] and 0.75 <= t["entry_ratio"] < 1.0),
+        ("1-1.5x",  lambda t: t["entry_ratio"] and 1.0 <= t["entry_ratio"] < 1.5),
+        (">1.5x",   lambda t: t["entry_ratio"] and t["entry_ratio"] >= 1.5),
+    ])
+    features.append(("entry_ratio (entry_mc / mc_migration) — fill_real only", r, d))
+
+    # 8. creator_hold
+    r, d = wr_table("creator_hold", [
+        ("creator_hold", lambda t: t["creator_hold"] == 1),
+        ("creator_close", lambda t: t["creator_hold"] == 0),
+    ])
+    features.append(("creator_token_status", r, d))
+
+    # 9. cto_flag
+    r, d = wr_table("cto", [
+        ("CTO=1", lambda t: t["cto"] == 1),
+        ("CTO=0", lambda t: t["cto"] == 0),
+    ])
+    features.append(("cto_flag (comunidade assumiu)", r, d))
+
+    # 10. H9 signal
+    r, d = wr_table("h9", [
+        ("H9 presente", lambda t: t["h9"] == 1),
+        ("H9 ausente",  lambda t: t["h9"] == 0),
+    ])
+    features.append(("H9 (signal type12 < 0.80×mig antes do bounce)", r, d))
+
+    # 11. absorção H22
+    r, d = wr_table("abs_events", [
+        ("0 eventos",  lambda t: (t["abs_events"] or 0) == 0),
+        ("1-5",        lambda t: t["abs_events"] and 1 <= t["abs_events"] <= 5),
+        ("6-15",       lambda t: t["abs_events"] and 6 <= t["abs_events"] <= 15),
+        (">15",        lambda t: t["abs_events"] and t["abs_events"] > 15),
+    ])
+    features.append(("absorption_events (H22 — Helius pAMM events)", r, d))
+
+    # 12. rat_trader_rate
+    r, d = wr_table("rat", [
+        ("<10%",   lambda t: t["rat"] and t["rat"] < 0.10),
+        ("10-20%", lambda t: t["rat"] and 0.10 <= t["rat"] < 0.20),
+        (">20%",   lambda t: t["rat"] and t["rat"] >= 0.20),
+    ])
+    features.append(("rat_trader_rate", r, d))
+
+    # 13. entrapment_ratio
+    r, d = wr_table("entrapment", [
+        ("<0.3",  lambda t: t["entrapment"] and t["entrapment"] < 0.3),
+        ("0.3-0.6", lambda t: t["entrapment"] and 0.3 <= t["entrapment"] < 0.6),
+        (">0.6",  lambda t: t["entrapment"] and t["entrapment"] >= 0.6),
+    ])
+    features.append(("entrapment_ratio", r, d))
+
+    # 14. renowned_wallets
+    r, d = wr_table("renowned", [
+        ("0",   lambda t: (t["renowned"] or 0) == 0),
+        ("1",   lambda t: t["renowned"] == 1),
+        ("≥2",  lambda t: t["renowned"] and t["renowned"] >= 2),
+    ])
+    features.append(("renowned_wallets (KOLs)", r, d))
+
+    # Ordena por discriminação decrescente
+    features.sort(key=lambda x: x[2], reverse=True)
+
+    # ── Tabela de ranking ────────────────────────────────────────────────────
+    H += "<h3>Ranking por poder discriminador</h3>"
+    H += "<table><tr><th>#</th><th>Feature</th><th>Delta WR (max-min)</th><th>Força</th></tr>"
+    for i, (name, buckets, delta) in enumerate(features):
+        wrs = [b[3] for b in buckets if b[3] is not None]
+        if not wrs:
+            continue
+        badge = "badge-strong" if delta >= 15 else "badge-mid" if delta >= 8 else "badge-weak"
+        badge_txt = "🔥 FORTE" if delta >= 15 else "⚡ MÉDIO" if delta >= 8 else "· fraco"
+        H += f"<tr><td>{i+1}</td><td><b>{name}</b></td>"
+        H += f"<td>{delta:.0f}pp</td><td class='{badge}'>{badge_txt}</td></tr>"
+    H += "</table>"
+
+    # ── Detalhe por feature ──────────────────────────────────────────────────
+    H += "<h3>Detalhe por feature</h3>"
+
+    for name, buckets, delta in features:
+        badge_cls = "sep-high" if delta >= 15 else "sep-mid" if delta >= 8 else "sep-low"
+        H += f"<h4 class='{badge_cls}'>▸ {name} &nbsp;<span class='dim'>(delta={delta:.0f}pp)</span></h4>"
+        H += "<table><tr><th>Bucket</th><th>N</th><th>TP</th><th>SL</th><th>WR</th><th>vs base</th></tr>"
+        for label, n, tp, wr in buckets:
+            sl = n - tp
+            wr_s  = f"{wr:.0f}%" if wr is not None else f"<span class='dim'>— (n={n})</span>"
+            if wr is not None:
+                delta_v = wr - wr_base
+                delta_s = f"<span class='{'pos' if delta_v > 0 else 'neg'}'>{delta_v:+.0f}pp</span>"
+                row_cls = " class='hi'" if wr >= wr_base + 10 else " class='lo'" if wr <= wr_base - 10 else ""
+            else:
+                delta_s = "—"
+                row_cls = ""
+            H += f"<tr{row_cls}><td>{label}</td><td>{n}</td>"
+            H += f"<td class='tp'>{tp}</td><td class='sl'>{sl}</td>"
+            H += f"<td><b>{wr_s}</b></td><td>{delta_s}</td></tr>"
+        H += "</table>"
+
+    # ── Tabela individual de todos os trades ─────────────────────────────────
+    H += "<h3>Todos os trades — métricas completas</h3>"
+    H += "<table><tr>"
+    H += "<th>#</th><th>Token</th><th>Status</th>"
+    H += "<th>bounce%</th><th>drop%</th><th>elapsed</th><th>ttb</th>"
+    H += "<th>smart</th><th>top10</th><th>entry_r</th><th>creator</th>"
+    H += "<th>H9</th><th>abs_ev</th></tr>"
+
+    for t in trades:
+        st_s = "<span class='tp'>TP</span>" if t["is_tp"] else "<span class='sl'>SL</span>"
+        bp   = f"{t['bounce_pct']*100:.0f}%" if t["bounce_pct"] else "?"
+        dp   = f"{t['drop_from_mig']*100:.0f}%" if t["drop_from_mig"] else "?"
+        el   = f"{t['elapsed_min']:.1f}m"
+        ttb  = f"{t['time_to_bottom']:.1f}m" if t["time_to_bottom"] else "?"
+        sm   = str(t["smart"] or "?")
+        tp10 = f"{t['top10']*100:.0f}%" if t["top10"] else "?"
+        er   = f"{t['entry_ratio']:.2f}x" if t["entry_ratio"] else "?"
+        cr   = "hold" if t["creator_hold"] else "close"
+        h9   = "<span class='tp'>✓</span>" if t["h9"] else "<span class='dim'>—</span>"
+        ae   = str(t["abs_events"] or 0)
+        H += f"<tr><td>{t['id']}</td><td><b>{t['symbol']}</b></td><td>{st_s}</td>"
+        H += f"<td>{bp}</td><td>{dp}</td><td>{el}</td><td>{ttb}</td>"
+        H += f"<td>{sm}</td><td>{tp10}</td><td>{er}</td><td>{cr}</td>"
+        H += f"<td>{h9}</td><td>{ae}</td></tr>"
+    H += "</table>"
+
+    H += "</body></html>"
+    return H
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
