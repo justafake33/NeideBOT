@@ -22207,6 +22207,7 @@ def analise_ttp_sim():
     limit      = min(int(request.args.get("limit",  "60")), 200)
     min_ticks  = int(request.args.get("min_ticks",  "3"))
     since_days = int(request.args.get("since_days", "30"))
+    safe_mode  = request.args.get("safe_mode", "0") not in ("0", "false", "")
 
     # ── estratégias a simular ────────────────────────────────────────────────
     # Cada entry: (label, tipo, p1, p2, p3)
@@ -22234,7 +22235,7 @@ def analise_ttp_sim():
     def simulate_trade(ticks, entry_mc, strat):
         label, tipo, p1, p2, p3 = strat
         sl_pct   = p3 if tipo == "ttp" else p2
-        tp_pct   = p2 if tipo == "fixed" else None
+        tp_pct   = p1 if tipo == "fixed" else None  # p1=tp_pct for fixed; p2 is sl_pct
         act_pct  = p1
         dd_pct   = p2 if tipo == "ttp" else None
 
@@ -22330,6 +22331,23 @@ def analise_ttp_sim():
     """)
     trades_raw = cur.fetchall()
 
+    # WR real do banco (ground truth) — para comparação com WR simulado
+    cur.execute(f"""
+        SELECT
+            COUNT(*) FILTER (WHERE status IN ('tp')) AS n_tp,
+            COUNT(*) FILTER (WHERE status IN ('sl')) AS n_sl,
+            COUNT(*) FILTER (WHERE status NOT IN ('error','pending','cancelled')) AS n_total
+        FROM trades
+        WHERE created_at > NOW() - INTERVAL '{since_days} days'
+          AND order_id IS NOT NULL
+          AND status NOT IN ('error','pending','cancelled')
+    """)
+    wr_row    = cur.fetchone()
+    db_n_tp   = wr_row["n_tp"]   if wr_row else 0
+    db_n_sl   = wr_row["n_sl"]   if wr_row else 0
+    db_n_tot  = wr_row["n_total"] if wr_row else 0
+    db_wr     = db_n_tp / db_n_tot if db_n_tot else None
+
     trade_data = []
     for tr in trades_raw:
         mint   = tr["mint"]
@@ -22350,11 +22368,11 @@ def analise_ttp_sim():
         if tr["entry_price_usd"] and tr["tokens_received"] and tr["tokens_received"] > 0:
             entry_mc  = (tr["entry_price_usd"] / tr["tokens_received"]) * PUMP_SUPPLY
             entry_src = "real_fill"
-        elif tr["entry_expected"]:
+        elif tr["entry_expected"] and not safe_mode:
             entry_mc  = tr["entry_expected"]
             entry_src = "expected*"
         else:
-            continue
+            continue  # safe_mode rejects non-fill trades
 
         trade_data.append({"trade": dict(tr), "ticks": ticks,
                             "entry_mc": entry_mc, "entry_src": entry_src,
@@ -22434,12 +22452,54 @@ tr.W{background:#1a0a0a!important}
     n_expected  = sum(1 for td in trade_data if td["entry_src"]=="expected*")
     n_no_ticks  = sum(1 for td in trade_data if td["n_ticks"] < min_ticks)
 
+    mode_label = "🔒 MODO SEGURO (só fill real)" if safe_mode else "⚠️ MODO ESTIMADO (entry_expected* aceito)"
+    mode_color = "#4f4" if safe_mode else "#fa0"
+
     H += f"<h2>📊 TTP/SL Simulation — {n_total} trades | {n_with_ticks} com ≥{min_ticks} ticks</h2>"
-    H += f"<p>?limit={limit} | ?min_ticks={min_ticks} | ?since_days={since_days}</p>"
-    H += f"""<div class='box'>
-<b>Cobertura:</b> fill_real={n_real_fill} | entry_expected*={n_expected} | sem_ticks_excluídos={n_no_ticks}<br>
-<small>* entry_expected=mc_bottom×1.15 — subestima entry real em ~10-15%</small>
-</div>"""
+    H += f"<p>?limit={limit} | ?min_ticks={min_ticks} | ?since_days={since_days} | ?safe_mode={'1' if safe_mode else '0'}</p>"
+
+    # Safe mode / hypothesis banner
+    H += f"<div class='box' style='border-color:{mode_color}'>"
+    H += f"<b style='color:{mode_color}'>{mode_label}</b><br>"
+    if safe_mode:
+        H += "Apenas trades com <code>entry_price_usd</code> real são incluídos. Conclusões são confiáveis.<br>"
+    else:
+        H += "<span class='warn'>HIPÓTESE FRACA: entry_expected*=mc_bottom×1.15 subestima entrada real em ~10-15%. "
+        H += "Não usar para decisões de TTP/SL. Adicione <code>?safe_mode=1</code> para modo seguro.</span><br>"
+    H += f"<b>Cobertura:</b> fill_real={n_real_fill} | entry_expected*={n_expected} | sem_ticks_excluídos={n_no_ticks}"
+    H += "</div>"
+
+    # WR real do banco vs WR simulado
+    if db_wr is not None:
+        curr_sim_wr = dict(grid).get(STRATEGIES[0][0], {}).get("wr") if n_with_ticks >= 1 else None
+        wr_db_str  = f"{db_wr*100:.1f}% ({db_n_tp} TP / {db_n_sl} SL / {db_n_tot} total)"
+        H += "<div class='box' style='border-color:#888'>"
+        H += f"<b>WR real do banco (últimos {since_days}d):</b> {wr_db_str}<br>"
+        if curr_sim_wr is not None:
+            diff = curr_sim_wr - db_wr
+            diff_c = "#f44" if abs(diff) > 0.15 else ("#fa0" if abs(diff) > 0.05 else "#4f4")
+            H += f"<b>WR simulado (ATUAL):</b> {curr_sim_wr*100:.1f}% | "
+            H += f"<b>Diferença:</b> <span style='color:{diff_c}'>{diff*100:+.1f}pp</span><br>"
+            if abs(diff) > 0.15:
+                H += "<span class='neg'>⚠️ Diferença grande — simulação NÃO representa realidade. "
+                H += "Possíveis causas: entry_expected* (não fill real), ausência de ticks pós-saída, "
+                H += "viés de seleção de ticks.</span>"
+            elif abs(diff) > 0.05:
+                H += "<span class='warn'>Diferença moderada — tratar simulação como hipótese.</span>"
+            else:
+                H += "<span class='pos'>Diferença pequena — simulação próxima da realidade.</span>"
+        H += "</div>"
+
+    # Safe mode: sem trades reais → abort com mensagem clara
+    if safe_mode and n_real_fill == 0:
+        H += f"""<div class='box' style='border-color:#f44;font-size:14px'>
+<span class='neg'><b>⛔ No analyzable trades — fill_real=0</b></span><br>
+Nenhum trade tem <code>entry_price_usd</code> real preenchido.<br>
+<b>NÃO recomendar mudança de TTP/SL com base nesta simulação.</b><br>
+Para preencher fills reais, execute <code>/debug/sell-recovery</code> (sem <code>?dry=1</code>).<br>
+Para ver simulação estimada (hipótese fraca): <a href='?safe_mode=0&limit={limit}&since_days={since_days}'>?safe_mode=0</a>
+</div></body></html>"""
+        return H
 
     if n_with_ticks < 10:
         H += f"<div class='box'><span class='neg'>⚠️ Apenas {n_with_ticks} com ticks — conclusões fracas.</span></div>"
