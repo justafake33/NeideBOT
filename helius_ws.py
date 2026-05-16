@@ -101,12 +101,24 @@ def _parse_pump_amm_event(raw: bytes, sol_usd: float, supply: float) -> dict | N
       offset 48: pool_base_token_reserves      u64  ← reservas de token no pool
       offset 56: pool_quote_token_reserves     u64  ← reservas de SOL no pool
       offset 64: quote_amount_in/out           u64  (SOL transacionado)
-      ... (mais campos: fees, pubkeys, ix_name, etc.)
+      offset 72: lpFeeBasisPoints              u64  (ignorado)
+      offset 80: lpFee                         u64  (ignorado)
+      offset 88: protocolFeeBasisPoints        u64  (ignorado)
+      offset 96: protocolFee                   u64  (ignorado)
+      offset 104: quoteAmountInWithLpFee       u64  (ignorado)
+      offset 112: userQuoteAmountIn            u64  (ignorado)
+      offset 120: pool                         Pubkey 32 bytes (ignorado)
+      offset 152: user                         Pubkey 32 bytes ← wallet do trader
 
     Fonte: pump-fun/pump-public-docs/idl/pump_amm.json
     """
     if len(raw) < 72:
         return None
+
+    # pump.fun tokens têm SEMPRE 1B de supply — não usar o parâmetro supply
+    # (GMGN às vezes retorna circulating_supply ou valor em unidades erradas,
+    # gerando mc_min 4× abaixo do real e entry_expected completamente errado)
+    _PUMP_SUPPLY = 1_000_000_000
 
     disc         = raw[:8]
     base_amount  = struct.unpack_from("<Q", raw, 16)[0]  # tokens
@@ -121,7 +133,7 @@ def _parse_pump_amm_event(raw: bytes, sol_usd: float, supply: float) -> dict | N
     mc = None
     if pool_base > 0 and pool_quote > 0:
         price_sol = (pool_quote / 10 ** _SOL_DECIMALS) / (pool_base / 10 ** _TOKEN_DECIMALS)
-        mc_cand   = price_sol * sol_usd * supply
+        mc_cand   = price_sol * sol_usd * _PUMP_SUPPLY
         if _MC_MIN < mc_cand < _MC_MAX:
             mc = mc_cand
 
@@ -130,13 +142,13 @@ def _parse_pump_amm_event(raw: bytes, sol_usd: float, supply: float) -> dict | N
         if side == "buy":
             tok_out = base_amount / 10 ** _TOKEN_DECIMALS
             if tok_out > 0:
-                mc_cand = (sol_amount / tok_out) * sol_usd * supply
+                mc_cand = (sol_amount / tok_out) * sol_usd * _PUMP_SUPPLY
                 if _MC_MIN < mc_cand < _MC_MAX:
                     mc = mc_cand
         else:
             tok_in = base_amount / 10 ** _TOKEN_DECIMALS
             if tok_in > 0:
-                mc_cand = (sol_amount / tok_in) * sol_usd * supply
+                mc_cand = (sol_amount / tok_in) * sol_usd * _PUMP_SUPPLY
                 if _MC_MIN < mc_cand < _MC_MAX:
                     mc = mc_cand
 
