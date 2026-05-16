@@ -27363,6 +27363,428 @@ def analise_h23_sim():
         return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
+# /analise/h23-sinal — interseção completa: carteira real + token_ticks + H23
+@app.route("/analise/h23-sinal")
+def analise_h23_sinal():
+    """
+    Versão ampliada de /analise/sinal-puro com H23 (net_sol_flow) como métrica adicional.
+
+    Dataset primário (ticks): bounce_signals + token_ticks, entry=mc_at_signal, TP+75%/SL-25%
+    Dataset carteira (trades reais): trades JOIN bounce_signals WHERE exit_type='helius_sell_recovery'
+      — os únicos outcomes com ground truth blockchain confirmado.
+    """
+    TP_MULT   = 1.75   # +75%
+    SL_MULT   = 0.75   # -25%
+    MIN_TICKS = 3      # ticks mínimos pós-sinal para incluir no dataset primário
+
+    css = """
+    <style>
+    body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+    h2{color:#58a6ff}h3{color:#79c0ff;margin-top:28px}h4{color:#8b949e;margin-top:20px}
+    p.desc{color:#8b949e;margin:4px 0 12px 0;font-size:12px}
+    table{border-collapse:collapse;width:100%;margin-bottom:16px}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:right}
+    th:first-child,th:nth-child(2){text-align:left}
+    td{padding:5px 10px;border:1px solid #21262d;text-align:right;white-space:nowrap}
+    td:first-child,td:nth-child(2){text-align:left}
+    .tp{color:#3fb950}.sl{color:#f85149}.dim{color:#6e7681}
+    .pos{color:#3fb950;font-weight:bold}.neg{color:#f85149;font-weight:bold}
+    .hi{background:#1f3a1f}.lo{background:#2d1f1f}.neu{background:#1e1e1e}
+    .box{background:#161b22;border:1px solid #30363d;padding:12px 16px;margin-bottom:14px;border-radius:6px}
+    .warn{background:#2d1f00;border:1px solid #9a6700;padding:10px 14px;margin-bottom:10px;border-radius:4px;font-size:12px}
+    .ok{background:#1f2d1f;border:1px solid #3fb950;padding:10px 14px;margin-bottom:10px;border-radius:4px;font-size:12px}
+    .section-ticks{border-left:3px solid #3fb950;padding-left:10px;margin-bottom:6px}
+    .section-carteira{border-left:3px solid #58a6ff;padding-left:10px;margin-bottom:6px}
+    .tag-t{display:inline-block;background:#1f3a1f;color:#3fb950;padding:1px 6px;border-radius:3px;font-size:11px}
+    .tag-c{display:inline-block;background:#1a2a3a;color:#58a6ff;padding:1px 6px;border-radius:3px;font-size:11px}
+    a{color:#58a6ff;text-decoration:none}a:hover{text-decoration:underline}
+    nav{margin-bottom:20px}nav a{margin-right:12px}
+    </style>
+    """
+
+    # ── Dataset primário: bounce_signals + token_ticks (mesmo do sinal-puro) ───
+    with db._cursor() as cur:
+        cur.execute("""
+            WITH outcomes AS (
+                SELECT
+                    bs.mint,
+                    bs.bounce_pct,
+                    bs.drop_from_mig,
+                    bs.elapsed_sec / 60.0               AS elapsed_min,
+                    bs.absorption_events,
+                    bs.net_sol_flow,
+                    bs.mc_at_signal                     AS entry_mc,
+                    m.smart_wallets,
+                    m.renowned_wallets,
+                    m.creator_token_status,
+                    m.cto_flag,
+                    m.top10_holder_rate,
+                    MAX(COALESCE(tt.mc_high, tt.mc))    AS max_mc,
+                    MIN(COALESCE(tt.mc_low,  tt.mc))    AS min_mc,
+                    COUNT(tt.id)                        AS tick_count
+                FROM bounce_signals bs
+                JOIN token_ticks tt ON tt.mint = bs.mint
+                    AND tt.tick_ts > bs.ts_signal
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '20 minutes'
+                LEFT JOIN migrations m ON m.mint = bs.mint
+                WHERE bs.mc_at_signal IS NOT NULL
+                  AND bs.mc_at_signal > 0
+                  AND bs.bounce_pct IS NOT NULL
+                GROUP BY bs.mint, bs.bounce_pct, bs.drop_from_mig, bs.elapsed_sec,
+                         bs.absorption_events, bs.net_sol_flow, bs.mc_at_signal,
+                         m.smart_wallets, m.renowned_wallets, m.creator_token_status,
+                         m.cto_flag, m.top10_holder_rate
+                HAVING COUNT(tt.id) >= %(min_ticks)s
+            )
+            SELECT *,
+                (max_mc >= entry_mc * %(tp)s) AS tp_hit,
+                (min_mc <= entry_mc * %(sl)s) AS sl_hit
+            FROM outcomes
+            ORDER BY bounce_pct
+        """, {"tp": TP_MULT, "sl": SL_MULT, "min_ticks": MIN_TICKS})
+        primary = cur.fetchall()
+
+    # ── Dataset carteira: trades com exit_type='helius_sell_recovery' ────────
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                t.id,
+                t.mint,
+                t.status,
+                t.pnl_pct_real,
+                t.ts_signal,
+                bs.bounce_pct,
+                bs.drop_from_mig,
+                bs.elapsed_sec / 60.0   AS elapsed_min,
+                bs.absorption_events,
+                bs.net_sol_flow,
+                bs.mc_at_signal,
+                m.smart_wallets,
+                m.renowned_wallets,
+                m.creator_token_status,
+                m.cto_flag,
+                m.top10_holder_rate
+            FROM trades t
+            JOIN bounce_signals bs ON bs.mint = t.mint
+            LEFT JOIN migrations m ON m.mint = t.mint
+            WHERE t.exit_type = 'helius_sell_recovery'
+              AND t.status IN ('tp', 'sl')
+            ORDER BY t.ts_signal DESC
+        """)
+        carteira = cur.fetchall()
+
+    # ── Estatísticas base ─────────────────────────────────────────────────────
+    n_ticks  = len(primary)
+    tp_ticks = sum(1 for r in primary if r["tp_hit"])
+    wr_ticks = tp_ticks / n_ticks * 100 if n_ticks else 0
+
+    n_cart   = len(carteira)
+    tp_cart  = sum(1 for r in carteira if r["status"] == "tp")
+    wr_cart  = tp_cart / n_cart * 100 if n_cart else 0
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def render_dual(title, desc, t_results, c_results):
+        """Renders a metric table with ticks (primary) and carteira (real trades) datasets."""
+        H  = f"<h4>{title}</h4>"
+        H += f"<p class='desc'>{desc}</p>"
+        H += "<table>"
+        H += ("<tr><th>Faixa</th>"
+              "<th colspan='3'><span class='tag-t'>Ticks (universo — TP/SL teórico)</span></th>"
+              "<th colspan='3'><span class='tag-c'>Carteira (trades reais blockchain)</span></th></tr>")
+        H += "<tr><th></th><th>n</th><th>WR</th><th>vs base</th><th>n</th><th>WR real</th><th>vs base</th></tr>"
+        for tr, cr in zip(t_results, c_results):
+            def fmt_wr(res, base):
+                if res["wr"] is None:
+                    return f"<span class='dim'>— (n={res['n']})</span>", "—"
+                cls = "pos" if res["wr"] >= 25 else "neg"
+                d = res["wr"] - base
+                return (f"<span class='{cls}'>{res['wr']:.0f}%</span>",
+                        f"<span class='{'pos' if d>0 else 'neg'}'>{d:+.0f}pp</span>")
+            tw_s, td_s = fmt_wr(tr, wr_ticks)
+            cw_s, cd_s = fmt_wr(cr, wr_cart)
+            row_cls = ""
+            if tr["delta"] and tr["delta"] >= 10: row_cls = " class='hi'"
+            elif tr["delta"] and tr["delta"] <= -10: row_cls = " class='lo'"
+            H += f"<tr{row_cls}><td>{tr['label']}</td>"
+            H += f"<td>{tr['n']}</td><td>{tw_s}</td><td>{td_s}</td>"
+            H += f"<td>{cr['n']}</td><td>{cw_s}</td><td>{cd_s}</td></tr>"
+        H += "</table>"
+        return H
+
+    def bucket_rows(rows, key, buckets, outcome_fn, base_wr):
+        results = []
+        for label, pred in buckets:
+            sub = [r for r in rows if r.get(key) is not None]
+            sub = [r for r in sub if _safe_pred(pred, r[key])]
+            n   = len(sub)
+            tp  = sum(1 for r in sub if outcome_fn(r))
+            wr  = tp / n * 100 if n >= 3 else None
+            results.append({"label": label, "n": n, "tp": tp, "wr": wr,
+                             "delta": (wr - base_wr) if wr is not None else None})
+        return results
+
+    def _safe_pred(pred, v):
+        try: return pred(v)
+        except: return False
+
+    # ── Definição das métricas ────────────────────────────────────────────────
+    METRICAS = [
+        {
+            "title": "Bounce % (faixa do sinal)",
+            "desc":  "Quanto o token subiu do fundo até o sinal. bounce_pct=0.55 → subiu 55%.",
+            "key":   "bounce_pct",
+            "buckets": [
+                ("< 40%",    lambda v: v < 0.40),
+                ("40–55%",   lambda v: 0.40 <= v < 0.55),
+                ("55–65%",   lambda v: 0.55 <= v < 0.65),
+                ("65–80%",   lambda v: 0.65 <= v < 0.80),
+                ("80–100%",  lambda v: 0.80 <= v < 1.00),
+                ("> 100%",   lambda v: v >= 1.00),
+            ],
+        },
+        {
+            "title": "Queda desde a migração (drop_from_mig)",
+            "desc":  "% de queda do MC de migração até o fundo. 0.60 = caiu 60%.",
+            "key":   "drop_from_mig",
+            "buckets": [
+                ("< 30%",  lambda v: v < 0.30),
+                ("30–40%", lambda v: 0.30 <= v < 0.40),
+                ("40–50%", lambda v: 0.40 <= v < 0.50),
+                ("50–60%", lambda v: 0.50 <= v < 0.60),
+                ("60–70%", lambda v: 0.60 <= v < 0.70),
+                ("> 70%",  lambda v: v >= 0.70),
+            ],
+        },
+        {
+            "title": "Tempo migração → sinal (elapsed_min)",
+            "desc":  "Minutos entre migração e sinal de bounce. A.5 bloqueia > 20min.",
+            "key":   "elapsed_min",
+            "buckets": [
+                ("0–3 min",   lambda v: v < 3.0),
+                ("3–6 min",   lambda v: 3.0 <= v < 6.0),
+                ("6–10 min",  lambda v: 6.0 <= v < 10.0),
+                ("10–15 min", lambda v: 10.0 <= v < 15.0),
+                ("15–20 min", lambda v: 15.0 <= v < 20.0),
+            ],
+        },
+        {
+            "title": "Smart wallets (contagem na migração)",
+            "desc":  "Snapshot de smart wallets com posição — não indica compra ativa recente.",
+            "key":   "smart_wallets",
+            "buckets": [
+                ("0–2",  lambda v: v < 3),
+                ("3–5",  lambda v: 3 <= v < 6),
+                ("6–10", lambda v: 6 <= v < 11),
+                ("> 10", lambda v: v >= 11),
+            ],
+        },
+        {
+            "title": "KOL wallets (renowned)",
+            "desc":  "Influenciadores com posição no token no momento da migração.",
+            "key":   "renowned_wallets",
+            "buckets": [
+                ("0",   lambda v: v == 0),
+                ("1",   lambda v: v == 1),
+                ("2–3", lambda v: 2 <= v <= 3),
+                ("> 3", lambda v: v > 3),
+            ],
+        },
+        {
+            "title": "Top 10 holders (concentração)",
+            "desc":  "% do supply nos 10 maiores holders. Alto = risco de dump coordenado.",
+            "key":   "top10_holder_rate",
+            "buckets": [
+                ("< 40%",  lambda v: v < 0.40),
+                ("40–55%", lambda v: 0.40 <= v < 0.55),
+                ("55–70%", lambda v: 0.55 <= v < 0.70),
+                ("70–80%", lambda v: 0.70 <= v < 0.80),
+                ("> 80%",  lambda v: v >= 0.80),
+            ],
+        },
+        {
+            "title": "Status do dev (creator_token_status)",
+            "desc":  "Se o desenvolvedor ainda segura tokens ou vendeu.",
+            "key":   "creator_token_status",
+            "buckets": [
+                ("Dev saiu (creator_close)", lambda v: v == "creator_close"),
+                ("Dev segura (creator_hold)", lambda v: v == "creator_hold"),
+            ],
+        },
+        {
+            "title": "CTO (comunidade assumiu)",
+            "desc":  "cto_flag=1 → comunidade assumiu o projeto após dev sair.",
+            "key":   "cto_flag",
+            "buckets": [
+                ("CTO = sim", lambda v: v == 1),
+                ("CTO = não", lambda v: v != 1),
+            ],
+        },
+        {
+            "title": "Absorção Helius — eventos no sinal (H22)",
+            "desc":  "Total de BuyEvent/SellEvent pAMM detectados nos 60s antes do sinal.",
+            "key":   "absorption_events",
+            "buckets": [
+                ("Sem dados (0/NULL)", lambda v: v is None or v == 0),
+                ("1–50",              lambda v: v and 1 <= v <= 50),
+                ("51–150",            lambda v: v and 51 <= v <= 150),
+                ("> 150",             lambda v: v and v > 150),
+            ],
+        },
+        {
+            "title": "Net SOL Flow — buy_vol − sell_vol nos 60s (H23)",
+            "desc":  ("Net SOL Flow = buy_vol_sol − sell_vol_sol na janela de 60s antes do sinal. "
+                      "Positivo = capital líquido entrando. Gate ativo: ≥ 1 SOL discrimina +14.8pp WR real."),
+            "key":   "net_sol_flow",
+            "buckets": [
+                ("< 0 SOL (saída líquida)", lambda v: v < 0),
+                ("0–1 SOL",                 lambda v: 0 <= v < 1.0),
+                ("1–3 SOL",                 lambda v: 1.0 <= v < 3.0),
+                ("3–10 SOL",                lambda v: 3.0 <= v < 10.0),
+                ("> 10 SOL",                lambda v: v >= 10.0),
+            ],
+        },
+    ]
+
+    # ── Monta HTML ─────────────────────────────────────────────────────────────
+    H = f"<!DOCTYPE html><html><head><title>H23 Sinal Completo</title>{css}</head><body>"
+    H += "<nav>"
+    H += "<a href='/analise/sinal-puro'>← Sinal Puro</a>"
+    H += "<a href='/analise/h23-sim'>H23 Sim</a>"
+    H += "<a href='/analise/h23-deep'>H23 Deep</a>"
+    H += "<a href='/analise/wr-breakdown'>WR Breakdown</a>"
+    H += "</nav>"
+    H += "<h2>🔬 Qualidade dos Sinais — Ticks + Carteira Real + H23</h2>"
+
+    H += "<div class='box'>"
+    H += f"<b>Dataset ticks (universo):</b> {n_ticks} bounces com ≥{MIN_TICKS} ticks em 20min | "
+    H += f"{tp_ticks} TP teórico (+75%) | WR base: <b>{wr_ticks:.1f}%</b><br>"
+    H += f"<b>Dataset carteira (blockchain):</b> {n_cart} trades com exit_type=helius_sell_recovery | "
+    H += f"{tp_cart} TP confirmado | WR real: <b>{wr_cart:.1f}%</b>"
+    H += "</div>"
+
+    H += "<div class='ok'>"
+    H += "✅ <b>Carteira = ground truth blockchain.</b> Apenas trades com <code>exit_type='helius_sell_recovery'</code> "
+    H += "— saídas verificadas on-chain via Helius. Entry = <code>mc_at_signal</code> (preço real quando o sinal disparou, "
+    H += "não mc_min × 1.15)."
+    H += "</div>"
+
+    H += "<div class='warn'>"
+    H += "⚠️ <b>Ticks:</b> cobertura ~12% do universo de bounces. Tokens sem ticks são excluídos — "
+    H += "não há bias de seleção conhecido (recovery_rate dos excluídos ≈ baseline). "
+    H += "<b>Carteira:</b> regime de mercado e filtros ativos no momento afetam quais sinais foram operados."
+    H += "</div>"
+
+    H += "<div class='section-ticks'>"
+    H += "<p style='color:#3fb950;margin:4px 0 8px 0'>"
+    H += "<b>🟢 Dataset ticks</b> — comportamento teórico do TOKEN após o sinal. "
+    H += "TP = +75% | SL = -25% | Break-even ≈ 25%</p>"
+    H += "</div>"
+    H += "<div class='section-carteira'>"
+    H += "<p style='color:#58a6ff;margin:4px 0 16px 0'>"
+    H += "<b>🔵 Dataset carteira</b> — resultado REAL de cada trade, verificado on-chain. "
+    H += f"n={n_cart} trades | WR={wr_cart:.1f}%</p>"
+    H += "</div>"
+
+    for m in METRICAS:
+        key = m["key"]
+        t_res = bucket_rows(primary, key, m["buckets"],
+                            lambda r: r["tp_hit"], wr_ticks)
+        c_res = bucket_rows(carteira, key, m["buckets"],
+                            lambda r: r["status"] == "tp", wr_cart)
+        H += render_dual(m["title"], m["desc"], t_res, c_res)
+
+    # ── Tabela de cobertura ───────────────────────────────────────────────────
+    H += "<h3>📊 Cobertura por faixa de bounce</h3>"
+    H += "<p class='desc'>Quantos bounces têm ticks suficientes (primário) e quantos foram operados (carteira), por faixa de bounce_pct.</p>"
+    H += ("<table><tr><th>Faixa bounce</th>"
+          "<th>Total bounces</th><th>Ticks ≥3</th><th>Cob. ticks</th><th>TP ticks</th><th>WR ticks</th>"
+          "<th>Operados</th><th>TP real</th><th>WR real</th></tr>")
+
+    with db._cursor() as cur:
+        cur.execute("SELECT bounce_pct FROM bounce_signals WHERE bounce_pct IS NOT NULL")
+        all_bs = [r["bounce_pct"] for r in cur.fetchall()]
+
+    cov_buckets = [
+        ("< 40%",   0,    0.40),
+        ("40–55%",  0.40, 0.55),
+        ("55–65%",  0.55, 0.65),
+        ("65–80%",  0.65, 0.80),
+        ("80–100%", 0.80, 1.00),
+        ("> 100%",  1.00, 99),
+    ]
+    for label, lo, hi in cov_buckets:
+        total  = sum(1 for v in all_bs if lo <= v < hi)
+        p_sub  = [r for r in primary  if lo <= (r["bounce_pct"] or 0) < hi]
+        c_sub  = [r for r in carteira if r.get("bounce_pct") and lo <= r["bounce_pct"] < hi]
+        pn, ptp = len(p_sub), sum(1 for r in p_sub if r["tp_hit"])
+        cn, ctp = len(c_sub), sum(1 for r in c_sub if r["status"] == "tp")
+        cov   = f"{pn/total*100:.0f}%" if total else "—"
+        pwr_s = (f"<span class='{'pos' if pn>=3 and ptp/pn>=0.25 else 'neg'}'>{ptp/pn*100:.0f}%</span>"
+                 if pn >= 3 else f"<span class='dim'>—</span>")
+        cwr_s = (f"<span class='{'pos' if cn>=3 and ctp/cn>=0.25 else 'neg'}'>{ctp/cn*100:.0f}%</span>"
+                 if cn >= 3 else f"<span class='dim'>— (n={cn})</span>")
+        H += (f"<tr><td>{label}</td><td>{total}</td>"
+              f"<td>{pn}</td><td>{cov}</td><td>{ptp}</td><td>{pwr_s}</td>"
+              f"<td>{cn}</td><td>{ctp}</td><td>{cwr_s}</td></tr>")
+    H += "</table>"
+
+    # ── H23 breakdown direto ─────────────────────────────────────────────────
+    H += "<h3>📈 H23 Net SOL Flow — discriminação direta</h3>"
+    H += "<p class='desc'>Resultado isolado da hipótese H23 para carteira real. Gate validado: nf ≥ 1 SOL.</p>"
+    nf_buckets = [
+        ("Sem dados H23",      lambda r: r.get("net_sol_flow") is None),
+        ("< 0 SOL (saída)",    lambda r: r.get("net_sol_flow") is not None and r["net_sol_flow"] < 0),
+        ("0–1 SOL",            lambda r: r.get("net_sol_flow") is not None and 0 <= r["net_sol_flow"] < 1),
+        ("1–3 SOL",            lambda r: r.get("net_sol_flow") is not None and 1 <= r["net_sol_flow"] < 3),
+        ("3–10 SOL",           lambda r: r.get("net_sol_flow") is not None and 3 <= r["net_sol_flow"] < 10),
+        ("> 10 SOL",           lambda r: r.get("net_sol_flow") is not None and r["net_sol_flow"] >= 10),
+    ]
+    H += "<table><tr><th>Faixa</th><th>n (ticks)</th><th>WR ticks</th><th>n (carteira)</th><th>WR real</th><th>vs base</th></tr>"
+    for label, pred in nf_buckets:
+        t_sub = [r for r in primary  if pred(r)]
+        c_sub = [r for r in carteira if pred(r)]
+        tn, ttp = len(t_sub), sum(1 for r in t_sub if r["tp_hit"])
+        cn, ctp = len(c_sub), sum(1 for r in c_sub if r["status"] == "tp")
+        twr_s = (f"{ttp/tn*100:.0f}%" if tn >= 3 else f"<span class='dim'>— (n={tn})</span>")
+        cwr   = ctp / cn * 100 if cn >= 3 else None
+        cwr_s = (f"<span class='{'pos' if cwr and cwr>=25 else 'neg'}'>{cwr:.0f}%</span>"
+                 if cwr is not None else f"<span class='dim'>— (n={cn})</span>")
+        delta_s = ""
+        if cwr is not None:
+            d = cwr - wr_cart
+            delta_s = f"<span class='{'pos' if d>0 else 'neg'}'>{d:+.0f}pp</span>"
+        H += f"<tr><td>{label}</td><td>{tn}</td><td>{twr_s}</td><td>{cn}</td><td>{cwr_s}</td><td>{delta_s}</td></tr>"
+    H += "</table>"
+
+    # ── Lista de trades reais ─────────────────────────────────────────────────
+    H += "<h3>📋 Trades reais (helius_sell_recovery)</h3>"
+    H += f"<p class='desc'>{n_cart} trades | {tp_cart} TP | {n_cart-tp_cart} SL | WR {wr_cart:.1f}%</p>"
+    H += ("<table><tr><th>Data</th><th>Token</th><th>Status</th><th>P&L</th>"
+          "<th>bounce%</th><th>elapsed</th><th>smart</th><th>net_flow</th></tr>")
+    for r in sorted(carteira, key=lambda x: x["ts_signal"] or 0, reverse=True):
+        nf = r.get("net_sol_flow")
+        nf_s = (f"<span class='{'pos' if nf>=1 else ('dim' if 0<=nf<1 else 'neg')}'>{nf:+.2f}◎</span>"
+                if nf is not None else "<span class='dim'>—</span>")
+        status_s = ("<span class='tp'>TP</span>" if r["status"] == "tp"
+                    else "<span class='sl'>SL</span>")
+        pnl = r.get("pnl_pct_real")
+        pnl_s = (f"<span class='{'pos' if pnl and pnl>0 else 'neg'}'>{pnl:+.1f}%</span>"
+                 if pnl is not None else "—")
+        bounce_s = f"{r['bounce_pct']*100:.0f}%" if r.get("bounce_pct") else "—"
+        elapsed_s = f"{r['elapsed_min']:.1f}m" if r.get("elapsed_min") else "—"
+        smart_s = str(r.get("smart_wallets") or "—")
+        ts = r.get("ts_signal")
+        ts_s = ts.strftime("%m-%d %H:%M") if ts else "—"
+        H += (f"<tr><td>{ts_s}</td><td>{r['mint'][:8]}…</td>"
+              f"<td>{status_s}</td><td>{pnl_s}</td>"
+              f"<td>{bounce_s}</td><td>{elapsed_s}</td>"
+              f"<td>{smart_s}</td><td>{nf_s}</td></tr>")
+    H += "</table>"
+
+    H += "</body></html>"
+    return H
+
+
 @app.route("/analise/h23-deep")
 def analise_h23_deep():
     """H23 Deep — análise completa de todos os tokens com net_sol_flow.
