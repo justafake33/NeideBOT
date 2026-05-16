@@ -12138,6 +12138,139 @@ def debug_h23():
         return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
+@app.route("/debug/flow-timeline")
+def debug_flow_timeline():
+    """Timeline de fluxo: PRÉ (absorção dump) + RISE (subida) + PÓS (sustentação)."""
+    from_id = int(request.args.get("from_id", 338))
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                bs.mint, bs.symbol, bs.ts_signal,
+                bs.bounce_pct, bs.elapsed_sec,
+                bs.h23_window,
+                -- PRÉ: [ts_min-60s → ts_min]
+                bs.absorption_buy_vol   AS pre_buy,
+                bs.absorption_sell_vol  AS pre_sell,
+                bs.absorption_events    AS pre_ev,
+                bs.net_sol_flow         AS pre_net,
+                -- RISE: [ts_min → ts_signal]
+                bs.rise_buy_vol,
+                bs.rise_sell_vol,
+                bs.rise_net_flow,
+                bs.rise_events,
+                -- PÓS-60s: [ts_signal → ts_signal+60s]
+                bs.p60s_buy_vol  AS pos_buy,
+                bs.p60s_sell_vol AS pos_sell,
+                bs.p60s_events   AS pos_ev,
+                -- Outcome do trade (se houver)
+                t.status, t.pnl_pct_real,
+                t.exit_type
+            FROM bounce_signals bs
+            LEFT JOIN trades t ON t.mint = bs.mint
+                AND t.exit_type IN ('helius_sell_recovery','helius','helius_recovery')
+                AND t.status IN ('tp','sl')
+                AND t.id >= %(from_id)s
+            WHERE bs.ts_signal >= NOW() - INTERVAL '7 days'
+              AND bs.h23_window = 'bottom'
+            ORDER BY bs.ts_signal DESC
+            LIMIT 100
+        """, {"from_id": from_id})
+        rows = cur.fetchall()
+
+    css = """<style>
+    body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:12px}
+    h2{color:#58a6ff}h3{color:#79c0ff;margin-top:20px}
+    table{border-collapse:collapse;width:100%;margin-bottom:16px}
+    th{background:#161b22;color:#8b949e;padding:5px 8px;border:1px solid #30363d;text-align:center;white-space:nowrap}
+    th.left{text-align:left}
+    td{padding:4px 8px;border:1px solid #21262d;text-align:center}
+    td.left{text-align:left}
+    .pos{color:#3fb950;font-weight:bold}.neg{color:#f85149;font-weight:bold}
+    .dim{color:#6e7681}.tp{color:#3fb950}.sl{color:#f85149}
+    .win{background:#1a2a1a}.lose{background:#2d1a1a}.pend{background:#1a1a2a}
+    .sep{border-left:2px solid #58a6ff !important}
+    </style>"""
+
+    H = f"<!DOCTYPE html><html><head><title>Flow Timeline</title>{css}</head><body>"
+    H += "<h2>🌊 Flow Timeline — PRÉ + RISE + PÓS por bounce</h2>"
+    H += ("<p style='color:#8b949e;font-size:11px'>"
+          "<b>PRÉ</b> [ts_min−60s → ts_min] = absorção do dump (exaustão dos sellers?)<br>"
+          "<b>RISE</b> [ts_min → ts_signal] = quem comprou durante a subida?<br>"
+          "<b>PÓS</b> [ts_signal → ts_signal+60s] = compra sustentando após o sinal?<br>"
+          "Apenas <code>h23_window='bottom'</code> — dados com janela correta.</p>")
+
+    if not rows:
+        H += "<p style='color:#e3b341'>Nenhum bounce com h23_window='bottom' nos últimos 7 dias. Aguardar deploy.</p>"
+        H += "</body></html>"
+        return H
+
+    def _flow(buy, sell, ev):
+        if ev is None or ev == 0:
+            return "<span class='dim'>—</span>"
+        net = (buy or 0) - (sell or 0)
+        nc  = "pos" if net >= 0 else "neg"
+        return (f"<span class='{nc}'>{net:+.2f}◎</span>"
+                f"<span class='dim' style='font-size:10px'> {int(ev)}ev</span>")
+
+    def _vol(v):
+        if v is None: return "<span class='dim'>—</span>"
+        c = "pos" if v >= 0 else "neg"
+        return f"<span class='{c}'>{v:+.2f}◎</span>"
+
+    DIM = "<span class='dim'>—</span>"
+
+    H += ("<table><tr>"
+          "<th class='left'>Token</th><th>bounce%</th><th>elapsed</th><th>janela</th>"
+          "<th class='sep'>PRÉ net</th><th>PRÉ buy</th><th>PRÉ sell</th>"
+          "<th class='sep'>RISE net</th><th>RISE buy</th><th>RISE sell</th>"
+          "<th class='sep'>PÓS net</th><th>PÓS buy</th><th>PÓS sell</th>"
+          "<th class='sep'>Outcome</th></tr>")
+
+    for r in rows:
+        bp    = f"{r['bounce_pct']*100:.0f}%" if r['bounce_pct'] else "—"
+        el    = f"{(r['elapsed_sec'] or 0)/60:.1f}m"
+        win   = r.get('h23_window', '—')
+        win_c = "#3fb950" if win == "bottom" else "#8b949e"
+
+        pre_net  = (r['pre_buy']  or 0) - (r['pre_sell']  or 0) if r['pre_ev']  else None
+        rise_net = r['rise_net_flow']
+        pos_net  = (r['pos_buy']  or 0) - (r['pos_sell']  or 0) if r['pos_ev']  else None
+
+        st = r.get('status')
+        if st == 'tp':
+            row_cls = "win"
+            pnl_s = f"<span class='tp'>TP {(r['pnl_pct_real'] or 0)*100:+.0f}%</span>"
+        elif st == 'sl':
+            row_cls = "lose"
+            pnl_s = f"<span class='sl'>SL {(r['pnl_pct_real'] or 0)*100:+.0f}%</span>"
+        else:
+            row_cls = "pend"
+            pnl_s = "<span class='dim'>—</span>"
+
+        H += (f"<tr class='{row_cls}'>"
+              f"<td class='left'><b>{r['symbol'] or r['mint'][:8]}</b></td>"
+              f"<td>{bp}</td><td>{el}</td>"
+              f"<td><span style='color:{win_c}'>{win}</span></td>"
+              f"<td class='sep'>{_vol(pre_net)}</td>"
+              f"<td>{_vol(r['pre_buy'])}</td><td>{_vol(-(r['pre_sell'] or 0)) if r['pre_sell'] else DIM}</td>"
+              f"<td class='sep'>{_vol(rise_net)}</td>"
+              f"<td>{_vol(r['rise_buy_vol'])}</td><td>{_vol(-(r['rise_sell_vol'] or 0)) if r['rise_sell_vol'] else DIM}</td>"
+              f"<td class='sep'>{_vol(pos_net)}</td>"
+              f"<td>{_vol(r['pos_buy'])}</td><td>{_vol(-(r['pos_sell'] or 0)) if r['pos_sell'] else DIM}</td>"
+              f"<td class='sep'>{pnl_s}</td></tr>")
+
+    H += "</table>"
+    H += ("<div style='background:#161b22;border:1px solid #30363d;padding:10px;border-radius:4px;"
+          "font-size:11px;color:#8b949e;margin-top:12px'>"
+          "🧠 <b>O que procurar:</b> PRÉ negativo + RISE positivo + PÓS positivo = dump absorvido, "
+          "subida com compradores reais, demanda sustentando. "
+          "PRÉ negativo + RISE positivo + PÓS negativo = spike de momentum sem demanda real."
+          "</div>")
+    H += "</body></html>"
+    return H
+
+
 @app.route("/debug/h23-window")
 def debug_h23_window():
     """H23 — Diagnóstico da janela de absorção: fundo vs bounce.
