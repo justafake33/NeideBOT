@@ -26432,9 +26432,11 @@ def analise_sinal_puro():
                 LEFT JOIN migrations m ON m.mint = bs.mint
                 WHERE bs.mc_min IS NOT NULL
                   AND bs.mc_min > 0
+                  AND bs.mc_at_signal IS NOT NULL
+                  AND bs.mc_at_signal > 0
                   AND bs.bounce_pct IS NOT NULL
                 GROUP BY bs.mint, bs.bounce_pct, bs.drop_from_mig, bs.elapsed_sec,
-                         bs.absorption_events, bs.mc_min, bs.mc_migration,
+                         bs.absorption_events, bs.mc_min, bs.mc_migration, bs.mc_at_signal,
                          m.smart_wallets, m.renowned_wallets, m.creator_token_status,
                          m.cto_flag, m.top10_holder_rate, m.rat_trader_rate
                 HAVING COUNT(tt.id) >= %(min_ticks)s
