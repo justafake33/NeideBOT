@@ -11984,31 +11984,42 @@ def debug_h23_window():
 
         avg_gap = total_gap_sec / n_with_gap if n_with_gap > 0 else None
 
-        # ── Seção 2: gap ts_migração → ts_signal via elapsed_sec ────────────────
-        # elapsed_sec = segundos da migração até o sinal de bounce (campo nativo)
+        # ── Seção 2: histórico por h23_window ─────────────────────────────────────
         with db._cursor() as cur:
             cur.execute("""
                 SELECT
                     symbol, ts_signal, elapsed_sec, bounce_pct,
                     absorption_events, absorption_buy_vol, absorption_sell_vol,
-                    net_sol_flow
+                    net_sol_flow, h23_window
                 FROM bounce_signals
                 WHERE ts_signal IS NOT NULL AND elapsed_sec IS NOT NULL
                 ORDER BY ts_signal DESC
-                LIMIT 30
+                LIMIT 40
             """)
             hist = [dict(r) for r in cur.fetchall()]
 
-            # Gap médio e distribuição usando elapsed_sec
+            # Contagem por grupo
+            cur.execute("""
+                SELECT
+                    COALESCE(h23_window, 'bounce') AS win,
+                    COUNT(*) AS n,
+                    COUNT(CASE WHEN absorption_events > 0 THEN 1 END) AS n_helius,
+                    ROUND(AVG(elapsed_sec)::numeric, 1) AS avg_gap_sec,
+                    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY elapsed_sec)::numeric, 1) AS p50_gap_sec
+                FROM bounce_signals
+                WHERE elapsed_sec IS NOT NULL
+                GROUP BY 1 ORDER BY 1
+            """)
+            window_groups = [dict(r) for r in cur.fetchall()]
+
+            # Gap stats totais
             cur.execute("""
                 SELECT
                     COUNT(*) AS n,
-                    ROUND(AVG(elapsed_sec)::numeric, 1)                                       AS avg_gap_sec,
+                    ROUND(AVG(elapsed_sec)::numeric, 1)                                         AS avg_gap_sec,
                     ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY elapsed_sec)::numeric, 1) AS p50_gap_sec,
-                    ROUND(MIN(elapsed_sec)::numeric, 1)                                       AS min_gap_sec,
-                    ROUND(MAX(elapsed_sec)::numeric, 1)                                       AS max_gap_sec,
-                    COUNT(CASE WHEN elapsed_sec <= 60 THEN 1 END)                             AS within_60s,
-                    COUNT(CASE WHEN elapsed_sec  > 60 THEN 1 END)                             AS beyond_60s
+                    COUNT(CASE WHEN elapsed_sec <= 60 THEN 1 END)                               AS within_60s,
+                    COUNT(CASE WHEN elapsed_sec  > 60 THEN 1 END)                               AS beyond_60s
                 FROM bounce_signals
                 WHERE ts_signal IS NOT NULL AND elapsed_sec IS NOT NULL
             """)
@@ -12041,7 +12052,12 @@ def debug_h23_window():
             else:
                 coverage_note = "<span class='green'>✓ fundo na janela</span>"
 
-            nf_str = f"<span style='color:{'#3fb950' if nf and nf > 0 else '#f85149'}'>{nf:+.3f}◎</span>" if nf is not None else "<span class='dim'>NULL</span>"
+            nf_color = "#3fb950" if nf and nf > 0 else "#f85149"
+            nf_str = f"<span style='color:{nf_color}'>{nf:+.3f}◎</span>" if nf is not None else "<span class='dim'>NULL</span>"
+
+            win = r.get("h23_window") or "bounce"
+            win_badge = ("<span style='color:#3fb950;font-size:10px'>●bottom</span>" if win == "bottom"
+                         else "<span style='color:#8b949e;font-size:10px'>●bounce</span>")
 
             hist_rows_html += (
                 f"<tr>"
@@ -12049,6 +12065,7 @@ def debug_h23_window():
                 f"<td><b>{sym}</b></td>"
                 f"<td>{bounce*100:.0f}%</td>"
                 f"<td>{gap_str}</td>"
+                f"<td>{win_badge}</td>"
                 f"<td>{ev}</td>"
                 f"<td>{bv:.3f}</td>"
                 f"<td>{sv:.3f}</td>"
@@ -12057,9 +12074,17 @@ def debug_h23_window():
                 f"</tr>"
             )
 
-        n_beyond = gap_stats.get("beyond_60s") or 0
-        n_total  = gap_stats.get("n") or 1
+        n_beyond  = gap_stats.get("beyond_60s") or 0
+        n_total   = gap_stats.get("n") or 1
         pct_wrong = n_beyond / n_total * 100
+
+        # Boxes por grupo
+        group_boxes = ""
+        for g in window_groups:
+            win   = g["win"]
+            color = "#3fb950" if win == "bottom" else "#8b949e"
+            label = "✅ bottom (correto)" if win == "bottom" else "⚠ bounce (antigo)"
+            group_boxes += _box(label, f"{g['n']} bounces | {g['n_helius']} Helius | P50 gap {g['p50_gap_sec']}s", color)
 
         html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
 <title>H23 Window Debug</title>{CSS}
@@ -12068,7 +12093,7 @@ def debug_h23_window():
 <h1>H23 — Diagnóstico da Janela de Absorção</h1>
 <p style='color:#8b949e;font-size:11px'>
   auto-refresh 10s · compara janela CORRETA [ts_min−60s → ts_min] vs ANTIGA [now−60s → now]<br>
-  A janela correta captura a absorção real do dump. A antiga capturava momentum pós-bounce.
+  Dois sinais distintos: <b style='color:#3fb950'>bottom</b> = absorção do dump | <b style='color:#8b949e'>bounce</b> = momentum pós-bounce.
 </p>
 <div>
   <a href='/debug/h23' style='color:#58a6ff;margin-right:14px;font-size:12px'>Debug H23</a>
@@ -12089,7 +12114,8 @@ def debug_h23_window():
 
 {_box("Tokens ativos", n_active)}
 {_box("Gap médio ts_min→agora", f"{avg_gap:.0f}s" if avg_gap else "—", "#e3b341" if avg_gap and avg_gap > 60 else "#3fb950")}
-{_box("Bounces com gap > 60s (janela errada)", f"{n_beyond}/{n_total} ({pct_wrong:.0f}%)", "#f85149" if pct_wrong > 30 else "#d29922")}
+{_box("Bounces com gap > 60s", f"{n_beyond}/{n_total} ({pct_wrong:.0f}%)", "#f85149" if pct_wrong > 30 else "#d29922")}
+<br>{group_boxes}
 
 <br><br>
 <h2>▸ Tokens ativos no HotMonitor — comparação janela CORRETA vs ANTIGA</h2>
@@ -12122,16 +12148,16 @@ def debug_h23_window():
 </table>
 
 <br>
-<h2>▸ Últimos 30 bounce_signals — gap ts_migração → ts_signal e cobertura da janela</h2>
+<h2>▸ Últimos 40 bounce_signals — janela usada e cobertura do fundo</h2>
 <p style='color:#484f58;font-size:11px'>
-  gap = tempo entre a migração e o sinal de bounce. Quanto maior, mais do fundo ficou fora da janela antiga.<br>
-  ❌ = gap > 60s → janela antiga capturava zero eventos do período de absorção real.<br>
-  <b>Dados com gap > 60s têm net_sol_flow inválido no banco (momentum, não absorção).</b>
+  <b style='color:#3fb950'>●bottom</b> = janela centrada no fundo (absorção real — pós-correção)<br>
+  <b style='color:#8b949e'>●bounce</b> = janela centrada no bounce (momentum — dados históricos)<br>
+  gap = elapsed_sec = segundos da migração até o sinal. Proxy do gap real ts_min→ts_signal (que é menor).
 </p>
 <table>
   <thead><tr>
     <th>Hora</th><th>Token</th><th>Bounce%</th>
-    <th>Gap ts_mig→sinal</th>
+    <th>Gap mig→sinal</th><th>Janela</th>
     <th>Ev</th><th>Buy◎</th><th>Sell◎</th>
     <th>net_sol_flow (salvo)</th>
     <th>Cobertura da janela</th>
@@ -12140,9 +12166,10 @@ def debug_h23_window():
 </table>
 
 <p style='color:#484f58;font-size:11px;margin-top:20px'>
-  ⚠ "Gap" acima usa ts_migration como proxy de ts_min, que ocorre depois da migração (P50 ~13min).<br>
-  O gap real ts_min→ts_signal é menor — mas ilustra a magnitude do problema.<br>
-  Bounces futuros (pós-deploy) usarão a janela correta centrada em ts_min.
+  ⚠ "Gap" usa elapsed_sec (migração → sinal) como proxy. O gap real ts_min → ts_signal é menor.<br>
+  Dados <b style='color:#3fb950'>bottom</b> são os únicos válidos para testar H23 como hipótese de absorção.<br>
+  Dados <b style='color:#8b949e'>bounce</b> representam outro sinal (momentum) — preservados para análise paralela futura.<br>
+  Gate para filtro: n≥30 com h23_window='bottom' + outcomes GMGN + discriminação ≥10pp.
 </p>
 </body></html>"""
         return html
