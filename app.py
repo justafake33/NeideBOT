@@ -11167,8 +11167,9 @@ def debug_absorption():
 
 @app.route("/debug/h23-wr")
 def debug_h23_wr():
-    """WR por faixa de H23 net_sol_flow — trades #338+ (helius_sell_recovery).
+    """WR por faixa de H23 net_sol_flow — trades blockchain verificados.
     Filtra por h23_window para separar absorção real (bottom) de momentum (bounce).
+    Aceita qualquer exit_type blockchain (helius_sell_recovery, helius, helius_recovery).
     """
     from_id  = int(request.args.get("from_id", 338))
     win_filter = request.args.get("window", "all")  # 'bottom', 'bounce', 'all'
@@ -11199,7 +11200,7 @@ def debug_h23_wr():
             FROM trades t
             JOIN bounce_signals bs ON bs.mint = t.mint
             WHERE t.id >= %(from_id)s
-              AND t.exit_type = 'helius_sell_recovery'
+              AND t.exit_type IN ('helius_sell_recovery', 'helius', 'helius_recovery')
               AND t.status IN ('tp', 'sl')
               {window_clause}
             ORDER BY bs.net_sol_flow NULLS FIRST, t.id
@@ -11207,7 +11208,8 @@ def debug_h23_wr():
         rows = cur.fetchall()
 
     if not rows:
-        return f"<pre>Nenhum trade helius_sell_recovery encontrado a partir do #{from_id}</pre>"
+        return (f"<pre>Nenhum trade blockchain verificado encontrado a partir do #{from_id}.\n"
+                f"Execute /debug/sell-recovery para classificar trades recentes.</pre>")
 
     ORDER = ['sem H23', 'negativo  (< 0)', 'fraco     (0–1)',
              'sweet     (1–3)', 'bom       (3–10)', 'alto      (> 10)']
@@ -11264,7 +11266,7 @@ def debug_h23_wr():
 
     H += (f"<div class='box'><b>Total:</b> {n_total} trades | {tp_total} TP | {n_total-tp_total} SL | "
           f"WR base: <b>{wr_base:.1f}%</b> &nbsp; Break-even: 25%<br>"
-          f"<span style='color:#8b949e;font-size:12px'>Apenas trades com exit_type=helius_sell_recovery (blockchain verificado)</span></div>")
+          f"<span style='color:#8b949e;font-size:12px'>Trades blockchain verificados (helius_sell_recovery + helius + helius_recovery)</span></div>")
 
     # ── Tabela por bucket ─────────────────────────────────────────────────────
     H += "<h3>📊 WR por faixa de net_sol_flow</h3>"
@@ -11432,6 +11434,153 @@ def debug_h23_wr():
     return H
 
 
+@app.route("/debug/h23-grid")
+def debug_h23_grid():
+    """Grid 2D: H23 absorption × bounce_pct — WR por célula (trades #338+ blockchain)."""
+    from_id = int(request.args.get("from_id", 338))
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                t.status,
+                bs.net_sol_flow,
+                bs.bounce_pct,
+                t.symbol,
+                t.id,
+                COALESCE(bs.h23_window, 'bounce') AS h23_window
+            FROM trades t
+            JOIN bounce_signals bs ON bs.mint = t.mint
+            WHERE t.id >= %(from_id)s
+              AND t.exit_type IN ('helius_sell_recovery', 'helius', 'helius_recovery')
+              AND t.status IN ('tp', 'sl')
+        """, {"from_id": from_id})
+        rows = cur.fetchall()
+
+    if not rows:
+        return (f"<pre>Nenhum trade blockchain verificado encontrado a partir do #{from_id}.\n"
+                f"Execute /debug/sell-recovery para classificar trades recentes.</pre>")
+
+    css = """<style>
+    body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+    h2{color:#58a6ff}h3{color:#79c0ff;margin-top:24px}
+    table{border-collapse:collapse;margin-bottom:16px}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:center;min-width:90px}
+    th.row-h{text-align:left;min-width:130px}
+    td{padding:5px 10px;border:1px solid #21262d;text-align:center}
+    .tp{color:#3fb950;font-weight:bold}.sl{color:#f85149}
+    .pos{color:#3fb950;font-weight:bold}.neg{color:#f85149;font-weight:bold}
+    .best{background:#1a3a1a}.ok{background:#1a2a1a}.bad{background:#2d1f1f}.zero{background:#161b22}
+    .box{background:#161b22;border:1px solid #30363d;padding:12px 16px;margin-bottom:14px;border-radius:6px}
+    .dim{color:#6e7681}.warn{background:#2d1f00;border:1px solid #e3b341;border-radius:4px;padding:8px 12px;margin-bottom:12px}
+    </style>"""
+
+    H = f"<!DOCTYPE html><html><head><title>H23 Grid</title>{css}</head><body>"
+    H += "<h2>🔬 Grid 2D: H23 absorção × bounce_pct</h2>"
+    H += ("<div class='warn'>⚠ Todos os 61 trades têm <code>h23_window='bounce'</code> (janela errada — momentum, não absorção). "
+          "Use como exploração, não como base de filtro.</div>")
+
+    n_total = len(rows)
+    tp_total = sum(1 for r in rows if r['status'] == 'tp')
+    wr_base  = tp_total / n_total * 100
+    H += (f"<div class='box'><b>Base:</b> {n_total} trades | {tp_total} TP | {n_total-tp_total} SL | "
+          f"WR base: <b>{wr_base:.1f}%</b> | Break-even: 25%</div>")
+
+    # Definição das faixas
+    h23_bands = [
+        ("< 0 SOL",   lambda x: x is not None and x < 0),
+        ("0–3 SOL",   lambda x: x is not None and 0 <= x < 3),
+        ("3–10 SOL",  lambda x: x is not None and 3 <= x < 10),
+        ("> 10 SOL",  lambda x: x is not None and x >= 10),
+        ("sem dados", lambda x: x is None),
+    ]
+    bounce_bands = [
+        ("30–55%",  lambda b: b is not None and 0.30 <= b < 0.55),
+        ("55–75%",  lambda b: b is not None and 0.55 <= b < 0.75),
+        ("75–120%", lambda b: b is not None and 0.75 <= b < 1.20),
+        ("> 120%",  lambda b: b is not None and b >= 1.20),
+    ]
+
+    def cell(rs):
+        n = len(rs)
+        if n == 0: return "<td class='zero'><span class='dim'>—</span></td>"
+        tp = sum(1 for r in rs if r['status'] == 'tp')
+        wr = tp / n * 100
+        delta = wr - wr_base
+        cls = "best" if delta >= 12 else "ok" if delta >= 0 else "bad"
+        col = "#3fb950" if wr >= 25 else "#f85149" if wr < 15 else "#c9d1d9"
+        return (f"<td class='{cls}'>"
+                f"<span style='color:{col};font-weight:bold'>{wr:.0f}%</span>"
+                f"<br><span class='dim' style='font-size:11px'>{tp}TP/{n-tp}SL</span></td>")
+
+    # ── Grid principal ─────────────────────────────────────────────────────────
+    H += "<h3>📊 WR por célula (linhas = H23, colunas = bounce)</h3>"
+    H += "<p style='font-size:12px;color:#8b949e'>Verde = acima de 25% break-even. Fundo escuro-verde = +12pp vs base.</p>"
+    H += "<table><tr><th class='row-h'>H23 \\ bounce</th>"
+    for bl, _ in bounce_bands:
+        H += f"<th>{bl}</th>"
+    H += "<th>TOTAL</th></tr>"
+
+    for h23_label, h23_fn in h23_bands:
+        h23_rows = [r for r in rows if h23_fn(r['net_sol_flow'])]
+        H += f"<tr><td style='text-align:left'><b>{h23_label}</b></td>"
+        for _, b_fn in bounce_bands:
+            cell_rows = [r for r in h23_rows if b_fn(r['bounce_pct'])]
+            H += cell(cell_rows)
+        H += cell(h23_rows) + "</tr>"
+
+    # Linha totais por coluna
+    H += "<tr style='border-top:2px solid #30363d'><td style='text-align:left'><b>TOTAL</b></td>"
+    for _, b_fn in bounce_bands:
+        col_rows = [r for r in rows if b_fn(r['bounce_pct'])]
+        H += cell(col_rows)
+    H += cell(rows) + "</tr></table>"
+
+    # ── Simulação de filtros combinados ────────────────────────────────────────
+    H += "<h3>⚡ Simulação: filtros combinados vs base</h3>"
+    combos = [
+        ("Base (sem filtro)",           rows),
+        ("bounce ≥ 55%",                [r for r in rows if r['bounce_pct'] and r['bounce_pct'] >= 0.55]),
+        ("H23 3–10 SOL",                [r for r in rows if r['net_sol_flow'] and 3 <= r['net_sol_flow'] < 10]),
+        ("H23 ≥ 1 SOL",                 [r for r in rows if r['net_sol_flow'] and r['net_sol_flow'] >= 1]),
+        ("bounce ≥ 55% + H23 3–10",    [r for r in rows if r['bounce_pct'] and r['bounce_pct'] >= 0.55
+                                         and r['net_sol_flow'] and 3 <= r['net_sol_flow'] < 10]),
+        ("bounce ≥ 55% + H23 ≥ 1",     [r for r in rows if r['bounce_pct'] and r['bounce_pct'] >= 0.55
+                                         and r['net_sol_flow'] and r['net_sol_flow'] >= 1]),
+        ("bounce ≥ 75%",                [r for r in rows if r['bounce_pct'] and r['bounce_pct'] >= 0.75]),
+        ("bounce ≥ 75% + H23 ≥ 1",     [r for r in rows if r['bounce_pct'] and r['bounce_pct'] >= 0.75
+                                         and r['net_sol_flow'] and r['net_sol_flow'] >= 1]),
+    ]
+
+    H += ("<table><tr><th style='text-align:left;min-width:250px'>Filtro</th>"
+          "<th>n</th><th>TP</th><th>SL</th><th>WR</th><th>vs base</th>"
+          "<th>Trades bloqueados</th><th>TPs perdidos</th></tr>")
+    tp_base_ids = {r['id'] for r in rows if r['status'] == 'tp'}
+    for label, rs in combos:
+        n = len(rs); tp = sum(1 for r in rs if r['status'] == 'tp')
+        wr = tp / n * 100 if n else 0
+        delta = wr - wr_base
+        blocked = n_total - n
+        lost_tp = len(tp_base_ids - {r['id'] for r in rs if r['status'] == 'tp'})
+        wr_c = "#3fb950" if wr >= 25 else "#f85149" if wr < 15 else "#c9d1d9"
+        d_c  = "#3fb950" if delta > 0 else "#f85149"
+        wr_s = (f"<span style='color:{wr_c};font-weight:bold'>{wr:.1f}%</span>"
+                if n >= 3 else f"<span class='dim'>— (n={n})</span>")
+        d_s  = (f"<span style='color:{d_c}'>{delta:+.1f}pp</span>" if n >= 3 else "—")
+        H += (f"<tr><td><b>{label}</b></td><td>{n}</td>"
+              f"<td class='tp'>{tp}</td><td class='sl'>{n-tp}</td>"
+              f"<td>{wr_s}</td><td>{d_s}</td>"
+              f"<td class='dim'>{blocked} (-{blocked/n_total*100:.0f}%)</td>"
+              f"<td class='{'sl' if lost_tp else 'tp'}'>{lost_tp} ({lost_tp/len(tp_base_ids)*100:.0f}%)</td></tr>")
+    H += "</table>"
+
+    H += ("<div class='box' style='margin-top:16px;font-size:12px;color:#8b949e'>"
+          "⚠ Lembrete: estes dados têm <code>h23_window='bounce'</code> (janela no momento do bounce, não do fundo). "
+          "H23 mede momentum, não absorção real. Gate para filtro: n≥30 com <code>h23_window='bottom'</code> + GMGN outcomes.</div>")
+
+    H += "</body></html>"
+    return H
+
+
 @app.route("/debug/bounce-wr")
 def debug_bounce_wr():
     """Análise de WR por faixa de bounce_pct — trades #338+ (helius_sell_recovery).
@@ -11477,14 +11626,15 @@ def _debug_bounce_wr_inner():
             JOIN bounce_signals bs ON bs.mint = t.mint
             LEFT JOIN migrations m  ON m.mint = t.mint
             WHERE t.id >= %(from_id)s
-              AND t.exit_type = 'helius_sell_recovery'
+              AND t.exit_type IN ('helius_sell_recovery', 'helius', 'helius_recovery')
               AND t.status IN ('tp', 'sl')
             ORDER BY bs.bounce_pct ASC NULLS LAST
         """, {"from_id": from_id})
         rows = cur.fetchall()
 
     if not rows:
-        return f"<pre>Nenhum trade helius_sell_recovery a partir do #{from_id}</pre>"
+        return (f"<pre>Nenhum trade blockchain verificado a partir do #{from_id}.\n"
+                f"Execute /debug/sell-recovery para classificar trades recentes.</pre>")
 
     n_total = len(rows)
     tp_all  = sum(1 for r in rows if r['status'] == 'tp')
