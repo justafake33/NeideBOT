@@ -11440,12 +11440,13 @@ def debug_bounce_wr():
         ev_s  = (f"<span class='{'pos' if ev_v and ev_v>0 else 'neg'}'>{ev_v:+.1%}</span>"
                  if ev_v is not None else "—")
         cls   = " class='hi'" if (n>=3 and delta>=8) else " class='lo'" if (n>=3 and delta<=-8) else ""
+        avg_b_s = f"{avg_b*100:.0f}%" if avg_b is not None else "—"
+        avg_e_s = f"{avg_e:.1f}m" if n else "—"
+        avg_h_s = f"{avg_h:+.1f}◎" if avg_h is not None else "—"
         H += (f"<tr{cls}><td class='l'><b>{lbl}</b></td><td>{n}</td>"
               f"<td class='tp'>{tp}</td><td class='sl'>{n-tp}</td>"
               f"<td>{wr_s}</td><td>{dlt_s}</td><td>{ev_s}</td>"
-              f"<td>{avg_b*100:.0f}%</td>"
-              f"<td>{avg_e:.1f}m</td>"
-              f"<td>{'—' if avg_h is None else f'{avg_h:+.1f}◎'}</td></tr>")
+              f"<td>{avg_b_s}</td><td>{avg_e_s}</td><td>{avg_h_s}</td></tr>")
     H += (f"<tr style='border-top:2px solid #30363d'><td class='l'><b>TOTAL</b></td>"
           f"<td>{n_total}</td><td class='tp'>{tp_all}</td><td class='sl'>{n_total-tp_all}</td>"
           f"<td><b>{wr_base:.1f}%</b></td><td>base</td>"
