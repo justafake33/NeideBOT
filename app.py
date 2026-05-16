@@ -11330,6 +11330,13 @@ def debug_bounce_wr():
     """Análise de WR por faixa de bounce_pct — trades #338+ (helius_sell_recovery).
     Compara todos os dados disponíveis estratificados por tamanho do bounce.
     """
+    import traceback as _tb
+    try:
+        return _debug_bounce_wr_inner()
+    except Exception:
+        return f"<pre>{_tb.format_exc()}</pre>", 500
+
+def _debug_bounce_wr_inner():
     from_id = int(request.args.get("from_id", 338))
 
     with db._cursor() as cur:
