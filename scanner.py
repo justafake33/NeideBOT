@@ -312,6 +312,38 @@ class HotMonitor:
         # alias para compatibilidade com código de insert abaixo
         absorption_window = pre_window
 
+        # H24 — concentração de sellers durante o dump [ts_migration → ts_min]
+        # H25 — profundidade do pool no momento do sinal
+        dump_concentration   = {}
+        pool_quote_at_signal = None
+
+        if self._helius:
+            try:
+                ts_mig_ts = state["ts_migration"].timestamp()
+                dump_concentration = self._helius.get_dump_seller_concentration(
+                    mint,
+                    window_start_ts=ts_mig_ts,
+                    window_end_ts=ts_min_ts or now_ts,
+                )
+                pool_quote_at_signal = self._helius.get_pool_quote(mint)
+                logger.info(
+                    "H24/H25 %s | sellers=%d HHI=%.3f top=%.1f%% | pool=%.1f SOL",
+                    state.get("symbol", mint[:8]),
+                    dump_concentration.get("seller_count", 0),
+                    dump_concentration.get("seller_hhi") or 0,
+                    (dump_concentration.get("top_seller_frac") or 0) * 100,
+                    pool_quote_at_signal or 0,
+                )
+            except Exception as e:
+                logger.debug("H24/H25 %s: %s", mint[:8], e)
+
+        # H26 — concentração de buyers na RISE window (largest_buy / total_buy_vol)
+        buy_concentration = None
+        rise_bv = rise_window.get("buy_vol_sol") or 0
+        rise_lb = rise_window.get("largest_buy") or 0
+        if rise_bv > 0:
+            buy_concentration = round(rise_lb / rise_bv, 4)
+
         state["bounce_fired"] = True
         symbol = state.get("symbol", mint[:8])
 
@@ -348,6 +380,14 @@ class HotMonitor:
                 ) if rise_window.get("total_events") else None,
                 "rise_events":   rise_window.get("total_events"),
                 "rise_lrg_buy":  rise_window.get("largest_buy"),
+                # H25 — pool depth
+                "pool_quote_at_signal": pool_quote_at_signal,
+                # H24 — seller concentration durante o dump
+                "dump_seller_count":    dump_concentration.get("seller_count"),
+                "dump_seller_hhi":      dump_concentration.get("seller_hhi"),
+                "dump_top_seller_frac": dump_concentration.get("top_seller_frac"),
+                # H26 — buyer concentration na subida
+                "buy_concentration":    buy_concentration,
             })
         except Exception as e:
             logger.warning("insert_bounce_signal %s: %s", mint[:8], e)
