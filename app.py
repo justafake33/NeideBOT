@@ -11356,6 +11356,78 @@ def debug_h23_wr():
               f"<td class='sl'>{pnl_s}</td></tr>")
     H += "</table>"
 
+    # ── Correlação net_sol_flow vs bounce_pct (causalidade reversa?) ─────────
+    H += "<h3>📐 Correlação net_sol_flow × bounce_pct — causalidade reversa?</h3>"
+    H += ("<p style='font-size:12px;color:#8b949e'>Se bounce maior → mais compras no pAMM → net_sol_flow alto, "
+          "então H23 é apenas um proxy de bounce_pct (redundante). "
+          "Correlação alta (>0.6) = causalidade reversa. Correlação baixa = H23 tem informação independente.</p>")
+
+    corr_rows = [(r['net_sol_flow'], r['bounce_pct'])
+                 for r in rows if r['net_sol_flow'] is not None and r['bounce_pct'] is not None]
+    if len(corr_rows) >= 5:
+        import math
+        xs = [x for x, _ in corr_rows]
+        ys = [y for _, y in corr_rows]
+        n_c = len(xs)
+        mx, my = sum(xs)/n_c, sum(ys)/n_c
+        cov  = sum((x-mx)*(y-my) for x, y in zip(xs, ys)) / n_c
+        sx   = math.sqrt(sum((x-mx)**2 for x in xs) / n_c)
+        sy   = math.sqrt(sum((y-my)**2 for y in ys) / n_c)
+        corr = cov / (sx * sy) if sx and sy else 0.0
+        interp = ("🔴 correlação alta — H23 é proxy de bounce_pct (causalidade reversa provável)"
+                  if abs(corr) > 0.6 else
+                  "🟡 correlação moderada — H23 tem alguma informação independente"
+                  if abs(corr) > 0.3 else
+                  "🟢 correlação baixa — H23 captura informação independente do bounce_pct")
+        corr_color = "#f85149" if abs(corr) > 0.6 else "#e3b341" if abs(corr) > 0.3 else "#3fb950"
+        by_window = {}
+        for r in rows:
+            if r['net_sol_flow'] is None or r['bounce_pct'] is None:
+                continue
+            w = r.get('h23_window', 'bounce')
+            by_window.setdefault(w, []).append((r['net_sol_flow'], r['bounce_pct']))
+
+        H += f"<div class='box'>"
+        H += (f"<b>Pearson r (todos):</b> "
+              f"<span style='color:{corr_color};font-size:16px'><b>{corr:+.3f}</b></span> "
+              f"(n={n_c}) &nbsp; {interp}</div>")
+
+        # Por janela
+        H += "<table><tr><th>Janela</th><th>n</th><th>Pearson r</th><th>Interpretação</th></tr>"
+        for w_name, pairs in by_window.items():
+            if len(pairs) < 3:
+                H += f"<tr><td>{w_name}</td><td>{len(pairs)}</td><td colspan=2 class='dim'>n insuficiente</td></tr>"
+                continue
+            xs2 = [x for x, _ in pairs]; ys2 = [y for _, y in pairs]
+            n2 = len(xs2); mx2, my2 = sum(xs2)/n2, sum(ys2)/n2
+            cov2 = sum((x-mx2)*(y-my2) for x,y in zip(xs2,ys2))/n2
+            sx2  = math.sqrt(sum((x-mx2)**2 for x in xs2)/n2)
+            sy2  = math.sqrt(sum((y-my2)**2 for y in ys2)/n2)
+            r2   = cov2/(sx2*sy2) if sx2 and sy2 else 0.0
+            rc   = "#f85149" if abs(r2)>0.6 else "#e3b341" if abs(r2)>0.3 else "#3fb950"
+            interp2 = ("proxy (alta)" if abs(r2)>0.6 else "moderada" if abs(r2)>0.3 else "independente (baixa)")
+            H += (f"<tr><td><code>{w_name}</code></td><td>{n2}</td>"
+                  f"<td><span style='color:{rc}'><b>{r2:+.3f}</b></span></td>"
+                  f"<td>{interp2}</td></tr>")
+        H += "</table>"
+    else:
+        H += f"<div class='box dim'>n insuficiente para correlação (n={len(corr_rows)} com ambos os campos)</div>"
+
+    # ── Trades suspeitos: status=sl mas pnl>0 ─────────────────────────────────
+    suspicious = [r for r in rows if r['status'] == 'sl' and r.get('pnl_pct_real') and r['pnl_pct_real'] > 0]
+    if suspicious:
+        H += f"<h3>⚠ Trades suspeitos — status=SL mas P&amp;L positivo ({len(suspicious)})</h3>"
+        H += ("<p style='font-size:12px;color:#e3b341'>Estes trades têm status='sl' mas pnl_pct_real > 0. "
+              "Possível erro de categorização no sell-recovery.</p>")
+        H += "<table><tr><th>#</th><th>Token</th><th>P&amp;L</th><th>net_flow</th><th>h23_window</th></tr>"
+        for r in suspicious:
+            nf = r['net_sol_flow']
+            nf_s = f"{nf:+.2f}◎" if nf is not None else "—"
+            H += (f"<tr style='background:#2d1f00'><td>{r['id']}</td><td><b>{r['symbol'] or ''}</b></td>"
+                  f"<td class='pos'>{r['pnl_pct_real']:+.1f}%</td>"
+                  f"<td>{nf_s}</td><td><code>{r.get('h23_window','?')}</code></td></tr>")
+        H += "</table>"
+
     H += "</body></html>"
     return H
 
