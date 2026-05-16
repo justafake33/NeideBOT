@@ -269,36 +269,48 @@ class HotMonitor:
                 name=f"backfill-{mint[:8]}",
             ).start()
 
-        # H22/H23 — Coleta de absorção centrada no FUNDO (ts_min), não no bounce.
-        # Bug corrigido: window_end_ts=ts_min captura [ts_min-60s → ts_min] —
-        # o período onde os vendedores se exaurem e os primeiros compradores entram.
-        # Usar time.time() (padrão anterior) capturava o bounce subindo, não o fundo.
-        absorption_window = {}
+        # Três janelas de fluxo — visão completa do bounce:
+        # PRÉ  [ts_min-60s → ts_min]   : absorção do dump (sellers exaustos?)
+        # RISE [ts_min    → ts_signal] : quem comprou durante a subida?
+        # PÓS  [ts_signal → ts_signal+60s]: coleta assíncrona (+60s via scheduler)
+        now_ts     = datetime.now(timezone.utc).timestamp()
+        ts_min_obj = state.get("ts_min")
+        ts_min_ts  = ts_min_obj.timestamp() if ts_min_obj else None
+
+        pre_window  = {}  # absorção do dump
+        rise_window = {}  # momentum da subida
+
         if self._helius:
             try:
-                ts_min = state.get("ts_min")
-                window_end = ts_min.timestamp() if ts_min else None
-                absorption_window = self._helius.get_absorption_window(
-                    mint, window_sec=60, window_end_ts=window_end
+                # PRÉ: [ts_min-60s → ts_min]
+                pre_window = self._helius.get_absorption_window(
+                    mint, window_sec=60, window_end_ts=ts_min_ts
                 )
-                ev = absorption_window.get("total_events", 0)
-                if ev > 0:
-                    bv = absorption_window.get("buy_vol_sol",  0) or 0
-                    sv = absorption_window.get("sell_vol_sol", 0) or 0
-                    logger.info(
-                        "H22 %s: %d eventos | buy=%.3fSOL(%d) sell=%.3fSOL(%d) "
-                        "lrg_buy=%.3f ratio=%.2f [janela: fundo±60s]",
-                        state.get("symbol", mint[:8]), ev,
-                        bv, absorption_window.get("buy_count",    0),
-                        sv, absorption_window.get("sell_count",   0),
-                        absorption_window.get("largest_buy", 0),
-                        bv / sv if sv > 0 else float("inf"),
+                # RISE: [ts_min → ts_signal]
+                if ts_min_ts:
+                    rise_sec = max(1, int(now_ts - ts_min_ts))
+                    rise_window = self._helius.get_absorption_window(
+                        mint, window_sec=rise_sec, window_end_ts=now_ts
                     )
-                else:
-                    logger.info("H22 %s: no_data (sem eventos Helius nos 60s antes do fundo)",
-                                state.get("symbol", mint[:8]))
+
+                pre_ev  = pre_window.get("total_events",  0) or 0
+                rise_ev = rise_window.get("total_events", 0) or 0
+                pre_bv  = pre_window.get("buy_vol_sol",   0) or 0
+                pre_sv  = pre_window.get("sell_vol_sol",  0) or 0
+                rise_bv = rise_window.get("buy_vol_sol",  0) or 0
+                rise_sv = rise_window.get("sell_vol_sol", 0) or 0
+                logger.info(
+                    "FLOW %s | PRÉ: %dev buy=%.2f sell=%.2f net=%+.2f"
+                    " | RISE: %dev buy=%.2f sell=%.2f net=%+.2f",
+                    state.get("symbol", mint[:8]),
+                    pre_ev,  pre_bv,  pre_sv,  pre_bv  - pre_sv,
+                    rise_ev, rise_bv, rise_sv, rise_bv - rise_sv,
+                )
             except Exception as e:
-                logger.debug("H22 absorption %s: %s", mint[:8], e)
+                logger.debug("flow_windows %s: %s", mint[:8], e)
+
+        # alias para compatibilidade com código de insert abaixo
+        absorption_window = pre_window
 
         state["bounce_fired"] = True
         symbol = state.get("symbol", mint[:8])
@@ -327,17 +339,27 @@ class HotMonitor:
                     (absorption_window.get("sell_vol_sol") or 0)
                 ) if absorption_window.get("total_events") else None,
                 "h23_window":          "bottom",
+                # Janela RISE: [ts_min → ts_signal]
+                "rise_buy_vol":  rise_window.get("buy_vol_sol"),
+                "rise_sell_vol": rise_window.get("sell_vol_sol"),
+                "rise_net_flow": (
+                    (rise_window.get("buy_vol_sol")  or 0) -
+                    (rise_window.get("sell_vol_sol") or 0)
+                ) if rise_window.get("total_events") else None,
+                "rise_events":   rise_window.get("total_events"),
+                "rise_lrg_buy":  rise_window.get("largest_buy"),
             })
         except Exception as e:
             logger.warning("insert_bounce_signal %s: %s", mint[:8], e)
 
-        # Snapshots pós-bounce: dois callbacks separados capturando os primeiros
-        # 30s e 60s reais após o sinal (window_sec=30 em t+30 = [t, t+30]).
-        # p30s = fluxo nos primeiros 30s; p60s = fluxo nos primeiros 60s.
+        # PÓS-sinal: coleta [ts_signal → ts_signal+30s] e [ts_signal → ts_signal+60s]
+        # window_end_ts = ts_signal + delay → captura apenas o período pós-sinal
         if self._helius and self.scheduler:
-            def _snap30(m=mint):
+            ts_signal_ts = now_ts
+
+            def _snap30(m=mint, t0=ts_signal_ts):
                 try:
-                    w = self._helius.get_absorption_window(m, window_sec=30)
+                    w = self._helius.get_absorption_window(m, window_sec=30, window_end_ts=t0 + 30)
                     db.update_bounce_snapshots(
                         m, "30s",
                         buy_vol=w.get("buy_vol_sol", 0) or 0,
@@ -347,9 +369,9 @@ class HotMonitor:
                 except Exception as ex:
                     logger.debug("snap30 %s: %s", m[:8], ex)
 
-            def _snap60(m=mint):
+            def _snap60(m=mint, t0=ts_signal_ts):
                 try:
-                    w = self._helius.get_absorption_window(m, window_sec=60)
+                    w = self._helius.get_absorption_window(m, window_sec=60, window_end_ts=t0 + 60)
                     db.update_bounce_snapshots(
                         m, "60s",
                         buy_vol=w.get("buy_vol_sol", 0) or 0,

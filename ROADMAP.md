@@ -316,24 +316,41 @@ Dashboard mostra correlação H22 → outcome com n atual. 3 tabelas: por `absor
 
 ---
 
-## 🔬 Fase de Microestrutura (sessão 6 — próximos passos ordenados por ROI)
+## 🔬 Fase de Microestrutura (sessão 7 — estado atual)
 
-### Implementação imediata (30min, zero custo API)
-- [ ] **H23 — Net SOL Flow**: calcular `net_sol_flow = buy_vol_sol - sell_vol_sol` no `_check_bounce()` e salvar em `bounce_signals` como novo campo. Adicionar ao `/analise/h22-correlation`. Dados já existem em `get_absorption_window()`, falta salvar. Gate para filtro: n≥30 bounces com outcomes GMGN.
+### Princípio desta fase
+> **Tudo é coleta de informações. Os dados mostram a verdade.**
+> Nenhuma hipótese é confirmada antes de n≥30 bounces com outcomes GMGN.
+> Nenhum filtro é implementado antes de confirmação nos dados.
+> Construir instrumentos de medição → deixar acumular → analisar → só então modelar.
 
-### Próxima sessão (2-3 dias, zero custo API)
-- [ ] **H24 — Seller Exhaustion**: acumular sellers únicos via Helius BuyEvent/SellEvent entre `ts_migration` e `ts_min`. Salvar `dump_seller_count` e `dump_seller_hhi` (índice Herfindahl — concentração dos sellers do dump) em `bounce_signals`. Hipótese: top-3 sellers > 70% do dump_vol → dump finito → WR maior. Causa raiz dos SLs (H21 confirmou: 90% dos SLs continuam caindo porque havia sellers que não terminaram).
-- [ ] **H25 — Pool Depth**: salvar `pool_quote_at_signal` em `bounce_signals` usando o último `pool_quote` (offset 56 do BuyEvent) recebido via Helius no momento do `_check_bounce()`. Flag no Telegram/dashboard quando `pool_quote < 20 SOL` (ruído de pool thin dispara SL artificialmente).
+### ✅ Infraestrutura de coleta implementada (sessão 7)
+- **Três janelas de fluxo por bounce** (`bounce_signals`):
+  - `absorption_*` + `net_sol_flow` = PRÉ `[ts_min−60s → ts_min]` — absorção do dump
+  - `rise_*` = RISE `[ts_min → ts_signal]` — quem comprou durante a subida?
+  - `p60s_*` = PÓS `[ts_signal → ts_signal+60s]` — demanda sustentando?
+- **`/debug/flow-timeline`**: tabela com as três janelas + outcome por bounce
+- **`h23_window` tagging**: `'bottom'` para todos os novos bounces pós-deploy
 
-### Após n≥30 bounces com novos dados
-- [ ] **H26 — Buy Concentration**: correlacionar `largest_buy / buy_vol` com outcomes GMGN. Paper arXiv 2602.14860 confirma que fast accumulation por poucos trades prediz sucesso. Campo calculável de dados já existentes. Implementar como filtro somente após validação.
-- [ ] Revisar H22 adicionando `net_sol_flow`, `pool_quote_at_signal`, e `dump_seller_hhi` como variáveis explicativas.
+### ⏳ Aguardando dados (não tocar até ter n≥30)
+- H22 (absorção pós-fundo) — gate: n≥30 com `absorption_events > 0` + outcomes GMGN
+- H23 (net_sol_flow pré-fundo) — gate: n≥30 com `h23_window='bottom'` + outcomes GMGN
+- Rise window — gate: n≥30 com `rise_events > 0` + outcomes GMGN
+- PÓS window — gate: n≥30 com `p60s_events > 0` + outcomes GMGN
+- H24 (seller exhaustion) — ⏳ pendente implementação de acumulação de sellers únicos
+- H25 (pool depth) — ⏳ pendente salvar `pool_quote_at_signal` no bounce
 
-### Descobertas analíticas desta sessão (não implementar sem validação)
-- **Entry correto = `mc_at_signal`**: simulações anteriores com `mc_min × 1.15` inflavam WR. WR base real com metodologia correta = 24% (break-even ~25%).
-- **Nenhuma métrica pré-trade entrega mais de +7pp**: bounce 55-65% (+7pp) e elapsed 0-3min (+7pp) são os únicos sinais relevantes. Smart, CTO, dev, top10 = ruído (±3pp).
-- **Smart >10 wallets = -13pp**: único sinal forte negativo. Confirma que smart_count alto é destrutivo.
-- **Benchmark correto**: usar `/analise/sinal-puro` (token outcome) em vez de WR da carteira para avaliar qualidade de sinais.
+### Próxima análise (quando n≥30 bottom bounces com outcomes)
+1. Abrir `/debug/flow-timeline` — ver os padrões que emergiram
+2. Calcular WR por combinação PRÉ/RISE/PÓS (positivo/negativo/nulo)
+3. Identificar qual janela discrimina mais
+4. Só então pensar em score ou filtro
+
+### Descobertas desta fase (observadas, não implementadas como filtro)
+- H23 bounce-window: zona 3–10 SOL tem WR 35.7% (+12pp) mas 56% dos TPs têm H23 negativo — não pode ser gate binário
+- bounce_pct >70%: WR 74% (n=23, +45pp) — maior discriminador encontrado, mas já coberto por BOUNCE_MIN_PCT
+- Pearson H23 × bounce_pct = -0.085 → informação independente, porém fraca isoladamente
+- Tokens com bounce >100% frequentemente têm H23 negativo (profit-taking durante a subida)
 
 ---
 
