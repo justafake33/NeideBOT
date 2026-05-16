@@ -11167,11 +11167,20 @@ def debug_absorption():
 
 @app.route("/debug/h23-wr")
 def debug_h23_wr():
-    """WR por faixa de H23 net_sol_flow — trades #338+ (helius_sell_recovery)."""
-    from_id = int(request.args.get("from_id", 338))
+    """WR por faixa de H23 net_sol_flow — trades #338+ (helius_sell_recovery).
+    Filtra por h23_window para separar absorção real (bottom) de momentum (bounce).
+    """
+    from_id  = int(request.args.get("from_id", 338))
+    win_filter = request.args.get("window", "all")  # 'bottom', 'bounce', 'all'
+
+    window_clause = ""
+    if win_filter == "bottom":
+        window_clause = "AND bs.h23_window = 'bottom'"
+    elif win_filter == "bounce":
+        window_clause = "AND (bs.h23_window = 'bounce' OR bs.h23_window IS NULL)"
 
     with db._cursor() as cur:
-        cur.execute("""
+        cur.execute(f"""
             SELECT
                 CASE
                     WHEN bs.net_sol_flow IS NULL    THEN 'sem H23'
@@ -11185,12 +11194,14 @@ def debug_h23_wr():
                 t.pnl_pct_real,
                 bs.net_sol_flow,
                 bs.bounce_pct,
-                bs.elapsed_sec / 60.0  AS elapsed_min
+                bs.elapsed_sec / 60.0  AS elapsed_min,
+                COALESCE(bs.h23_window, 'bounce') AS h23_window
             FROM trades t
             JOIN bounce_signals bs ON bs.mint = t.mint
             WHERE t.id >= %(from_id)s
               AND t.exit_type = 'helius_sell_recovery'
               AND t.status IN ('tp', 'sl')
+              {window_clause}
             ORDER BY bs.net_sol_flow NULLS FIRST, t.id
         """, {"from_id": from_id})
         rows = cur.fetchall()
@@ -11225,8 +11236,32 @@ def debug_h23_wr():
     .dim{color:#6e7681}
     </style>"""
 
+    # Contagem de bottom vs bounce no conjunto filtrado
+    n_bottom = sum(1 for r in rows if r.get('h23_window') == 'bottom')
+    n_bounce = len(rows) - n_bottom
+
+    win_label = {"all": "todos", "bottom": "✅ bottom (absorção)", "bounce": "⚠ bounce (momentum)"}.get(win_filter, "todos")
+
     H = f"<!DOCTYPE html><html><head><title>H23 WR</title>{css}</head><body>"
     H += f"<h2>🔬 H23 net_sol_flow — WR por faixa (trades #{from_id}+)</h2>"
+
+    # Banner de aviso sobre h23_window
+    if win_filter != "bottom":
+        H += ("<div style='background:#2d1f00;border:1px solid #e3b341;border-radius:4px;padding:8px 12px;margin-bottom:12px'>"
+              "⚠ <b>Atenção:</b> dados históricos (<code>h23_window='bounce'</code>) capturam <b>momentum pós-bounce</b>, "
+              "não absorção real do dump. Análise misturada com dados inválidos.<br>"
+              f"Este conjunto: <b>{n_bottom} bottom</b> (válidos) + <b>{n_bounce} bounce</b> (momentum).<br>"
+              "Filtre por <a href='?window=bottom' style='color:#58a6ff'>?window=bottom</a> para ver apenas dados corretos."
+              "</div>")
+    else:
+        H += (f"<div style='background:#0d1f0d;border:1px solid #3fb950;border-radius:4px;padding:8px 12px;margin-bottom:12px'>"
+              f"✅ Mostrando apenas <b>h23_window='bottom'</b> — absorção real do fundo. n={n_bottom} trades.</div>")
+
+    H += (f"<p style='font-size:12px;color:#8b949e'>Janela: <b>{win_label}</b> &nbsp;|&nbsp; "
+          f"<a href='?window=all&from_id={from_id}' style='color:#58a6ff'>Todos</a> &nbsp; "
+          f"<a href='?window=bottom&from_id={from_id}' style='color:#3fb950'>✅ bottom</a> &nbsp; "
+          f"<a href='?window=bounce&from_id={from_id}' style='color:#8b949e'>⚠ bounce</a></p>")
+
     H += (f"<div class='box'><b>Total:</b> {n_total} trades | {tp_total} TP | {n_total-tp_total} SL | "
           f"WR base: <b>{wr_base:.1f}%</b> &nbsp; Break-even: 25%<br>"
           f"<span style='color:#8b949e;font-size:12px'>Apenas trades com exit_type=helius_sell_recovery (blockchain verificado)</span></div>")
@@ -11351,6 +11386,7 @@ def _debug_bounce_wr_inner():
                 bs.bounce_pct,
                 bs.elapsed_sec / 60.0          AS elapsed_min,
                 bs.net_sol_flow,
+                COALESCE(bs.h23_window, 'bounce') AS h23_window,
                 bs.mc_at_signal,
                 bs.absorption_events,
                 bs.absorption_buy_vol          AS buy_vol,
@@ -11401,11 +11437,27 @@ def _debug_bounce_wr_inner():
     .dim{color:#484f58}.warn{color:#e3b341}
     </style>"""
 
+    n_bottom_rs = sum(1 for r in rs if r.get('h23_window') == 'bottom')
+    n_bounce_rs = len(rs) - n_bottom_rs
+
     H = f"<!DOCTYPE html><html><head><title>Bounce WR</title>{CSS}</head><body>"
     H += f"<h2>📊 WR por Faixa de Bounce — Trades #{from_id}+</h2>"
     H += (f"<div class='box'><b>Total</b>: {n_total} trades | "
           f"<span class='tp'>{tp_all} TP</span> | <span class='sl'>{n_total-tp_all} SL</span> | "
           f"WR base: <b>{wr_base:.1f}%</b> | Break-even: 25%</div>")
+    if n_bottom_rs > 0:
+        H += (f"<div style='background:#0d1f0d;border:1px solid #3fb950;border-radius:4px;"
+              f"padding:6px 12px;margin-bottom:8px;font-size:12px'>"
+              f"✅ <b>{n_bottom_rs}</b> trades com H23 correto (<code>h23_window='bottom'</code>) "
+              f"| <span style='color:#8b949e'>{n_bounce_rs} com janela antiga (momentum)</span><br>"
+              f"Ver WR segregado por janela: "
+              f"<a href='/debug/h23-wr?window=bottom&from_id={from_id}' style='color:#3fb950'>?window=bottom</a>"
+              f" | <a href='/debug/h23-wr?window=all&from_id={from_id}' style='color:#58a6ff'>?window=all</a></div>")
+    else:
+        H += (f"<div style='background:#2d1f00;border:1px solid #e3b341;border-radius:4px;"
+              f"padding:6px 12px;margin-bottom:8px;font-size:12px'>"
+              f"⚠ Nenhum trade com <code>h23_window='bottom'</code> ainda — aguardando bounces pós-deploy.<br>"
+              f"Todos os {n_bounce_rs} trades têm H23 medido na janela do bounce (momentum), não do fundo.</div>")
     H += "<p class='dim' style='font-size:11px'>Apenas exit_type=helius_sell_recovery. Bounce = (mc_at_signal − mc_bottom) / mc_bottom.</p>"
 
     # ── 1. Tabela por faixa de bounce ────────────────────────────────────────
