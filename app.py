@@ -26365,9 +26365,9 @@ def analise_sinal_puro():
     não o resultado da carteira (que é contaminado por SL/TP, filtros e regime de mercado).
 
     Dataset primário: bounce_signals + token_ticks (20min após ts_signal)
-      - entry_mc = mc_min × 1.15
-      - tp_hit   = max_mc_after >= entry_mc × 1.75
-      - sl_hit   = min_mc_after <= entry_mc × 0.75
+      - entry_mc = mc_at_signal (preço real quando o sinal disparou — inclui o bounce inteiro)
+      - tp_hit   = max_mc_after >= entry_mc × 1.75  (+75% a partir do sinal)
+      - sl_hit   = min_mc_after <= entry_mc × 0.75  (-25% a partir do sinal)
       ⚠️ Cobertura ~12% dos bounces. Sem bias de carteira.
 
     Dataset secundário: migrations.recovery (proxy 1h)
@@ -26375,10 +26375,11 @@ def analise_sinal_puro():
         (a) Não monitoramos tokens abaixo de $5k MC
         (b) Não sabemos se o token bateu nosso SL no meio do caminho antes de recuperar
     """
-    TP_MULT  = 1.75   # +75%
-    SL_MULT  = 0.75   # -25%
-    ENTRY_MULT = 1.15 # entry = mc_min × 1.15
-    MIN_TICKS  = 3    # ticks mínimos após sinal para considerar o outcome
+    TP_MULT   = 1.75  # +75%
+    SL_MULT   = 0.75  # -25%
+    MIN_TICKS = 3     # ticks mínimos após sinal para considerar o outcome
+    # entry = mc_at_signal (preço real no momento do sinal, já inclui o bounce inteiro)
+    # mc_min × 1.15 foi REMOVIDO — inflava o WR porque assume compra antes do sinal disparar
 
     css = """
     <style>
@@ -26414,7 +26415,7 @@ def analise_sinal_puro():
                     bs.absorption_events,
                     bs.mc_min,
                     bs.mc_migration,
-                    bs.mc_min * %(entry)s                          AS entry_mc,
+                    bs.mc_at_signal                                AS entry_mc,
                     m.smart_wallets,
                     m.renowned_wallets,
                     m.creator_token_status,
@@ -26443,7 +26444,7 @@ def analise_sinal_puro():
                 (min_mc <= entry_mc * %(sl)s)  AS sl_hit
             FROM outcomes
             ORDER BY bounce_pct
-        """, {"entry": ENTRY_MULT, "tp": TP_MULT, "sl": SL_MULT, "min_ticks": MIN_TICKS})
+        """, {"tp": TP_MULT, "sl": SL_MULT, "min_ticks": MIN_TICKS})
         primary = cur.fetchall()
 
     # ── Dataset secundário: migrations.recovery ───────────────────────────────
@@ -26659,7 +26660,7 @@ def analise_sinal_puro():
     H += "<div class='section-primary'>"
     H += "<p style='color:#3fb950;margin:4px 0 16px 0'><b>🟢 Dataset primário</b> — "
     H += "comportamento real do token nos 20min pós-sinal. "
-    H += "Entry = mc_min × 1.15 | TP = +75% | SL = -25% | Break-even: ~25%</p>"
+    H += "Entry = mc_at_signal (preço quando o sinal disparou) | TP = +75% | SL = -25% | Break-even: ~25%</p>"
     H += "</div>"
 
     for m in METRICAS:
