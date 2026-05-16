@@ -30184,5 +30184,222 @@ def analise_h23_deep():
         return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
+@app.route("/debug/microstructure")
+def debug_microstructure():
+    """
+    Verifica coleta H24/H25/H26 em tempo real.
+    - Seção 1: estado live do HeliusWS (pool quotes + eventos com wallet por mint ativo)
+    - Seção 2: últimos 30 bounce_signals com cobertura dos novos campos
+    - Seção 3: estatísticas de cobertura globais
+    """
+    import traceback
+    try:
+        import psycopg2
+        from db import DATABASE_URL
+
+        # ── Seção 1: estado live do HeliusWS ─────────────────────────────
+        live_rows = ""
+        helius = getattr(scanner, "_hot", None)
+        helius = getattr(helius, "_helius", None) if helius else None
+        if helius is None:
+            helius = getattr(scanner, "_helius", None)
+
+        if helius:
+            with helius._lock:
+                active_mints = list(helius._mint_supply.keys())
+                pool_quotes  = dict(helius._pool_quote_last)
+                swap_events  = {m: list(helius._swap_events.get(m, [])) for m in active_mints}
+
+            for mint in active_mints:
+                evs     = swap_events.get(mint, [])
+                pq      = pool_quotes.get(mint, 0)
+                n_ev    = len(evs)
+                n_w     = sum(1 for e in evs if e.get("wallet"))
+                n_sells = sum(1 for e in evs if e.get("side") == "sell" and e.get("wallet"))
+                n_buys  = sum(1 for e in evs if e.get("side") == "buy"  and e.get("wallet"))
+                pq_str  = f"{pq:.2f} SOL" if pq else "—"
+                cov_str = f"{n_w}/{n_ev}" if n_ev else "0 evs"
+                color   = "#2a2" if n_w > 0 else "#888"
+                live_rows += f"""<tr>
+                  <td style='font-family:monospace'>{mint[:12]}…</td>
+                  <td style='color:{color}'>{cov_str} c/wallet</td>
+                  <td>{n_buys}buy / {n_sells}sell</td>
+                  <td>{pq_str}</td>
+                </tr>"""
+            if not active_mints:
+                live_rows = "<tr><td colspan=4>Nenhum token ativo no HotMonitor</td></tr>"
+        else:
+            live_rows = "<tr><td colspan=4>HeliusWS não inicializado (sem HELIUS_API_KEY?)</td></tr>"
+
+        # ── Seção 2: últimos 30 bounce_signals com novos campos ───────────
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT
+                bs.ts_signal, bs.symbol, bs.bounce_pct, bs.drop_from_mig,
+                bs.h23_window,
+                bs.pool_quote_at_signal,
+                bs.dump_seller_count, bs.dump_seller_hhi, bs.dump_top_seller_frac,
+                bs.rise_events, bs.rise_lrg_buy, bs.rise_buy_vol,
+                bs.buy_concentration,
+                bs.absorption_events,
+                t.status, t.pnl_pct_real
+            FROM bounce_signals bs
+            LEFT JOIN LATERAL (
+                SELECT status, pnl_pct_real
+                FROM trades
+                WHERE mint = bs.mint
+                ORDER BY created_at DESC LIMIT 1
+            ) t ON true
+            WHERE bs.ts_signal > NOW() - INTERVAL '48 hours'
+            ORDER BY bs.ts_signal DESC
+            LIMIT 30
+        """)
+        rows = cur.fetchall()
+        conn.close()
+
+        def _pct(v):
+            return f"{v*100:.1f}%" if v is not None else "—"
+        def _f(v, fmt=".2f"):
+            return f"{v:{fmt}}" if v is not None else "—"
+
+        bounce_rows = ""
+        for r in rows:
+            (ts, sym, bpct, drop, win, pq, dsc, hhi, tsf, rev, rlb, rbv, buyc,
+             abs_ev, status, pnl) = r
+
+            # Cobertura: verde se tem dados, vermelho se NULL
+            def cell(v, label=None, fmt=None):
+                if v is None:
+                    return "<td style='color:#a44'>—</td>"
+                txt = label or (f"{v:{fmt}}" if fmt else str(v))
+                return f"<td style='color:#2a2'>{txt}</td>"
+
+            pq_cell  = cell(pq,  f"{pq:.1f}◎"   if pq  else None)
+            hhi_cell = cell(hhi, f"{hhi:.3f}"     if hhi else None)
+            tsf_cell = cell(tsf, f"{tsf*100:.0f}%" if tsf else None)
+            bc_cell  = cell(buyc,f"{buyc:.3f}"    if buyc else None)
+            rev_cell = cell(rev, str(rev))
+
+            outcome = ""
+            if status == "tp":
+                outcome = f"<span style='color:#2a2'>TP {pnl*100:+.0f}%</span>" if pnl else "TP"
+            elif status in ("sl", "error"):
+                outcome = f"<span style='color:#a44'>SL {pnl*100:+.0f}%</span>" if pnl else "SL"
+            elif status:
+                outcome = status
+
+            bounce_rows += f"""<tr>
+              <td>{ts.strftime('%H:%M') if ts else '—'}</td>
+              <td><b>{sym or '?'}</b></td>
+              <td>{_pct(bpct)}</td>
+              <td style='color:{"#2a2" if win=="bottom" else "#fa0"}'>{win or '—'}</td>
+              {pq_cell}
+              <td>{dsc or '—'}</td>
+              {hhi_cell}
+              {tsf_cell}
+              {rev_cell}
+              {bc_cell}
+              <td>{outcome}</td>
+            </tr>"""
+
+        if not rows:
+            bounce_rows = "<tr><td colspan=11>Nenhum bounce nas últimas 48h</td></tr>"
+
+        # ── Seção 3: cobertura global dos novos campos ────────────────────
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT
+                COUNT(*) AS total,
+                COUNT(pool_quote_at_signal) AS n_h25,
+                COUNT(dump_seller_count) FILTER (WHERE dump_seller_count > 0) AS n_h24,
+                COUNT(dump_seller_hhi)   AS n_hhi,
+                COUNT(buy_concentration) AS n_h26,
+                COUNT(*) FILTER (WHERE h23_window = 'bottom') AS n_bottom,
+                COUNT(*) FILTER (WHERE ts_signal > NOW() - INTERVAL '24 hours') AS n_24h
+            FROM bounce_signals
+        """)
+        cov = cur.fetchone()
+        conn.close()
+
+        total, n_h25, n_h24, n_hhi, n_h26, n_bot, n_24h = cov
+        def pct_cov(n):
+            return f"{n}/{total} ({n*100//total if total else 0}%)"
+
+        html = f"""<!DOCTYPE html>
+<html><head><title>Microstructure Debug</title>
+<meta http-equiv='refresh' content='15'>
+<style>
+  body{{background:#111;color:#ddd;font-family:monospace;padding:20px}}
+  h2{{color:#fa0;margin-top:24px}}
+  table{{border-collapse:collapse;width:100%;margin-top:8px}}
+  th{{background:#222;color:#fa0;padding:6px 10px;text-align:left}}
+  td{{padding:5px 10px;border-bottom:1px solid #222}}
+  .ok{{color:#2a2}} .miss{{color:#a44}} .warn{{color:#fa0}}
+  .sep{{border-top:1px solid #333;margin:20px 0}}
+</style></head><body>
+<h1>Microstructure Debug — H24/H25/H26</h1>
+<p style='color:#888'>Auto-refresh 15s · {len(rows)} bounces nas últimas 48h · {len(active_mints) if helius else 0} tokens ativos</p>
+
+<div class='sep'></div>
+<h2>▸ 1. HeliusWS — Estado Live por Token</h2>
+<p style='color:#888'>Eventos com wallet = dados disponíveis para H24. Pool quote = H25.</p>
+<table>
+  <thead><tr>
+    <th>Mint</th><th>Eventos c/wallet</th><th>Buys/Sells</th><th>Pool Depth (H25)</th>
+  </tr></thead>
+  <tbody>{live_rows}</tbody>
+</table>
+
+<div class='sep'></div>
+<h2>▸ 2. Últimos 30 Bounces — Cobertura H24/H25/H26</h2>
+<p style='color:#888'>Verde = dado coletado · Vermelho = NULL · window=bottom = janela correta</p>
+<table>
+  <thead><tr>
+    <th>Hora</th><th>Token</th><th>Bounce</th><th>window</th>
+    <th>H25 pool◎</th><th>H24 sellers</th><th>HHI</th><th>Top seller</th>
+    <th>RISE evs</th><th>H26 buyconc</th><th>Outcome</th>
+  </tr></thead>
+  <tbody>{bounce_rows}</tbody>
+</table>
+
+<div class='sep'></div>
+<h2>▸ 3. Cobertura Global</h2>
+<table>
+  <thead><tr><th>Métrica</th><th>Cobertura</th><th>Interpretação</th></tr></thead>
+  <tbody>
+    <tr><td>Total bounce_signals</td><td>{total}</td><td></td></tr>
+    <tr><td>Últimas 24h</td><td>{n_24h}</td><td>taxa de novos bounces</td></tr>
+    <tr><td>H25 pool_quote_at_signal</td>
+        <td class='{"ok" if n_h25 > 0 else "miss"}'>{pct_cov(n_h25)}</td>
+        <td>Deve crescer com bounces novos post-deploy</td></tr>
+    <tr><td>H24 dump_seller_count > 0</td>
+        <td class='{"ok" if n_h24 > 0 else "miss"}'>{pct_cov(n_h24)}</td>
+        <td>Wallets identificados durante o dump</td></tr>
+    <tr><td>H24 dump_seller_hhi</td>
+        <td class='{"ok" if n_hhi > 0 else "miss"}'>{pct_cov(n_hhi)}</td>
+        <td>HHI calculado (requer ≥1 sell com wallet)</td></tr>
+    <tr><td>H26 buy_concentration</td>
+        <td class='{"ok" if n_h26 > 0 else "miss"}'>{pct_cov(n_h26)}</td>
+        <td>RISE window com ≥1 buy event</td></tr>
+    <tr><td>h23_window = bottom</td>
+        <td class='{"ok" if n_bot > 0 else "miss"}'>{pct_cov(n_bot)}</td>
+        <td>Janela correta (pós-fix do bug H23)</td></tr>
+  </tbody>
+</table>
+
+<p style='color:#555;margin-top:24px'>
+  H24 requer sells durante o dump com wallet parseable (≥184 bytes raw).<br>
+  H25 requer qualquer evento Anchor do pAMM.<br>
+  H26 requer pelo menos 1 buy na RISE window [ts_min → ts_signal].
+</p>
+</body></html>"""
+        return html
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
