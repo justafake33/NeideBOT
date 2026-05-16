@@ -11352,7 +11352,6 @@ def _debug_bounce_wr_inner():
                 bs.elapsed_sec / 60.0          AS elapsed_min,
                 bs.net_sol_flow,
                 bs.mc_at_signal,
-                bs.mc_bottom,
                 bs.absorption_events,
                 bs.absorption_buy_vol          AS buy_vol,
                 bs.absorption_sell_vol         AS sell_vol,
