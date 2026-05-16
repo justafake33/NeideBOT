@@ -26421,13 +26421,13 @@ def analise_sinal_puro():
                     m.cto_flag,
                     m.top10_holder_rate,
                     m.rat_trader_rate,
-                    MAX(tt.mc)                                     AS max_mc,
-                    MIN(tt.mc)                                     AS min_mc,
+                    MAX(COALESCE(tt.mc_high, tt.mc))               AS max_mc,
+                    MIN(COALESCE(tt.mc_low,  tt.mc))               AS min_mc,
                     COUNT(tt.id)                                   AS tick_count
                 FROM bounce_signals bs
                 JOIN token_ticks tt ON tt.mint = bs.mint
-                    AND tt.ts > bs.ts_signal
-                    AND tt.ts < bs.ts_signal + INTERVAL '20 minutes'
+                    AND tt.tick_ts > bs.ts_signal
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '20 minutes'
                 LEFT JOIN migrations m ON m.mint = bs.mint
                 WHERE bs.mc_min IS NOT NULL
                   AND bs.mc_min > 0
