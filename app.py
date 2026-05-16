@@ -26357,5 +26357,367 @@ def analise_bounce_faixas():
     return H
 
 
+# /analise/sinal-puro — qualidade real dos sinais medida pelo comportamento do token (não da carteira)
+@app.route("/analise/sinal-puro")
+def analise_sinal_puro():
+    """
+    Mede a qualidade de cada métrica usando o comportamento do TOKEN nos ticks após o sinal,
+    não o resultado da carteira (que é contaminado por SL/TP, filtros e regime de mercado).
+
+    Dataset primário: bounce_signals + token_ticks (20min após ts_signal)
+      - entry_mc = mc_min × 1.15
+      - tp_hit   = max_mc_after >= entry_mc × 1.75
+      - sl_hit   = min_mc_after <= entry_mc × 0.75
+      ⚠️ Cobertura ~12% dos bounces. Sem bias de carteira.
+
+    Dataset secundário: migrations.recovery (proxy 1h)
+      ⚠️ Limitações:
+        (a) Não monitoramos tokens abaixo de $5k MC
+        (b) Não sabemos se o token bateu nosso SL no meio do caminho antes de recuperar
+    """
+    TP_MULT  = 1.75   # +75%
+    SL_MULT  = 0.75   # -25%
+    ENTRY_MULT = 1.15 # entry = mc_min × 1.15
+    MIN_TICKS  = 3    # ticks mínimos após sinal para considerar o outcome
+
+    css = """
+    <style>
+    body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+    h2{color:#58a6ff}h3{color:#79c0ff;margin-top:28px}h4{color:#8b949e;margin-top:20px}
+    p.desc{color:#8b949e;margin:4px 0 12px 0;font-size:12px}
+    table{border-collapse:collapse;width:100%;margin-bottom:16px}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:right}
+    th:first-child,th:nth-child(2){text-align:left}
+    td{padding:5px 10px;border:1px solid #21262d;text-align:right;white-space:nowrap}
+    td:first-child,td:nth-child(2){text-align:left}
+    .tp{color:#3fb950}.sl{color:#f85149}.dim{color:#6e7681}
+    .pos{color:#3fb950;font-weight:bold}.neg{color:#f85149;font-weight:bold}
+    .hi{background:#1f3a1f}.lo{background:#2d1f1f}.neu{background:#1e1e1e}
+    .box{background:#161b22;border:1px solid #30363d;padding:12px 16px;margin-bottom:14px;border-radius:6px}
+    .warn{background:#2d1f00;border:1px solid #9a6700;padding:10px 14px;margin-bottom:10px;border-radius:4px;font-size:12px}
+    .section-primary{border-left:3px solid #3fb950;padding-left:10px}
+    .section-secondary{border-left:3px solid #f0e68c;padding-left:10px}
+    .tag-p{display:inline-block;background:#1f3a1f;color:#3fb950;padding:1px 6px;border-radius:3px;font-size:11px}
+    .tag-s{display:inline-block;background:#3a3a1f;color:#f0e68c;padding:1px 6px;border-radius:3px;font-size:11px}
+    </style>
+    """
+
+    # ── Dataset primário: bounce_signals + token_ticks ────────────────────────
+    with db._cursor() as cur:
+        cur.execute("""
+            WITH outcomes AS (
+                SELECT
+                    bs.mint,
+                    bs.bounce_pct,
+                    bs.drop_from_mig,
+                    bs.elapsed_sec / 60.0                          AS elapsed_min,
+                    bs.absorption_events,
+                    bs.mc_min,
+                    bs.mc_migration,
+                    bs.mc_min * %(entry)s                          AS entry_mc,
+                    m.smart_wallets,
+                    m.renowned_wallets,
+                    m.creator_token_status,
+                    m.cto_flag,
+                    m.top10_holder_rate,
+                    m.rat_trader_rate,
+                    MAX(tt.mc)                                     AS max_mc,
+                    MIN(tt.mc)                                     AS min_mc,
+                    COUNT(tt.id)                                   AS tick_count
+                FROM bounce_signals bs
+                JOIN token_ticks tt ON tt.mint = bs.mint
+                    AND tt.ts > bs.ts_signal
+                    AND tt.ts < bs.ts_signal + INTERVAL '20 minutes'
+                LEFT JOIN migrations m ON m.mint = bs.mint
+                WHERE bs.mc_min IS NOT NULL
+                  AND bs.mc_min > 0
+                  AND bs.bounce_pct IS NOT NULL
+                GROUP BY bs.mint, bs.bounce_pct, bs.drop_from_mig, bs.elapsed_sec,
+                         bs.absorption_events, bs.mc_min, bs.mc_migration,
+                         m.smart_wallets, m.renowned_wallets, m.creator_token_status,
+                         m.cto_flag, m.top10_holder_rate, m.rat_trader_rate
+                HAVING COUNT(tt.id) >= %(min_ticks)s
+            )
+            SELECT *,
+                (max_mc >= entry_mc * %(tp)s)  AS tp_hit,
+                (min_mc <= entry_mc * %(sl)s)  AS sl_hit
+            FROM outcomes
+            ORDER BY bounce_pct
+        """, {"entry": ENTRY_MULT, "tp": TP_MULT, "sl": SL_MULT, "min_ticks": MIN_TICKS})
+        primary = cur.fetchall()
+
+    # ── Dataset secundário: migrations.recovery ───────────────────────────────
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                m.mint,
+                m.recovery,
+                m.smart_wallets,
+                m.renowned_wallets,
+                m.creator_token_status,
+                m.cto_flag,
+                m.top10_holder_rate,
+                m.rat_trader_rate,
+                m.pct_drop,
+                m.time_to_bottom,
+                bs.bounce_pct,
+                bs.drop_from_mig,
+                bs.elapsed_sec / 60.0  AS elapsed_min,
+                bs.absorption_events
+            FROM migrations m
+            JOIN bounce_signals bs ON bs.mint = m.mint
+            WHERE m.recovery IS NOT NULL
+        """)
+        secondary = cur.fetchall()
+
+    n_primary   = len(primary)
+    tp_primary  = sum(1 for r in primary if r["tp_hit"])
+    sl_primary  = sum(1 for r in primary if r["sl_hit"])
+    wr_primary  = tp_primary / n_primary * 100 if n_primary else 0
+
+    n_sec       = len(secondary)
+    rec_sec     = sum(1 for r in secondary if r["recovery"])
+    rr_sec      = rec_sec / n_sec * 100 if n_sec else 0
+
+    # ── Função genérica de buckets ────────────────────────────────────────────
+    def bucket_analysis(rows, key_fn, buckets, outcome_fn, base_rate):
+        """
+        rows: lista de dicts
+        key_fn: função que extrai o valor da métrica
+        buckets: lista de (label, predicate_fn)
+        outcome_fn: função que retorna True se resultado positivo
+        base_rate: WR/RR do universo todo
+        """
+        results = []
+        for label, pred in buckets:
+            subset = [r for r in rows if r[key_fn] is not None and pred(r[key_fn])]
+            n  = len(subset)
+            tp = sum(1 for r in subset if outcome_fn(r))
+            wr = tp / n * 100 if n >= 3 else None
+            delta = (wr - base_rate) if wr is not None else None
+            results.append({"label": label, "n": n, "tp": tp, "wr": wr, "delta": delta})
+        return results
+
+    def render_metric(title, desc, p_results, s_results):
+        H = f"<h4>{title}</h4>"
+        H += f"<p class='desc'>{desc}</p>"
+        H += "<table>"
+        H += ("<tr><th>Faixa</th>"
+              "<th colspan='3'><span class='tag-p'>Primário — ticks reais (TP/SL exato)</span></th>"
+              "<th colspan='3'><span class='tag-s'>Secundário — recovery 1h ⚠️</span></th></tr>")
+        H += "<tr><th></th><th>n</th><th>WR</th><th>vs base</th><th>n</th><th>Rec%</th><th>vs base</th></tr>"
+
+        for pr, sr in zip(p_results, s_results):
+            wr_s = (f"<span class='{'pos' if pr['wr'] and pr['wr']>=25 else 'neg'}'>{pr['wr']:.0f}%</span>"
+                    if pr["wr"] is not None else f"<span class='dim'>— (n={pr['n']})</span>")
+            dp_s = (f"<span class='{'pos' if pr['delta'] and pr['delta']>0 else 'neg'}'>{pr['delta']:+.0f}pp</span>"
+                    if pr["delta"] is not None else "—")
+            rr_s = (f"{sr['wr']:.0f}%" if sr["wr"] is not None else f"<span class='dim'>— (n={sr['n']})</span>")
+            ds_s = (f"<span class='{'pos' if sr['delta'] and sr['delta']>0 else 'neg'}'>{sr['delta']:+.0f}pp</span>"
+                    if sr["delta"] is not None else "—")
+            cls = ""
+            if pr["delta"] and pr["delta"] >= 10: cls = " class='hi'"
+            elif pr["delta"] and pr["delta"] <= -10: cls = " class='lo'"
+            H += f"<tr{cls}><td>{pr['label']}</td>"
+            H += f"<td>{pr['n']}</td><td>{wr_s}</td><td>{dp_s}</td>"
+            H += f"<td>{sr['n']}</td><td>{rr_s}</td><td>{ds_s}</td></tr>"
+        H += "</table>"
+        return H
+
+    # ── Definição das métricas e seus buckets ─────────────────────────────────
+
+    METRICAS = [
+        {
+            "title": "Bounce % (faixa do sinal)",
+            "desc":  "Quanto o token subiu do fundo até o momento do sinal. "
+                     "Medido em bounce_pct (0.55 = 55%).",
+            "key":   "bounce_pct",
+            "buckets": [
+                ("< 40%",    lambda v: v < 0.40),
+                ("40–55%",   lambda v: 0.40 <= v < 0.55),
+                ("55–65%",   lambda v: 0.55 <= v < 0.65),
+                ("65–80%",   lambda v: 0.65 <= v < 0.80),
+                ("80–100%",  lambda v: 0.80 <= v < 1.00),
+                ("> 100%",   lambda v: v >= 1.00),
+            ],
+        },
+        {
+            "title": "Queda desde a migração (drop_from_mig)",
+            "desc":  "Quanto o token caiu do MC de migração (~$37k) até o fundo. "
+                     "0.50 = caiu 50% desde a migração.",
+            "key":   "drop_from_mig",
+            "buckets": [
+                ("< 30%",    lambda v: v < 0.30),
+                ("30–40%",   lambda v: 0.30 <= v < 0.40),
+                ("40–50%",   lambda v: 0.40 <= v < 0.50),
+                ("50–60%",   lambda v: 0.50 <= v < 0.60),
+                ("60–70%",   lambda v: 0.60 <= v < 0.70),
+                ("> 70%",    lambda v: v >= 0.70),
+            ],
+        },
+        {
+            "title": "Tempo da migração até o sinal (elapsed_min)",
+            "desc":  "Minutos entre o token migrar e o sinal de bounce disparar. "
+                     "Sinal muito precoce pega tokens ainda em queda. Muito tardio = fundo velho.",
+            "key":   "elapsed_min",
+            "buckets": [
+                ("0–3 min",   lambda v: v < 3.0),
+                ("3–6 min",   lambda v: 3.0 <= v < 6.0),
+                ("6–10 min",  lambda v: 6.0 <= v < 10.0),
+                ("10–15 min", lambda v: 10.0 <= v < 15.0),
+                ("15–20 min", lambda v: 15.0 <= v < 20.0),
+            ],
+        },
+        {
+            "title": "Smart wallets (contagem)",
+            "desc":  "Número de smart wallets que tinham posição no token no momento da migração. "
+                     "Snapshot — não indica compra ativa.",
+            "key":   "smart_wallets",
+            "buckets": [
+                ("0–2",  lambda v: v < 3),
+                ("3–5",  lambda v: 3 <= v < 6),
+                ("6–10", lambda v: 6 <= v < 11),
+                ("> 10", lambda v: v >= 11),
+            ],
+        },
+        {
+            "title": "KOL wallets (renowned)",
+            "desc":  "Número de wallets KOL (influenciadores) com posição no token.",
+            "key":   "renowned_wallets",
+            "buckets": [
+                ("0",    lambda v: v == 0),
+                ("1",    lambda v: v == 1),
+                ("2–3",  lambda v: 2 <= v <= 3),
+                ("> 3",  lambda v: v > 3),
+            ],
+        },
+        {
+            "title": "Top 10 holders (concentração)",
+            "desc":  "% do supply que os 10 maiores holders concentram. "
+                     "Alto = risco de dump coordenado.",
+            "key":   "top10_holder_rate",
+            "buckets": [
+                ("< 40%",   lambda v: v < 0.40),
+                ("40–55%",  lambda v: 0.40 <= v < 0.55),
+                ("55–70%",  lambda v: 0.55 <= v < 0.70),
+                ("70–80%",  lambda v: 0.70 <= v < 0.80),
+                ("> 80%",   lambda v: v >= 0.80),
+            ],
+        },
+        {
+            "title": "Status do dev (creator_token_status)",
+            "desc":  "Se o desenvolvedor ainda segura tokens ou já vendeu tudo.",
+            "key":   "creator_token_status",
+            "buckets": [
+                ("Dev saiu (creator_close)", lambda v: v == "creator_close"),
+                ("Dev segura (creator_hold)", lambda v: v == "creator_hold"),
+            ],
+        },
+        {
+            "title": "CTO (comunidade assumiu)",
+            "desc":  "Se a comunidade assumiu o projeto após o dev sair.",
+            "key":   "cto_flag",
+            "buckets": [
+                ("CTO = sim", lambda v: v == 1),
+                ("CTO = não", lambda v: v != 1),
+            ],
+        },
+        {
+            "title": "Absorção Helius (eventos no momento do sinal)",
+            "desc":  "Transações buy/sell detectadas pelo Helius nos 60s antes do sinal. "
+                     "Disponível apenas para bounces recentes (pós-2026-05-12).",
+            "key":   "absorption_events",
+            "buckets": [
+                ("0 eventos",    lambda v: v is None or v == 0),
+                ("1–50",         lambda v: v and 1 <= v <= 50),
+                ("51–150",       lambda v: v and 51 <= v <= 150),
+                ("> 150",        lambda v: v and v > 150),
+            ],
+        },
+    ]
+
+    # ── Monta os resultados ───────────────────────────────────────────────────
+    H = f"<!DOCTYPE html><html><head><title>Sinal Puro</title>{css}</head><body>"
+    H += "<h2>🧪 Qualidade Real dos Sinais — Token vs Carteira</h2>"
+
+    H += f"<div class='box'>"
+    H += f"<b>Dataset primário (ticks reais):</b> {n_primary} bounces com ≥{MIN_TICKS} ticks nos 20min seguintes | "
+    H += f"{tp_primary} TP teórico (+75%) | {sl_primary} SL teórico (-25%) | WR base: <b>{wr_primary:.1f}%</b><br>"
+    H += f"<b>Dataset secundário (recovery 1h):</b> {n_sec} bounces com recovery definido | "
+    H += f"{rec_sec} recovery=TRUE | Taxa base: <b>{rr_sec:.1f}%</b>"
+    H += f"</div>"
+
+    H += f"<div class='warn'>"
+    H += f"⚠️ <b>Limitações do dataset secundário (recovery 1h):</b><br>"
+    H += f"(a) Não monitoramos tokens abaixo de $5k MC — excluídos da análise.<br>"
+    H += f"(b) <b>Não sabemos se o token bateu nosso SL de 25% no meio do caminho antes de recuperar.</b> "
+    H += f"Recovery=TRUE não significa que nossa estratégia teria sido lucrativa — "
+    H += f"o token pode ter caído -25% primeiro, acionado o SL, e só depois subido. "
+    H += f"Use o primário como referência principal."
+    H += f"</div>"
+
+    H += "<div class='section-primary'>"
+    H += "<p style='color:#3fb950;margin:4px 0 16px 0'><b>🟢 Dataset primário</b> — "
+    H += "comportamento real do token nos 20min pós-sinal. "
+    H += "Entry = mc_min × 1.15 | TP = +75% | SL = -25% | Break-even: ~25%</p>"
+    H += "</div>"
+
+    for m in METRICAS:
+        key = m["key"]
+
+        def make_pred(pred_fn):
+            def _fn(r):
+                v = r.get(key)
+                if v is None: return False
+                try: return pred_fn(v)
+                except: return False
+            return _fn
+
+        p_results = []
+        s_results = []
+        for label, pred in m["buckets"]:
+            # Primário
+            p_sub = [r for r in primary if make_pred(pred)(r)]
+            pn = len(p_sub)
+            ptp = sum(1 for r in p_sub if r["tp_hit"])
+            pwr = ptp / pn * 100 if pn >= 3 else None
+            p_results.append({"label": label, "n": pn, "tp": ptp, "wr": pwr,
+                               "delta": (pwr - wr_primary) if pwr is not None else None})
+            # Secundário
+            s_sub = [r for r in secondary if make_pred(pred)(r)]
+            sn = len(s_sub)
+            srec = sum(1 for r in s_sub if r["recovery"])
+            srr = srec / sn * 100 if sn >= 3 else None
+            s_results.append({"label": label, "n": sn, "tp": srec, "wr": srr,
+                               "delta": (srr - rr_sec) if srr is not None else None})
+
+        H += render_metric(m["title"], m["desc"], p_results, s_results)
+
+    # Tabela de cobertura
+    H += "<h3>📊 Cobertura do dataset primário por faixa de bounce</h3>"
+    H += "<p class='desc'>Quantos bounces têm ticks suficientes para o dataset primário, por faixa.</p>"
+    H += "<table><tr><th>Faixa bounce</th><th>Total bounces</th><th>Com ticks ≥3</th><th>Cobertura</th><th>TP hit</th><th>WR primário</th></tr>"
+
+    with db._cursor() as cur:
+        cur.execute("SELECT bounce_pct FROM bounce_signals WHERE bounce_pct IS NOT NULL")
+        all_bs = [r["bounce_pct"] for r in cur.fetchall()]
+
+    bs_buckets = [("< 40%", 0, 0.40), ("40–55%", 0.40, 0.55), ("55–65%", 0.55, 0.65),
+                  ("65–80%", 0.65, 0.80), ("80–100%", 0.80, 1.00), ("> 100%", 1.00, 99)]
+    for label, lo, hi in bs_buckets:
+        total  = sum(1 for v in all_bs if lo <= v < hi)
+        p_sub  = [r for r in primary if lo <= (r["bounce_pct"] or 0) < hi]
+        pn     = len(p_sub)
+        ptp    = sum(1 for r in p_sub if r["tp_hit"])
+        cov    = f"{pn/total*100:.0f}%" if total else "—"
+        pwr_s  = (f"<span class='{'pos' if pn>=3 and ptp/pn>=0.25 else 'neg'}'>{ptp/pn*100:.0f}%</span>"
+                  if pn >= 3 else f"<span class='dim'>— (n={pn})</span>")
+        H += f"<tr><td>{label}</td><td>{total}</td><td>{pn}</td><td>{cov}</td><td>{ptp}</td><td>{pwr_s}</td></tr>"
+    H += "</table>"
+
+    H += "</body></html>"
+    return H
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
