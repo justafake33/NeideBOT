@@ -26158,5 +26158,204 @@ def analise_intersecao():
     return H
 
 
+# /analise/bounce-faixas — WR por faixa de bounce_pct (histórico vs recentes)
+@app.route("/analise/bounce-faixas")
+def analise_bounce_faixas():
+    """
+    Compara o Win Rate em cada faixa de bounce_pct.
+    Mostra histórico completo vs período recente (#338+) lado a lado.
+    """
+    css = """
+    <style>
+    body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+    h2{color:#58a6ff}h3{color:#79c0ff;margin-top:28px}
+    p.desc{color:#8b949e;margin:4px 0 12px 0;font-size:12px}
+    table{border-collapse:collapse;width:100%;margin-bottom:16px}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:right}
+    th:first-child{text-align:left}
+    td{padding:5px 10px;border:1px solid #21262d;text-align:right;white-space:nowrap}
+    td:first-child{text-align:left}
+    .tp{color:#3fb950}.sl{color:#f85149}.dim{color:#6e7681}
+    .pos{color:#3fb950;font-weight:bold}.neg{color:#f85149;font-weight:bold}
+    .hi{background:#1f3a1f}.lo{background:#2d1f1f}.cur{background:#1a2030}
+    .box{background:#161b22;border:1px solid #30363d;padding:12px 16px;margin-bottom:14px;border-radius:6px}
+    .bar-wrap{display:inline-block;vertical-align:middle;width:120px;background:#21262d;height:10px;border-radius:3px;margin-left:6px}
+    .bar{display:inline-block;height:10px;border-radius:3px;background:#3fb950;vertical-align:top}
+    .bar-be{display:inline-block;position:relative;height:10px;width:1px;background:#f0e68c;vertical-align:top}
+    .arrow{color:#f0e68c;font-size:10px}
+    </style>
+    """
+
+    BUCKETS = [
+        ("< 30%",   0.00, 0.30),
+        ("30–40%",  0.30, 0.40),
+        ("40–55%",  0.40, 0.55),
+        ("55–60%",  0.55, 0.60),
+        ("60–65%",  0.60, 0.65),
+        ("65–70%",  0.65, 0.70),
+        ("70–80%",  0.70, 0.80),
+        ("80–100%", 0.80, 1.00),
+        ("> 100%",  1.00, 99.0),
+    ]
+    ATUAL = (0.30, 0.55)  # faixa do bot atual (BOUNCE_MIN_PCT=0.30, mas A.7 e mortos na prática ficam aqui)
+    ATUAL_LABEL = "55%"   # onde estamos hoje
+
+    def bucket_stats(rows):
+        result = []
+        for label, lo, hi in BUCKETS:
+            subset = [r for r in rows if r["bounce_pct"] and lo <= r["bounce_pct"] < hi]
+            n  = len(subset)
+            tp = sum(1 for r in subset if r["status"] in ("tp", "trailing_active"))
+            wr = tp / n * 100 if n >= 3 else None
+            result.append({"label": label, "n": n, "tp": tp, "wr": wr, "lo": lo, "hi": hi})
+        return result
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT t.id, t.symbol, t.status, bs.bounce_pct
+            FROM trades t
+            JOIN bounce_signals bs ON t.mint = bs.mint
+            WHERE t.status IN ('tp','sl','trailing_active')
+              AND bs.bounce_pct IS NOT NULL
+            ORDER BY t.id
+        """)
+        all_rows = cur.fetchall()
+
+    recentes = [r for r in all_rows if r["id"] >= 338]
+    historico = all_rows
+
+    stats_rec = bucket_stats(recentes)
+    stats_his = bucket_stats(historico)
+
+    n_rec = len(recentes)
+    tp_rec = sum(1 for r in recentes if r["status"] in ("tp", "trailing_active"))
+    wr_rec = tp_rec / n_rec * 100 if n_rec else 0
+
+    n_his = len(historico)
+    tp_his = sum(1 for r in historico if r["status"] in ("tp", "trailing_active"))
+    wr_his = tp_his / n_his * 100 if n_his else 0
+
+    BREAK_EVEN = 25.0  # SL=25%, TP=75%
+
+    H = f"<!DOCTYPE html><html><head><title>Bounce por Faixa</title>{css}</head><body>"
+    H += "<h2>📊 Win Rate por Faixa de Bounce</h2>"
+    H += f"<div class='box'>"
+    H += f"<b>Recentes (#338+):</b> {n_rec} trades | {tp_rec} TP | {wr_rec:.1f}% WR &nbsp;&nbsp;"
+    H += f"<b>Histórico completo:</b> {n_his} trades | {tp_his} TP | {wr_his:.1f}% WR<br>"
+    H += f"<span style='color:#8b949e;font-size:12px'>Break-even com SL=25%/TP=75%: ~25% &nbsp;|&nbsp; "
+    H += f"Bounce atual do bot: BOUNCE_MIN_PCT=0.30 — sinais em produção chegam em torno de 55–70%</span>"
+    H += f"</div>"
+
+    H += "<h3>🔍 Comparação por faixa de bounce</h3>"
+    H += "<p class='desc'>Cada linha é uma faixa de bounce_pct. A coluna 'Recentes' é o período de 29% WR (#338+). "
+    H += "A barra mostra o WR visualmente — a linha amarela é o break-even de 25%.</p>"
+
+    H += "<table>"
+    H += "<tr>"
+    H += "<th>Faixa de bounce</th>"
+    H += "<th>Recentes: n</th><th>TP/SL</th><th>WR</th><th style='min-width:160px'>Barra</th>"
+    H += "<th>Histórico: n</th><th>TP/SL</th><th>WR</th><th style='min-width:160px'>Barra</th>"
+    H += "</tr>"
+
+    def wr_bar(wr, be=BREAK_EVEN, max_wr=80):
+        if wr is None:
+            return "<span class='dim'>n insuf.</span>"
+        pct_bar = min(wr / max_wr * 100, 100)
+        pct_be  = min(be / max_wr * 100, 100)
+        color = "#3fb950" if wr >= be else "#f85149"
+        return (f"<div class='bar-wrap'>"
+                f"<div class='bar' style='width:{pct_bar:.0f}%;background:{color}'></div>"
+                f"</div>"
+                f"<span style='color:#f0e68c;font-size:10px;margin-left:2px'>|{be:.0f}%</span>")
+
+    def wr_fmt(stats):
+        if stats["wr"] is None:
+            return f"<span class='dim'>— (n={stats['n']})</span>"
+        col = "pos" if stats["wr"] >= BREAK_EVEN else "neg"
+        return f"<span class='{col}'>{stats['wr']:.0f}%</span>"
+
+    for sr, sh in zip(stats_rec, stats_his):
+        # Destaca a faixa onde o bot está agora
+        is_current = (sr["lo"] <= 0.55 < sr["hi"]) or (sr["lo"] == 0.55)
+        row_cls = " class='cur'" if is_current else (
+            " class='hi'" if (sr["wr"] and sr["wr"] >= BREAK_EVEN) or (sh["wr"] and sh["wr"] >= BREAK_EVEN) else ""
+        )
+        marker = " ← <span class='arrow'>bot hoje</span>" if is_current else ""
+
+        tp_sl_r = f"<span class='tp'>{sr['tp']}TP</span>/<span class='sl'>{sr['n']-sr['tp']}SL</span>" if sr["n"] else "—"
+        tp_sl_h = f"<span class='tp'>{sh['tp']}TP</span>/<span class='sl'>{sh['n']-sh['tp']}SL</span>" if sh["n"] else "—"
+
+        H += f"<tr{row_cls}>"
+        H += f"<td><b>{sr['label']}</b>{marker}</td>"
+        H += f"<td>{sr['n']}</td><td>{tp_sl_r}</td><td>{wr_fmt(sr)}</td><td>{wr_bar(sr['wr'])}</td>"
+        H += f"<td>{sh['n']}</td><td>{tp_sl_h}</td><td>{wr_fmt(sh)}</td><td>{wr_bar(sh['wr'])}</td>"
+        H += "</tr>"
+
+    H += "</table>"
+
+    # Tabela de acumulação: "se o bot exigisse bounce ≥ X%, qual seria o WR?"
+    H += "<h3>🎯 Simulação: e se exigíssemos bounce mínimo de X%?</h3>"
+    H += "<p class='desc'>Mostra quantos trades restam e qual seria o WR se só aceitássemos bounces acima de cada threshold. "
+    H += "Trades excluídos ficam de fora — trade perdido, mas não dinheiro perdido.</p>"
+
+    THRESHOLDS = [0.30, 0.40, 0.50, 0.55, 0.60, 0.65, 0.70, 0.80, 1.00]
+
+    H += "<table>"
+    H += "<tr><th>Bounce mínimo</th>"
+    H += "<th>Recentes: trades</th><th>TP</th><th>WR</th><th>vs base rec.</th>"
+    H += "<th>Histórico: trades</th><th>TP</th><th>WR</th><th>vs base hist.</th>"
+    H += "</tr>"
+
+    for thr in THRESHOLDS:
+        sub_r = [r for r in recentes  if r["bounce_pct"] and r["bounce_pct"] >= thr]
+        sub_h = [r for r in historico if r["bounce_pct"] and r["bounce_pct"] >= thr]
+        nr = len(sub_r); tpr = sum(1 for r in sub_r if r["status"] in ("tp","trailing_active"))
+        nh = len(sub_h); tph = sum(1 for r in sub_h if r["status"] in ("tp","trailing_active"))
+        wrr = tpr/nr*100 if nr >= 3 else None
+        wrh = tph/nh*100 if nh >= 3 else None
+        dr  = (wrr - wr_rec)  if wrr else None
+        dh  = (wrh - wr_his)  if wrh else None
+
+        is_cur = abs(thr - 0.55) < 0.001
+        row_cls = " class='cur'" if is_cur else (
+            " class='hi'" if (wrr and wrr >= BREAK_EVEN) or (wrh and wrh >= BREAK_EVEN) else ""
+        )
+        marker = " ← hoje" if is_cur else ""
+
+        wrr_s = f"<span class='{'pos' if wrr and wrr>=BREAK_EVEN else 'neg'}'>{wrr:.0f}%</span>" if wrr else f"<span class='dim'>—</span>"
+        wrh_s = f"<span class='{'pos' if wrh and wrh>=BREAK_EVEN else 'neg'}'>{wrh:.0f}%</span>" if wrh else f"<span class='dim'>—</span>"
+        dr_s  = f"<span class='{'pos' if dr and dr>0 else 'neg'}'>{dr:+.0f}pp</span>" if dr else "—"
+        dh_s  = f"<span class='{'pos' if dh and dh>0 else 'neg'}'>{dh:+.0f}pp</span>" if dh else "—"
+
+        H += f"<tr{row_cls}><td><b>≥ {int(thr*100)}%{marker}</b></td>"
+        H += f"<td>{nr}</td><td class='tp'>{tpr}</td><td>{wrr_s}</td><td>{dr_s}</td>"
+        H += f"<td>{nh}</td><td class='tp'>{tph}</td><td>{wrh_s}</td><td>{dh_s}</td>"
+        H += "</tr>"
+
+    H += "</table>"
+
+    # Tabela detalhada: todos os trades com seu bounce_pct
+    H += "<h3>📋 Todos os trades — bounce_pct real (recentes #338+)</h3>"
+    H += "<p class='desc'>Ordenado por bounce_pct decrescente. Mostra onde cada TP/SL caiu.</p>"
+    H += "<table><tr><th>#</th><th>Token</th><th>Resultado</th><th>Bounce</th><th>Barra</th></tr>"
+
+    recentes_sorted = sorted(recentes, key=lambda r: r["bounce_pct"] or 0, reverse=True)
+    for r in recentes_sorted:
+        bp = r["bounce_pct"]
+        bp_s = f"{bp*100:.1f}%" if bp else "—"
+        st = "<span class='tp'>✓ TP</span>" if r["status"] in ("tp","trailing_active") else "<span class='sl'>✗ SL</span>"
+        bar_w = min(int((bp or 0) / 2.0 * 100), 100)
+        color = "#3fb950" if r["status"] in ("tp","trailing_active") else "#f85149"
+        bar = f"<div class='bar-wrap'><div class='bar' style='width:{bar_w}%;background:{color}'></div></div>"
+        is_cur_row = bp and 0.55 <= bp < 0.70
+        row_cls = " class='cur'" if is_cur_row else ""
+        sym = r["symbol"] or str(r["id"])
+        H += f"<tr{row_cls}><td>{r['id']}</td><td><b>{sym}</b></td><td>{st}</td><td><b>{bp_s}</b></td><td>{bar}</td></tr>"
+    H += "</table>"
+
+    H += "</body></html>"
+    return H
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
