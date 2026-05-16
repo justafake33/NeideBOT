@@ -11165,6 +11165,166 @@ def debug_absorption():
         return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
+@app.route("/debug/h23-wr")
+def debug_h23_wr():
+    """WR por faixa de H23 net_sol_flow — trades #338+ (helius_sell_recovery)."""
+    from_id = int(request.args.get("from_id", 338))
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                CASE
+                    WHEN bs.net_sol_flow IS NULL    THEN 'sem H23'
+                    WHEN bs.net_sol_flow < 0        THEN 'negativo  (< 0)'
+                    WHEN bs.net_sol_flow < 1        THEN 'fraco     (0–1)'
+                    WHEN bs.net_sol_flow < 3        THEN 'sweet     (1–3)'
+                    WHEN bs.net_sol_flow < 10       THEN 'bom       (3–10)'
+                    ELSE                                 'alto      (> 10)'
+                END                     AS bucket,
+                t.id, t.symbol, t.status,
+                t.pnl_pct_real,
+                bs.net_sol_flow,
+                bs.bounce_pct,
+                bs.elapsed_sec / 60.0  AS elapsed_min
+            FROM trades t
+            JOIN bounce_signals bs ON bs.mint = t.mint
+            WHERE t.id >= %(from_id)s
+              AND t.exit_type = 'helius_sell_recovery'
+              AND t.status IN ('tp', 'sl')
+            ORDER BY bs.net_sol_flow NULLS FIRST, t.id
+        """, {"from_id": from_id})
+        rows = cur.fetchall()
+
+    if not rows:
+        return f"<pre>Nenhum trade helius_sell_recovery encontrado a partir do #{from_id}</pre>"
+
+    ORDER = ['sem H23', 'negativo  (< 0)', 'fraco     (0–1)',
+             'sweet     (1–3)', 'bom       (3–10)', 'alto      (> 10)']
+
+    from collections import defaultdict
+    buckets = defaultdict(list)
+    for r in rows:
+        buckets[r['bucket']].append(r)
+
+    n_total = len(rows)
+    tp_total = sum(1 for r in rows if r['status'] == 'tp')
+    wr_base  = tp_total / n_total * 100
+
+    css = """<style>
+    body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+    h2{color:#58a6ff}h3{color:#79c0ff;margin-top:24px}
+    table{border-collapse:collapse;width:100%;margin-bottom:16px}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:right}
+    th:first-child{text-align:left}
+    td{padding:5px 10px;border:1px solid #21262d;text-align:right}
+    td:first-child{text-align:left}
+    .tp{color:#3fb950;font-weight:bold}.sl{color:#f85149}
+    .pos{color:#3fb950;font-weight:bold}.neg{color:#f85149;font-weight:bold}
+    .hi{background:#1f3a1f}.lo{background:#2d1f1f}
+    .box{background:#161b22;border:1px solid #30363d;padding:12px 16px;margin-bottom:14px;border-radius:6px}
+    .dim{color:#6e7681}
+    </style>"""
+
+    H = f"<!DOCTYPE html><html><head><title>H23 WR</title>{css}</head><body>"
+    H += f"<h2>🔬 H23 net_sol_flow — WR por faixa (trades #{from_id}+)</h2>"
+    H += (f"<div class='box'><b>Total:</b> {n_total} trades | {tp_total} TP | {n_total-tp_total} SL | "
+          f"WR base: <b>{wr_base:.1f}%</b> &nbsp; Break-even: 25%<br>"
+          f"<span style='color:#8b949e;font-size:12px'>Apenas trades com exit_type=helius_sell_recovery (blockchain verificado)</span></div>")
+
+    # ── Tabela por bucket ─────────────────────────────────────────────────────
+    H += "<h3>📊 WR por faixa de net_sol_flow</h3>"
+    H += ("<table><tr><th>Faixa H23</th><th>n</th><th>TP</th><th>SL</th>"
+          "<th>WR</th><th>vs base</th><th>EV/trade</th></tr>")
+    for b in ORDER:
+        rs = buckets.get(b, [])
+        n  = len(rs)
+        tp = sum(1 for r in rs if r['status'] == 'tp')
+        sl = n - tp
+        wr = tp / n * 100 if n else 0
+        ev = wr/100 * 0.75 - (1 - wr/100) * 0.25 if n else 0
+        delta = wr - wr_base
+        wr_s  = (f"<span class='{'pos' if wr>=25 else 'neg'}'>{wr:.1f}%</span>"
+                 if n >= 3 else f"<span class='dim'>— (n={n})</span>")
+        dlt_s = (f"<span class='{'pos' if delta>0 else 'neg'}'>{delta:+.1f}pp</span>"
+                 if n >= 3 else "—")
+        ev_s  = (f"<span class='{'pos' if ev>0 else 'neg'}'>{ev:+.1%}</span>"
+                 if n >= 3 else "—")
+        cls   = " class='hi'" if (n>=3 and delta>=10) else " class='lo'" if (n>=3 and delta<=-10) else ""
+        H += (f"<tr{cls}><td><b>{b}</b></td><td>{n}</td>"
+              f"<td class='tp'>{tp}</td><td class='sl'>{sl}</td>"
+              f"<td>{wr_s}</td><td>{dlt_s}</td><td>{ev_s}</td></tr>")
+    H += f"<tr style='border-top:2px solid #30363d'><td><b>TOTAL</b></td><td>{n_total}</td>"
+    H += (f"<td class='tp'>{tp_total}</td><td class='sl'>{n_total-tp_total}</td>"
+          f"<td><b>{wr_base:.1f}%</b></td><td>base</td>"
+          f"<td><span class='{'pos' if wr_base>=25 else 'neg'}'>"
+          f"{wr_base/100*0.75-(1-wr_base/100)*0.25:+.1%}</span></td></tr>")
+    H += "</table>"
+
+    # ── Split binário: H23 ≥ 1 vs resto ──────────────────────────────────────
+    H += "<h3>⚡ Split binário: H23 ≥ 1 SOL vs o resto</h3>"
+    H += ("<table><tr><th>Grupo</th><th>n</th><th>TP</th><th>SL</th>"
+          "<th>WR</th><th>vs base</th><th>EV/trade</th><th>EV total (vs base)</th></tr>")
+    yes = [r for r in rows if r['net_sol_flow'] is not None and r['net_sol_flow'] >= 1.0]
+    no  = [r for r in rows if r['net_sol_flow'] is None or r['net_sol_flow'] < 1.0]
+    for label, rs, cls_ in [
+        ("H23 ≥ 1 SOL (PASSA)", yes, "hi"),
+        ("H23 < 1 ou sem dados (FALHA)", no, "lo"),
+    ]:
+        n  = len(rs); tp = sum(1 for r in rs if r['status'] == 'tp')
+        wr = tp / n * 100 if n else 0
+        ev = wr/100 * 0.75 - (1-wr/100) * 0.25 if n else 0
+        ev_base = wr_base/100 * 0.75 - (1-wr_base/100) * 0.25
+        delta = wr - wr_base
+        ev_total = n * ev  # relative to base
+        ev_base_total = n * ev_base
+        wr_s = (f"<span class='{'pos' if wr>=25 else 'neg'}'>{wr:.1f}%</span>"
+                if n >= 3 else f"<span class='dim'>— (n={n})</span>")
+        dlt_s = (f"<span class='{'pos' if delta>0 else 'neg'}'>{delta:+.1f}pp</span>" if n>=3 else "—")
+        ev_s  = f"<span class='{'pos' if ev>0 else 'neg'}'>{ev:+.1%}</span>" if n>=3 else "—"
+        ev_tot_s = f"<span class='{'pos' if ev_total>ev_base_total else 'neg'}'>{ev_total:+.2f} vs {ev_base_total:+.2f}</span>" if n>=3 else "—"
+        H += (f"<tr class='{cls_}'><td><b>{label}</b></td><td>{n}</td>"
+              f"<td class='tp'>{tp}</td><td class='sl'>{n-tp}</td>"
+              f"<td>{wr_s}</td><td>{dlt_s}</td><td>{ev_s}</td><td>{ev_tot_s}</td></tr>")
+    H += "</table>"
+
+    # ── Lista de TPs ──────────────────────────────────────────────────────────
+    H += "<h3>✓ Lista de TPs — onde estava o H23?</h3>"
+    H += ("<table><tr><th>#</th><th>Token</th><th>net_flow</th>"
+          "<th>bounce%</th><th>elapsed</th><th>P&L</th></tr>")
+    for r in rows:
+        if r['status'] != 'tp': continue
+        nf = r['net_sol_flow']
+        nf_s = (f"<span class='{'pos' if nf and nf>=1 else 'neg'}'>{nf:+.2f}◎</span>"
+                if nf is not None else "<span class='dim'>—</span>")
+        bp = f"{r['bounce_pct']*100:.0f}%" if r['bounce_pct'] else "—"
+        el = f"{r['elapsed_min']:.1f}m" if r['elapsed_min'] else "—"
+        pnl = r['pnl_pct_real']
+        pnl_s = f"{pnl:+.1f}%" if pnl else "—"
+        H += (f"<tr class='hi'><td>{r['id']}</td><td><b>{r['symbol'] or ''}</b></td>"
+              f"<td>{nf_s}</td><td>{bp}</td><td>{el}</td><td class='tp'>{pnl_s}</td></tr>")
+    H += "</table>"
+
+    # ── Lista de SLs com H23 ≥ 1 (os "falsos positivos") ────────────────────
+    sl_h23 = [r for r in rows if r['status']=='sl' and r['net_sol_flow'] is not None and r['net_sol_flow']>=1.0]
+    H += f"<h3>✗ SLs com H23 ≥ 1 SOL — o que errou? ({len(sl_h23)} trades)</h3>"
+    H += ("<table><tr><th>#</th><th>Token</th><th>net_flow</th>"
+          "<th>bounce%</th><th>elapsed</th><th>P&L</th></tr>")
+    for r in sl_h23:
+        nf = r['net_sol_flow']
+        nf_s = f"{nf:+.2f}◎"
+        bp = f"{r['bounce_pct']*100:.0f}%" if r['bounce_pct'] else "—"
+        el = f"{r['elapsed_min']:.1f}m" if r['elapsed_min'] else "—"
+        pnl = r['pnl_pct_real']
+        pnl_s = f"{pnl:+.1f}%" if pnl else "—"
+        H += (f"<tr class='lo'><td>{r['id']}</td><td><b>{r['symbol'] or ''}</b></td>"
+              f"<td><span class='pos'>{nf_s}</span></td><td>{bp}</td><td>{el}</td>"
+              f"<td class='sl'>{pnl_s}</td></tr>")
+    H += "</table>"
+
+    H += "</body></html>"
+    return H
+
+
 @app.route("/debug/h23")
 def debug_h23():
     """H23 — Verificação pré-deploy de net_sol_flow.
