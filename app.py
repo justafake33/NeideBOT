@@ -10921,6 +10921,7 @@ def debug_absorption():
                 lrg_buy  = w.get("largest_buy",  0) or 0
                 ratio    = buy_vol / sell_vol if sell_vol > 0 else None
                 conc     = lrg_buy / buy_vol if buy_vol > 0 else None
+                net_flow = buy_vol - sell_vol if total > 0 else None
                 event_cls = "ok" if total >= 5 else ("warn" if total >= 1 else "bad")
                 ratio_cls = "ok" if (ratio and ratio >= 1.0) else "bad"
                 # H22 só captura pump.fun pAMM — Raydium/Meteora/outros = sem dados
@@ -10942,6 +10943,12 @@ def debug_absorption():
                 ).total_seconds() / 60)
 
                 dex_url = f"https://dexscreener.com/solana/{mint}"
+                if net_flow is None:
+                    net_flow_str = "<span style='color:#484f58'>—</span>"
+                else:
+                    nf_color = "#3fb950" if net_flow > 0 else ("#f85149" if net_flow < 0 else "#8b949e")
+                    net_flow_str = f"<span style='color:{nf_color}'>{net_flow:+.3f}◎</span>"
+
                 live_rows_html += f"""<tr>
                   <td><b>{symbol}</b></td>
                   <td class='{exch_cls}'>{exchange}</td>
@@ -10950,6 +10957,7 @@ def debug_absorption():
                   <td class='ok'>{buy_vol:.3f} SOL ({buy_cnt}×)</td>
                   <td class='bad'>{sell_vol:.3f} SOL ({sell_cnt}×)</td>
                   <td>{ratio_str}</td>
+                  <td>{net_flow_str}</td>
                   <td>{lrg_buy:.3f} SOL</td>
                   <td style='color:#8b949e'>{conc_str}</td>
                   <td style='font-size:10px;color:#8b949e'>{mint[:12]}…</td>
@@ -10957,7 +10965,7 @@ def debug_absorption():
                 </tr>"""
 
         if not live_rows_html:
-            live_rows_html = "<tr><td colspan='9' style='color:#484f58'>Nenhum token ativo no HotMonitor agora</td></tr>"
+            live_rows_html = "<tr><td colspan='12' style='color:#484f58'>Nenhum token ativo no HotMonitor agora</td></tr>"
 
         # ── 2. Últimos 30 bounce_signals com métricas brutas H22 ──────────────────────
         with db._cursor() as cur:
@@ -11026,6 +11034,7 @@ def debug_absorption():
             outcome  = r.get("trade_status") or "—"
             ratio    = bv / sv if (bv is not None and sv and float(sv) > 0) else None
             conc     = lb / bv if (lb is not None and bv and float(bv) > 0) else None
+            net_flow_val = (float(bv) - float(sv)) if (bv is not None and sv is not None and ev) else None
 
             ratio_cls = "ok" if (ratio and ratio >= 1.0) else ("bad" if ratio is not None else "")
             out_cls   = "ok" if outcome == "tp" else ("bad" if outcome in ("sl","expired") else "")
@@ -11044,6 +11053,12 @@ def debug_absorption():
 
             conc_str = f"{conc:.2f}" if conc is not None else "—"
 
+            if net_flow_val is None:
+                nf_str = "<span style='color:#484f58'>—</span>"
+            else:
+                nf_color = "#3fb950" if net_flow_val > 0 else ("#f85149" if net_flow_val < 0 else "#8b949e")
+                nf_str = f"<span style='color:{nf_color}'>{net_flow_val:+.3f}◎</span>"
+
             bounce_rows_html += f"""<tr>
               <td>{ts}</td>
               <td><b>{symbol}</b></td>
@@ -11053,6 +11068,7 @@ def debug_absorption():
               <td>{f"{bv:.3f} ({bc}×)" if bv is not None else "<span style='color:#484f58'>NULL</span>"}</td>
               <td>{f"{sv:.3f} ({sc}×)" if sv is not None else "<span style='color:#484f58'>NULL</span>"}</td>
               <td>{ratio_str}</td>
+              <td>{nf_str}</td>
               <td style='color:#8b949e'>{conc_str}</td>
               <td>{ev if ev is not None else "<span style='color:#f85149'>NULL</span>"}</td>
             </tr>"""
@@ -11122,7 +11138,7 @@ def debug_absorption():
   <thead><tr>
     <th>Token</th><th>Exchange</th><th>Elapsed</th><th>Eventos Helius</th>
     <th>Buy vol</th><th>Sell vol</th><th>Ratio</th>
-    <th>Largest buy</th><th>Conc.</th><th>Mint</th><th></th>
+    <th>Net flow (H23)</th><th>Largest buy</th><th>Conc.</th><th>Mint</th><th></th>
   </tr></thead>
   <tbody>{live_rows_html}</tbody>
 </table>
@@ -11137,7 +11153,7 @@ def debug_absorption():
 <table>
   <thead><tr>
     <th>Hora</th><th>Token</th><th>Exchange</th><th>Bounce</th><th>Trade</th>
-    <th>Buy SOL</th><th>Sell SOL</th><th>Ratio</th><th>Conc.</th><th>Eventos</th>
+    <th>Buy SOL</th><th>Sell SOL</th><th>Ratio</th><th>Net flow (H23)</th><th>Conc.</th><th>Eventos</th>
   </tr></thead>
   <tbody>{bounce_rows_html}</tbody>
 </table>
@@ -11530,6 +11546,7 @@ def analise_h22_correlation():
             r["has_helius"] = ev > 0
             r["ratio"] = bv / sv if sv > 0 else (float("inf") if bv > 0 else None)
             r["concentration"] = lb / bv if bv > 0 else None
+            r["net_flow"] = (bv - sv) if ev > 0 else None
 
         # Rows with Helius data + outcome
         helius_with_outcome = [r for r in all_rows if r["has_helius"] and r["outcome"] is not None]
@@ -11610,6 +11627,22 @@ def analise_h22_correlation():
             return rows
 
         conc_rows_html = _conc_rows()
+
+        # --- Table 4: net_sol_flow (H23) ---
+        def _net_flow_rows():
+            no_data   = [r for r in helius_with_outcome if r["net_flow"] is None]
+            negative  = [r for r in helius_with_outcome if r["net_flow"] is not None and r["net_flow"] < 0]
+            low_pos   = [r for r in helius_with_outcome if r["net_flow"] is not None and 0 <= r["net_flow"] < 1]
+            mid_pos   = [r for r in helius_with_outcome if r["net_flow"] is not None and 1 <= r["net_flow"] < 3]
+            high_pos  = [r for r in helius_with_outcome if r["net_flow"] is not None and r["net_flow"] >= 3]
+            rows  = _wr_row("< 0 SOL (pool drenando)",    negative)
+            rows += _wr_row("0–1 SOL (levemente positivo)", low_pos)
+            rows += _wr_row("1–3 SOL (compra real)",        mid_pos)
+            rows += _wr_row("> 3 SOL (demanda forte)",      high_pos)
+            rows += _wr_row("— (sem dados Helius)",          no_data)
+            return rows
+
+        net_flow_rows_html = _net_flow_rows()
 
         # --- Classify outcomes for trajectory rows ---
         for r in trajectory_rows:
@@ -11831,6 +11864,19 @@ def analise_h22_correlation():
     <th>Concentração</th><th>n (traded)</th><th>Win Rate</th><th>TP</th><th>SL</th><th>Total</th>
   </tr></thead>
   <tbody>{conc_rows_html}</tbody>
+</table>
+
+<br>
+<h2>▸ Por net SOL flow (H23) — capital real entrando vs saindo (buy_vol − sell_vol)</h2>
+<p style='color:#484f58;font-size:11px'>
+  Net flow negativo = vendedores dominaram mesmo com muitas compras. Um sell de 10 SOL after 30 compras de 0.1 SOL = pool drenando.<br>
+  <b>Coleta apenas</b> — gate para filtro: n≥30 com outcomes GMGN mostrando discriminação ≥10pp.
+</p>
+<table>
+  <thead><tr>
+    <th>Net flow bucket</th><th>n (traded)</th><th>Win Rate</th><th>TP</th><th>SL</th><th>Total bounces</th>
+  </tr></thead>
+  <tbody>{net_flow_rows_html}</tbody>
 </table>
 
 <br>
