@@ -11172,6 +11172,7 @@ def debug_h23():
     (4) cálculo ao vivo nos tokens ativos do HotMonitor.
     """
     import traceback
+    from flask import request as _req
     try:
         CSS = ("<style>body{background:#0d1117;color:#e6edf3;font:13px/1.6 monospace;padding:20px}"
                "a{color:#58a6ff;text-decoration:none}table{border-collapse:collapse;width:100%}"
@@ -11185,6 +11186,25 @@ def debug_h23():
                "h2{color:#8b949e;font-size:12px;margin:20px 0 6px;text-transform:uppercase}"
                "h1{color:#58a6ff;font-size:16px;margin-bottom:4px}"
                ".pass{color:#3fb950;font-weight:bold}.fail{color:#f85149;font-weight:bold}</style>")
+
+        # ?fix=1 — backfill imediato sem reiniciar o processo
+        backfill_msg = ""
+        if _req.args.get("fix") == "1":
+            with db._cursor() as cur:
+                cur.execute("""
+                    UPDATE bounce_signals
+                    SET net_sol_flow = absorption_buy_vol - absorption_sell_vol
+                    WHERE net_sol_flow IS NULL
+                      AND absorption_events > 0
+                      AND absorption_buy_vol  IS NOT NULL
+                      AND absorption_sell_vol IS NOT NULL
+                """)
+                n_fixed = cur.rowcount
+            backfill_msg = (
+                f"<p style='color:#3fb950;font-weight:bold'>✅ Backfill executado: {n_fixed} rows atualizadas.</p>"
+                if n_fixed > 0 else
+                "<p style='color:#8b949e'>Backfill: nada a fazer (todas as rows já estavam preenchidas).</p>"
+            )
 
         def _box(label, val, color="#e6edf3"):
             return f"<div class='box'><div class='lbl'>{label}</div><div class='val' style='color:{color}'>{val}</div></div>"
@@ -11380,6 +11400,8 @@ def debug_h23():
 
 <h2>▸ Veredicto</h2>
 <p style='font-size:18px;font-weight:bold;color:{verdict_color}'>{verdict_text}</p>
+{backfill_msg}
+<p style='color:#484f58;font-size:11px'>Para backfill imediato das rows antigas: <a href='/debug/h23?fix=1'>/debug/h23?fix=1</a></p>
 
 <h2>▸ Checks</h2>
 <table>

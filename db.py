@@ -229,6 +229,16 @@ def init_db():
         ]:
             cur.execute(f"ALTER TABLE bounce_signals {col}")
 
+        # Backfill H23: preenche net_sol_flow para rows que já têm buy/sell vol mas ainda NULL
+        cur.execute("""
+            UPDATE bounce_signals
+            SET net_sol_flow = absorption_buy_vol - absorption_sell_vol
+            WHERE net_sol_flow IS NULL
+              AND absorption_events > 0
+              AND absorption_buy_vol  IS NOT NULL
+              AND absorption_sell_vol IS NOT NULL
+        """)
+
         # Tabela de trades — Fase 6-lite (calibração $1/trade)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS trades (
