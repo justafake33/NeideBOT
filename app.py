@@ -11167,11 +11167,20 @@ def debug_absorption():
 
 @app.route("/debug/h23-wr")
 def debug_h23_wr():
-    """WR por faixa de H23 net_sol_flow — trades #338+ (helius_sell_recovery)."""
-    from_id = int(request.args.get("from_id", 338))
+    """WR por faixa de H23 net_sol_flow — trades #338+ (helius_sell_recovery).
+    Filtra por h23_window para separar absorção real (bottom) de momentum (bounce).
+    """
+    from_id  = int(request.args.get("from_id", 338))
+    win_filter = request.args.get("window", "all")  # 'bottom', 'bounce', 'all'
+
+    window_clause = ""
+    if win_filter == "bottom":
+        window_clause = "AND bs.h23_window = 'bottom'"
+    elif win_filter == "bounce":
+        window_clause = "AND (bs.h23_window = 'bounce' OR bs.h23_window IS NULL)"
 
     with db._cursor() as cur:
-        cur.execute("""
+        cur.execute(f"""
             SELECT
                 CASE
                     WHEN bs.net_sol_flow IS NULL    THEN 'sem H23'
@@ -11185,12 +11194,14 @@ def debug_h23_wr():
                 t.pnl_pct_real,
                 bs.net_sol_flow,
                 bs.bounce_pct,
-                bs.elapsed_sec / 60.0  AS elapsed_min
+                bs.elapsed_sec / 60.0  AS elapsed_min,
+                COALESCE(bs.h23_window, 'bounce') AS h23_window
             FROM trades t
             JOIN bounce_signals bs ON bs.mint = t.mint
             WHERE t.id >= %(from_id)s
               AND t.exit_type = 'helius_sell_recovery'
               AND t.status IN ('tp', 'sl')
+              {window_clause}
             ORDER BY bs.net_sol_flow NULLS FIRST, t.id
         """, {"from_id": from_id})
         rows = cur.fetchall()
@@ -11225,8 +11236,32 @@ def debug_h23_wr():
     .dim{color:#6e7681}
     </style>"""
 
+    # Contagem de bottom vs bounce no conjunto filtrado
+    n_bottom = sum(1 for r in rows if r.get('h23_window') == 'bottom')
+    n_bounce = len(rows) - n_bottom
+
+    win_label = {"all": "todos", "bottom": "✅ bottom (absorção)", "bounce": "⚠ bounce (momentum)"}.get(win_filter, "todos")
+
     H = f"<!DOCTYPE html><html><head><title>H23 WR</title>{css}</head><body>"
     H += f"<h2>🔬 H23 net_sol_flow — WR por faixa (trades #{from_id}+)</h2>"
+
+    # Banner de aviso sobre h23_window
+    if win_filter != "bottom":
+        H += ("<div style='background:#2d1f00;border:1px solid #e3b341;border-radius:4px;padding:8px 12px;margin-bottom:12px'>"
+              "⚠ <b>Atenção:</b> dados históricos (<code>h23_window='bounce'</code>) capturam <b>momentum pós-bounce</b>, "
+              "não absorção real do dump. Análise misturada com dados inválidos.<br>"
+              f"Este conjunto: <b>{n_bottom} bottom</b> (válidos) + <b>{n_bounce} bounce</b> (momentum).<br>"
+              "Filtre por <a href='?window=bottom' style='color:#58a6ff'>?window=bottom</a> para ver apenas dados corretos."
+              "</div>")
+    else:
+        H += (f"<div style='background:#0d1f0d;border:1px solid #3fb950;border-radius:4px;padding:8px 12px;margin-bottom:12px'>"
+              f"✅ Mostrando apenas <b>h23_window='bottom'</b> — absorção real do fundo. n={n_bottom} trades.</div>")
+
+    H += (f"<p style='font-size:12px;color:#8b949e'>Janela: <b>{win_label}</b> &nbsp;|&nbsp; "
+          f"<a href='?window=all&from_id={from_id}' style='color:#58a6ff'>Todos</a> &nbsp; "
+          f"<a href='?window=bottom&from_id={from_id}' style='color:#3fb950'>✅ bottom</a> &nbsp; "
+          f"<a href='?window=bounce&from_id={from_id}' style='color:#8b949e'>⚠ bounce</a></p>")
+
     H += (f"<div class='box'><b>Total:</b> {n_total} trades | {tp_total} TP | {n_total-tp_total} SL | "
           f"WR base: <b>{wr_base:.1f}%</b> &nbsp; Break-even: 25%<br>"
           f"<span style='color:#8b949e;font-size:12px'>Apenas trades com exit_type=helius_sell_recovery (blockchain verificado)</span></div>")
@@ -11351,6 +11386,7 @@ def _debug_bounce_wr_inner():
                 bs.bounce_pct,
                 bs.elapsed_sec / 60.0          AS elapsed_min,
                 bs.net_sol_flow,
+                COALESCE(bs.h23_window, 'bounce') AS h23_window,
                 bs.mc_at_signal,
                 bs.absorption_events,
                 bs.absorption_buy_vol          AS buy_vol,
@@ -11401,11 +11437,27 @@ def _debug_bounce_wr_inner():
     .dim{color:#484f58}.warn{color:#e3b341}
     </style>"""
 
+    n_bottom_rs = sum(1 for r in rs if r.get('h23_window') == 'bottom')
+    n_bounce_rs = len(rs) - n_bottom_rs
+
     H = f"<!DOCTYPE html><html><head><title>Bounce WR</title>{CSS}</head><body>"
     H += f"<h2>📊 WR por Faixa de Bounce — Trades #{from_id}+</h2>"
     H += (f"<div class='box'><b>Total</b>: {n_total} trades | "
           f"<span class='tp'>{tp_all} TP</span> | <span class='sl'>{n_total-tp_all} SL</span> | "
           f"WR base: <b>{wr_base:.1f}%</b> | Break-even: 25%</div>")
+    if n_bottom_rs > 0:
+        H += (f"<div style='background:#0d1f0d;border:1px solid #3fb950;border-radius:4px;"
+              f"padding:6px 12px;margin-bottom:8px;font-size:12px'>"
+              f"✅ <b>{n_bottom_rs}</b> trades com H23 correto (<code>h23_window='bottom'</code>) "
+              f"| <span style='color:#8b949e'>{n_bounce_rs} com janela antiga (momentum)</span><br>"
+              f"Ver WR segregado por janela: "
+              f"<a href='/debug/h23-wr?window=bottom&from_id={from_id}' style='color:#3fb950'>?window=bottom</a>"
+              f" | <a href='/debug/h23-wr?window=all&from_id={from_id}' style='color:#58a6ff'>?window=all</a></div>")
+    else:
+        H += (f"<div style='background:#2d1f00;border:1px solid #e3b341;border-radius:4px;"
+              f"padding:6px 12px;margin-bottom:8px;font-size:12px'>"
+              f"⚠ Nenhum trade com <code>h23_window='bottom'</code> ainda — aguardando bounces pós-deploy.<br>"
+              f"Todos os {n_bounce_rs} trades têm H23 medido na janela do bounce (momentum), não do fundo.</div>")
     H += "<p class='dim' style='font-size:11px'>Apenas exit_type=helius_sell_recovery. Bounce = (mc_at_signal − mc_bottom) / mc_bottom.</p>"
 
     # ── 1. Tabela por faixa de bounce ────────────────────────────────────────
@@ -11984,31 +12036,42 @@ def debug_h23_window():
 
         avg_gap = total_gap_sec / n_with_gap if n_with_gap > 0 else None
 
-        # ── Seção 2: gap ts_migração → ts_signal via elapsed_sec ────────────────
-        # elapsed_sec = segundos da migração até o sinal de bounce (campo nativo)
+        # ── Seção 2: histórico por h23_window ─────────────────────────────────────
         with db._cursor() as cur:
             cur.execute("""
                 SELECT
                     symbol, ts_signal, elapsed_sec, bounce_pct,
                     absorption_events, absorption_buy_vol, absorption_sell_vol,
-                    net_sol_flow
+                    net_sol_flow, h23_window
                 FROM bounce_signals
                 WHERE ts_signal IS NOT NULL AND elapsed_sec IS NOT NULL
                 ORDER BY ts_signal DESC
-                LIMIT 30
+                LIMIT 40
             """)
             hist = [dict(r) for r in cur.fetchall()]
 
-            # Gap médio e distribuição usando elapsed_sec
+            # Contagem por grupo
+            cur.execute("""
+                SELECT
+                    COALESCE(h23_window, 'bounce') AS win,
+                    COUNT(*) AS n,
+                    COUNT(CASE WHEN absorption_events > 0 THEN 1 END) AS n_helius,
+                    ROUND(AVG(elapsed_sec)::numeric, 1) AS avg_gap_sec,
+                    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY elapsed_sec)::numeric, 1) AS p50_gap_sec
+                FROM bounce_signals
+                WHERE elapsed_sec IS NOT NULL
+                GROUP BY 1 ORDER BY 1
+            """)
+            window_groups = [dict(r) for r in cur.fetchall()]
+
+            # Gap stats totais
             cur.execute("""
                 SELECT
                     COUNT(*) AS n,
-                    ROUND(AVG(elapsed_sec)::numeric, 1)                                       AS avg_gap_sec,
+                    ROUND(AVG(elapsed_sec)::numeric, 1)                                         AS avg_gap_sec,
                     ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY elapsed_sec)::numeric, 1) AS p50_gap_sec,
-                    ROUND(MIN(elapsed_sec)::numeric, 1)                                       AS min_gap_sec,
-                    ROUND(MAX(elapsed_sec)::numeric, 1)                                       AS max_gap_sec,
-                    COUNT(CASE WHEN elapsed_sec <= 60 THEN 1 END)                             AS within_60s,
-                    COUNT(CASE WHEN elapsed_sec  > 60 THEN 1 END)                             AS beyond_60s
+                    COUNT(CASE WHEN elapsed_sec <= 60 THEN 1 END)                               AS within_60s,
+                    COUNT(CASE WHEN elapsed_sec  > 60 THEN 1 END)                               AS beyond_60s
                 FROM bounce_signals
                 WHERE ts_signal IS NOT NULL AND elapsed_sec IS NOT NULL
             """)
@@ -12041,7 +12104,12 @@ def debug_h23_window():
             else:
                 coverage_note = "<span class='green'>✓ fundo na janela</span>"
 
-            nf_str = f"<span style='color:{'#3fb950' if nf and nf > 0 else '#f85149'}'>{nf:+.3f}◎</span>" if nf is not None else "<span class='dim'>NULL</span>"
+            nf_color = "#3fb950" if nf and nf > 0 else "#f85149"
+            nf_str = f"<span style='color:{nf_color}'>{nf:+.3f}◎</span>" if nf is not None else "<span class='dim'>NULL</span>"
+
+            win = r.get("h23_window") or "bounce"
+            win_badge = ("<span style='color:#3fb950;font-size:10px'>●bottom</span>" if win == "bottom"
+                         else "<span style='color:#8b949e;font-size:10px'>●bounce</span>")
 
             hist_rows_html += (
                 f"<tr>"
@@ -12049,6 +12117,7 @@ def debug_h23_window():
                 f"<td><b>{sym}</b></td>"
                 f"<td>{bounce*100:.0f}%</td>"
                 f"<td>{gap_str}</td>"
+                f"<td>{win_badge}</td>"
                 f"<td>{ev}</td>"
                 f"<td>{bv:.3f}</td>"
                 f"<td>{sv:.3f}</td>"
@@ -12057,9 +12126,17 @@ def debug_h23_window():
                 f"</tr>"
             )
 
-        n_beyond = gap_stats.get("beyond_60s") or 0
-        n_total  = gap_stats.get("n") or 1
+        n_beyond  = gap_stats.get("beyond_60s") or 0
+        n_total   = gap_stats.get("n") or 1
         pct_wrong = n_beyond / n_total * 100
+
+        # Boxes por grupo
+        group_boxes = ""
+        for g in window_groups:
+            win   = g["win"]
+            color = "#3fb950" if win == "bottom" else "#8b949e"
+            label = "✅ bottom (correto)" if win == "bottom" else "⚠ bounce (antigo)"
+            group_boxes += _box(label, f"{g['n']} bounces | {g['n_helius']} Helius | P50 gap {g['p50_gap_sec']}s", color)
 
         html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
 <title>H23 Window Debug</title>{CSS}
@@ -12068,7 +12145,7 @@ def debug_h23_window():
 <h1>H23 — Diagnóstico da Janela de Absorção</h1>
 <p style='color:#8b949e;font-size:11px'>
   auto-refresh 10s · compara janela CORRETA [ts_min−60s → ts_min] vs ANTIGA [now−60s → now]<br>
-  A janela correta captura a absorção real do dump. A antiga capturava momentum pós-bounce.
+  Dois sinais distintos: <b style='color:#3fb950'>bottom</b> = absorção do dump | <b style='color:#8b949e'>bounce</b> = momentum pós-bounce.
 </p>
 <div>
   <a href='/debug/h23' style='color:#58a6ff;margin-right:14px;font-size:12px'>Debug H23</a>
@@ -12089,7 +12166,8 @@ def debug_h23_window():
 
 {_box("Tokens ativos", n_active)}
 {_box("Gap médio ts_min→agora", f"{avg_gap:.0f}s" if avg_gap else "—", "#e3b341" if avg_gap and avg_gap > 60 else "#3fb950")}
-{_box("Bounces com gap > 60s (janela errada)", f"{n_beyond}/{n_total} ({pct_wrong:.0f}%)", "#f85149" if pct_wrong > 30 else "#d29922")}
+{_box("Bounces com gap > 60s", f"{n_beyond}/{n_total} ({pct_wrong:.0f}%)", "#f85149" if pct_wrong > 30 else "#d29922")}
+<br>{group_boxes}
 
 <br><br>
 <h2>▸ Tokens ativos no HotMonitor — comparação janela CORRETA vs ANTIGA</h2>
@@ -12122,16 +12200,16 @@ def debug_h23_window():
 </table>
 
 <br>
-<h2>▸ Últimos 30 bounce_signals — gap ts_migração → ts_signal e cobertura da janela</h2>
+<h2>▸ Últimos 40 bounce_signals — janela usada e cobertura do fundo</h2>
 <p style='color:#484f58;font-size:11px'>
-  gap = tempo entre a migração e o sinal de bounce. Quanto maior, mais do fundo ficou fora da janela antiga.<br>
-  ❌ = gap > 60s → janela antiga capturava zero eventos do período de absorção real.<br>
-  <b>Dados com gap > 60s têm net_sol_flow inválido no banco (momentum, não absorção).</b>
+  <b style='color:#3fb950'>●bottom</b> = janela centrada no fundo (absorção real — pós-correção)<br>
+  <b style='color:#8b949e'>●bounce</b> = janela centrada no bounce (momentum — dados históricos)<br>
+  gap = elapsed_sec = segundos da migração até o sinal. Proxy do gap real ts_min→ts_signal (que é menor).
 </p>
 <table>
   <thead><tr>
     <th>Hora</th><th>Token</th><th>Bounce%</th>
-    <th>Gap ts_mig→sinal</th>
+    <th>Gap mig→sinal</th><th>Janela</th>
     <th>Ev</th><th>Buy◎</th><th>Sell◎</th>
     <th>net_sol_flow (salvo)</th>
     <th>Cobertura da janela</th>
@@ -12140,9 +12218,10 @@ def debug_h23_window():
 </table>
 
 <p style='color:#484f58;font-size:11px;margin-top:20px'>
-  ⚠ "Gap" acima usa ts_migration como proxy de ts_min, que ocorre depois da migração (P50 ~13min).<br>
-  O gap real ts_min→ts_signal é menor — mas ilustra a magnitude do problema.<br>
-  Bounces futuros (pós-deploy) usarão a janela correta centrada em ts_min.
+  ⚠ "Gap" usa elapsed_sec (migração → sinal) como proxy. O gap real ts_min → ts_signal é menor.<br>
+  Dados <b style='color:#3fb950'>bottom</b> são os únicos válidos para testar H23 como hipótese de absorção.<br>
+  Dados <b style='color:#8b949e'>bounce</b> representam outro sinal (momentum) — preservados para análise paralela futura.<br>
+  Gate para filtro: n≥30 com h23_window='bottom' + outcomes GMGN + discriminação ≥10pp.
 </p>
 </body></html>"""
         return html
