@@ -11957,8 +11957,11 @@ def debug_h23_window():
 
                 # Diferença entre as duas janelas
                 diff_flow = (bv_b - sv_b) - (bv_n - sv_n) if (ev_b > 0 or ev_n > 0) else None
-                diff_str  = (f"<span style='color:{'#e3b341' if abs(diff_flow) > 0.01 else '#484f58}'>"
-                             f"{diff_flow:+.3f}◎</span>") if diff_flow is not None else "<span class='dim'>—</span>"
+                if diff_flow is not None:
+                    diff_color = "#e3b341" if abs(diff_flow) > 0.01 else "#484f58"
+                    diff_str = f"<span style='color:{diff_color}'>{diff_flow:+.3f}◎</span>"
+                else:
+                    diff_str = "<span class='dim'>—</span>"
 
                 live_rows_html += (
                     f"<tr>"
