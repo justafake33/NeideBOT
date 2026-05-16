@@ -25855,5 +25855,294 @@ def analise_feature_scan_recente():
     return H
 
 
+# /analise/intersecao — sobreposição dos melhores sinais (trades recentes)
+@app.route("/analise/intersecao")
+def analise_intersecao():
+    """
+    Analisa a interseção dos melhores sinais encontrados nos trades recentes.
+    Labels em português com explicações simples.
+    Parâmetros: ?from_id=338&to_id=999999
+    """
+    from_id = int(request.args.get("from_id", 338))
+    to_id   = int(request.args.get("to_id", 999999))
+    PUMP_SUPPLY = 1_000_000_000
+
+    css = """
+    <style>
+    body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+    h2{color:#58a6ff}h3{color:#79c0ff;margin-top:28px}
+    p.desc{color:#8b949e;margin:4px 0 12px 0;font-size:12px}
+    table{border-collapse:collapse;width:100%;margin-bottom:8px}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:right}
+    th:first-child,th:nth-child(2){text-align:left}
+    td{padding:5px 10px;border:1px solid #21262d;text-align:right;white-space:nowrap}
+    td:first-child,td:nth-child(2){text-align:left}
+    .tp{color:#3fb950}.sl{color:#f85149}.dim{color:#6e7681}
+    .pos{color:#3fb950;font-weight:bold}.neg{color:#f85149}
+    .hi{background:#1f3a1f}.lo{background:#2d1f1f}
+    .box{background:#161b22;border:1px solid #30363d;padding:12px 16px;margin-bottom:14px;border-radius:6px}
+    .legenda{background:#0d1f0d;border:1px solid #238636;padding:10px 14px;margin-bottom:6px;border-radius:4px}
+    .badge{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;margin-right:4px}
+    .b1{background:#1f3a5f;color:#79c0ff}
+    .b2{background:#3a1f5f;color:#d2a679}
+    .b3{background:#1f3a1f;color:#3fb950}
+    .b4{background:#3a3a1f;color:#f0e68c}
+    .b5{background:#3a1f1f;color:#ff8080}
+    .b6{background:#1f3a3a;color:#79d4d4}
+    .score-3{background:#1f3a1f}.score-2{background:#1e2a3a}.score-1{background:#161b22}
+    </style>
+    """
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT t.id, t.mint, t.symbol, t.ts_signal, t.status,
+                   t.entry_price_usd, t.tokens_received,
+                   bs.bounce_pct, bs.drop_from_mig, bs.elapsed_sec,
+                   bs.absorption_events,
+                   m.smart_wallets, m.creator_token_status, m.cto_flag,
+                   m.time_to_bottom
+            FROM trades t
+            LEFT JOIN bounce_signals bs ON t.mint = bs.mint
+            LEFT JOIN migrations m      ON t.mint = m.mint
+            WHERE t.status IN ('tp','sl','trailing_active')
+              AND t.id >= %s AND t.id <= %s
+            ORDER BY t.id DESC
+        """, (from_id, to_id))
+        rows = cur.fetchall()
+
+    # ── Define os sinais com nome em português e explicação ─────────────────
+
+    SINAIS = [
+        {
+            "key":   "bounce_moderado",
+            "nome":  "Bounce moderado (70–100%)",
+            "badge": "b1",
+            "desc":  "O token subiu entre 70% e 100% acima do ponto mais baixo antes do sinal disparar. "
+                     "Abaixo de 70% o bounce é fraco. Acima de 100% é spike — sobe rápido demais e cai.",
+            "fn":    lambda t: t["bounce_pct"] and 0.70 <= t["bounce_pct"] < 1.0,
+        },
+        {
+            "key":   "dev_saiu",
+            "nome":  "Dev já saiu",
+            "badge": "b2",
+            "desc":  "O desenvolvedor do token já vendeu toda a posição dele. "
+                     "Quando o dev ainda segura (creator_hold), ele pode vender a qualquer momento e derrubar o preço.",
+            "fn":    lambda t: t["creator_hold"] == 0,
+        },
+        {
+            "key":   "sinal_tardio",
+            "nome":  "Sinal entre 3–8 min da migração",
+            "badge": "b3",
+            "desc":  "O sinal de compra disparou entre 3 e 8 minutos após o token migrar. "
+                     "Muito cedo (0–3 min) pega tokens que ainda estão em queda. "
+                     "Esse intervalo indica que o token já passou pelo pânico inicial.",
+            "fn":    lambda t: 3.0 <= t["elapsed_min"] < 8.0,
+        },
+        {
+            "key":   "comunidade_controle",
+            "nome":  "Comunidade no controle (CTO)",
+            "badge": "b4",
+            "desc":  "A comunidade assumiu o projeto após o dev abandonar. "
+                     "Indica interesse coletivo em sustentar o preço — menos risco de rug.",
+            "fn":    lambda t: t["cto"] == 1,
+        },
+        {
+            "key":   "queda_moderada",
+            "nome":  "Queda moderada do preço de lançamento (40–60%)",
+            "badge": "b5",
+            "desc":  "O token caiu entre 40% e 60% desde o preço de migração (~$37k). "
+                     "Quedas menores de 40% indicam dump fraco. Quedas acima de 60% raramente se recuperam.",
+            "fn":    lambda t: t["drop_from_mig"] and 0.40 <= t["drop_from_mig"] < 0.60,
+        },
+        {
+            "key":   "absorcao_equilibrada",
+            "nome":  "Absorção equilibrada (51–150 eventos)",
+            "badge": "b6",
+            "desc":  "Quantidade de transações de compra/venda detectadas pelo Helius no momento do sinal. "
+                     "Poucos eventos = sem interesse. Muitos (>150) = spike caótico. "
+                     "Entre 51–150 indica compra real sem manipulação excessiva.",
+            "fn":    lambda t: t["abs_events"] and 51 <= t["abs_events"] <= 150,
+        },
+    ]
+
+    # ── Monta lista de trades enriquecidos ───────────────────────────────────
+    trades = []
+    for r in rows:
+        elapsed_min = (r["elapsed_sec"] or 0) / 60.0
+        t = {
+            "id":          r["id"],
+            "symbol":      r["symbol"] or r["mint"][:8],
+            "is_tp":       r["status"] in ("tp", "trailing_active"),
+            "bounce_pct":  r["bounce_pct"],
+            "drop_from_mig": r["drop_from_mig"],
+            "elapsed_min": elapsed_min,
+            "abs_events":  r["absorption_events"],
+            "smart":       r["smart_wallets"],
+            "creator_hold": 0 if r["creator_token_status"] == "creator_close" else 1,
+            "cto":         r["cto_flag"] or 0,
+            "ttb":         float(r["time_to_bottom"]) if r["time_to_bottom"] else None,
+        }
+        # Avalia cada sinal
+        for s in SINAIS:
+            try:
+                t[s["key"]] = bool(s["fn"](t))
+            except Exception:
+                t[s["key"]] = False
+        trades.append(t)
+
+    n_total = len(trades)
+    n_tp    = sum(1 for t in trades if t["is_tp"])
+    wr_base = n_tp / n_total * 100 if n_total else 0
+
+    H = f"<!DOCTYPE html><html><head><title>Interseção de Sinais</title>{css}</head><body>"
+    H += "<h2>🔗 Interseção de Sinais — Trades Recentes</h2>"
+    H += f"<div class='box'><b>{n_total} trades | {n_tp} TP / {n_total-n_tp} SL | Taxa de acerto base: {wr_base:.1f}%</b><br>"
+    H += f"Trades #{from_id} em diante &nbsp;|&nbsp; Break-even com SL=25% / TP=75%: ~25%</div>"
+
+    # ── Legenda dos sinais ───────────────────────────────────────────────────
+    H += "<h3>📖 Legenda dos sinais</h3>"
+    for s in SINAIS:
+        n_s  = sum(1 for t in trades if t[s["key"]])
+        tp_s = sum(1 for t in trades if t[s["key"]] and t["is_tp"])
+        wr_s = tp_s / n_s * 100 if n_s >= 3 else None
+        wr_txt = f"<b>{wr_s:.0f}%</b> de acerto ({tp_s}/{n_s} trades)" if wr_s is not None else f"n={n_s} (pequeno)"
+        H += f"<div class='legenda'>"
+        H += f"<span class='badge {s['badge']}'>{s['nome']}</span> &nbsp; {wr_txt}<br>"
+        H += f"<span style='color:#8b949e;font-size:11px'>{s['desc']}</span></div>"
+
+    # ── Análise individual de cada sinal ────────────────────────────────────
+    H += "<h3>📊 Cada sinal sozinho — taxa de acerto</h3>"
+    H += "<p class='desc'>Comparação entre trades que têm o sinal vs os que não têm.</p>"
+    H += "<table><tr><th>Sinal</th><th>Com sinal</th><th>Acerto</th><th>Sem sinal</th><th>Acerto</th><th>Diferença</th></tr>"
+    for s in SINAIS:
+        com   = [t for t in trades if t[s["key"]]]
+        sem   = [t for t in trades if not t[s["key"]]]
+        n_com = len(com); tp_com = sum(1 for t in com if t["is_tp"])
+        n_sem = len(sem); tp_sem = sum(1 for t in sem if t["is_tp"])
+        wr_com = tp_com / n_com * 100 if n_com >= 3 else None
+        wr_sem = tp_sem / n_sem * 100 if n_sem >= 3 else None
+        delta  = (wr_com - wr_sem) if (wr_com and wr_sem) else None
+        wr_com_s = f"<b>{wr_com:.0f}%</b>" if wr_com else f"<span class='dim'>— (n={n_com})</span>"
+        wr_sem_s = f"{wr_sem:.0f}%" if wr_sem else f"<span class='dim'>—</span>"
+        delta_s  = f"<span class='{'pos' if delta and delta>0 else 'neg'}'>{delta:+.0f}pp</span>" if delta else "—"
+        cls = " class='hi'" if (delta and delta >= 10) else " class='lo'" if (delta and delta <= -10) else ""
+        H += f"<tr{cls}><td><span class='badge {s['badge']}'>{s['nome']}</span></td>"
+        H += f"<td>{tp_com}/{n_com}</td><td>{wr_com_s}</td>"
+        H += f"<td>{tp_sem}/{n_sem}</td><td>{wr_sem_s}</td>"
+        H += f"<td>{delta_s}</td></tr>"
+    H += "</table>"
+
+    # ── Combinações de 2 sinais ──────────────────────────────────────────────
+    H += "<h3>🔗 Combinações de 2 sinais — o que acontece quando dois sinais se encontram?</h3>"
+    H += "<p class='desc'>Mostra quantos trades tiveram os dois sinais ao mesmo tempo e qual foi o resultado.</p>"
+    H += "<table><tr><th>Sinal A</th><th>Sinal B</th><th>Trades com A+B</th><th>Acerto</th><th>vs base</th></tr>"
+
+    combos2 = []
+    for i in range(len(SINAIS)):
+        for j in range(i+1, len(SINAIS)):
+            sa, sb  = SINAIS[i], SINAIS[j]
+            subset  = [t for t in trades if t[sa["key"]] and t[sb["key"]]]
+            n       = len(subset)
+            tp      = sum(1 for t in subset if t["is_tp"])
+            wr      = tp / n * 100 if n >= 3 else None
+            combos2.append((sa, sb, n, tp, wr))
+
+    combos2.sort(key=lambda x: (x[4] or 0), reverse=True)
+
+    for sa, sb, n, tp, wr in combos2:
+        wr_s   = f"<b>{wr:.0f}%</b>" if wr else f"<span class='dim'>— (n={n})</span>"
+        delta  = (wr - wr_base) if wr else None
+        delta_s = f"<span class='{'pos' if delta and delta>0 else 'neg'}'>{delta:+.0f}pp</span>" if delta else "—"
+        cls = " class='hi'" if (delta and delta >= 10) else " class='lo'" if (delta and delta <= -5) else ""
+        H += f"<tr{cls}><td><span class='badge {sa['badge']}'>{sa['nome']}</span></td>"
+        H += f"<td><span class='badge {sb['badge']}'>{sb['nome']}</span></td>"
+        H += f"<td>{tp}/{n}</td><td>{wr_s}</td><td>{delta_s}</td></tr>"
+    H += "</table>"
+
+    # ── Combinações de 3 sinais ──────────────────────────────────────────────
+    H += "<h3>🔗🔗 Combinações de 3 sinais</h3>"
+    H += "<p class='desc'>Trades com três sinais positivos ao mesmo tempo.</p>"
+    H += "<table><tr><th>Sinais presentes</th><th>Trades</th><th>Acerto</th><th>vs base</th></tr>"
+
+    combos3 = []
+    for i in range(len(SINAIS)):
+        for j in range(i+1, len(SINAIS)):
+            for k in range(j+1, len(SINAIS)):
+                sa, sb, sc = SINAIS[i], SINAIS[j], SINAIS[k]
+                subset = [t for t in trades if t[sa["key"]] and t[sb["key"]] and t[sc["key"]]]
+                n  = len(subset)
+                tp = sum(1 for t in subset if t["is_tp"])
+                wr = tp / n * 100 if n >= 3 else None
+                combos3.append((sa, sb, sc, n, tp, wr))
+
+    combos3.sort(key=lambda x: (x[5] or 0), reverse=True)
+
+    for sa, sb, sc, n, tp, wr in combos3:
+        wr_s   = f"<b>{wr:.0f}%</b>" if wr else f"<span class='dim'>— (n={n})</span>"
+        delta  = (wr - wr_base) if wr else None
+        delta_s = f"<span class='{'pos' if delta and delta>0 else 'neg'}'>{delta:+.0f}pp</span>" if delta else "—"
+        cls = " class='hi'" if (delta and delta >= 10) else " class='lo'" if (delta and delta <= -5) else ""
+        badges = (f"<span class='badge {sa['badge']}'>{sa['nome']}</span> + "
+                  f"<span class='badge {sb['badge']}'>{sb['nome']}</span> + "
+                  f"<span class='badge {sc['badge']}'>{sc['nome']}</span>")
+        H += f"<tr{cls}><td>{badges}</td><td>{tp}/{n}</td><td>{wr_s}</td><td>{delta_s}</td></tr>"
+    H += "</table>"
+
+    # ── Pontuação por trade ──────────────────────────────────────────────────
+    H += "<h3>🏆 Pontuação por trade — quantos sinais positivos cada trade tinha?</h3>"
+    H += "<p class='desc'>Cada sinal presente conta 1 ponto. Máximo: 6 pontos. "
+    H += "Se a teoria funciona, trades com mais pontos deveriam ter mais TP.</p>"
+
+    # Tabela resumo de pontuação
+    score_buckets = {0:[], 1:[], 2:[], 3:[], 4:[], 5:[], 6:[]}
+    for t in trades:
+        score = sum(1 for s in SINAIS if t[s["key"]])
+        t["score"] = score
+        score_buckets[score].append(t)
+
+    H += "<table><tr><th>Pontuação</th><th>Trades</th><th>TP</th><th>SL</th><th>Acerto</th><th>vs base</th></tr>"
+    for sc in sorted(score_buckets.keys(), reverse=True):
+        subset = score_buckets[sc]
+        if not subset: continue
+        n  = len(subset)
+        tp = sum(1 for t in subset if t["is_tp"])
+        sl = n - tp
+        wr = tp / n * 100 if n >= 3 else None
+        wr_s = f"<b>{wr:.0f}%</b>" if wr else f"<span class='dim'>— (n={n})</span>"
+        delta = (wr - wr_base) if wr else None
+        delta_s = f"<span class='{'pos' if delta and delta>0 else 'neg'}'>{delta:+.0f}pp</span>" if delta else "—"
+        cls = " class='hi'" if (delta and delta >= 10) else " class='lo'" if (delta and delta <= -10) else ""
+        stars = "⭐" * sc if sc > 0 else "·"
+        H += f"<tr{cls}><td>{stars} {sc} ponto{'s' if sc!=1 else ''}</td>"
+        H += f"<td>{n}</td><td class='tp'>{tp}</td><td class='sl'>{sl}</td>"
+        H += f"<td>{wr_s}</td><td>{delta_s}</td></tr>"
+    H += "</table>"
+
+    # Tabela detalhada por trade com pontuação
+    H += "<h3>📋 Lista completa — cada trade com sua pontuação</h3>"
+    H += "<table><tr><th>#</th><th>Token</th><th>Resultado</th><th>Pontos</th>"
+    for s in SINAIS:
+        short = s["nome"].split("(")[0].strip()
+        H += f"<th style='font-size:10px'>{short}</th>"
+    H += "</tr>"
+
+    trades_sorted = sorted(trades, key=lambda t: (-t["score"], t["id"]))
+    for t in trades_sorted:
+        sc  = t["score"]
+        st  = "<span class='tp'>✓ TP</span>" if t["is_tp"] else "<span class='sl'>✗ SL</span>"
+        row_cls = f" class='score-{min(sc,3)}'"
+        dots = "⭐" * sc if sc > 0 else "·"
+        H += f"<tr{row_cls}><td>{t['id']}</td><td><b>{t['symbol']}</b></td><td>{st}</td>"
+        H += f"<td style='text-align:center'>{dots} <span class='dim'>({sc})</span></td>"
+        for s in SINAIS:
+            val = "✓" if t[s["key"]] else "<span class='dim'>—</span>"
+            H += f"<td style='text-align:center'>{val}</td>"
+        H += "</tr>"
+    H += "</table>"
+
+    H += "</body></html>"
+    return H
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
