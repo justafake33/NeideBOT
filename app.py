@@ -11864,6 +11864,293 @@ def debug_h23():
         return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
+@app.route("/debug/h23-window")
+def debug_h23_window():
+    """H23 — Diagnóstico da janela de absorção: fundo vs bounce.
+    Mostra side-by-side para cada token ativo:
+      - Janela CORRETA: [ts_min - 60s → ts_min] (absorção real do dump)
+      - Janela ANTIGA:  [now - 60s → now]       (momentum pós-bounce — ERRADA)
+    Permite verificar empiricamente se a correção muda os dados.
+    Também mostra o gap ts_min → ts_signal dos últimos bounce_signals para
+    quantificar o erro sistemático que existia antes da correção.
+    """
+    import traceback, time as _time
+    try:
+        CSS = ("<style>body{background:#0d1117;color:#e6edf3;font:13px/1.6 monospace;padding:20px}"
+               "a{color:#58a6ff;text-decoration:none}table{border-collapse:collapse;width:100%}"
+               "th{background:#161b22;padding:6px 10px;text-align:left;font-size:11px;color:#8b949e}"
+               "td{padding:5px 10px;border-bottom:1px solid #21262d;font-size:12px}"
+               ".box{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px 16px;"
+               "margin:8px 4px;display:inline-block;vertical-align:top}"
+               ".lbl{color:#8b949e;font-size:11px}.val{font-size:18px;font-weight:bold}"
+               ".green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}.dim{color:#484f58}"
+               ".warn{background:#2d1f00;border:1px solid #e3b341;border-radius:4px;padding:8px 12px;margin:8px 0}"
+               "h2{color:#8b949e;font-size:12px;margin:20px 0 6px;text-transform:uppercase}"
+               "h1{color:#58a6ff;font-size:16px;margin-bottom:4px}</style>")
+
+        def _box(label, val, color="#e6edf3"):
+            return f"<div class='box'><div class='lbl'>{label}</div><div class='val' style='color:{color}'>{val}</div></div>"
+
+        def _flow_fmt(bv, sv, ev):
+            if ev == 0:
+                return "<span class='dim'>—</span>", "<span class='dim'>—</span>", "<span class='dim'>—</span>"
+            flow = bv - sv
+            ratio = bv / sv if sv > 0 else float("inf")
+            fc = "#3fb950" if flow > 0 else "#f85149"
+            rc = "#3fb950" if ratio >= 1.5 else ("#d29922" if ratio >= 1.0 else "#f85149")
+            flow_s  = f"<span style='color:{fc}'>{flow:+.3f}◎</span>"
+            ratio_s = f"<span style='color:{rc}'>{'∞' if ratio == float('inf') else f'{ratio:.1f}×'}</span>"
+            ev_s    = f"{ev} ev"
+            return flow_s, ratio_s, ev_s
+
+        # ── Seção 1: tokens ativos no HotMonitor ──────────────────────────────
+        live_rows_html = ""
+        n_active = 0
+        n_with_gap = 0
+        total_gap_sec = 0.0
+
+        if scanner and hasattr(scanner, "hot") and scanner.hot._helius:
+            with scanner.hot._lock:
+                active = dict(scanner.hot._tokens)
+            n_active = len(active)
+
+            for mint, state in active.items():
+                sym     = state.get("symbol", mint[:8])
+                ts_min  = state.get("ts_min")
+                ts_mig  = state.get("ts_migration")
+                now_ts  = _time.time()
+
+                # Janela correta: centrada no fundo
+                try:
+                    w_bottom = scanner.hot._helius.get_absorption_window(
+                        mint, window_sec=60,
+                        window_end_ts=ts_min.timestamp() if ts_min else None
+                    )
+                except Exception:
+                    w_bottom = {}
+
+                # Janela antiga: centrada em agora
+                try:
+                    w_now = scanner.hot._helius.get_absorption_window(mint, window_sec=60)
+                except Exception:
+                    w_now = {}
+
+                bv_b = w_bottom.get("buy_vol_sol", 0) or 0
+                sv_b = w_bottom.get("sell_vol_sol", 0) or 0
+                ev_b = w_bottom.get("total_events", 0) or 0
+
+                bv_n = w_now.get("buy_vol_sol", 0) or 0
+                sv_n = w_now.get("sell_vol_sol", 0) or 0
+                ev_n = w_now.get("total_events", 0) or 0
+
+                flow_b, ratio_b, ev_b_s = _flow_fmt(bv_b, sv_b, ev_b)
+                flow_n, ratio_n, ev_n_s = _flow_fmt(bv_n, sv_n, ev_n)
+
+                # Gap ts_min → agora (proxy para ts_signal)
+                gap_sec = (datetime.now(timezone.utc) - ts_min).total_seconds() if ts_min else None
+                gap_str = f"{gap_sec:.0f}s" if gap_sec is not None else "—"
+                gap_color = "#f85149" if (gap_sec and gap_sec > 60) else "#3fb950"
+
+                if gap_sec is not None:
+                    n_with_gap += 1
+                    total_gap_sec += gap_sec
+
+                # Diferença entre as duas janelas
+                diff_flow = (bv_b - sv_b) - (bv_n - sv_n) if (ev_b > 0 or ev_n > 0) else None
+                diff_str  = (f"<span style='color:{'#e3b341' if abs(diff_flow) > 0.01 else '#484f58}'>"
+                             f"{diff_flow:+.3f}◎</span>") if diff_flow is not None else "<span class='dim'>—</span>"
+
+                live_rows_html += (
+                    f"<tr>"
+                    f"<td><b>{sym}</b></td>"
+                    f"<td style='color:{gap_color}'>{gap_str}</td>"
+                    f"<td>{ev_b_s}</td>"
+                    f"<td>{flow_b}</td>"
+                    f"<td>{ratio_b}</td>"
+                    f"<td class='dim'>|</td>"
+                    f"<td>{ev_n_s}</td>"
+                    f"<td>{flow_n}</td>"
+                    f"<td>{ratio_n}</td>"
+                    f"<td>{diff_str}</td>"
+                    f"<td style='color:#484f58;font-size:10px'>{mint[:12]}…</td>"
+                    f"</tr>"
+                )
+
+        if not live_rows_html:
+            live_rows_html = "<tr><td colspan='11' class='dim'>Nenhum token ativo no HotMonitor agora</td></tr>"
+
+        avg_gap = total_gap_sec / n_with_gap if n_with_gap > 0 else None
+
+        # ── Seção 2: gap ts_min → ts_signal dos últimos bounce_signals ─────────
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT
+                    symbol, ts_signal, elapsed_sec, bounce_pct,
+                    absorption_events, absorption_buy_vol, absorption_sell_vol,
+                    net_sol_flow,
+                    EXTRACT(EPOCH FROM (ts_signal - ts_migration)) AS secs_to_signal,
+                    ts_migration
+                FROM bounce_signals
+                WHERE ts_signal IS NOT NULL AND ts_migration IS NOT NULL
+                ORDER BY ts_signal DESC
+                LIMIT 30
+            """)
+            hist = [dict(r) for r in cur.fetchall()]
+
+            # Gap médio e distribuição
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS n,
+                    ROUND(AVG(EXTRACT(EPOCH FROM (ts_signal - ts_migration)))::numeric, 1) AS avg_gap_sec,
+                    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (
+                        ORDER BY EXTRACT(EPOCH FROM (ts_signal - ts_migration))
+                    )::numeric, 1) AS p50_gap_sec,
+                    ROUND(MIN(EXTRACT(EPOCH FROM (ts_signal - ts_migration)))::numeric, 1) AS min_gap_sec,
+                    ROUND(MAX(EXTRACT(EPOCH FROM (ts_signal - ts_migration)))::numeric, 1) AS max_gap_sec,
+                    COUNT(CASE WHEN EXTRACT(EPOCH FROM (ts_signal - ts_migration)) <= 60 THEN 1 END) AS within_60s,
+                    COUNT(CASE WHEN EXTRACT(EPOCH FROM (ts_signal - ts_migration)) > 60 THEN 1 END) AS beyond_60s
+                FROM bounce_signals
+                WHERE ts_signal IS NOT NULL AND ts_migration IS NOT NULL
+            """)
+            gap_stats = dict(cur.fetchone())
+
+        hist_rows_html = ""
+        for r in hist:
+            sym     = r.get("symbol") or "?"
+            ts_sig  = r.get("ts_signal")
+            ts_str  = ts_sig.strftime("%m-%d %H:%M") if ts_sig else "—"
+            gap_s   = float(r.get("secs_to_signal") or 0)
+            bounce  = r.get("bounce_pct") or 0
+            ev      = r.get("absorption_events") or 0
+            bv      = r.get("absorption_buy_vol") or 0
+            sv      = r.get("absorption_sell_vol") or 0
+            nf      = r.get("net_sol_flow")
+
+            # Gap: se > 60s, a janela antiga NÃO capturou o fundo
+            gap_color = "#f85149" if gap_s > 60 else ("#d29922" if gap_s > 30 else "#3fb950")
+            gap_str = f"<span style='color:{gap_color}'>{gap_s:.0f}s</span>"
+
+            # O que a janela CORRETA (centrada no ts_min) capturaria vs o que foi salvo
+            # ts_min ≈ ts_signal - elapsed (dentro do bounce)
+            # Estimativa de qual fração dos eventos foi capturada com janela antiga
+            # Se gap > 60s: janela antiga capturou ZERO dos eventos do fundo
+            if gap_s > 60:
+                coverage_note = "<span class='red'>❌ fundo fora da janela (gap > 60s)</span>"
+            elif gap_s > 30:
+                coverage_note = "<span class='yellow'>⚠ cobertura parcial do fundo</span>"
+            else:
+                coverage_note = "<span class='green'>✓ fundo na janela</span>"
+
+            nf_str = f"<span style='color:{'#3fb950' if nf and nf > 0 else '#f85149'}'>{nf:+.3f}◎</span>" if nf is not None else "<span class='dim'>NULL</span>"
+
+            hist_rows_html += (
+                f"<tr>"
+                f"<td>{ts_str}</td>"
+                f"<td><b>{sym}</b></td>"
+                f"<td>{bounce*100:.0f}%</td>"
+                f"<td>{gap_str}</td>"
+                f"<td>{ev}</td>"
+                f"<td>{bv:.3f}</td>"
+                f"<td>{sv:.3f}</td>"
+                f"<td>{nf_str}</td>"
+                f"<td>{coverage_note}</td>"
+                f"</tr>"
+            )
+
+        n_beyond = gap_stats.get("beyond_60s") or 0
+        n_total  = gap_stats.get("n") or 1
+        pct_wrong = n_beyond / n_total * 100
+
+        html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>H23 Window Debug</title>{CSS}
+<meta http-equiv='refresh' content='10'>
+</head><body>
+<h1>H23 — Diagnóstico da Janela de Absorção</h1>
+<p style='color:#8b949e;font-size:11px'>
+  auto-refresh 10s · compara janela CORRETA [ts_min−60s → ts_min] vs ANTIGA [now−60s → now]<br>
+  A janela correta captura a absorção real do dump. A antiga capturava momentum pós-bounce.
+</p>
+<div>
+  <a href='/debug/h23' style='color:#58a6ff;margin-right:14px;font-size:12px'>Debug H23</a>
+  <a href='/debug/absorption' style='color:#58a6ff;margin-right:14px;font-size:12px'>Absorption</a>
+  <a href='/debug/h23-wr' style='color:#58a6ff;font-size:12px'>H23 WR</a>
+</div>
+<br>
+
+<div class='warn'>
+  ⚠ <b>Bug corrigido neste deploy:</b> a janela de absorção agora usa <code>window_end_ts = ts_min</code>
+  (fundo) em vez de <code>time.time()</code> (momento do bounce).<br>
+  Dados históricos no banco foram coletados com a janela errada — somente novos bounces terão H23 correto.
+  <br>Gap médio ts_min→ts_signal: <b>{gap_stats.get('avg_gap_sec') or '—'}s</b> (P50: {gap_stats.get('p50_gap_sec') or '—'}s).
+  <b style='color:#f85149'>{pct_wrong:.0f}% dos bounces históricos tinham gap > 60s</b> —
+  ou seja, a janela antiga não capturava nenhum evento do período real de absorção.
+</div>
+<br>
+
+{_box("Tokens ativos", n_active)}
+{_box("Gap médio ts_min→agora", f"{avg_gap:.0f}s" if avg_gap else "—", "#e3b341" if avg_gap and avg_gap > 60 else "#3fb950")}
+{_box("Bounces com gap > 60s (janela errada)", f"{n_beyond}/{n_total} ({pct_wrong:.0f}%)", "#f85149" if pct_wrong > 30 else "#d29922")}
+
+<br><br>
+<h2>▸ Tokens ativos no HotMonitor — comparação janela CORRETA vs ANTIGA</h2>
+<p style='color:#484f58;font-size:11px'>
+  "Gap ts_min→agora" = tempo desde o fundo até agora. Se > 60s, a janela antiga não capturava o fundo.<br>
+  "Diff" = (flow correto) − (flow antigo). Valor ≠ 0 confirma que a correção muda os dados.
+</p>
+<table>
+  <thead><tr>
+    <th>Token</th>
+    <th>Gap fundo→agora</th>
+    <th colspan='3' style='background:#1a2d1a'>✅ JANELA CORRETA (ts_min)</th>
+    <th></th>
+    <th colspan='3' style='background:#2d1a1a'>❌ JANELA ANTIGA (now)</th>
+    <th>Diff flow</th>
+    <th>Mint</th>
+  </tr>
+  <tr>
+    <th></th><th></th>
+    <th style='background:#0d1f0d'>Eventos</th>
+    <th style='background:#0d1f0d'>Net flow</th>
+    <th style='background:#0d1f0d'>Ratio</th>
+    <th></th>
+    <th style='background:#1f0d0d'>Eventos</th>
+    <th style='background:#1f0d0d'>Net flow</th>
+    <th style='background:#1f0d0d'>Ratio</th>
+    <th></th><th></th>
+  </tr></thead>
+  <tbody>{live_rows_html}</tbody>
+</table>
+
+<br>
+<h2>▸ Últimos 30 bounce_signals — gap ts_migração → ts_signal e cobertura da janela</h2>
+<p style='color:#484f58;font-size:11px'>
+  gap = tempo entre a migração e o sinal de bounce. Quanto maior, mais do fundo ficou fora da janela antiga.<br>
+  ❌ = gap > 60s → janela antiga capturava zero eventos do período de absorção real.<br>
+  <b>Dados com gap > 60s têm net_sol_flow inválido no banco (momentum, não absorção).</b>
+</p>
+<table>
+  <thead><tr>
+    <th>Hora</th><th>Token</th><th>Bounce%</th>
+    <th>Gap ts_mig→sinal</th>
+    <th>Ev</th><th>Buy◎</th><th>Sell◎</th>
+    <th>net_sol_flow (salvo)</th>
+    <th>Cobertura da janela</th>
+  </tr></thead>
+  <tbody>{hist_rows_html}</tbody>
+</table>
+
+<p style='color:#484f58;font-size:11px;margin-top:20px'>
+  ⚠ "Gap" acima usa ts_migration como proxy de ts_min, que ocorre depois da migração (P50 ~13min).<br>
+  O gap real ts_min→ts_signal é menor — mas ilustra a magnitude do problema.<br>
+  Bounces futuros (pós-deploy) usarão a janela correta centrada em ts_min.
+</p>
+</body></html>"""
+        return html
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
 @app.route("/analise/post-sl-recovery")
 def analise_post_sl_recovery():
     """Para cada SL, o que o token fez depois do nosso stop?

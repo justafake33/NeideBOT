@@ -465,18 +465,22 @@ class HeliusWS:
     # Price resolution — Anchor logs → DexScreener fallback
     # ──────────────────────────────────────────────────────────────────
 
-    def get_absorption_window(self, mint: str, window_sec: int = 60) -> dict:
+    def get_absorption_window(self, mint: str, window_sec: int = 60,
+                              window_end_ts: float = None) -> dict:
         """
-        H22 — retorna métricas de fluxo de ordens para um mint na janela de window_sec.
-        Filtra apenas eventos pump.fun pAMM (side='buy'/'sell') mais recentes que window_sec.
-        Retorna dict com buy_count, sell_count, buy_vol_sol, sell_vol_sol, etc.
-        Seguro para chamar a qualquer momento — retorna zeros se sem dados.
+        H22/H23 — retorna métricas de fluxo de ordens para um mint na janela de window_sec.
+
+        window_end_ts: timestamp Unix (float) do FIM da janela. Default = time.time() (agora).
+        Para capturar absorção REAL do dump (não momentum pós-bounce), passar
+        state["ts_min"].timestamp() — janela fica [ts_min - window_sec, ts_min].
+        Sem esse parâmetro, a janela captura o bounce subindo, não o fundo sendo absorvido.
         """
-        cutoff = time.time() - window_sec
+        end   = window_end_ts if window_end_ts is not None else time.time()
+        cutoff = end - window_sec
         with self._lock:
             events = list(self._swap_events.get(mint, []))
 
-        recent = [e for e in events if e["ts"] >= cutoff]
+        recent = [e for e in events if cutoff <= e["ts"] <= end]
         buys   = [e for e in recent if e["side"] == "buy"]
         sells  = [e for e in recent if e["side"] == "sell"]
 
@@ -492,6 +496,7 @@ class HeliusWS:
             "largest_sell":   max((e["sol"] for e in sells), default=0.0),
             "total_events":   len(recent),
             "window_sec":     window_sec,
+            "window_end_ts":  end,
         }
 
     def _dexscreener_fallback(self, mint: str, supply: float):

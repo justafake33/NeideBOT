@@ -269,30 +269,33 @@ class HotMonitor:
                 name=f"backfill-{mint[:8]}",
             ).start()
 
-        # H22 — Coleta de métricas brutas de absorção (observe-only, NÃO bloqueia o sinal)
-        # Fonte: Helius pAMM events (buy/sell) na janela de 60s anterior ao bounce.
-        # Score/grade NÃO calculados aqui — fórmula não validada por dados reais.
-        # Após n≥30 bounces com outcomes (TP/SL), analisar quais métricas brutas
-        # discriminam e SÓ ENTÃO construir score baseado em correlações reais.
+        # H22/H23 — Coleta de absorção centrada no FUNDO (ts_min), não no bounce.
+        # Bug corrigido: window_end_ts=ts_min captura [ts_min-60s → ts_min] —
+        # o período onde os vendedores se exaurem e os primeiros compradores entram.
+        # Usar time.time() (padrão anterior) capturava o bounce subindo, não o fundo.
         absorption_window = {}
         if self._helius:
             try:
-                absorption_window = self._helius.get_absorption_window(mint, window_sec=60)
+                ts_min = state.get("ts_min")
+                window_end = ts_min.timestamp() if ts_min else None
+                absorption_window = self._helius.get_absorption_window(
+                    mint, window_sec=60, window_end_ts=window_end
+                )
                 ev = absorption_window.get("total_events", 0)
                 if ev > 0:
                     bv = absorption_window.get("buy_vol_sol",  0) or 0
-                    sv = absorption_window.get("sell_vol_sol", 0) or 0.0001
+                    sv = absorption_window.get("sell_vol_sol", 0) or 0
                     logger.info(
                         "H22 %s: %d eventos | buy=%.3fSOL(%d) sell=%.3fSOL(%d) "
-                        "lrg_buy=%.3f ratio=%.2f",
+                        "lrg_buy=%.3f ratio=%.2f [janela: fundo±60s]",
                         state.get("symbol", mint[:8]), ev,
                         bv, absorption_window.get("buy_count",    0),
                         sv, absorption_window.get("sell_count",   0),
                         absorption_window.get("largest_buy", 0),
-                        bv / sv,
+                        bv / sv if sv > 0 else float("inf"),
                     )
                 else:
-                    logger.info("H22 %s: no_data (sem eventos Helius na janela de 60s)",
+                    logger.info("H22 %s: no_data (sem eventos Helius nos 60s antes do fundo)",
                                 state.get("symbol", mint[:8]))
             except Exception as e:
                 logger.debug("H22 absorption %s: %s", mint[:8], e)
