@@ -25855,15 +25855,15 @@ def analise_feature_scan_recente():
     return H
 
 
-# /analise/intersecao — sobreposição dos melhores sinais (trades recentes)
+# /analise/intersecao — sobreposição dos melhores sinais (todos os trades com dados reais)
 @app.route("/analise/intersecao")
 def analise_intersecao():
     """
-    Analisa a interseção dos melhores sinais encontrados nos trades recentes.
+    Analisa a interseção dos melhores sinais em todos os trades com dados de bounce confirmados.
     Labels em português com explicações simples.
-    Parâmetros: ?from_id=338&to_id=999999
+    Parâmetros: ?from_id=1&to_id=999999
     """
-    from_id = int(request.args.get("from_id", 338))
+    from_id = int(request.args.get("from_id", 1))
     to_id   = int(request.args.get("to_id", 999999))
     PUMP_SUPPLY = 1_000_000_000
 
@@ -25893,6 +25893,8 @@ def analise_intersecao():
     </style>
     """
 
+    helius_from_id = 338  # absorção Helius só confiável a partir deste ID
+
     with db._cursor() as cur:
         cur.execute("""
             SELECT t.id, t.mint, t.symbol, t.ts_signal, t.status,
@@ -25902,10 +25904,11 @@ def analise_intersecao():
                    m.smart_wallets, m.creator_token_status, m.cto_flag,
                    m.time_to_bottom
             FROM trades t
-            LEFT JOIN bounce_signals bs ON t.mint = bs.mint
-            LEFT JOIN migrations m      ON t.mint = m.mint
+            JOIN bounce_signals bs ON t.mint = bs.mint
+            LEFT JOIN migrations m ON t.mint = m.mint
             WHERE t.status IN ('tp','sl','trailing_active')
               AND t.id >= %s AND t.id <= %s
+              AND bs.bounce_pct IS NOT NULL
             ORDER BY t.id DESC
         """, (from_id, to_id))
         rows = cur.fetchall()
@@ -25994,10 +25997,21 @@ def analise_intersecao():
     n_tp    = sum(1 for t in trades if t["is_tp"])
     wr_base = n_tp / n_total * 100 if n_total else 0
 
+    n_com_absorcao = sum(1 for r in rows if r["absorption_events"] and r["absorption_events"] > 0)
+    n_sem_absorcao = n_total - n_com_absorcao
+
     H = f"<!DOCTYPE html><html><head><title>Interseção de Sinais</title>{css}</head><body>"
-    H += "<h2>🔗 Interseção de Sinais — Trades Recentes</h2>"
+    H += "<h2>🔗 Interseção de Sinais — Todos os Trades com Dados Confirmados</h2>"
     H += f"<div class='box'><b>{n_total} trades | {n_tp} TP / {n_total-n_tp} SL | Taxa de acerto base: {wr_base:.1f}%</b><br>"
-    H += f"Trades #{from_id} em diante &nbsp;|&nbsp; Break-even com SL=25% / TP=75%: ~25%</div>"
+    H += f"Trades #{from_id} a #{to_id} com bounce_pct confirmado &nbsp;|&nbsp; Break-even com SL=25% / TP=75%: ~25%<br>"
+    H += f"<span style='color:#8b949e;font-size:11px'>Filtros rápidos: "
+    H += f"<a href='?from_id=1' style='color:#79c0ff'>Todos</a> &nbsp;|&nbsp; "
+    H += f"<a href='?from_id=338' style='color:#79c0ff'>Recentes (#338+, WR 29%)</a></span></div>"
+    H += f"<div style='background:#1f2d1f;border:1px solid #238636;padding:10px 14px;margin-bottom:14px;border-radius:4px'>"
+    H += f"⚠️ <b>Absorção Helius</b>: disponível em <b>{n_com_absorcao}/{n_total}</b> trades "
+    H += f"({n_com_absorcao/n_total*100:.0f}%). "
+    H += f"Trades antes do #{helius_from_id} têm <code>absorption_events = NULL</code> — "
+    H += f"o sinal <span class='badge b6'>Absorção equilibrada</span> fica desabilitado nesses trades históricos.</div>"
 
     # ── Legenda dos sinais ───────────────────────────────────────────────────
     H += "<h3>📖 Legenda dos sinais</h3>"
