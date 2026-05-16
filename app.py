@@ -11325,6 +11325,257 @@ def debug_h23_wr():
     return H
 
 
+@app.route("/debug/bounce-wr")
+def debug_bounce_wr():
+    """Análise de WR por faixa de bounce_pct — trades #338+ (helius_sell_recovery).
+    Compara todos os dados disponíveis estratificados por tamanho do bounce.
+    """
+    from_id = int(request.args.get("from_id", 338))
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                t.id,
+                t.symbol,
+                t.status,
+                t.pnl_pct_real,
+                t.entry_price_usd,
+                t.tokens_received,
+                bs.bounce_pct,
+                bs.elapsed_sec / 60.0          AS elapsed_min,
+                bs.net_sol_flow,
+                bs.mc_at_signal,
+                bs.mc_bottom,
+                bs.absorption_events,
+                bs.absorption_buy_vol          AS buy_vol,
+                bs.absorption_sell_vol         AS sell_vol,
+                m.mc_migration,
+                m.smart_wallets,
+                m.renowned_wallets,
+                m.creator_token_status,
+                m.top10_holder_rate,
+                m.rug_ratio,
+                m.rat_trader_rate,
+                m.pct_drop,
+                m.time_to_bottom,
+                m.liq_migration
+            FROM trades t
+            JOIN bounce_signals bs ON bs.mint = t.mint
+            LEFT JOIN migrations m  ON m.mint = t.mint
+            WHERE t.id >= %(from_id)s
+              AND t.exit_type = 'helius_sell_recovery'
+              AND t.status IN ('tp', 'sl')
+            ORDER BY bs.bounce_pct ASC NULLS LAST
+        """, {"from_id": from_id})
+        rows = cur.fetchall()
+
+    if not rows:
+        return f"<pre>Nenhum trade helius_sell_recovery a partir do #{from_id}</pre>"
+
+    n_total = len(rows)
+    tp_all  = sum(1 for r in rows if r['status'] == 'tp')
+    wr_base = tp_all / n_total * 100
+
+    def ev(wr_pct, n):
+        if n < 3: return None
+        return wr_pct / 100 * 0.75 - (1 - wr_pct / 100) * 0.25
+
+    CSS = """<style>
+    body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+    h2{color:#58a6ff;margin-bottom:4px}h3{color:#79c0ff;margin-top:28px;margin-bottom:8px}
+    table{border-collapse:collapse;width:100%;margin-bottom:14px}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:right;font-size:11px}
+    th:first-child,th.l{text-align:left}
+    td{padding:5px 10px;border:1px solid #21262d;text-align:right;font-size:12px}
+    td:first-child,td.l{text-align:left}
+    .tp{color:#3fb950;font-weight:bold}.sl{color:#f85149}
+    .pos{color:#3fb950;font-weight:bold}.neg{color:#f85149;font-weight:bold}
+    .hi{background:#1a2e1a}.lo{background:#2d1a1a}.mid{background:#1e1e2e}
+    .box{background:#161b22;border:1px solid #30363d;padding:10px 16px;margin-bottom:12px;border-radius:6px;display:inline-block;margin-right:12px;vertical-align:top}
+    .dim{color:#484f58}.warn{color:#e3b341}
+    </style>"""
+
+    H = f"<!DOCTYPE html><html><head><title>Bounce WR</title>{CSS}</head><body>"
+    H += f"<h2>📊 WR por Faixa de Bounce — Trades #{from_id}+</h2>"
+    H += (f"<div class='box'><b>Total</b>: {n_total} trades | "
+          f"<span class='tp'>{tp_all} TP</span> | <span class='sl'>{n_total-tp_all} SL</span> | "
+          f"WR base: <b>{wr_base:.1f}%</b> | Break-even: 25%</div>")
+    H += "<p class='dim' style='font-size:11px'>Apenas exit_type=helius_sell_recovery. Bounce = (mc_at_signal − mc_bottom) / mc_bottom.</p>"
+
+    # ── 1. Tabela por faixa de bounce ────────────────────────────────────────
+    BUCKETS = [
+        ("30–55%",   0.30, 0.55),
+        ("55–65%",   0.55, 0.65),
+        ("65–80%",   0.65, 0.80),
+        ("80–100%",  0.80, 1.00),
+        ("100–150%", 1.00, 1.50),
+        ("150%+",    1.50, 9999),
+    ]
+
+    def bucket_label(bp):
+        if bp is None: return "sem dado"
+        for lbl, lo, hi in BUCKETS:
+            if lo <= bp < hi: return lbl
+        return "sem dado"
+
+    H += "<h3>1 — WR por faixa de bounce_pct</h3>"
+    H += ("<table><tr>"
+          "<th class='l'>Faixa</th><th>n</th><th>TP</th><th>SL</th>"
+          "<th>WR</th><th>vs base</th><th>EV/trade</th>"
+          "<th>Bounce médio</th><th>Elapsed médio</th><th>H23 médio</th></tr>")
+    for lbl, lo, hi in BUCKETS:
+        rs = [r for r in rows if r['bounce_pct'] is not None and lo <= r['bounce_pct'] < hi]
+        n  = len(rs)
+        tp = sum(1 for r in rs if r['status'] == 'tp')
+        wr = tp / n * 100 if n else 0
+        delta = wr - wr_base
+        ev_v  = ev(wr, n)
+        avg_b = sum(r['bounce_pct'] for r in rs) / n if n else None
+        avg_e = sum(r['elapsed_min'] for r in rs if r['elapsed_min']) / max(1, sum(1 for r in rs if r['elapsed_min']))
+        h23s  = [r['net_sol_flow'] for r in rs if r['net_sol_flow'] is not None]
+        avg_h = sum(h23s) / len(h23s) if h23s else None
+        wr_s  = (f"<span class='{'pos' if wr>=25 else 'neg'}'>{wr:.1f}%</span>"
+                 if n >= 3 else f"<span class='dim'>— (n={n})</span>")
+        dlt_s = (f"<span class='{'pos' if delta>0 else 'neg'}'>{delta:+.1f}pp</span>" if n>=3 else "—")
+        ev_s  = (f"<span class='{'pos' if ev_v and ev_v>0 else 'neg'}'>{ev_v:+.1%}</span>"
+                 if ev_v is not None else "—")
+        cls   = " class='hi'" if (n>=3 and delta>=8) else " class='lo'" if (n>=3 and delta<=-8) else ""
+        H += (f"<tr{cls}><td class='l'><b>{lbl}</b></td><td>{n}</td>"
+              f"<td class='tp'>{tp}</td><td class='sl'>{n-tp}</td>"
+              f"<td>{wr_s}</td><td>{dlt_s}</td><td>{ev_s}</td>"
+              f"<td>{avg_b*100:.0f}%</td>"
+              f"<td>{avg_e:.1f}m</td>"
+              f"<td>{'—' if avg_h is None else f'{avg_h:+.1f}◎'}</td></tr>")
+    H += (f"<tr style='border-top:2px solid #30363d'><td class='l'><b>TOTAL</b></td>"
+          f"<td>{n_total}</td><td class='tp'>{tp_all}</td><td class='sl'>{n_total-tp_all}</td>"
+          f"<td><b>{wr_base:.1f}%</b></td><td>base</td>"
+          f"<td><span class='{'pos' if ev(wr_base,n_total) and ev(wr_base,n_total)>0 else 'neg'}'>"
+          f"{ev(wr_base,n_total):+.1%}</span></td><td colspan='3'></td></tr>")
+    H += "</table>"
+
+    # ── 2. Bounce × Elapsed cruzado ─────────────────────────────────────────
+    ELAP_BUCKETS = [("0–2m", 0, 2), ("2–5m", 2, 5), ("5–10m", 5, 10), ("10m+", 10, 999)]
+    H += "<h3>2 — WR: Bounce × Elapsed (grid)</h3>"
+    H += "<table><tr><th class='l'>Bounce \\ Elapsed</th>"
+    for elbl, _, __ in ELAP_BUCKETS:
+        H += f"<th>{elbl}</th>"
+    H += "<th>Total faixa</th></tr>"
+    for blbl, blo, bhi in BUCKETS:
+        H += f"<tr><td class='l'><b>{blbl}</b></td>"
+        rs_b = [r for r in rows if r['bounce_pct'] is not None and blo <= r['bounce_pct'] < bhi]
+        for elbl, elo, ehi in ELAP_BUCKETS:
+            cell = [r for r in rs_b if r['elapsed_min'] is not None and elo <= r['elapsed_min'] < ehi]
+            n_c  = len(cell)
+            tp_c = sum(1 for r in cell if r['status'] == 'tp')
+            wr_c = tp_c / n_c * 100 if n_c else 0
+            delta_c = wr_c - wr_base
+            if n_c == 0:
+                H += "<td class='dim'>—</td>"
+            elif n_c < 3:
+                H += f"<td class='dim'>{tp_c}/{n_c}</td>"
+            else:
+                cls_c = "pos" if delta_c >= 8 else "neg" if delta_c <= -8 else ""
+                H += f"<td><span class='{cls_c}'>{wr_c:.0f}%</span> <span class='dim'>n={n_c}</span></td>"
+        # row total
+        n_r = len(rs_b); tp_r = sum(1 for r in rs_b if r['status']=='tp')
+        wr_r = tp_r/n_r*100 if n_r else 0
+        cls_r = "pos" if wr_r-wr_base>=8 else "neg" if wr_r-wr_base<=-8 else ""
+        H += (f"<td><b><span class='{cls_r}'>{wr_r:.0f}%</span></b> n={n_r}</td></tr>")
+    H += "</table>"
+
+    # ── 3. Bounce × H23 cruzado ──────────────────────────────────────────────
+    H23_BUCKETS = [("H23<0", lambda x: x is not None and x < 0),
+                   ("H23 0–3", lambda x: x is not None and 0 <= x < 3),
+                   ("H23 3–10", lambda x: x is not None and 3 <= x < 10),
+                   ("H23>10", lambda x: x is not None and x >= 10),
+                   ("sem H23", lambda x: x is None)]
+    H += "<h3>3 — WR: Bounce × H23 net_sol_flow (grid)</h3>"
+    H += "<table><tr><th class='l'>Bounce \\ H23</th>"
+    for hlbl, _ in H23_BUCKETS:
+        H += f"<th>{hlbl}</th>"
+    H += "<th>Total faixa</th></tr>"
+    for blbl, blo, bhi in BUCKETS:
+        H += f"<tr><td class='l'><b>{blbl}</b></td>"
+        rs_b = [r for r in rows if r['bounce_pct'] is not None and blo <= r['bounce_pct'] < bhi]
+        for hlbl, hfn in H23_BUCKETS:
+            cell = [r for r in rs_b if hfn(r['net_sol_flow'])]
+            n_c  = len(cell); tp_c = sum(1 for r in cell if r['status']=='tp')
+            wr_c = tp_c/n_c*100 if n_c else 0; delta_c = wr_c - wr_base
+            if n_c == 0: H += "<td class='dim'>—</td>"
+            elif n_c < 3: H += f"<td class='dim'>{tp_c}/{n_c}</td>"
+            else:
+                cls_c = "pos" if delta_c>=8 else "neg" if delta_c<=-8 else ""
+                H += f"<td><span class='{cls_c}'>{wr_c:.0f}%</span> <span class='dim'>n={n_c}</span></td>"
+        n_r = len(rs_b); tp_r = sum(1 for r in rs_b if r['status']=='tp')
+        wr_r = tp_r/n_r*100 if n_r else 0
+        cls_r = "pos" if wr_r-wr_base>=8 else "neg" if wr_r-wr_base<=-8 else ""
+        H += f"<td><b><span class='{cls_r}'>{wr_r:.0f}%</span></b> n={n_r}</td></tr>"
+    H += "</table>"
+
+    # ── 4. Bounce × Drop from migration cruzado ──────────────────────────────
+    DROP_BUCKETS = [("drop 30–50%", 0.30, 0.50), ("drop 50–70%", 0.50, 0.70),
+                    ("drop 70–85%", 0.70, 0.85), ("drop 85%+", 0.85, 9999)]
+    H += "<h3>4 — WR: Bounce × Drop da migração</h3>"
+    H += "<table><tr><th class='l'>Bounce \\ Drop</th>"
+    for dlbl, _, __ in DROP_BUCKETS:
+        H += f"<th>{dlbl}</th>"
+    H += "<th>Total faixa</th></tr>"
+    for blbl, blo, bhi in BUCKETS:
+        H += f"<tr><td class='l'><b>{blbl}</b></td>"
+        rs_b = [r for r in rows if r['bounce_pct'] is not None and blo <= r['bounce_pct'] < bhi]
+        for dlbl, dlo, dhi in DROP_BUCKETS:
+            cell = [r for r in rs_b if r['pct_drop'] is not None and dlo <= r['pct_drop'] < dhi]
+            n_c = len(cell); tp_c = sum(1 for r in cell if r['status']=='tp')
+            wr_c = tp_c/n_c*100 if n_c else 0; delta_c = wr_c - wr_base
+            if n_c == 0: H += "<td class='dim'>—</td>"
+            elif n_c < 3: H += f"<td class='dim'>{tp_c}/{n_c}</td>"
+            else:
+                cls_c = "pos" if delta_c>=8 else "neg" if delta_c<=-8 else ""
+                H += f"<td><span class='{cls_c}'>{wr_c:.0f}%</span> <span class='dim'>n={n_c}</span></td>"
+        n_r = len(rs_b); tp_r = sum(1 for r in rs_b if r['status']=='tp')
+        wr_r = tp_r/n_r*100 if n_r else 0
+        cls_r = "pos" if wr_r-wr_base>=8 else "neg" if wr_r-wr_base<=-8 else ""
+        H += f"<td><b><span class='{cls_r}'>{wr_r:.0f}%</span></b> n={n_r}</td></tr>"
+    H += "</table>"
+
+    # ── 5. Lista completa de trades ──────────────────────────────────────────
+    H += "<h3>5 — Lista completa de trades (ordenado por bounce asc)</h3>"
+    H += ("<table><tr>"
+          "<th>#</th><th class='l'>Token</th>"
+          "<th>bounce</th><th>elapsed</th><th>H23◎</th>"
+          "<th>drop/mig</th><th>TTB</th><th>smart</th><th>creator</th>"
+          "<th>top10</th><th>liq$k</th>"
+          "<th>status</th><th>P&amp;L</th></tr>")
+    for r in rows:
+        bp  = r['bounce_pct']; bp_s  = f"{bp*100:.0f}%" if bp else "—"
+        el  = r['elapsed_min']; el_s  = f"{el:.1f}m" if el else "—"
+        nf  = r['net_sol_flow']
+        nf_s = (f"<span class='{'pos' if nf>=1 else ('neg' if nf<0 else 'dim')}'>{nf:+.1f}</span>"
+                if nf is not None else "<span class='dim'>—</span>")
+        drp = r['pct_drop']; drp_s = f"{drp*100:.0f}%" if drp else "—"
+        ttb = r['time_to_bottom']; ttb_s = f"{ttb:.0f}m" if ttb else "—"
+        sw  = r['smart_wallets']; sw_s  = str(int(sw)) if sw else "—"
+        cr  = r['creator_token_status']
+        cr_s = ("<span class='pos'>saiu</span>" if cr == "creator_close"
+                else "<span class='warn'>segura</span>" if cr == "creator_hold" else "—")
+        t10 = r['top10_holder_rate']
+        t10_s = f"{t10*100:.0f}%" if t10 else "—"
+        liq = r['liq_migration']
+        liq_s = f"${liq/1000:.0f}k" if liq else "—"
+        pnl = r['pnl_pct_real']
+        pnl_s = f"{pnl:+.1f}%" if pnl else "—"
+        is_tp = r['status'] == 'tp'
+        row_cls = " class='hi'" if is_tp else ""
+        st_s = f"<span class='tp'>TP</span>" if is_tp else f"<span class='sl'>SL</span>"
+        H += (f"<tr{row_cls}><td>{r['id']}</td><td class='l'><b>{r['symbol'] or ''}</b></td>"
+              f"<td>{bp_s}</td><td>{el_s}</td><td>{nf_s}</td>"
+              f"<td>{drp_s}</td><td>{ttb_s}</td><td>{sw_s}</td><td>{cr_s}</td>"
+              f"<td>{t10_s}</td><td>{liq_s}</td>"
+              f"<td>{st_s}</td><td>{pnl_s}</td></tr>")
+    H += "</table></body></html>"
+    return H
+
+
 @app.route("/debug/h23")
 def debug_h23():
     """H23 — Verificação pré-deploy de net_sol_flow.
