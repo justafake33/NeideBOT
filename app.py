@@ -11167,8 +11167,9 @@ def debug_absorption():
 
 @app.route("/debug/h23-wr")
 def debug_h23_wr():
-    """WR por faixa de H23 net_sol_flow — trades #338+ (helius_sell_recovery).
+    """WR por faixa de H23 net_sol_flow — trades blockchain verificados.
     Filtra por h23_window para separar absorção real (bottom) de momentum (bounce).
+    Aceita qualquer exit_type blockchain (helius_sell_recovery, helius, helius_recovery).
     """
     from_id  = int(request.args.get("from_id", 338))
     win_filter = request.args.get("window", "all")  # 'bottom', 'bounce', 'all'
@@ -11199,7 +11200,7 @@ def debug_h23_wr():
             FROM trades t
             JOIN bounce_signals bs ON bs.mint = t.mint
             WHERE t.id >= %(from_id)s
-              AND t.exit_type = 'helius_sell_recovery'
+              AND t.exit_type IN ('helius_sell_recovery', 'helius', 'helius_recovery')
               AND t.status IN ('tp', 'sl')
               {window_clause}
             ORDER BY bs.net_sol_flow NULLS FIRST, t.id
@@ -11207,7 +11208,8 @@ def debug_h23_wr():
         rows = cur.fetchall()
 
     if not rows:
-        return f"<pre>Nenhum trade helius_sell_recovery encontrado a partir do #{from_id}</pre>"
+        return (f"<pre>Nenhum trade blockchain verificado encontrado a partir do #{from_id}.\n"
+                f"Execute /debug/sell-recovery para classificar trades recentes.</pre>")
 
     ORDER = ['sem H23', 'negativo  (< 0)', 'fraco     (0–1)',
              'sweet     (1–3)', 'bom       (3–10)', 'alto      (> 10)']
@@ -11264,7 +11266,7 @@ def debug_h23_wr():
 
     H += (f"<div class='box'><b>Total:</b> {n_total} trades | {tp_total} TP | {n_total-tp_total} SL | "
           f"WR base: <b>{wr_base:.1f}%</b> &nbsp; Break-even: 25%<br>"
-          f"<span style='color:#8b949e;font-size:12px'>Apenas trades com exit_type=helius_sell_recovery (blockchain verificado)</span></div>")
+          f"<span style='color:#8b949e;font-size:12px'>Trades blockchain verificados (helius_sell_recovery + helius + helius_recovery)</span></div>")
 
     # ── Tabela por bucket ─────────────────────────────────────────────────────
     H += "<h3>📊 WR por faixa de net_sol_flow</h3>"
@@ -11449,13 +11451,14 @@ def debug_h23_grid():
             FROM trades t
             JOIN bounce_signals bs ON bs.mint = t.mint
             WHERE t.id >= %(from_id)s
-              AND t.exit_type = 'helius_sell_recovery'
+              AND t.exit_type IN ('helius_sell_recovery', 'helius', 'helius_recovery')
               AND t.status IN ('tp', 'sl')
         """, {"from_id": from_id})
         rows = cur.fetchall()
 
     if not rows:
-        return f"<pre>Nenhum trade helius_sell_recovery encontrado a partir do #{from_id}</pre>"
+        return (f"<pre>Nenhum trade blockchain verificado encontrado a partir do #{from_id}.\n"
+                f"Execute /debug/sell-recovery para classificar trades recentes.</pre>")
 
     css = """<style>
     body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
@@ -11623,14 +11626,15 @@ def _debug_bounce_wr_inner():
             JOIN bounce_signals bs ON bs.mint = t.mint
             LEFT JOIN migrations m  ON m.mint = t.mint
             WHERE t.id >= %(from_id)s
-              AND t.exit_type = 'helius_sell_recovery'
+              AND t.exit_type IN ('helius_sell_recovery', 'helius', 'helius_recovery')
               AND t.status IN ('tp', 'sl')
             ORDER BY bs.bounce_pct ASC NULLS LAST
         """, {"from_id": from_id})
         rows = cur.fetchall()
 
     if not rows:
-        return f"<pre>Nenhum trade helius_sell_recovery a partir do #{from_id}</pre>"
+        return (f"<pre>Nenhum trade blockchain verificado a partir do #{from_id}.\n"
+                f"Execute /debug/sell-recovery para classificar trades recentes.</pre>")
 
     n_total = len(rows)
     tp_all  = sum(1 for r in rows if r['status'] == 'tp')
