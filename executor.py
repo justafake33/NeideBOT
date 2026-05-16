@@ -674,19 +674,16 @@ class TradeMonitor:
                 return
 
         # SL usa entry_mc real se disponível; fallback para entry_expected.
-        # TP/trailing só dispara com entry_mc real — entry_expected × 1.75 é baixo
-        # demais para trades antigos (entrada real era 30-100% acima do esperado),
-        # gerando falsos positivos que mostram +75% quando o real foi -15%.
+        # tp_mc: usa entry_mc_real se disponível.
+        # Fallback: mc_at_signal (MC no momento do sinal = aproximação da entrada real).
+        # entry_expected (mc_bottom × 1.15) está SEMPRE abaixo da entrada real —
+        # para bounce 88%, entry_expected×1.75 = ×2.01 mas o bot comprou em ×1.88.
+        # tp_mc ficaria abaixo do preço de entrada → marca trailing_active imediato no 1º tick.
         sl_ref  = entry_mc_real or entry_mc
         sl_mc   = sl_ref * (1 - sl_pct)
-        # tp_mc: usa entry_mc_real se disponível.
-        # Fallback para entry_expected quando fill não foi registrado (GMGN não retorna
-        # filled_output_amount no query_order). entry_expected é conservador (real fill
-        # é igual ou maior), então tp_mc calculado assim é igual ou menor que o real —
-        # detecta TP um pouco cedo, mas sem falso positivo estrutural.
-        # Detectado sem fill → marca trailing_active (não tp direto) para sinalizar incerteza.
-        tp_mc            = entry_mc_real * (1 + tp_pct) if entry_mc_real else entry_mc * (1 + tp_pct)
-        tp_from_expected = entry_mc_real is None  # flag: tp_mc baseado em entry_expected
+        mc_at_signal     = trade.get("mc_at_signal") or entry_mc  # melhor proxy que entry_expected
+        tp_mc            = entry_mc_real * (1 + tp_pct) if entry_mc_real else mc_at_signal * (1 + tp_pct)
+        tp_from_expected = entry_mc_real is None  # flag: tp_mc baseado em proxy (não fill real)
 
         ticks = db.get_ticks_after(mint, min_ts=ref_ts)
         if not ticks:
