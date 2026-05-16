@@ -30243,10 +30243,10 @@ def debug_microstructure():
                 bs.rise_events, bs.rise_lrg_buy, bs.rise_buy_vol,
                 bs.buy_concentration,
                 bs.absorption_events,
-                t.status, t.pnl_pct_real
+                t.status, t.pnl_pct_real, t.exit_type
             FROM bounce_signals bs
             LEFT JOIN LATERAL (
-                SELECT status, pnl_pct_real
+                SELECT status, pnl_pct_real, exit_type
                 FROM trades
                 WHERE mint = bs.mint
                   AND created_at > bs.ts_signal - INTERVAL '5 minutes'
@@ -30268,7 +30268,7 @@ def debug_microstructure():
         bounce_rows = ""
         for r in rows:
             (ts, sym, bpct, drop, win, pq, dsc, hhi, tsf, rev, rlb, rbv, buyc,
-             abs_ev, status, pnl) = r
+             abs_ev, status, pnl, exit_type) = r
 
             # Cobertura: verde se tem dados, vermelho se NULL
             def cell(v, label=None, fmt=None):
@@ -30283,13 +30283,14 @@ def debug_microstructure():
             bc_cell  = cell(buyc,f"{buyc:.3f}"    if buyc else None)
             rev_cell = cell(rev, str(rev))
 
-            outcome = ""
-            if status == "tp":
-                outcome = f"<span style='color:#2a2'>TP {pnl*100:+.0f}%</span>" if pnl else "TP"
-            elif status in ("sl", "error"):
-                outcome = f"<span style='color:#a44'>SL {pnl*100:+.0f}%</span>" if pnl else "SL"
-            elif status:
-                outcome = status
+            # Só mostra outcome se confirmado on-chain (exit_type preenchido)
+            outcome = "—"
+            if exit_type and status == "tp":
+                outcome = f"<span style='color:#2a2'>TP {pnl*100:+.0f}%</span>" if pnl else "<span style='color:#2a2'>TP</span>"
+            elif exit_type and status in ("sl", "error"):
+                outcome = f"<span style='color:#a44'>SL {pnl*100:+.0f}%</span>" if pnl else "<span style='color:#a44'>SL</span>"
+            elif status and not exit_type:
+                outcome = f"<span style='color:#888'>{status}</span>"
 
             bounce_rows += f"""<tr>
               <td>{ts.strftime('%H:%M') if ts else '—'}</td>
