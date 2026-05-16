@@ -11984,36 +11984,33 @@ def debug_h23_window():
 
         avg_gap = total_gap_sec / n_with_gap if n_with_gap > 0 else None
 
-        # ── Seção 2: gap ts_min → ts_signal dos últimos bounce_signals ─────────
+        # ── Seção 2: gap ts_migração → ts_signal via elapsed_sec ────────────────
+        # elapsed_sec = segundos da migração até o sinal de bounce (campo nativo)
         with db._cursor() as cur:
             cur.execute("""
                 SELECT
                     symbol, ts_signal, elapsed_sec, bounce_pct,
                     absorption_events, absorption_buy_vol, absorption_sell_vol,
-                    net_sol_flow,
-                    EXTRACT(EPOCH FROM (ts_signal - ts_migration)) AS secs_to_signal,
-                    ts_migration
+                    net_sol_flow
                 FROM bounce_signals
-                WHERE ts_signal IS NOT NULL AND ts_migration IS NOT NULL
+                WHERE ts_signal IS NOT NULL AND elapsed_sec IS NOT NULL
                 ORDER BY ts_signal DESC
                 LIMIT 30
             """)
             hist = [dict(r) for r in cur.fetchall()]
 
-            # Gap médio e distribuição
+            # Gap médio e distribuição usando elapsed_sec
             cur.execute("""
                 SELECT
                     COUNT(*) AS n,
-                    ROUND(AVG(EXTRACT(EPOCH FROM (ts_signal - ts_migration)))::numeric, 1) AS avg_gap_sec,
-                    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (
-                        ORDER BY EXTRACT(EPOCH FROM (ts_signal - ts_migration))
-                    )::numeric, 1) AS p50_gap_sec,
-                    ROUND(MIN(EXTRACT(EPOCH FROM (ts_signal - ts_migration)))::numeric, 1) AS min_gap_sec,
-                    ROUND(MAX(EXTRACT(EPOCH FROM (ts_signal - ts_migration)))::numeric, 1) AS max_gap_sec,
-                    COUNT(CASE WHEN EXTRACT(EPOCH FROM (ts_signal - ts_migration)) <= 60 THEN 1 END) AS within_60s,
-                    COUNT(CASE WHEN EXTRACT(EPOCH FROM (ts_signal - ts_migration)) > 60 THEN 1 END) AS beyond_60s
+                    ROUND(AVG(elapsed_sec)::numeric, 1)                                       AS avg_gap_sec,
+                    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY elapsed_sec)::numeric, 1) AS p50_gap_sec,
+                    ROUND(MIN(elapsed_sec)::numeric, 1)                                       AS min_gap_sec,
+                    ROUND(MAX(elapsed_sec)::numeric, 1)                                       AS max_gap_sec,
+                    COUNT(CASE WHEN elapsed_sec <= 60 THEN 1 END)                             AS within_60s,
+                    COUNT(CASE WHEN elapsed_sec  > 60 THEN 1 END)                             AS beyond_60s
                 FROM bounce_signals
-                WHERE ts_signal IS NOT NULL AND ts_migration IS NOT NULL
+                WHERE ts_signal IS NOT NULL AND elapsed_sec IS NOT NULL
             """)
             gap_stats = dict(cur.fetchone())
 
@@ -12022,7 +12019,7 @@ def debug_h23_window():
             sym     = r.get("symbol") or "?"
             ts_sig  = r.get("ts_signal")
             ts_str  = ts_sig.strftime("%m-%d %H:%M") if ts_sig else "—"
-            gap_s   = float(r.get("secs_to_signal") or 0)
+            gap_s   = float(r.get("elapsed_sec") or 0)
             bounce  = r.get("bounce_pct") or 0
             ev      = r.get("absorption_events") or 0
             bv      = r.get("absorption_buy_vol") or 0
