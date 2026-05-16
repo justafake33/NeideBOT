@@ -30184,6 +30184,171 @@ def analise_h23_deep():
         return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
+@app.route("/analise/phantom-bounces")
+def analise_phantom_bounces():
+    """
+    Retroactive supply-bug analysis.
+    Compara mc_min usado na detecção vs mc_bottom real (kline).
+    Se mc_min < mc_bottom * 0.6 → phantom bounce (supply 250M ao invés de 1B).
+    Mostra WR separado: phantom vs real.
+    """
+    import psycopg2
+    from db import DATABASE_URL
+
+    THRESHOLD = 0.60  # mc_min < mc_bottom * threshold → phantom
+
+    conn = psycopg2.connect(DATABASE_URL)
+    cur  = conn.cursor()
+
+    # Todos os bounces com trade blockchain-verificado + mc_bottom disponível
+    cur.execute("""
+        SELECT
+            bs.ts_signal,
+            bs.symbol,
+            bs.mint,
+            bs.mc_min,
+            bs.mc_at_signal,
+            bs.bounce_pct,
+            bs.mc_migration,
+            m.mc_bottom,
+            t.status,
+            t.pnl_pct_real,
+            t.exit_type
+        FROM bounce_signals bs
+        JOIN migrations m ON m.mint = bs.mint
+        JOIN LATERAL (
+            SELECT status, pnl_pct_real, exit_type
+            FROM trades
+            WHERE mint = bs.mint
+              AND created_at > bs.ts_signal - INTERVAL '5 minutes'
+              AND created_at < bs.ts_signal + INTERVAL '30 minutes'
+              AND exit_type IS NOT NULL
+            ORDER BY created_at ASC LIMIT 1
+        ) t ON true
+        WHERE bs.mc_min IS NOT NULL
+          AND m.mc_bottom IS NOT NULL
+          AND m.mc_bottom > 0
+        ORDER BY bs.ts_signal DESC
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    phantoms, reals = [], []
+    for r in rows:
+        (ts, sym, mint, mc_min, mc_sig, bpct, mc_mig, mc_bottom,
+         status, pnl, exit_type) = r
+        ratio = mc_min / mc_bottom if mc_bottom else None
+        is_phantom = ratio is not None and ratio < THRESHOLD
+        rec = {
+            "ts": ts, "sym": sym, "mint": mint,
+            "mc_min": mc_min, "mc_bottom": mc_bottom,
+            "ratio": ratio, "mc_sig": mc_sig,
+            "bpct": bpct, "mc_mig": mc_mig,
+            "status": status, "pnl": pnl,
+        }
+        (phantoms if is_phantom else reals).append(rec)
+
+    def stats(lst):
+        if not lst:
+            return {"n": 0, "tp": 0, "sl": 0, "wr": None, "avg_pnl": None}
+        tp = sum(1 for r in lst if r["status"] == "tp")
+        sl = sum(1 for r in lst if r["status"] in ("sl", "error"))
+        pnls = [r["pnl"] for r in lst if r["pnl"] is not None]
+        return {
+            "n": len(lst), "tp": tp, "sl": sl,
+            "wr": tp / len(lst) if lst else None,
+            "avg_pnl": sum(pnls) / len(pnls) if pnls else None,
+        }
+
+    ps = stats(phantoms)
+    rs = stats(reals)
+
+    def fmt_pct(v):
+        return f"{v*100:.1f}%" if v is not None else "—"
+    def fmt_usd(v):
+        return f"${v/1000:.1f}k" if v else "—"
+
+    def rows_html(lst, color):
+        out = ""
+        for r in lst:
+            ratio_str = f"{r['ratio']:.2f}×" if r['ratio'] else "—"
+            bpct_str  = f"{r['bpct']*100:.0f}%" if r['bpct'] else "—"
+            oc = "#2a2" if r["status"] == "tp" else "#a44"
+            pnl_str = f"{r['pnl']*100:+.0f}%" if r["pnl"] else "—"
+            out += f"""<tr>
+              <td>{r['ts'].strftime('%m-%d %H:%M') if r['ts'] else '—'}</td>
+              <td><b>{r['sym'] or '?'}</b></td>
+              <td>{fmt_usd(r['mc_min'])}</td>
+              <td>{fmt_usd(r['mc_bottom'])}</td>
+              <td style='color:{color}'>{ratio_str}</td>
+              <td>{bpct_str}</td>
+              <td style='color:{oc}'>{r['status']} {pnl_str}</td>
+            </tr>"""
+        return out or "<tr><td colspan=7>Nenhum</td></tr>"
+
+    ph_rows = rows_html(phantoms, "#a44")
+    re_rows = rows_html(reals,    "#2a2")
+
+    total_n = ps["n"] + rs["n"]
+
+    return f"""<!DOCTYPE html><html><head>
+    <meta charset='utf-8'>
+    <title>Phantom Bounces</title>
+    <style>
+      body {{ font-family: monospace; background: #111; color: #ccc; padding: 20px; }}
+      h2 {{ color: #fa0; }}
+      table {{ border-collapse: collapse; width: 100%; margin-bottom: 30px; }}
+      th, td {{ padding: 6px 10px; border: 1px solid #333; text-align: right; }}
+      th {{ background: #222; color: #fa0; }}
+      td:first-child, td:nth-child(2) {{ text-align: left; }}
+      .card {{ background: #1a1a1a; border: 1px solid #333; border-radius: 6px;
+               padding: 16px; margin-bottom: 24px; display: inline-block;
+               min-width: 220px; vertical-align: top; margin-right: 16px; }}
+      .big {{ font-size: 2em; font-weight: bold; }}
+    </style></head><body>
+    <h2>Phantom Bounces — Análise Retroativa do Supply Bug</h2>
+    <p style='color:#888'>
+      Supply bug: GMGN retornava total_supply=250M em vez de 1B → Helius calculava MC 4× abaixo do real
+      → mc_min fantasma → bounce_pct inflado → bot entrava em tokens que não tinham bounceado.<br>
+      <b>Critério phantom:</b> mc_min_usado / mc_bottom_real &lt; {THRESHOLD:.0%}
+      &nbsp;|&nbsp; Base: {total_n} trades blockchain-verificados com mc_bottom disponível
+    </p>
+
+    <div>
+      <div class='card'>
+        <div style='color:#a44'>🔴 Phantom (supply bug)</div>
+        <div class='big' style='color:#a44'>{ps['n']}</div>
+        <div>trades ({ps['n']/total_n*100:.0f}% do total)' if total_n else ''</div>
+        <div style='margin-top:8px'>TP: {ps['tp']} &nbsp; SL: {ps['sl']}</div>
+        <div>WR: <b style='color:#a44'>{fmt_pct(ps['wr'])}</b></div>
+        <div>P&L médio: <b>{fmt_pct(ps['avg_pnl'])}</b></div>
+      </div>
+      <div class='card'>
+        <div style='color:#2a2'>🟢 Real (sinal legítimo)</div>
+        <div class='big' style='color:#2a2'>{rs['n']}</div>
+        <div>trades ({rs['n']/total_n*100:.0f}% do total)' if total_n else ''</div>
+        <div style='margin-top:8px'>TP: {rs['tp']} &nbsp; SL: {rs['sl']}</div>
+        <div>WR: <b style='color:#2a2'>{fmt_pct(rs['wr'])}</b></div>
+        <div>P&L médio: <b>{fmt_pct(rs['avg_pnl'])}</b></div>
+      </div>
+    </div>
+
+    <h3 style='color:#a44'>Phantom Bounces — mc_min era fantasma</h3>
+    <table>
+      <tr><th>Data</th><th>Token</th><th>mc_min usado</th>
+          <th>mc_bottom real</th><th>ratio</th><th>bounce_pct</th><th>Outcome</th></tr>
+      {ph_rows}
+    </table>
+
+    <h3 style='color:#2a2'>Sinais Reais — mc_min era legítimo</h3>
+    <table>
+      <tr><th>Data</th><th>Token</th><th>mc_min usado</th>
+          <th>mc_bottom real</th><th>ratio</th><th>bounce_pct</th><th>Outcome</th></tr>
+      {re_rows}
+    </table>
+    </body></html>"""
+
+
 @app.route("/debug/microstructure")
 def debug_microstructure():
     """
