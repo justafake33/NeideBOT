@@ -27049,5 +27049,427 @@ def analise_sinal_puro():
     return H
 
 
+@app.route("/analise/h23-deep")
+def analise_h23_deep():
+    """H23 Deep — análise completa de todos os tokens com net_sol_flow.
+    Cruza bounce_signals + trades + migrations + token_ticks.
+    Mostra correlações entre net_sol_flow e todas as métricas disponíveis.
+    """
+    import traceback
+    try:
+        CSS = """<style>
+        body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+        h1{color:#58a6ff;font-size:16px;margin-bottom:4px}
+        h2{color:#79c0ff;font-size:13px;margin:24px 0 6px}
+        p.sub{color:#8b949e;font-size:11px;margin:2px 0 10px}
+        table{border-collapse:collapse;width:100%;margin-bottom:6px}
+        th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:right;font-size:11px}
+        th:first-child,th:nth-child(2){text-align:left}
+        td{padding:4px 9px;border:1px solid #21262d;text-align:right;font-size:12px;white-space:nowrap}
+        td:first-child{text-align:left}
+        .tp{color:#3fb950;font-weight:bold}.sl{color:#f85149}
+        .pos{color:#3fb950}.neg{color:#f85149}.dim{color:#484f58}.warn{color:#e3b341}
+        .hi{background:#1a2f1a}.lo{background:#2f1a1a}.neu{background:#161b22}
+        .box{background:#161b22;border:1px solid #30363d;padding:10px 14px;margin:4px;
+             border-radius:6px;display:inline-block;vertical-align:top}
+        .lbl{color:#8b949e;font-size:11px}.val{font-size:18px;font-weight:bold}
+        .nav a{color:#58a6ff;margin-right:14px;font-size:12px;text-decoration:none}
+        .sep{border-top:1px solid #30363d;margin:20px 0}
+        </style>"""
+
+        with db._cursor() as cur:
+            # ── Query principal: tudo em uma passagem ──────────────────────────
+            cur.execute("""
+                WITH latest_trade AS (
+                    SELECT DISTINCT ON (mint)
+                        mint, id AS trade_id, status, pnl_pct_real, exit_type,
+                        entry_price_usd, tokens_received, amount_usd,
+                        ts_signal AS trade_ts
+                    FROM trades
+                    ORDER BY mint, created_at DESC
+                ),
+                tick_agg AS (
+                    SELECT
+                        b.mint,
+                        COUNT(tt.id)                                                                                AS tick_count,
+                        MAX(CASE WHEN tt.tick_ts <= b.ts_signal + interval  '5 minutes' THEN COALESCE(tt.mc_high, tt.mc) END) AS mc_max_5m,
+                        MAX(CASE WHEN tt.tick_ts <= b.ts_signal + interval '10 minutes' THEN COALESCE(tt.mc_high, tt.mc) END) AS mc_max_10m,
+                        MAX(CASE WHEN tt.tick_ts <= b.ts_signal + interval '20 minutes' THEN COALESCE(tt.mc_high, tt.mc) END) AS mc_max_20m,
+                        MIN(CASE WHEN tt.tick_ts <= b.ts_signal + interval '20 minutes' THEN COALESCE(tt.mc_low,  tt.mc) END) AS mc_min_20m
+                    FROM bounce_signals b
+                    JOIN token_ticks tt ON tt.mint = b.mint
+                        AND tt.tick_ts > b.ts_signal
+                        AND tt.tick_ts <= b.ts_signal + interval '20 minutes'
+                    WHERE b.net_sol_flow IS NOT NULL
+                    GROUP BY b.mint
+                )
+                SELECT
+                    b.mint, b.symbol, b.ts_signal,
+                    b.net_sol_flow,
+                    b.absorption_buy_vol,
+                    b.absorption_sell_vol,
+                    b.absorption_events,
+                    b.bounce_pct,
+                    b.drop_from_mig,
+                    b.elapsed_sec,
+                    b.mc_migration,
+                    b.mc_min,
+                    b.mc_at_signal,
+                    -- Trade
+                    lt.trade_id,
+                    lt.status        AS trade_status,
+                    lt.pnl_pct_real,
+                    lt.exit_type,
+                    lt.entry_price_usd,
+                    lt.amount_usd,
+                    -- Migrations
+                    m.smart_wallets,
+                    m.renowned_wallets,
+                    m.sniper_wallets,
+                    m.creator_token_status,
+                    m.cto_flag,
+                    m.time_to_bottom,
+                    m.time_to_peak,
+                    m.pct_drop,
+                    m.rug_ratio,
+                    m.top10_holder_rate,
+                    m.rat_trader_rate,
+                    m.is_wash_trading,
+                    m.liq_migration,
+                    m.total_fee_sol,
+                    m.exchange,
+                    -- Token ticks
+                    ta.tick_count,
+                    ta.mc_max_5m,
+                    ta.mc_max_10m,
+                    ta.mc_max_20m,
+                    ta.mc_min_20m
+                FROM bounce_signals b
+                LEFT JOIN latest_trade lt ON lt.mint = b.mint
+                LEFT JOIN migrations   m  ON m.mint  = b.mint
+                LEFT JOIN tick_agg     ta ON ta.mint  = b.mint
+                WHERE b.net_sol_flow IS NOT NULL
+                ORDER BY b.net_sol_flow DESC
+            """)
+            raw = [dict(r) for r in cur.fetchall()]
+
+        # ── Enriquecer cada row ────────────────────────────────────────────────
+        TP_STATUS = {'tp'}
+        SL_STATUS = {'sl'}
+
+        def classify(r):
+            s = r.get("trade_status") or ""
+            if s in TP_STATUS:   return "tp"
+            if s in SL_STATUS:   return "sl"
+            if s == "expired":
+                pnl = r.get("pnl_pct_real")
+                return "tp" if (pnl and pnl > 0) else ("sl" if pnl is not None else None)
+            return None
+
+        def pct(v, ref):
+            if ref and v:
+                return (v - ref) / ref
+            return None
+
+        for r in raw:
+            r["outcome"]    = classify(r)
+            r["has_trade"]  = r["trade_status"] is not None
+            r["nf"]         = r["net_sol_flow"] or 0.0
+            r["bv"]         = r["absorption_buy_vol"]  or 0.0
+            r["sv"]         = r["absorption_sell_vol"]  or 0.0
+            r["elapsed_min"]= (r["elapsed_sec"] or 0) / 60.0
+            mc_sig          = r.get("mc_at_signal") or 0
+            r["gain_5m"]    = pct(r.get("mc_max_5m"),  mc_sig)
+            r["gain_10m"]   = pct(r.get("mc_max_10m"), mc_sig)
+            r["gain_20m"]   = pct(r.get("mc_max_20m"), mc_sig)
+            r["loss_20m"]   = pct(r.get("mc_min_20m"), mc_sig)
+            r["nf_bucket"]  = (
+                "< 0"  if r["nf"] < 0 else
+                "0–1"  if r["nf"] < 1 else
+                "1–3"  if r["nf"] < 3 else
+                "> 3"
+            )
+
+        traded    = [r for r in raw if r["outcome"] in ("tp", "sl")]
+        tp_rows   = [r for r in traded if r["outcome"] == "tp"]
+        sl_rows   = [r for r in traded if r["outcome"] == "sl"]
+        n_total   = len(raw)
+        n_traded  = len(traded)
+        n_tp      = len(tp_rows)
+        n_sl      = len(sl_rows)
+        wr_base   = n_tp / n_traded * 100 if n_traded else 0
+
+        # ── Helpers ────────────────────────────────────────────────────────────
+        def _avg(lst):
+            lst2 = [x for x in lst if x is not None]
+            return sum(lst2) / len(lst2) if lst2 else None
+
+        def _wr(subset):
+            tp = sum(1 for r in subset if r["outcome"] == "tp")
+            sl = sum(1 for r in subset if r["outcome"] == "sl")
+            n  = tp + sl
+            return (tp / n * 100) if n else None, tp, sl, n
+
+        def _fmt_pct(v, digits=1):
+            if v is None: return "<span class='dim'>—</span>"
+            c = "#3fb950" if v > 0 else ("#f85149" if v < 0 else "#8b949e")
+            return f"<span style='color:{c}'>{v:+.{digits}f}%</span>"
+
+        def _fmt_wr(wr, n, baseline=None):
+            if wr is None or n < 3:
+                return f"<span class='dim'>— (n={n})</span>"
+            delta = wr - baseline if baseline else None
+            color = "#3fb950" if wr >= 22 else ("#e3b341" if wr >= 13 else "#f85149")
+            d_str = ""
+            if delta is not None:
+                dc = "#3fb950" if delta >= 10 else ("#f85149" if delta <= -5 else "#8b949e")
+                d_str = f" <span style='color:{dc}'>({delta:+.1f}pp)</span>"
+            return f"<span style='color:{color};font-weight:bold'>{wr:.1f}%</span>{d_str}"
+
+        def _box(label, val, color="#e6edf3"):
+            return f"<div class='box'><div class='lbl'>{label}</div><div class='val' style='color:{color}'>{val}</div></div>"
+
+        # ── Seção 1: Resumo por bucket ─────────────────────────────────────────
+        buckets = [("< 0", "< 0 SOL (drenando)"), ("0–1", "0–1 SOL"), ("1–3", "1–3 SOL"), ("> 3", "> 3 SOL")]
+        bucket_rows_html = ""
+        for bkey, blabel in buckets:
+            subset     = [r for r in raw       if r["nf_bucket"] == bkey]
+            t_subset   = [r for r in traded    if r["nf_bucket"] == bkey]
+            wr, tp, sl, n = _wr(t_subset)
+            nf_vals    = [r["nf"] for r in subset]
+            avg_nf     = _avg(nf_vals)
+            avg_bv     = _avg([r["bv"] for r in subset])
+            avg_sv     = _avg([r["sv"] for r in subset])
+            cls        = "hi" if (wr and wr >= 20) else ("lo" if (wr and wr < 10) else "neu")
+            wr_str     = _fmt_wr(wr, n, wr_base)
+            nf_color   = "#3fb950" if (avg_nf and avg_nf > 0) else "#f85149"
+            bucket_rows_html += (
+                f"<tr class='{cls}'>"
+                f"<td><b>{blabel}</b></td>"
+                f"<td>{len(subset)}</td>"
+                f"<td>{n} <span class='dim'>({n/n_traded*100:.0f}%)</span></td>"
+                f"<td>{wr_str}</td>"
+                f"<td>{tp}</td><td>{sl}</td>"
+                f"<td><span style='color:{nf_color}'>{avg_nf:+.2f}◎</span></td>"
+                f"<td>{avg_bv:.2f}◎</td>"
+                f"<td>{avg_sv:.2f}◎</td>"
+                f"</tr>"
+            )
+
+        # ── Seção 2: Correlações — net_sol_flow vs métricas ───────────────────
+        # Para cada métrica: avg(metric) quando TP vs SL, e avg quando nf<1 vs nf≥1
+        neg_rows = [r for r in traded if r["nf"] < 1]
+        pos_rows = [r for r in traded if r["nf"] >= 1]
+
+        def _corr_row(label, key_fn, fmt=".2f"):
+            tp_vals = [key_fn(r) for r in tp_rows if key_fn(r) is not None]
+            sl_vals = [key_fn(r) for r in sl_rows if key_fn(r) is not None]
+            neg_vals= [key_fn(r) for r in neg_rows if key_fn(r) is not None]
+            pos_vals= [key_fn(r) for r in pos_rows if key_fn(r) is not None]
+            avg_tp  = _avg(tp_vals)
+            avg_sl  = _avg(sl_vals)
+            avg_neg = _avg(neg_vals)
+            avg_pos = _avg(pos_vals)
+
+            def _v(v):
+                if v is None: return "<span class='dim'>—</span>"
+                return f"{v:{fmt}}"
+
+            delta_out = (avg_tp - avg_sl) if (avg_tp and avg_sl) else None
+            delta_nf  = (avg_pos - avg_neg) if (avg_pos and avg_neg) else None
+
+            d_out_str = ""
+            d_nf_str  = ""
+            if delta_out is not None:
+                c = "#3fb950" if delta_out > 0 else "#f85149"
+                d_out_str = f" <span style='color:{c}'>({delta_out:+{fmt}})</span>"
+            if delta_nf is not None:
+                c = "#3fb950" if delta_nf > 0 else "#f85149"
+                d_nf_str = f" <span style='color:{c}'>({delta_nf:+{fmt}})</span>"
+
+            return (
+                f"<tr>"
+                f"<td>{label}</td>"
+                f"<td>{_v(avg_tp)}{d_out_str}</td>"
+                f"<td>{_v(avg_sl)}</td>"
+                f"<td>{_v(avg_neg)}</td>"
+                f"<td>{_v(avg_pos)}{d_nf_str}</td>"
+                f"</tr>"
+            )
+
+        corr_html = ""
+        corr_html += _corr_row("net_sol_flow (◎)",      lambda r: r["nf"])
+        corr_html += _corr_row("bounce_pct (%)",         lambda r: (r.get("bounce_pct") or 0) * 100, ".1f")
+        corr_html += _corr_row("drop_from_mig (%)",      lambda r: (r.get("drop_from_mig") or 0) * 100, ".1f")
+        corr_html += _corr_row("elapsed_min",             lambda r: r["elapsed_min"], ".1f")
+        corr_html += _corr_row("absorption_events",       lambda r: r.get("absorption_events"), ".0f")
+        corr_html += _corr_row("buy_vol (◎)",            lambda r: r["bv"])
+        corr_html += _corr_row("sell_vol (◎)",           lambda r: r["sv"])
+        corr_html += _corr_row("smart_wallets",           lambda r: r.get("smart_wallets"), ".1f")
+        corr_html += _corr_row("renowned_wallets",        lambda r: r.get("renowned_wallets"), ".1f")
+        corr_html += _corr_row("time_to_bottom (min)",   lambda r: float(r["time_to_bottom"]) if r.get("time_to_bottom") else None, ".1f")
+        corr_html += _corr_row("top10_holder_rate",       lambda r: (r.get("top10_holder_rate") or 0) * 100, ".1f")
+        corr_html += _corr_row("rug_ratio",               lambda r: r.get("rug_ratio"))
+        corr_html += _corr_row("liq_migration ($)",       lambda r: r.get("liq_migration"), ".0f")
+        corr_html += _corr_row("total_fee_sol",           lambda r: r.get("total_fee_sol"))
+        corr_html += _corr_row("gain_5m pós-sinal (%)",  lambda r: (r["gain_5m"] or 0) * 100 if r["gain_5m"] is not None else None, ".1f")
+        corr_html += _corr_row("gain_20m pós-sinal (%)", lambda r: (r["gain_20m"] or 0) * 100 if r["gain_20m"] is not None else None, ".1f")
+        corr_html += _corr_row("loss_20m pós-sinal (%)", lambda r: (r["loss_20m"] or 0) * 100 if r["loss_20m"] is not None else None, ".1f")
+
+        # ── Seção 3: Trajetória de preço split nf<1 vs nf≥1 ──────────────────
+        def _traj_row(label, subset):
+            n    = len(subset)
+            wr, tp, sl, nt = _wr(subset)
+            g5   = _avg([r["gain_5m"]  for r in subset if r["gain_5m"]  is not None])
+            g20  = _avg([r["gain_20m"] for r in subset if r["gain_20m"] is not None])
+            l20  = _avg([r["loss_20m"] for r in subset if r["loss_20m"] is not None])
+            ntk  = sum(1 for r in subset if r.get("tick_count"))
+            wr_s = _fmt_wr(wr, nt, wr_base)
+            return (
+                f"<tr>"
+                f"<td>{label}</td>"
+                f"<td>{n} <span class='dim'>({ntk} com ticks)</span></td>"
+                f"<td>{wr_s} <span class='dim'>({tp}T/{sl}S)</span></td>"
+                f"<td>{_fmt_pct((g5 or 0)*100)}</td>"
+                f"<td>{_fmt_pct((g20 or 0)*100)}</td>"
+                f"<td>{_fmt_pct((l20 or 0)*100)}</td>"
+                f"</tr>"
+            )
+
+        traj_html  = _traj_row("nf < 1 SOL (drenando/fraco)", [r for r in raw if r["nf"] < 1])
+        traj_html += _traj_row("nf ≥ 1 SOL (absorção real)",  [r for r in raw if r["nf"] >= 1])
+        traj_html += _traj_row("nf ≥ 3 SOL (demanda forte)",  [r for r in raw if r["nf"] >= 3])
+
+        # ── Seção 4: Lista completa por token ─────────────────────────────────
+        def _nf_str(v):
+            color = "#3fb950" if v > 0 else "#f85149"
+            return f"<span style='color:{color};font-weight:bold'>{v:+.2f}◎</span>"
+
+        def _out_badge(r):
+            o = r["outcome"]
+            if o == "tp": return "<span class='tp'>TP</span>"
+            if o == "sl": return "<span class='sl'>SL</span>"
+            if r["has_trade"]: return "<span class='dim'>⏳</span>"
+            return "<span class='dim'>—</span>"
+
+        detail_rows = ""
+        for r in raw:
+            ts      = r["ts_signal"].strftime("%m-%d %H:%M") if r.get("ts_signal") else "—"
+            sym     = r.get("symbol") or r["mint"][:8]
+            nf      = r["nf"]
+            cls     = "hi" if nf >= 1 else "lo"
+            bp      = f"{r['bounce_pct']*100:.0f}%" if r.get("bounce_pct") else "—"
+            dp      = f"{r['drop_from_mig']*100:.0f}%" if r.get("drop_from_mig") else "—"
+            el      = f"{r['elapsed_min']:.1f}m"
+            ev      = r.get("absorption_events") or 0
+            sm      = r.get("smart_wallets") or "—"
+            ttb     = f"{float(r['time_to_bottom']):.0f}m" if r.get("time_to_bottom") else "—"
+            pnl     = r.get("pnl_pct_real")
+            pnl_str = _fmt_pct(pnl * 100 if pnl else None) if pnl else "<span class='dim'>—</span>"
+            g20s    = _fmt_pct((r["gain_20m"] or 0) * 100) if r["gain_20m"] is not None else "<span class='dim'>—</span>"
+            l20s    = _fmt_pct((r["loss_20m"] or 0) * 100) if r["loss_20m"] is not None else "<span class='dim'>—</span>"
+            dex_url = f"https://dexscreener.com/solana/{r['mint']}"
+
+            detail_rows += (
+                f"<tr class='{cls}'>"
+                f"<td>{ts}</td>"
+                f"<td><a href='{dex_url}' target='_blank' style='color:#58a6ff'>{sym}</a></td>"
+                f"<td>{_nf_str(nf)}</td>"
+                f"<td>{r['bv']:.2f}◎</td>"
+                f"<td>{r['sv']:.2f}◎</td>"
+                f"<td>{ev}</td>"
+                f"<td>{bp}</td>"
+                f"<td>{dp}</td>"
+                f"<td>{el}</td>"
+                f"<td>{sm}</td>"
+                f"<td>{ttb}</td>"
+                f"<td>{_out_badge(r)}</td>"
+                f"<td>{pnl_str}</td>"
+                f"<td>{g20s}</td>"
+                f"<td>{l20s}</td>"
+                f"</tr>"
+            )
+
+        # ── HTML final ────────────────────────────────────────────────────────
+        html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>H23 Deep — net_sol_flow</title>{CSS}</head><body>
+<h1>H23 Deep — Net SOL Flow: análise completa dos {n_total} tokens</h1>
+<p style='color:#8b949e;font-size:11px;margin-bottom:10px'>
+  net_sol_flow = buy_vol − sell_vol nos 60s pré-bounce (Helius pAMM) ·
+  Tokens ordenados por net_sol_flow desc · Verde = absorção real, Vermelho = pool drenando
+</p>
+<div class='nav'>
+  <a href='/analise/intersecao'>Interseção de Sinais</a>
+  <a href='/analise/h22-correlation'>H22 Correlation</a>
+  <a href='/debug/h23'>H23 Check</a>
+  <a href='/analise/wr-breakdown'>WR Breakdown</a>
+</div>
+<br>
+{_box("Tokens com H23", n_total)}
+{_box("Com trade+outcome", n_traded)}
+{_box("WR base", f"{wr_base:.1f}%", "#e3b341")}
+{_box("TP", n_tp, "#3fb950")}
+{_box("SL", n_sl, "#f85149")}
+{_box("Sem trade", n_total - n_traded, "#484f58")}
+
+<h2>▸ WR por bucket de net_sol_flow</h2>
+<p class='sub'>Verde = fundo comprado com capital real. Vermelho = pool drenando no momento do bounce.</p>
+<table>
+  <thead><tr>
+    <th>Bucket</th><th>Todos bounces</th><th>Com trade</th><th>Win Rate</th>
+    <th>TP</th><th>SL</th><th>avg net_flow</th><th>avg buy_vol</th><th>avg sell_vol</th>
+  </tr></thead>
+  <tbody>{bucket_rows_html}</tbody>
+</table>
+
+<div class='sep'></div>
+<h2>▸ Correlações — média de cada métrica por outcome e por nf_bucket</h2>
+<p class='sub'>
+  "TP avg" vs "SL avg" = o quanto cada métrica diferencia winners de losers.<br>
+  "nf &lt; 1 avg" vs "nf ≥ 1 avg" = o quanto cada métrica difere entre pools drenando e pools com absorção.
+</p>
+<table>
+  <thead><tr>
+    <th>Métrica</th>
+    <th>TP avg</th><th>SL avg</th>
+    <th>nf &lt; 1 avg</th><th>nf ≥ 1 avg</th>
+  </tr></thead>
+  <tbody>{corr_html}</tbody>
+</table>
+
+<div class='sep'></div>
+<h2>▸ Trajetória de preço pós-sinal (token_ticks — 20min)</h2>
+<p class='sub'>max gain e min loss nos 20min após o sinal, split por net_sol_flow.</p>
+<table>
+  <thead><tr>
+    <th>Grupo</th><th>n (com ticks)</th><th>WR carteira</th>
+    <th>avg max gain +5min</th><th>avg max gain +20min</th><th>avg min loss +20min</th>
+  </tr></thead>
+  <tbody>{traj_html}</tbody>
+</table>
+
+<div class='sep'></div>
+<h2>▸ Lista completa — {n_total} tokens ordenados por net_sol_flow</h2>
+<p class='sub'>
+  Verde = nf ≥ 1 SOL · Vermelho = nf &lt; 1 SOL · Gain/loss +20min = trajetória real via token_ticks.
+</p>
+<table>
+  <thead><tr>
+    <th>Hora</th><th>Token</th><th>net_flow</th>
+    <th>buy◎</th><th>sell◎</th><th>eventos</th>
+    <th>bounce</th><th>drop</th><th>elapsed</th>
+    <th>smart</th><th>TTB</th>
+    <th>outcome</th><th>P&L real</th>
+    <th>+20m max</th><th>+20m min</th>
+  </tr></thead>
+  <tbody>{detail_rows}</tbody>
+</table>
+</body></html>"""
+        return html
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
