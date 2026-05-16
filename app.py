@@ -27049,6 +27049,320 @@ def analise_sinal_puro():
     return H
 
 
+@app.route("/analise/h23-sim")
+def analise_h23_sim():
+    """Simulação: bounce + H23 como filtros combinados.
+    Entry = mc_at_signal (real). Backtesta TP/SL via token_ticks.
+    Parâmetros: ?tp=0.75&sl=0.25&bounce=0.55&nf=1.0
+    """
+    import traceback
+    from collections import defaultdict
+    try:
+        tp_pct     = float(request.args.get("tp",     0.75))
+        sl_pct     = float(request.args.get("sl",     0.25))
+        bounce_min = float(request.args.get("bounce", 0.55))
+        nf_min     = float(request.args.get("nf",     1.0))
+
+        CSS = """<style>
+        body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+        h1{color:#58a6ff;font-size:16px;margin-bottom:4px}
+        h2{color:#79c0ff;font-size:13px;margin:22px 0 6px}
+        p.sub{color:#8b949e;font-size:11px;margin:2px 0 10px}
+        table{border-collapse:collapse;width:100%;margin-bottom:6px}
+        th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:right;font-size:11px}
+        th:first-child,th:nth-child(2){text-align:left}
+        td{padding:4px 9px;border:1px solid #21262d;text-align:right;font-size:12px;white-space:nowrap}
+        td:first-child{text-align:left}
+        .tp{color:#3fb950;font-weight:bold}.sl{color:#f85149}.te{color:#484f58}
+        .pos{color:#3fb950}.neg{color:#f85149}.dim{color:#484f58}.warn{color:#e3b341}
+        .hi{background:#1a2f1a}.lo{background:#2f1a1a}.neu{background:#161b22}
+        .sc{background:#161b22;border:1px solid #30363d;padding:14px 18px;margin:6px;
+            border-radius:8px;display:inline-block;vertical-align:top;min-width:200px}
+        .sc h3{color:#58a6ff;font-size:13px;margin:0 0 8px}
+        .sc .wr{font-size:28px;font-weight:bold;margin:4px 0}
+        .sc .ev{font-size:15px;margin:2px 0}
+        .sc .meta{color:#8b949e;font-size:11px;margin-top:6px}
+        .nav a{color:#58a6ff;margin-right:14px;font-size:12px;text-decoration:none}
+        .badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px}
+        .b-bounce{background:#1f3a5f;color:#79c0ff}
+        .b-h23{background:#1f3a1f;color:#3fb950}
+        .sep{border-top:1px solid #30363d;margin:20px 0}
+        </style>"""
+
+        with db._cursor() as cur:
+            # ── 1. Bounce signals com campos necessários ──────────────────────
+            cur.execute("""
+                SELECT
+                    b.mint, b.symbol, b.ts_signal,
+                    b.mc_at_signal, b.bounce_pct, b.drop_from_mig,
+                    b.elapsed_sec, b.net_sol_flow, b.absorption_events,
+                    b.absorption_buy_vol, b.absorption_sell_vol
+                FROM bounce_signals b
+                WHERE b.mc_at_signal IS NOT NULL
+                  AND b.bounce_pct   IS NOT NULL
+                ORDER BY b.ts_signal
+            """)
+            bounces = [dict(r) for r in cur.fetchall()]
+
+            # ── 2. Token ticks para todos os mints ────────────────────────────
+            mints = list({b["mint"] for b in bounces})
+            cur.execute("""
+                SELECT mint, tick_ts, mc, mc_high, mc_low, mc_open, source
+                FROM token_ticks
+                WHERE mint = ANY(%s)
+                ORDER BY mint, tick_ts
+            """, (mints,))
+            all_ticks = [dict(r) for r in cur.fetchall()]
+
+        # Indexa ticks por mint
+        ticks_by_mint = defaultdict(list)
+        for t in all_ticks:
+            ticks_by_mint[t["mint"]].append(t)
+
+        # ── Simulador de TP/SL via token_ticks ───────────────────────────────
+        def simulate(entry_mc, ticks_after, tp_pct, sl_pct):
+            tp_target = entry_mc * (1 + tp_pct)
+            sl_floor  = entry_mc * (1 - sl_pct)
+            for tick in ticks_after:
+                src  = tick.get("source", "trenches")
+                if src == "kline":
+                    mc_h = tick.get("mc_high") or tick.get("mc") or 0
+                    mc_l = tick.get("mc_low")  or tick.get("mc") or 0
+                    mc_o = tick.get("mc_open") or tick.get("mc") or 0
+                    hit_tp = mc_h >= tp_target
+                    hit_sl = mc_l <= sl_floor
+                    if hit_tp and hit_sl:
+                        mid = (sl_floor + tp_target) / 2
+                        return "tp" if mc_o >= mid else "sl"
+                    if hit_tp: return "tp"
+                    if hit_sl: return "sl"
+                else:
+                    mc = tick.get("mc") or 0
+                    if mc >= tp_target: return "tp"
+                    if mc <= sl_floor:  return "sl"
+            return "time_exit"
+
+        # ── Enriquecer cada bounce ────────────────────────────────────────────
+        for b in bounces:
+            mint   = b["mint"]
+            ts_sig = b["ts_signal"]
+            entry  = b["mc_at_signal"] or 0
+            b["nf"]      = b.get("net_sol_flow")
+            b["bounce"]  = b.get("bounce_pct") or 0
+            b["elapsed_min"] = (b.get("elapsed_sec") or 0) / 60.0
+
+            ticks       = ticks_by_mint.get(mint, [])
+            after       = [t for t in ticks if t["tick_ts"] > ts_sig]
+            b["n_ticks"] = len(after)
+
+            if not after or entry <= 0:
+                b["outcome"] = "no_ticks"
+            else:
+                b["outcome"] = simulate(entry, after, tp_pct, sl_pct)
+
+        # ── Estatísticas por cenário ──────────────────────────────────────────
+        def stats(subset):
+            with_ticks = [r for r in subset if r["outcome"] != "no_ticks"]
+            tp = sum(1 for r in with_ticks if r["outcome"] == "tp")
+            sl = sum(1 for r in with_ticks if r["outcome"] == "sl")
+            te = sum(1 for r in with_ticks if r["outcome"] == "time_exit")
+            no = len(subset) - len(with_ticks)
+            n  = tp + sl
+            wr = tp / n * 100 if n else None
+            ev = (wr / 100 * tp_pct - (1 - wr / 100) * sl_pct) * 100 if wr else None
+            return dict(total=len(subset), with_ticks=len(with_ticks),
+                        tp=tp, sl=sl, te=te, no_ticks=no, n=n, wr=wr, ev=ev)
+
+        # Cenário A: todos os bounces (sem filtro adicional)
+        sc_a = stats(bounces)
+        # Cenário B: bounce ≥ bounce_min
+        filt_b = [r for r in bounces if r["bounce"] >= bounce_min]
+        sc_b   = stats(filt_b)
+        # Cenário C: bounce ≥ bounce_min + H23 ≥ nf_min
+        filt_c = [r for r in filt_b
+                  if r["nf"] is not None and r["nf"] >= nf_min]
+        sc_c   = stats(filt_c)
+        # Cenário D: só H23 ≥ nf_min (sem filtro de bounce)
+        filt_d = [r for r in bounces
+                  if r["nf"] is not None and r["nf"] >= nf_min]
+        sc_d   = stats(filt_d)
+
+        # ── Render helpers ────────────────────────────────────────────────────
+        def _wr_color(wr):
+            if wr is None: return "#484f58"
+            if wr >= 25:   return "#3fb950"
+            if wr >= 15:   return "#e3b341"
+            return "#f85149"
+
+        def _ev_color(ev):
+            if ev is None: return "#484f58"
+            return "#3fb950" if ev > 0 else "#f85149"
+
+        def _sc_card(title, badge_html, s, highlight=False):
+            wr  = s["wr"]
+            ev  = s["ev"]
+            wr_str = f"{wr:.1f}%" if wr else "—"
+            ev_str = f"{ev:+.1f}%" if ev is not None else "—"
+            be_note = ""
+            if ev is not None:
+                be_note = (f"<span class='pos'>✅ acima do break-even</span>"
+                           if ev > 0 else
+                           f"<span class='neg'>❌ abaixo do break-even</span>")
+            border = "border:2px solid #3fb950" if highlight else ""
+            return f"""<div class='sc' style='{border}'>
+              <h3>{title}</h3>
+              {badge_html}
+              <div class='wr' style='color:{_wr_color(wr)}'>{wr_str}</div>
+              <div class='ev' style='color:{_ev_color(ev)}'>EV {ev_str}/trade</div>
+              <div class='meta'>
+                {s['n']} trades simulados · {s['tp']} TP · {s['sl']} SL<br>
+                {s['te']} time-exit · {s['no_ticks']} sem ticks<br>
+                {s['total']} bounces no filtro
+              </div>
+              <div style='margin-top:6px'>{be_note}</div>
+            </div>"""
+
+        card_a = _sc_card(
+            "A — Todos os bounces", "<span class='badge' style='background:#333;color:#999'>sem filtro extra</span>", sc_a)
+        card_b = _sc_card(
+            f"B — Bounce ≥ {bounce_min*100:.0f}%",
+            f"<span class='badge b-bounce'>bounce ≥ {bounce_min*100:.0f}%</span>", sc_b)
+        card_d = _sc_card(
+            f"D — H23 ≥ {nf_min:.0f} SOL",
+            f"<span class='badge b-h23'>nf ≥ {nf_min:.0f}◎</span>", sc_d)
+        card_c = _sc_card(
+            f"C — Bounce ≥ {bounce_min*100:.0f}% + H23 ≥ {nf_min:.0f} SOL",
+            f"<span class='badge b-bounce'>bounce ≥ {bounce_min*100:.0f}%</span> "
+            f"<span class='badge b-h23'>nf ≥ {nf_min:.0f}◎</span>",
+            sc_c, highlight=True)
+
+        # ── Tabela comparativa de cenários ────────────────────────────────────
+        def _trow(label, s, base_wr=None):
+            wr  = s["wr"]
+            ev  = s["ev"]
+            delta = (wr - base_wr) if (wr and base_wr) else None
+            wr_s  = f"<span style='color:{_wr_color(wr)};font-weight:bold'>{wr:.1f}%</span>" if wr else "<span class='dim'>—</span>"
+            ev_s  = f"<span style='color:{_ev_color(ev)}'>{ev:+.1f}%</span>" if ev is not None else "<span class='dim'>—</span>"
+            d_s   = (f"<span style='color:{'#3fb950' if delta > 0 else '#f85149'}'>{delta:+.1f}pp</span>"
+                     if delta else "<span class='dim'>base</span>")
+            cov_pct = f"{s['total']/max(sc_a['total'],1)*100:.0f}%"
+            return (f"<tr><td>{label}</td>"
+                    f"<td>{s['total']} <span class='dim'>({cov_pct})</span></td>"
+                    f"<td>{s['n']}</td><td>{s['tp']}</td><td>{s['sl']}</td>"
+                    f"<td>{wr_s}</td><td>{d_s}</td><td>{ev_s}</td></tr>")
+
+        base_wr = sc_a["wr"]
+        compare_rows = (
+            _trow("A — sem filtro (baseline)", sc_a) +
+            _trow(f"B — bounce ≥ {bounce_min*100:.0f}%", sc_b, base_wr) +
+            _trow(f"D — H23 ≥ {nf_min:.0f} SOL", sc_d, base_wr) +
+            _trow(f"C — bounce ≥ {bounce_min*100:.0f}% + H23 ≥ {nf_min:.0f} SOL", sc_c, base_wr)
+        )
+
+        # ── Lista detalhada do cenário C ──────────────────────────────────────
+        def _out_cls(o):
+            return "tp" if o == "tp" else ("sl" if o == "sl" else "te")
+
+        def _out_label(o):
+            return ("✅ TP" if o == "tp" else
+                    "❌ SL" if o == "sl" else
+                    "<span class='dim'>⏱ time</span>" if o == "time_exit" else
+                    "<span class='dim'>— sem ticks</span>")
+
+        detail_rows = ""
+        for r in sorted(filt_c, key=lambda x: x["ts_signal"] or 0, reverse=True):
+            ts  = r["ts_signal"].strftime("%m-%d %H:%M") if r.get("ts_signal") else "—"
+            sym = r.get("symbol") or r["mint"][:8]
+            nf  = r["nf"] or 0
+            bp  = r["bounce"] * 100
+            dp  = (r.get("drop_from_mig") or 0) * 100
+            el  = r["elapsed_min"]
+            ev  = r.get("absorption_events") or 0
+            nf_color = "#3fb950" if nf >= 3 else "#e3b341"
+            out  = r["outcome"]
+            cls  = "hi" if out == "tp" else ("lo" if out == "sl" else "neu")
+            entry = r.get("mc_at_signal") or 0
+            dex   = f"https://dexscreener.com/solana/{r['mint']}"
+            detail_rows += (
+                f"<tr class='{cls}'>"
+                f"<td>{ts}</td>"
+                f"<td><a href='{dex}' target='_blank' style='color:#58a6ff'>{sym}</a></td>"
+                f"<td><span style='color:{nf_color}'>{nf:+.2f}◎</span></td>"
+                f"<td>{bp:.0f}%</td>"
+                f"<td>{dp:.0f}%</td>"
+                f"<td>{el:.1f}m</td>"
+                f"<td>{ev}</td>"
+                f"<td>${entry:,.0f}</td>"
+                f"<td class='{_out_cls(out)}'>{_out_label(out)}</td>"
+                f"<td class='dim'>{r['n_ticks']}</td>"
+                f"</tr>"
+            )
+
+        if not detail_rows:
+            detail_rows = "<tr><td colspan='10' class='dim'>Nenhum token passa os filtros combinados</td></tr>"
+
+        # ── HTML ──────────────────────────────────────────────────────────────
+        html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>H23 Sim — Backtest</title>{CSS}</head><body>
+<h1>H23 Sim — Backtest: bounce + net_sol_flow como filtros</h1>
+<p style='color:#8b949e;font-size:11px;margin-bottom:10px'>
+  Entry = <b>mc_at_signal</b> (preço real no momento do bounce, nunca mc_min × 1.15) ·
+  Walk token_ticks: kline usa mc_high/low para TP/SL, trenches usa mc (close) ·
+  TP={tp_pct*100:.0f}% · SL={sl_pct*100:.0f}% · Break-even ≈ {sl_pct/(tp_pct+sl_pct)*100:.0f}%
+</p>
+<p class='sub'>
+  Ajustar parâmetros: <code>?tp=0.75&sl=0.25&bounce=0.55&nf=1.0</code>
+</p>
+<div class='nav'>
+  <a href='/analise/h23-deep'>H23 Deep</a>
+  <a href='/analise/intersecao'>Interseção</a>
+  <a href='/analise/h23-sim?tp=0.75&sl=0.25&bounce=0.55&nf=1.0'>Bounce 55% + H23 ≥ 1</a>
+  <a href='/analise/h23-sim?tp=0.75&sl=0.25&bounce=0.30&nf=1.0'>Bounce 30% + H23 ≥ 1</a>
+  <a href='/analise/h23-sim?tp=0.75&sl=0.25&bounce=0.70&nf=1.0'>Bounce 70% + H23 ≥ 1</a>
+</div>
+<br>
+
+<h2>▸ Cenários — WR e EV estimados</h2>
+<p class='sub'>
+  Cenário C (borda verde) = combinação proposta. Time-exit = token sem hit de TP ou SL nos ticks disponíveis.
+</p>
+{card_a}{card_b}{card_d}{card_c}
+
+<div class='sep'></div>
+<h2>▸ Comparativo</h2>
+<table>
+  <thead><tr>
+    <th>Cenário</th><th>Bounces (% do total)</th>
+    <th>Trades sim.</th><th>TP</th><th>SL</th>
+    <th>Win Rate</th><th>vs baseline</th><th>EV/trade</th>
+  </tr></thead>
+  <tbody>{compare_rows}</tbody>
+</table>
+<p class='sub'>
+  "Trades sim." = bounces com ticks disponíveis (excluídos no_ticks).
+  Time-exit não entra no cálculo de WR — apenas TP e SL contam.
+</p>
+
+<div class='sep'></div>
+<h2>▸ Tokens que passam o cenário C: bounce ≥ {bounce_min*100:.0f}% + H23 ≥ {nf_min:.0f} SOL ({len(filt_c)} tokens)</h2>
+<p class='sub'>
+  Verde = TP simulado · Vermelho = SL · Cinza = time-exit ou sem ticks
+</p>
+<table>
+  <thead><tr>
+    <th>Hora</th><th>Token</th><th>net_flow</th>
+    <th>bounce</th><th>drop</th><th>elapsed</th><th>eventos</th>
+    <th>entry MC</th><th>Resultado sim.</th><th>ticks</th>
+  </tr></thead>
+  <tbody>{detail_rows}</tbody>
+</table>
+</body></html>"""
+        return html
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
 @app.route("/analise/h23-deep")
 def analise_h23_deep():
     """H23 Deep — análise completa de todos os tokens com net_sol_flow.
