@@ -30249,7 +30249,9 @@ def debug_microstructure():
                 SELECT status, pnl_pct_real
                 FROM trades
                 WHERE mint = bs.mint
-                ORDER BY created_at DESC LIMIT 1
+                  AND created_at > bs.ts_signal - INTERVAL '5 minutes'
+                  AND created_at < bs.ts_signal + INTERVAL '30 minutes'
+                ORDER BY created_at ASC LIMIT 1
             ) t ON true
             WHERE bs.ts_signal > NOW() - INTERVAL '48 hours'
             ORDER BY bs.ts_signal DESC
