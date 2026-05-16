@@ -729,10 +729,16 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 125. **Pool depth em tempo real está em `pool_quote` (offset 56 do BuyEvent)**: `pool_quote < 20 SOL` no momento do bounce significa que um sell de ~$300 move o preço 25%. Com SL=25%, qualquer ruído de pool thin dispara a saída — não é price action real, é física de AMM. Isso explica por que SL=15% "disparava em segundos": o pool era pequeno demais. Salvar `pool_quote_at_signal` em `bounce_signals` usando o último valor recebido via Helius WebSocket no momento do `_check_bounce()`.
 126. **Net SOL flow = `buy_vol_sol - sell_vol_sol` (H23)**: dado já existe em `get_absorption_window()`. Mede capital real entrando vs saindo, independente de contagem de trades. Um sell de 10 SOL depois de 20 compras de 0.1 SOL = `net_flow < 0` — pool drenando apesar da maioria de trades ser compra. H22 atual (contagem de eventos) esconde essa assimetria. Gate para filtro: salvar em `bounce_signals` e correlacionar com outcomes GMGN (n≥30).
 127. **Buy concentration = `largest_buy / buy_vol` (H26)**: paper arXiv 2602.14860 sobre pump.fun confirma que "fast accumulation por poucos trades" é o preditor mais forte de sucesso. Bounce com 3 buyers de 3-5 SOL é estruturalmente melhor que 30 buyers de 0.1 SOL — o primeiro indica demanda concentrada real, o segundo pode ser bots ou wash. Campo já existe em `bounce_signals` (`absorption_lrg_buy` e `absorption_buy_vol`). Falta calcular a razão e correlacionar com outcomes GMGN (gate: n≥30).
+128. **Bug crítico H23: janela de absorção estava no momento errado (sessão 7, 2026-05-16)**: `get_absorption_window()` usava `time.time()` como fim da janela — ou seja, capturava os 60s ANTES do momento do sinal de bounce. Nesse momento o token já subiu 30-50%, então a janela mede compras DO BOUNCE (momentum), não absorção DO DUMP. A janela correta é `[ts_min - 60s → ts_min]` — os 60s que antecedem o FUNDO. Fix: parâmetro `window_end_ts: float = None` adicionado a `get_absorption_window()`. Scanner passa `state["ts_min"].timestamp()` como `window_end_ts`. Nunca usar `time.time()` como referência para janelas de absorção.
+129. **`h23_window` — campo de tag nos bounce_signals**: coluna `TEXT` adicionada ao schema. Valor `'bounce'` = janela antiga (captura momentum pós-bounce, dado inválido para H23). Valor `'bottom'` = janela correta (captura absorção do dump). Backfill histórico: `UPDATE bounce_signals SET h23_window = 'bounce' WHERE h23_window IS NULL`. Todo bounce novo gerado pelo scanner corrigido recebe `h23_window='bottom'`. 82% dos 749 registros históricos têm `'bounce'` — preservados para análise paralela de momentum, não para H23.
+130. **H23 bounce-window: correlação com bounce_pct = -0.252 (independente)**: dado que a janela bounce capta momentum, esperava-se correlação positiva alta com bounce_pct (quanto maior o bounce, mais compras). Pearson = -0.252 → correlação baixa e levemente negativa — H23 bounce não é simplesmente proxy de bounce_pct. Isso é surpreendente e sugere que mesmo a janela errada captura alguma informação estrutural independente. Não é argumento para manter — a janela bottom é metodologicamente correta.
+131. **5/12 TPs históricos (42%) tinham net_sol_flow negativo**: na faixa "bom (3-10 SOL)" — 35.7% WR — todos os 14 trades já tinham bounce ≥ 55%. Mas dos 12 TPs totais, 5 tinham H23 negativo (PENNY -25 SOL, GEGE -11 SOL, PUFF -9.22 SOL, GROX -7.93 SOL, Miss -1.65 SOL). Esses tokens com bounce explosivo (>100%) frequentemente tinham H23 negativo porque os vendedores estavam realizando lucro durante o próprio bounce. Gate para filtro H23: 42% de TPs perdidos é inaceitável — confirmar que bottom-window não tem o mesmo padrão antes de implementar como gate obrigatório.
+132. **`pnl_pct_real` está armazenado como decimal (0.75 = 75% ganho)**: display com `f"{pnl:+.1f}%"` mostra `0.75` como `+0.8%` na tela — parece 0.8% mas significa 80% de retorno. TPs mostrando "+0.9%" = +90% real. SLs mostrando "-0.3%" = -30% real. Trades suspeitos com status=sl e "+0.2%" = +20% (artefato de execução marginal acima do entry, não TP real). Nunca interpretar os valores literalmente como porcentagem — multiplicar por 100 para obter o retorno real.
+133. **`/debug/h23-grid` — grade 2D H23 × bounce_pct**: endpoint de análise cruzada. Grid com WR por célula (linhas = faixas de net_sol_flow, colunas = faixas de bounce_pct). Tabela de simulação com 8 combinações de filtros mostrando n, WR, delta pp vs base, trades bloqueados (%) e TPs perdidos (%). Descoberta: na faixa 3-10 SOL, todos os 14 trades (TPs e SLs) já tinham bounce ≥ 55% — os dois filtros são correlacionados nessa faixa, não multiplicativos.
 
 ---
 
-## 🔄 Estado Atual: Bot ativo a $1/trade (2026-05-16, sessão 6)
+## 🔄 Estado Atual: Bot ativo a $1/trade (2026-05-16, sessão 7)
 
 ### Pipeline ativo
 `TRADING_ENABLED=true`, `CALIBRATION_AMOUNT_USD=1.0`, `CALIBRATION_MAX_TRADES=999999`.
@@ -762,11 +768,14 @@ Próxima mudança de env var: `BOUNCE_MIN_PCT=0.50` (teste) → `0.70` se confir
 - `spike_suspect`: max_gain alto + <5 pre_ticks = provável spike artifact
 - GMGN trailing TP confirmado funcionando — mc_high era o dado contaminado
 
-**Pendências críticas (sessão 5):**
+**Pendências críticas (sessão 7):**
 - ✅ **`/debug/sell-recovery` executado** — 139 correções blockchain persistidas. Banco 100% verificado on-chain.
+- ✅ **Bug H23 corrigido** — `get_absorption_window()` agora usa `ts_min` (fundo) em vez de `time.time()` (bounce)
+- ✅ **`h23_window` tagging implementado** — histórico marcado como `'bounce'`, novos bounces com `'bottom'`
+- ✅ **`/debug/h23-grid` criado** — grade 2D H23 × bounce_pct com simulação de 8 combinações de filtros
 - Mudar `BOUNCE_MIN_PCT=0.50` no Railway (env var, zero código)
+- Aguardar n≥30 bounces com `h23_window='bottom'` para validação real do H23
 - Verificar discriminação smart_wallets após n≥50 trades com smart≥3
-- H22: aguardando n≥30 bounces com absorption_events > 0
 
 **Regra de ouro para novos filtros:** só implementar com n≥30 trades validados no GMGN. **Nunca usar DB WR como fonte — banco estava completamente errado antes da correção blockchain da sessão 5.**
 
