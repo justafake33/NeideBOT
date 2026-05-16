@@ -1,7 +1,7 @@
 # NeideBOT — Roadmap
 
-**Atualizado:** 2026-05-14 (sessão 5)
-**Estado:** Bot ativo a $1/trade · WR **real blockchain 10.1%** (14 TP / 125 SL / 139 trades — corrigido sessão 5) · banco com dados fictícios corrigido via `/debug/sell-recovery` · filtros A.2/A.3/A.5/A.6/A.7/smart≥3/FILTER_PUMP_ONLY ativos · SL=25% · Helius RPC ativo
+**Atualizado:** 2026-05-16 (sessão 6)
+**Estado:** Bot ativo a $1/trade · WR **real blockchain 24%** (medido por token outcome via `/analise/sinal-puro`, n=692 bounces) · banco corrigido sessão 5 · filtros A.2/A.3/A.5/A.6/A.7/smart≥3/FILTER_PUMP_ONLY ativos · SL=25% · Helius RPC ativo
 
 ---
 
@@ -305,6 +305,31 @@ Dashboard mostra correlação H22 → outcome com n atual. 3 tabelas: por `absor
 | H20 | W-bottom = sinal de confirmação | ❌ 98% prevalência — ubíquo |
 | H21 | SL ancorado no fundo (mc_bottom × 90%) resolveria a maioria dos SLs | ❌ **REFUTADA** — 90% dos SLs caem abaixo de 0.90× o fundo (mediana 0.55×) |
 | H22 | Buy volume > sell volume nos 60s pós-fundo discrimina WR ≥15pp | ⏳ **DATA COLLECTION** — janela rolante ativa, métricas brutas salvas em bounce_signals. Score aguarda n≥30 outcomes GMGN. |
+| H23 | `net_sol_flow = buy_vol_sol - sell_vol_sol > threshold` discrimina WR | ⏳ **PENDENTE IMPLEMENTAÇÃO** — dados existem em `get_absorption_window()`, falta salvar em `bounce_signals`. Zero custo API. |
+| H24 | Seller exhaustion (top-3 sellers > 70% do dump_vol) → WR maior | ⏳ **PENDENTE IMPLEMENTAÇÃO** — hipótese central pós H21. Requer acumular sellers únicos via Helius entre ts_migration e ts_min. |
+| H25 | Pool depth `pool_quote < 20 SOL` → SL é ruído de pool thin, não price action | ⏳ **PENDENTE IMPLEMENTAÇÃO** — dado em offset 56 do BuyEvent já chega via Helius. Falta salvar em bounce_signals. |
+| H26 | Buy concentration `largest_buy / buy_vol` alta → WR maior | ⏳ **PENDENTE CORRELAÇÃO** — campo calculável dos dados existentes. Gate: n≥30 com outcomes GMGN. |
+
+---
+
+## 🔬 Fase de Microestrutura (sessão 6 — próximos passos ordenados por ROI)
+
+### Implementação imediata (30min, zero custo API)
+- [ ] **H23 — Net SOL Flow**: calcular `net_sol_flow = buy_vol_sol - sell_vol_sol` no `_check_bounce()` e salvar em `bounce_signals` como novo campo. Adicionar ao `/analise/h22-correlation`. Dados já existem em `get_absorption_window()`, falta salvar. Gate para filtro: n≥30 bounces com outcomes GMGN.
+
+### Próxima sessão (2-3 dias, zero custo API)
+- [ ] **H24 — Seller Exhaustion**: acumular sellers únicos via Helius BuyEvent/SellEvent entre `ts_migration` e `ts_min`. Salvar `dump_seller_count` e `dump_seller_hhi` (índice Herfindahl — concentração dos sellers do dump) em `bounce_signals`. Hipótese: top-3 sellers > 70% do dump_vol → dump finito → WR maior. Causa raiz dos SLs (H21 confirmou: 90% dos SLs continuam caindo porque havia sellers que não terminaram).
+- [ ] **H25 — Pool Depth**: salvar `pool_quote_at_signal` em `bounce_signals` usando o último `pool_quote` (offset 56 do BuyEvent) recebido via Helius no momento do `_check_bounce()`. Flag no Telegram/dashboard quando `pool_quote < 20 SOL` (ruído de pool thin dispara SL artificialmente).
+
+### Após n≥30 bounces com novos dados
+- [ ] **H26 — Buy Concentration**: correlacionar `largest_buy / buy_vol` com outcomes GMGN. Paper arXiv 2602.14860 confirma que fast accumulation por poucos trades prediz sucesso. Campo calculável de dados já existentes. Implementar como filtro somente após validação.
+- [ ] Revisar H22 adicionando `net_sol_flow`, `pool_quote_at_signal`, e `dump_seller_hhi` como variáveis explicativas.
+
+### Descobertas analíticas desta sessão (não implementar sem validação)
+- **Entry correto = `mc_at_signal`**: simulações anteriores com `mc_min × 1.15` inflavam WR. WR base real com metodologia correta = 24% (break-even ~25%).
+- **Nenhuma métrica pré-trade entrega mais de +7pp**: bounce 55-65% (+7pp) e elapsed 0-3min (+7pp) são os únicos sinais relevantes. Smart, CTO, dev, top10 = ruído (±3pp).
+- **Smart >10 wallets = -13pp**: único sinal forte negativo. Confirma que smart_count alto é destrutivo.
+- **Benchmark correto**: usar `/analise/sinal-puro` (token outcome) em vez de WR da carteira para avaliar qualidade de sinais.
 
 ---
 
