@@ -27785,6 +27785,404 @@ def analise_h23_sinal():
     return H
 
 
+# /analise/intersecao-h23 — interseção de sinais com 3 datasets: ticks, carteira total, carteira #338+
+@app.route("/analise/intersecao-h23")
+def analise_intersecao_h23():
+    """
+    Intersecção de 7 sinais (H23 incluído) comparada em 3 datasets paralelos:
+      - Ticks: bounce_signals + token_ticks (teórico, TP+75%/SL-25%)
+      - Carteira total: todos os trades helius_sell_recovery
+      - Carteira recente: trades #338+ (filtros A.6/A.7 ativos, WR ~29%)
+    """
+    import itertools
+
+    TP_MULT   = 1.75
+    SL_MULT   = 0.75
+    MIN_TICKS = 3
+    RECENT_ID = 338
+
+    css = """
+    <style>
+    body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+    h2{color:#58a6ff}h3{color:#79c0ff;margin-top:28px}h4{color:#8b949e;margin-top:18px}
+    p.desc{color:#8b949e;margin:4px 0 12px 0;font-size:12px}
+    table{border-collapse:collapse;width:100%;margin-bottom:12px}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:right}
+    th:first-child{text-align:left}
+    td{padding:5px 10px;border:1px solid #21262d;text-align:right;white-space:nowrap}
+    td:first-child{text-align:left}
+    .tp{color:#3fb950}.sl{color:#f85149}.dim{color:#6e7681}
+    .pos{color:#3fb950;font-weight:bold}.neg{color:#f85149;font-weight:bold}
+    .hi{background:#1f3a1f}.lo{background:#2d1f1f}.neu{background:#1e1e1e}
+    .box{background:#161b22;border:1px solid #30363d;padding:12px 16px;margin-bottom:14px;border-radius:6px}
+    .legenda{background:#161b22;border:1px solid #30363d;padding:9px 14px;margin-bottom:5px;border-radius:4px}
+    .badge{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;margin-right:4px}
+    .b1{background:#1f3a5f;color:#79c0ff}.b2{background:#3a1f5f;color:#d2a679}
+    .b3{background:#1f3a1f;color:#3fb950}.b4{background:#3a3a1f;color:#f0e68c}
+    .b5{background:#3a1f1f;color:#ff8080}.b6{background:#1f3a3a;color:#79d4d4}
+    .b7{background:#3a1a3a;color:#e090e0}
+    .tag-t{background:#1f3a1f;color:#3fb950;padding:1px 6px;border-radius:3px;font-size:11px;display:inline-block}
+    .tag-a{background:#1a2a3a;color:#58a6ff;padding:1px 6px;border-radius:3px;font-size:11px;display:inline-block}
+    .tag-r{background:#2d1f00;color:#f0a030;padding:1px 6px;border-radius:3px;font-size:11px;display:inline-block}
+    a{color:#58a6ff;text-decoration:none}a:hover{text-decoration:underline}
+    nav{margin-bottom:20px}nav a{margin-right:12px}
+    </style>
+    """
+
+    # ── Dataset 1: Token ticks ────────────────────────────────────────────────
+    with db._cursor() as cur:
+        cur.execute("""
+            WITH outcomes AS (
+                SELECT
+                    bs.mint,
+                    bs.bounce_pct,
+                    bs.drop_from_mig,
+                    bs.elapsed_sec / 60.0   AS elapsed_min,
+                    bs.absorption_events,
+                    bs.net_sol_flow,
+                    bs.mc_at_signal         AS entry_mc,
+                    m.smart_wallets,
+                    m.renowned_wallets,
+                    m.creator_token_status,
+                    m.cto_flag,
+                    m.top10_holder_rate,
+                    MAX(COALESCE(tt.mc_high, tt.mc)) AS max_mc,
+                    MIN(COALESCE(tt.mc_low,  tt.mc)) AS min_mc,
+                    COUNT(tt.id)                     AS tick_count
+                FROM bounce_signals bs
+                JOIN token_ticks tt ON tt.mint = bs.mint
+                    AND tt.tick_ts > bs.ts_signal
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '20 minutes'
+                LEFT JOIN migrations m ON m.mint = bs.mint
+                WHERE bs.mc_at_signal IS NOT NULL
+                  AND bs.mc_at_signal > 0
+                  AND bs.bounce_pct IS NOT NULL
+                GROUP BY bs.mint, bs.bounce_pct, bs.drop_from_mig, bs.elapsed_sec,
+                         bs.absorption_events, bs.net_sol_flow, bs.mc_at_signal,
+                         m.smart_wallets, m.renowned_wallets, m.creator_token_status,
+                         m.cto_flag, m.top10_holder_rate
+                HAVING COUNT(tt.id) >= %(min_ticks)s
+            )
+            SELECT *,
+                (max_mc >= entry_mc * %(tp)s) AS tp_hit,
+                (min_mc <= entry_mc * %(sl)s) AS sl_hit
+            FROM outcomes
+        """, {"tp": TP_MULT, "sl": SL_MULT, "min_ticks": MIN_TICKS})
+        ticks_raw = cur.fetchall()
+
+    # ── Dataset 2 + 3: Carteira (helius_sell_recovery) ───────────────────────
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                t.id, t.mint, t.symbol, t.status, t.ts_signal,
+                bs.bounce_pct,
+                bs.drop_from_mig,
+                bs.elapsed_sec / 60.0   AS elapsed_min,
+                bs.absorption_events,
+                bs.net_sol_flow,
+                m.smart_wallets,
+                m.renowned_wallets,
+                m.creator_token_status,
+                m.cto_flag,
+                m.top10_holder_rate
+            FROM trades t
+            JOIN bounce_signals bs ON bs.mint = t.mint
+            LEFT JOIN migrations m ON m.mint = t.mint
+            WHERE t.exit_type = 'helius_sell_recovery'
+              AND t.status IN ('tp', 'sl')
+        """)
+        cart_raw = cur.fetchall()
+
+    # ── Enriquece e separa datasets ───────────────────────────────────────────
+    def mk_ticks(rows):
+        return [dict(r, is_tp=bool(r["tp_hit"])) for r in rows]
+
+    def mk_cart(rows):
+        return [dict(r, is_tp=(r["status"] == "tp")) for r in rows]
+
+    DS_TICKS = mk_ticks(ticks_raw)
+    DS_ALL   = mk_cart(cart_raw)
+    DS_REC   = mk_cart([r for r in cart_raw if r["id"] >= RECENT_ID])
+
+    def base_stats(rows):
+        n  = len(rows)
+        tp = sum(1 for r in rows if r["is_tp"])
+        return tp, n, (tp / n * 100 if n else 0)
+
+    tp_t, n_t, wr_t = base_stats(DS_TICKS)
+    tp_a, n_a, wr_a = base_stats(DS_ALL)
+    tp_r, n_r, wr_r = base_stats(DS_REC)
+
+    # ── 7 sinais ──────────────────────────────────────────────────────────────
+    def _safe(fn, r):
+        try:
+            v = fn(r)
+            return bool(v)
+        except Exception:
+            return False
+
+    SINAIS = [
+        {
+            "key":   "h23_sweet",
+            "badge": "b1",
+            "nome":  "H23 net_flow 1–10◎",
+            "desc":  ("Net SOL Flow (buy_vol − sell_vol) nos 60s antes do sinal entre 1 e 10 SOL. "
+                      "< 1 SOL: sellers dominando. > 10 SOL: possível pump artificial. "
+                      "Carteira total: +12pp | Recente: a calcular."),
+            "fn":    lambda r: r.get("net_sol_flow") is not None and 1.0 <= r["net_sol_flow"] < 10.0,
+        },
+        {
+            "key":   "bounce_65_80",
+            "badge": "b2",
+            "nome":  "Bounce 65–80%",
+            "desc":  ("Token subiu 65–80% do fundo ao sinal. "
+                      "< 65%: fraco. > 80%: possível dead-cat ou spike. "
+                      "Carteira total: 31% WR (+18pp, n=16)."),
+            "fn":    lambda r: r.get("bounce_pct") and 0.65 <= r["bounce_pct"] < 0.80,
+        },
+        {
+            "key":   "elapsed_ok",
+            "badge": "b3",
+            "nome":  "Elapsed fora do dead zone (não 3–6 min)",
+            "desc":  ("Sinal disparou em < 3 min OU ≥ 6 min após migração. "
+                      "Janela 3–6 min tem 6% WR na carteira real (−7pp). "
+                      "Tokens em queda livre ainda nessa janela não formaram suporte."),
+            "fn":    lambda r: not (3.0 <= (r.get("elapsed_min") or 0) < 6.0),
+        },
+        {
+            "key":   "dev_saiu",
+            "badge": "b4",
+            "nome":  "Dev já saiu",
+            "desc":  "Desenvolvedor vendeu toda a posição (creator_close). Menor risco de dump pelo dev.",
+            "fn":    lambda r: r.get("creator_token_status") == "creator_close",
+        },
+        {
+            "key":   "drop_moderado",
+            "badge": "b5",
+            "nome":  "Queda 30–60% da migração",
+            "desc":  ("Token caiu 30–60% do MC de migração até o fundo. "
+                      "Quedas > 60%: 7–10% WR na carteira (token muito destruído). "
+                      "Quedas < 30%: dump fraco, bounce improvável."),
+            "fn":    lambda r: r.get("drop_from_mig") and 0.30 <= r["drop_from_mig"] < 0.60,
+        },
+        {
+            "key":   "renowned_alto",
+            "badge": "b6",
+            "nome":  "KOLs > 3",
+            "desc":  "Mais de 3 wallets de influenciadores com posição. Carteira: 22% WR (+9pp, n=45).",
+            "fn":    lambda r: (r.get("renowned_wallets") or 0) > 3,
+        },
+        {
+            "key":   "absorcao_baixa",
+            "badge": "b7",
+            "nome":  "Absorção 1–50 eventos",
+            "desc":  ("1–50 eventos pAMM Helius nos 60s: compra real sem pump caótico. "
+                      "Carteira: 24% WR (+11pp). > 150 eventos na carteira = apenas 10% WR (bots/MEV). "
+                      "Disponível apenas em trades recentes pós-2026-05-12."),
+            "fn":    lambda r: r.get("absorption_events") and 1 <= r["absorption_events"] <= 50,
+        },
+    ]
+
+    # ── Aplica sinais em cada dataset ─────────────────────────────────────────
+    for ds in (DS_TICKS, DS_ALL, DS_REC):
+        for r in ds:
+            for s in SINAIS:
+                r[s["key"]] = _safe(s["fn"], r)
+            r["score"] = sum(1 for s in SINAIS if r[s["key"]])
+
+    # ── Helper: WR por subset ─────────────────────────────────────────────────
+    def wr_sub(rows, keys):
+        sub = [r for r in rows if all(r.get(k) for k in keys)]
+        n   = len(sub)
+        tp  = sum(1 for r in sub if r["is_tp"])
+        wr  = tp / n * 100 if n >= 3 else None
+        return tp, n, wr
+
+    def fmt3(tp, n, wr, base):
+        if wr is None:
+            return f"<span class='dim'>— (n={n})</span>", "—"
+        cls = "pos" if wr >= 25 else "neg"
+        d   = wr - base
+        dsp = f"<span class='{'pos' if d>0 else 'neg'}'>{d:+.0f}pp</span>"
+        return f"<span class='{cls}'>{wr:.0f}%</span> <span class='dim'>({tp}/{n})</span>", dsp
+
+    # ── HTML ──────────────────────────────────────────────────────────────────
+    H = f"<!DOCTYPE html><html><head><title>Interseção H23</title>{css}</head><body>"
+    H += "<nav>"
+    H += "<a href='/analise/intersecao'>Interseção original</a>"
+    H += "<a href='/analise/h23-sinal'>H23 Sinal</a>"
+    H += "<a href='/analise/h23-sim'>H23 Sim</a>"
+    H += "<a href='/analise/sinal-puro'>Sinal Puro</a>"
+    H += "</nav>"
+    H += "<h2>🔗 Interseção de Sinais — 3 Datasets × 7 Sinais (H23 incluído)</h2>"
+
+    H += "<div class='box'>"
+    H += (f"<span class='tag-t'>Ticks (teórico)</span> {n_t} bounces | {tp_t} TP | WR base <b>{wr_t:.1f}%</b> &nbsp; "
+          f"<span class='tag-a'>Carteira total</span> {n_a} trades | {tp_a} TP | WR base <b>{wr_a:.1f}%</b> &nbsp; "
+          f"<span class='tag-r'>Recente #338+</span> {n_r} trades | {tp_r} TP | WR base <b>{wr_r:.1f}%</b><br>")
+    H += "<span style='color:#8b949e;font-size:11px'>Break-even SL=25%/TP=75%: ~25% &nbsp;|&nbsp; "
+    H += "Ticks: simulação TP/SL teórico | Carteira: blockchain-verificado | Recente: filtros A.6+A.7 ativos</span>"
+    H += "</div>"
+
+    # ── Legenda ───────────────────────────────────────────────────────────────
+    H += "<h3>📖 Sinais</h3>"
+    for s in SINAIS:
+        tt, nt, wrt = wr_sub(DS_TICKS, [s["key"]])
+        ta, na, wra = wr_sub(DS_ALL,   [s["key"]])
+        tr, nr, wrr = wr_sub(DS_REC,   [s["key"]])
+        wrt_s = f"{wrt:.0f}% ({tt}/{nt})" if wrt is not None else f"n={nt}"
+        wra_s = f"{wra:.0f}% ({ta}/{na})" if wra is not None else f"n={na}"
+        wrr_s = f"{wrr:.0f}% ({tr}/{nr})" if wrr is not None else f"n={nr}"
+        H += f"<div class='legenda'>"
+        H += f"<span class='badge {s['badge']}'>{s['nome']}</span>"
+        H += (f"&nbsp; <span class='tag-t'>Ticks {wrt_s}</span>"
+              f"&nbsp; <span class='tag-a'>Total {wra_s}</span>"
+              f"&nbsp; <span class='tag-r'>Recente {wrr_s}</span><br>")
+        H += f"<span style='color:#8b949e;font-size:11px'>{s['desc']}</span>"
+        H += "</div>"
+
+    # ── Sinal único: com vs sem ───────────────────────────────────────────────
+    H += "<h3>📊 Cada sinal sozinho — comparação dos 3 datasets</h3>"
+    H += ("<table><tr><th>Sinal</th>"
+          "<th colspan='2'><span class='tag-t'>Ticks</span></th>"
+          "<th colspan='2'><span class='tag-a'>Carteira total</span></th>"
+          "<th colspan='2'><span class='tag-r'>Recente #338+</span></th></tr>")
+    H += "<tr><th></th><th>Com sinal</th><th>vs base</th><th>Com sinal</th><th>vs base</th><th>Com sinal</th><th>vs base</th></tr>"
+    for s in SINAIS:
+        wt, dt = fmt3(*wr_sub(DS_TICKS, [s["key"]]), wr_t)
+        wa, da = fmt3(*wr_sub(DS_ALL,   [s["key"]]), wr_a)
+        wr, dr = fmt3(*wr_sub(DS_REC,   [s["key"]]), wr_r)
+        # Color row by carteira recente delta (the most reliable)
+        _, _, wrr_val = wr_sub(DS_REC, [s["key"]])
+        delta_r = (wrr_val - wr_r) if wrr_val is not None else 0
+        cls = " class='hi'" if delta_r >= 10 else " class='lo'" if delta_r <= -10 else ""
+        H += f"<tr{cls}><td><span class='badge {s['badge']}'>{s['nome']}</span></td>"
+        H += f"<td>{wt}</td><td>{dt}</td><td>{wa}</td><td>{da}</td><td>{wr}</td><td>{dr}</td></tr>"
+    H += "</table>"
+
+    # ── Combinações de 2 sinais ───────────────────────────────────────────────
+    H += "<h3>🔗 Combinações de 2 sinais</h3>"
+    H += "<p class='desc'>Ordenadas por WR da carteira recente. Cor verde = ≥10pp acima da base recente.</p>"
+    H += ("<table><tr><th>Sinal A</th><th>Sinal B</th>"
+          "<th colspan='2'><span class='tag-t'>Ticks</span></th>"
+          "<th colspan='2'><span class='tag-a'>Carteira total</span></th>"
+          "<th colspan='2'><span class='tag-r'>Recente #338+</span></th></tr>")
+    H += "<tr><th></th><th></th><th>WR</th><th>vs base</th><th>WR</th><th>vs base</th><th>WR</th><th>vs base</th></tr>"
+
+    combos2 = []
+    for i, j in itertools.combinations(range(len(SINAIS)), 2):
+        sa, sb = SINAIS[i], SINAIS[j]
+        keys = [sa["key"], sb["key"]]
+        rt = wr_sub(DS_TICKS, keys)
+        ra = wr_sub(DS_ALL,   keys)
+        rr = wr_sub(DS_REC,   keys)
+        combos2.append((sa, sb, rt, ra, rr))
+
+    combos2.sort(key=lambda x: (x[4][2] or -99), reverse=True)
+
+    for sa, sb, rt, ra, rr in combos2:
+        wt, dt = fmt3(*rt, wr_t)
+        wa, da = fmt3(*ra, wr_a)
+        wr2, dr = fmt3(*rr, wr_r)
+        delta_r = (rr[2] - wr_r) if rr[2] is not None else 0
+        cls = " class='hi'" if delta_r >= 10 else " class='lo'" if delta_r <= -10 else ""
+        H += f"<tr{cls}>"
+        H += f"<td><span class='badge {sa['badge']}'>{sa['nome']}</span></td>"
+        H += f"<td><span class='badge {sb['badge']}'>{sb['nome']}</span></td>"
+        H += f"<td>{wt}</td><td>{dt}</td><td>{wa}</td><td>{da}</td><td>{wr2}</td><td>{dr}</td></tr>"
+    H += "</table>"
+
+    # ── Combinações de 3 sinais ───────────────────────────────────────────────
+    H += "<h3>🔗🔗 Combinações de 3 sinais</h3>"
+    H += "<p class='desc'>Ordenadas por WR da carteira recente. Mostra apenas combos com n≥3 em algum dataset.</p>"
+    H += ("<table><tr><th>Sinais</th>"
+          "<th colspan='2'><span class='tag-t'>Ticks</span></th>"
+          "<th colspan='2'><span class='tag-a'>Carteira total</span></th>"
+          "<th colspan='2'><span class='tag-r'>Recente #338+</span></th></tr>")
+    H += "<tr><th></th><th>WR</th><th>vs base</th><th>WR</th><th>vs base</th><th>WR</th><th>vs base</th></tr>"
+
+    combos3 = []
+    for i, j, k in itertools.combinations(range(len(SINAIS)), 3):
+        sa, sb, sc = SINAIS[i], SINAIS[j], SINAIS[k]
+        keys = [sa["key"], sb["key"], sc["key"]]
+        rt = wr_sub(DS_TICKS, keys)
+        ra = wr_sub(DS_ALL,   keys)
+        rr = wr_sub(DS_REC,   keys)
+        if rt[1] >= 3 or ra[1] >= 3 or rr[1] >= 3:
+            combos3.append((sa, sb, sc, rt, ra, rr))
+
+    combos3.sort(key=lambda x: (x[5][2] or -99), reverse=True)
+
+    for sa, sb, sc, rt, ra, rr in combos3[:40]:  # top 40
+        wt, dt = fmt3(*rt, wr_t)
+        wa, da = fmt3(*ra, wr_a)
+        wr3, dr = fmt3(*rr, wr_r)
+        delta_r = (rr[2] - wr_r) if rr[2] is not None else 0
+        cls = " class='hi'" if delta_r >= 10 else " class='lo'" if delta_r <= -10 else ""
+        badges = (f"<span class='badge {sa['badge']}'>{sa['nome']}</span> + "
+                  f"<span class='badge {sb['badge']}'>{sb['nome']}</span> + "
+                  f"<span class='badge {sc['badge']}'>{sc['nome']}</span>")
+        H += f"<tr{cls}><td>{badges}</td>"
+        H += f"<td>{wt}</td><td>{dt}</td><td>{wa}</td><td>{da}</td><td>{wr3}</td><td>{dr}</td></tr>"
+    H += "</table>"
+
+    # ── Pontuação por score ───────────────────────────────────────────────────
+    H += "<h3>🏆 Pontuação — WR por número de sinais ativos (0–7)</h3>"
+    H += ("<table><tr><th>Score</th>"
+          "<th colspan='3'><span class='tag-t'>Ticks</span></th>"
+          "<th colspan='3'><span class='tag-a'>Carteira total</span></th>"
+          "<th colspan='3'><span class='tag-r'>Recente #338+</span></th></tr>")
+    H += "<tr><th></th><th>n</th><th>TP</th><th>WR</th><th>n</th><th>TP</th><th>WR</th><th>n</th><th>TP</th><th>WR</th></tr>"
+
+    for sc in range(7, -1, -1):
+        sub_t = [r for r in DS_TICKS if r["score"] == sc]
+        sub_a = [r for r in DS_ALL   if r["score"] == sc]
+        sub_r = [r for r in DS_REC   if r["score"] == sc]
+        if not sub_t and not sub_a and not sub_r:
+            continue
+        def wr_sc(sub):
+            n = len(sub); tp = sum(1 for r in sub if r["is_tp"])
+            return n, tp, tp/n*100 if n >= 3 else None
+        nt, tpt, wrt = wr_sc(sub_t)
+        na, tpa, wra = wr_sc(sub_a)
+        nr, tpr, wrr = wr_sc(sub_r)
+        def fmt_wr(n, tp, wr, base):
+            if wr is None: return f"<span class='dim'>— (n={n})</span>"
+            cls = "pos" if wr >= 25 else "neg"
+            return f"<span class='{cls}'>{wr:.0f}%</span>"
+        stars = "⭐" * sc if sc else "·"
+        delta_r = (wrr - wr_r) if wrr else None
+        row_cls = " class='hi'" if (delta_r and delta_r >= 10) else " class='lo'" if (delta_r and delta_r <= -10) else ""
+        H += (f"<tr{row_cls}><td>{stars} {sc}p</td>"
+              f"<td>{nt}</td><td>{tpt}</td><td>{fmt_wr(nt,tpt,wrt,wr_t)}</td>"
+              f"<td>{na}</td><td>{tpa}</td><td>{fmt_wr(na,tpa,wra,wr_a)}</td>"
+              f"<td>{nr}</td><td>{tpr}</td><td>{fmt_wr(nr,tpr,wrr,wr_r)}</td></tr>")
+    H += "</table>"
+
+    # ── Trades recentes com pontuação ─────────────────────────────────────────
+    H += "<h3>📋 Trades recentes (#338+) — pontuação por sinal</h3>"
+    H += "<table><tr><th>#</th><th>Token</th><th>Resultado</th><th>Score</th>"
+    for s in SINAIS:
+        H += f"<th style='font-size:10px'>{s['nome'].split(' ')[0]}</th>"
+    H += "</tr>"
+    for r in sorted(DS_REC, key=lambda x: (-x["score"], -(x["id"] or 0))):
+        sc   = r["score"]
+        st   = "<span class='tp'>✓ TP</span>" if r["is_tp"] else "<span class='sl'>✗ SL</span>"
+        stars = "⭐" * sc if sc else "·"
+        cls  = f" class='hi'" if sc >= 3 else ""
+        sym  = (r.get("symbol") or str(r.get("id", "")))[:10]
+        H += f"<tr{cls}><td>{r.get('id','')}</td><td><b>{sym}</b></td><td>{st}</td>"
+        H += f"<td style='text-align:center'>{stars} ({sc})</td>"
+        for s in SINAIS:
+            v = "✓" if r[s["key"]] else "<span class='dim'>—</span>"
+            H += f"<td style='text-align:center'>{v}</td>"
+        H += "</tr>"
+    H += "</table>"
+
+    H += "</body></html>"
+    return H
+
+
 @app.route("/analise/h23-deep")
 def analise_h23_deep():
     """H23 Deep — análise completa de todos os tokens com net_sol_flow.
