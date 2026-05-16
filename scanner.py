@@ -319,6 +319,10 @@ class HotMonitor:
                 "absorption_sell_cnt": absorption_window.get("sell_count"),
                 "absorption_lrg_buy":  absorption_window.get("largest_buy"),
                 "absorption_events":   absorption_window.get("total_events"),
+                "net_sol_flow": (
+                    (absorption_window.get("buy_vol_sol") or 0) -
+                    (absorption_window.get("sell_vol_sol") or 0)
+                ) if absorption_window.get("total_events") else None,
             })
         except Exception as e:
             logger.warning("insert_bounce_signal %s: %s", mint[:8], e)

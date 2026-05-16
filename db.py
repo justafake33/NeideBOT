@@ -201,6 +201,8 @@ def init_db():
                 absorption_sell_cnt  INT,
                 absorption_lrg_buy   FLOAT,
                 absorption_events    INT,
+                -- H23: net SOL flow = buy_vol - sell_vol (capital real entrando vs saindo)
+                net_sol_flow         FLOAT,
                 UNIQUE (mint)
             )
         """)
@@ -216,6 +218,7 @@ def init_db():
             "ADD COLUMN IF NOT EXISTS absorption_sell_cnt INT",
             "ADD COLUMN IF NOT EXISTS absorption_lrg_buy  FLOAT",
             "ADD COLUMN IF NOT EXISTS absorption_events   INT",
+            "ADD COLUMN IF NOT EXISTS net_sol_flow        FLOAT",
             # Ajuste 2: snapshots pós-bounce +30s e +60s
             "ADD COLUMN IF NOT EXISTS p30s_buy_vol   FLOAT",
             "ADD COLUMN IF NOT EXISTS p30s_sell_vol  FLOAT",
@@ -618,14 +621,16 @@ def insert_bounce_signal(data: dict):
                  absorption_score, absorption_grade,
                  absorption_buy_vol, absorption_sell_vol,
                  absorption_buy_cnt, absorption_sell_cnt,
-                 absorption_lrg_buy, absorption_events)
+                 absorption_lrg_buy, absorption_events,
+                 net_sol_flow)
             VALUES
                 (%(mint)s, %(symbol)s, %(exchange)s, %(elapsed_sec)s, %(mc_migration)s, %(mc_min)s,
                  %(mc_at_signal)s, %(drop_from_mig)s, %(bounce_pct)s,
                  %(absorption_score)s, %(absorption_grade)s,
                  %(absorption_buy_vol)s, %(absorption_sell_vol)s,
                  %(absorption_buy_cnt)s, %(absorption_sell_cnt)s,
-                 %(absorption_lrg_buy)s, %(absorption_events)s)
+                 %(absorption_lrg_buy)s, %(absorption_events)s,
+                 %(net_sol_flow)s)
             ON CONFLICT (mint) DO UPDATE SET
                 absorption_score    = EXCLUDED.absorption_score,
                 absorption_grade    = EXCLUDED.absorption_grade,
@@ -634,7 +639,8 @@ def insert_bounce_signal(data: dict):
                 absorption_buy_cnt  = EXCLUDED.absorption_buy_cnt,
                 absorption_sell_cnt = EXCLUDED.absorption_sell_cnt,
                 absorption_lrg_buy  = EXCLUDED.absorption_lrg_buy,
-                absorption_events   = EXCLUDED.absorption_events
+                absorption_events   = EXCLUDED.absorption_events,
+                net_sol_flow        = EXCLUDED.net_sol_flow
             WHERE bounce_signals.absorption_events IS NULL
         """, {
             **data,
@@ -647,6 +653,7 @@ def insert_bounce_signal(data: dict):
             "absorption_sell_cnt": data.get("absorption_sell_cnt"),
             "absorption_lrg_buy":  data.get("absorption_lrg_buy"),
             "absorption_events":   data.get("absorption_events"),
+            "net_sol_flow":        data.get("net_sol_flow"),
         })
 
 

@@ -10921,6 +10921,7 @@ def debug_absorption():
                 lrg_buy  = w.get("largest_buy",  0) or 0
                 ratio    = buy_vol / sell_vol if sell_vol > 0 else None
                 conc     = lrg_buy / buy_vol if buy_vol > 0 else None
+                net_flow = buy_vol - sell_vol if total > 0 else None
                 event_cls = "ok" if total >= 5 else ("warn" if total >= 1 else "bad")
                 ratio_cls = "ok" if (ratio and ratio >= 1.0) else "bad"
                 # H22 só captura pump.fun pAMM — Raydium/Meteora/outros = sem dados
@@ -10942,6 +10943,12 @@ def debug_absorption():
                 ).total_seconds() / 60)
 
                 dex_url = f"https://dexscreener.com/solana/{mint}"
+                if net_flow is None:
+                    net_flow_str = "<span style='color:#484f58'>—</span>"
+                else:
+                    nf_color = "#3fb950" if net_flow > 0 else ("#f85149" if net_flow < 0 else "#8b949e")
+                    net_flow_str = f"<span style='color:{nf_color}'>{net_flow:+.3f}◎</span>"
+
                 live_rows_html += f"""<tr>
                   <td><b>{symbol}</b></td>
                   <td class='{exch_cls}'>{exchange}</td>
@@ -10950,6 +10957,7 @@ def debug_absorption():
                   <td class='ok'>{buy_vol:.3f} SOL ({buy_cnt}×)</td>
                   <td class='bad'>{sell_vol:.3f} SOL ({sell_cnt}×)</td>
                   <td>{ratio_str}</td>
+                  <td>{net_flow_str}</td>
                   <td>{lrg_buy:.3f} SOL</td>
                   <td style='color:#8b949e'>{conc_str}</td>
                   <td style='font-size:10px;color:#8b949e'>{mint[:12]}…</td>
@@ -10957,7 +10965,7 @@ def debug_absorption():
                 </tr>"""
 
         if not live_rows_html:
-            live_rows_html = "<tr><td colspan='9' style='color:#484f58'>Nenhum token ativo no HotMonitor agora</td></tr>"
+            live_rows_html = "<tr><td colspan='12' style='color:#484f58'>Nenhum token ativo no HotMonitor agora</td></tr>"
 
         # ── 2. Últimos 30 bounce_signals com métricas brutas H22 ──────────────────────
         with db._cursor() as cur:
@@ -11026,6 +11034,7 @@ def debug_absorption():
             outcome  = r.get("trade_status") or "—"
             ratio    = bv / sv if (bv is not None and sv and float(sv) > 0) else None
             conc     = lb / bv if (lb is not None and bv and float(bv) > 0) else None
+            net_flow_val = (float(bv) - float(sv)) if (bv is not None and sv is not None and ev) else None
 
             ratio_cls = "ok" if (ratio and ratio >= 1.0) else ("bad" if ratio is not None else "")
             out_cls   = "ok" if outcome == "tp" else ("bad" if outcome in ("sl","expired") else "")
@@ -11044,6 +11053,12 @@ def debug_absorption():
 
             conc_str = f"{conc:.2f}" if conc is not None else "—"
 
+            if net_flow_val is None:
+                nf_str = "<span style='color:#484f58'>—</span>"
+            else:
+                nf_color = "#3fb950" if net_flow_val > 0 else ("#f85149" if net_flow_val < 0 else "#8b949e")
+                nf_str = f"<span style='color:{nf_color}'>{net_flow_val:+.3f}◎</span>"
+
             bounce_rows_html += f"""<tr>
               <td>{ts}</td>
               <td><b>{symbol}</b></td>
@@ -11053,6 +11068,7 @@ def debug_absorption():
               <td>{f"{bv:.3f} ({bc}×)" if bv is not None else "<span style='color:#484f58'>NULL</span>"}</td>
               <td>{f"{sv:.3f} ({sc}×)" if sv is not None else "<span style='color:#484f58'>NULL</span>"}</td>
               <td>{ratio_str}</td>
+              <td>{nf_str}</td>
               <td style='color:#8b949e'>{conc_str}</td>
               <td>{ev if ev is not None else "<span style='color:#f85149'>NULL</span>"}</td>
             </tr>"""
@@ -11122,7 +11138,7 @@ def debug_absorption():
   <thead><tr>
     <th>Token</th><th>Exchange</th><th>Elapsed</th><th>Eventos Helius</th>
     <th>Buy vol</th><th>Sell vol</th><th>Ratio</th>
-    <th>Largest buy</th><th>Conc.</th><th>Mint</th><th></th>
+    <th>Net flow (H23)</th><th>Largest buy</th><th>Conc.</th><th>Mint</th><th></th>
   </tr></thead>
   <tbody>{live_rows_html}</tbody>
 </table>
@@ -11137,13 +11153,272 @@ def debug_absorption():
 <table>
   <thead><tr>
     <th>Hora</th><th>Token</th><th>Exchange</th><th>Bounce</th><th>Trade</th>
-    <th>Buy SOL</th><th>Sell SOL</th><th>Ratio</th><th>Conc.</th><th>Eventos</th>
+    <th>Buy SOL</th><th>Sell SOL</th><th>Ratio</th><th>Net flow (H23)</th><th>Conc.</th><th>Eventos</th>
   </tr></thead>
   <tbody>{bounce_rows_html}</tbody>
 </table>
 </body></html>"""
         return html
 
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
+@app.route("/debug/h23")
+def debug_h23():
+    """H23 — Verificação pré-deploy de net_sol_flow.
+    Checa: (1) coluna existe no DB, (2) cobertura, (3) math correto nos últimos bounces,
+    (4) cálculo ao vivo nos tokens ativos do HotMonitor.
+    """
+    import traceback
+    try:
+        CSS = ("<style>body{background:#0d1117;color:#e6edf3;font:13px/1.6 monospace;padding:20px}"
+               "a{color:#58a6ff;text-decoration:none}table{border-collapse:collapse;width:100%}"
+               "th{background:#161b22;padding:6px 10px;text-align:left;font-size:11px;color:#8b949e}"
+               "td{padding:5px 10px;border-bottom:1px solid #21262d;font-size:12px}"
+               ".box{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px 16px;"
+               "margin:8px 4px;display:inline-block;vertical-align:top}"
+               ".lbl{color:#8b949e;font-size:11px}.val{font-size:20px;font-weight:bold}"
+               ".ok{color:#3fb950}.warn{color:#e3b341}.bad{color:#f85149}.dim{color:#484f58}"
+               ".nav a{color:#58a6ff;margin-right:14px;font-size:12px}"
+               "h2{color:#8b949e;font-size:12px;margin:20px 0 6px;text-transform:uppercase}"
+               "h1{color:#58a6ff;font-size:16px;margin-bottom:4px}"
+               ".pass{color:#3fb950;font-weight:bold}.fail{color:#f85149;font-weight:bold}</style>")
+
+        def _box(label, val, color="#e6edf3"):
+            return f"<div class='box'><div class='lbl'>{label}</div><div class='val' style='color:{color}'>{val}</div></div>"
+
+        checks = []  # lista de (label, ok, detalhe)
+
+        with db._cursor() as cur:
+            # ── Check 1: coluna existe no DB ────────────────────────────────────
+            cur.execute("""
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_name = 'bounce_signals'
+                  AND column_name = 'net_sol_flow'
+            """)
+            col_row = cur.fetchone()
+            col_ok = col_row is not None
+            checks.append((
+                "Coluna net_sol_flow existe em bounce_signals",
+                col_ok,
+                f"tipo: {col_row['data_type']}" if col_ok else "coluna NÃO encontrada — migration não rodou"
+            ))
+
+            # ── Check 2: cobertura ──────────────────────────────────────────────
+            cur.execute("""
+                SELECT
+                    COUNT(*)                                          AS total,
+                    COUNT(net_sol_flow)                               AS with_flow,
+                    COUNT(CASE WHEN absorption_events > 0 THEN 1 END) AS with_helius,
+                    COUNT(CASE WHEN absorption_events > 0
+                               AND net_sol_flow IS NULL THEN 1 END)   AS helius_missing_flow
+                FROM bounce_signals
+            """)
+            cov = dict(cur.fetchone())
+            total        = cov["total"]
+            with_flow    = cov["with_flow"]
+            with_helius  = cov["with_helius"]
+            missing_flow = cov["helius_missing_flow"]
+            # Bounces com Helius mas sem net_sol_flow = problema de pipeline
+            cov_ok = (missing_flow == 0)
+            checks.append((
+                "Bounces com Helius têm net_sol_flow preenchido",
+                cov_ok,
+                f"{with_helius} com Helius, {missing_flow} faltando net_sol_flow"
+                + (" ✅" if cov_ok else " ← problema: insert não passou o campo")
+            ))
+
+            # ── Check 3: matemática correta nos últimos bounces com dados ────────
+            cur.execute("""
+                SELECT mint, symbol, ts_signal,
+                       absorption_buy_vol  AS buy_vol,
+                       absorption_sell_vol AS sell_vol,
+                       absorption_events   AS events,
+                       net_sol_flow        AS stored_flow
+                FROM bounce_signals
+                WHERE absorption_events > 0
+                ORDER BY ts_signal DESC
+                LIMIT 20
+            """)
+            recent = [dict(r) for r in cur.fetchall()]
+
+            math_errors = 0
+            math_rows_html = ""
+            for r in recent:
+                bv    = r["buy_vol"]  or 0.0
+                sv    = r["sell_vol"] or 0.0
+                ev    = r["events"]   or 0
+                stored = r["stored_flow"]
+                expected = (bv - sv) if ev > 0 else None
+                ts_str = r["ts_signal"].strftime("%m-%d %H:%M") if r["ts_signal"] else "—"
+                sym    = r.get("symbol") or r["mint"][:8]
+
+                if expected is None:
+                    match = stored is None
+                else:
+                    match = stored is not None and abs(stored - expected) < 1e-9
+
+                if not match:
+                    math_errors += 1
+                    row_cls = "fail"
+                else:
+                    row_cls = ""
+
+                stored_str   = f"{stored:+.4f}" if stored is not None else "<span class='dim'>NULL</span>"
+                expected_str = f"{expected:+.4f}" if expected is not None else "<span class='dim'>NULL</span>"
+                ok_str       = "✅" if match else "<span class='fail'>❌ DIFF</span>"
+
+                nf_color = "#3fb950" if (stored and stored > 0) else ("#f85149" if (stored and stored < 0) else "#8b949e")
+                flow_bar = f"<span style='color:{nf_color}'>{stored:+.3f}◎</span>" if stored is not None else "—"
+
+                math_rows_html += (
+                    f"<tr>"
+                    f"<td>{ts_str}</td>"
+                    f"<td><b>{sym}</b></td>"
+                    f"<td>{ev}</td>"
+                    f"<td>{bv:.4f}</td>"
+                    f"<td>{sv:.4f}</td>"
+                    f"<td>{expected_str}</td>"
+                    f"<td>{stored_str}</td>"
+                    f"<td>{flow_bar}</td>"
+                    f"<td>{ok_str}</td>"
+                    f"</tr>"
+                )
+
+            math_ok = (math_errors == 0)
+            checks.append((
+                f"Matemática correta (buy - sell == net_sol_flow) nos últimos {len(recent)} bounces",
+                math_ok,
+                f"{math_errors} divergências encontradas" if not math_ok else f"todos os {len(recent)} corretos"
+            ))
+
+        # ── Check 4: live — tokens ativos no HotMonitor ─────────────────────────
+        live_rows_html = ""
+        helius_ok = False
+        if scanner and hasattr(scanner, "hot") and scanner.hot._helius:
+            helius_ok = True
+            with scanner.hot._lock:
+                active = dict(scanner.hot._tokens)
+
+            for mint, state in active.items():
+                sym  = state.get("symbol", mint[:8])
+                try:
+                    w = scanner.hot._helius.get_absorption_window(mint, window_sec=60)
+                except Exception:
+                    w = {}
+                bv   = w.get("buy_vol_sol",  0) or 0
+                sv   = w.get("sell_vol_sol", 0) or 0
+                ev   = w.get("total_events", 0) or 0
+                flow = (bv - sv) if ev > 0 else None
+                flow_str = (
+                    f"<span style='color:{'#3fb950' if flow > 0 else '#f85149'}'>{flow:+.4f}◎</span>"
+                    if flow is not None else "<span class='dim'>NULL (sem eventos)</span>"
+                )
+                live_rows_html += (
+                    f"<tr>"
+                    f"<td><b>{sym}</b></td>"
+                    f"<td>{ev}</td>"
+                    f"<td>{bv:.4f}</td>"
+                    f"<td>{sv:.4f}</td>"
+                    f"<td>{flow_str}</td>"
+                    f"<td style='color:#484f58;font-size:10px'>{mint[:16]}…</td>"
+                    f"</tr>"
+                )
+
+        if not live_rows_html:
+            live_rows_html = "<tr><td colspan='6' class='dim'>Nenhum token ativo no HotMonitor agora</td></tr>"
+
+        checks.append((
+            "Helius WebSocket ativo (fonte do net_sol_flow)",
+            helius_ok,
+            "online" if helius_ok else "offline — net_sol_flow será NULL em todos os bounces"
+        ))
+
+        # ── Render checks summary ───────────────────────────────────────────────
+        all_pass = all(ok for _, ok, _ in checks)
+        checks_html = ""
+        for label, ok, detail in checks:
+            icon = "✅ PASS" if ok else "❌ FAIL"
+            cls  = "pass" if ok else "fail"
+            checks_html += (
+                f"<tr>"
+                f"<td><span class='{cls}'>{icon}</span></td>"
+                f"<td>{label}</td>"
+                f"<td class='dim'>{detail}</td>"
+                f"</tr>"
+            )
+
+        verdict_color = "#3fb950" if all_pass else "#f85149"
+        verdict_text  = "TUDO OK — pode mergear para main" if all_pass else "ATENÇÃO — corrija antes de mergear"
+
+        summary_boxes = (
+            _box("Total bounce_signals", total) +
+            _box("Com net_sol_flow", with_flow,
+                 "#3fb950" if with_flow == with_helius else "#e3b341") +
+            _box("Com Helius (esperado ter flow)", with_helius, "#58a6ff") +
+            _box("Faltando flow (bug)", missing_flow,
+                 "#3fb950" if missing_flow == 0 else "#f85149")
+        )
+
+        html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>Debug H23 — net_sol_flow</title>{CSS}
+<meta http-equiv='refresh' content='15'>
+</head><body>
+<h1>H23 — net_sol_flow — Verificação Pré-Deploy</h1>
+<p style='color:#8b949e;font-size:11px'>
+  auto-refresh 15s · net_sol_flow = absorption_buy_vol − absorption_sell_vol<br>
+  NULL quando absorption_events = 0 (sem dados Helius) — comportamento correto.
+</p>
+<div class='nav'>
+  <a href='/debug/absorption'>Absorption Debug</a>
+  <a href='/analise/h22-correlation'>H22 Correlation</a>
+</div>
+<br>
+
+<h2>▸ Veredicto</h2>
+<p style='font-size:18px;font-weight:bold;color:{verdict_color}'>{verdict_text}</p>
+
+<h2>▸ Checks</h2>
+<table>
+  <thead><tr><th>Status</th><th>Verificação</th><th>Detalhe</th></tr></thead>
+  <tbody>{checks_html}</tbody>
+</table>
+
+<br>
+{summary_boxes}
+
+<h2>▸ Últimos bounces com Helius — matemática buy−sell vs stored</h2>
+<p style='color:#484f58;font-size:11px'>
+  "Esperado" = buy_vol − sell_vol calculado agora. "Armazenado" = net_sol_flow do banco.
+  Devem ser idênticos. Diferença = bug no scanner.py ou na migration do DB.
+</p>
+<table>
+  <thead><tr>
+    <th>Hora</th><th>Token</th><th>Eventos</th>
+    <th>Buy (SOL)</th><th>Sell (SOL)</th>
+    <th>Esperado</th><th>Armazenado</th><th>Net flow</th><th>Match</th>
+  </tr></thead>
+  <tbody>{math_rows_html if math_rows_html else "<tr><td colspan='9' class='dim'>Sem bounces com dados Helius ainda</td></tr>"}</tbody>
+</table>
+
+<br>
+<h2>▸ Live — cálculo ao vivo nos tokens ativos agora</h2>
+<p style='color:#484f58;font-size:11px'>
+  Mostra o net_sol_flow que seria salvo se um bounce disparasse agora para cada token ativo.
+</p>
+<table>
+  <thead><tr>
+    <th>Token</th><th>Eventos (60s)</th><th>Buy vol</th><th>Sell vol</th>
+    <th>net_sol_flow que seria salvo</th><th>Mint</th>
+  </tr></thead>
+  <tbody>{live_rows_html}</tbody>
+</table>
+
+</body></html>"""
+        return html
 
     except Exception:
         return "<pre>" + traceback.format_exc() + "</pre>", 500
@@ -11530,6 +11805,7 @@ def analise_h22_correlation():
             r["has_helius"] = ev > 0
             r["ratio"] = bv / sv if sv > 0 else (float("inf") if bv > 0 else None)
             r["concentration"] = lb / bv if bv > 0 else None
+            r["net_flow"] = (bv - sv) if ev > 0 else None
 
         # Rows with Helius data + outcome
         helius_with_outcome = [r for r in all_rows if r["has_helius"] and r["outcome"] is not None]
@@ -11610,6 +11886,22 @@ def analise_h22_correlation():
             return rows
 
         conc_rows_html = _conc_rows()
+
+        # --- Table 4: net_sol_flow (H23) ---
+        def _net_flow_rows():
+            no_data   = [r for r in helius_with_outcome if r["net_flow"] is None]
+            negative  = [r for r in helius_with_outcome if r["net_flow"] is not None and r["net_flow"] < 0]
+            low_pos   = [r for r in helius_with_outcome if r["net_flow"] is not None and 0 <= r["net_flow"] < 1]
+            mid_pos   = [r for r in helius_with_outcome if r["net_flow"] is not None and 1 <= r["net_flow"] < 3]
+            high_pos  = [r for r in helius_with_outcome if r["net_flow"] is not None and r["net_flow"] >= 3]
+            rows  = _wr_row("< 0 SOL (pool drenando)",    negative)
+            rows += _wr_row("0–1 SOL (levemente positivo)", low_pos)
+            rows += _wr_row("1–3 SOL (compra real)",        mid_pos)
+            rows += _wr_row("> 3 SOL (demanda forte)",      high_pos)
+            rows += _wr_row("— (sem dados Helius)",          no_data)
+            return rows
+
+        net_flow_rows_html = _net_flow_rows()
 
         # --- Classify outcomes for trajectory rows ---
         for r in trajectory_rows:
@@ -11831,6 +12123,19 @@ def analise_h22_correlation():
     <th>Concentração</th><th>n (traded)</th><th>Win Rate</th><th>TP</th><th>SL</th><th>Total</th>
   </tr></thead>
   <tbody>{conc_rows_html}</tbody>
+</table>
+
+<br>
+<h2>▸ Por net SOL flow (H23) — capital real entrando vs saindo (buy_vol − sell_vol)</h2>
+<p style='color:#484f58;font-size:11px'>
+  Net flow negativo = vendedores dominaram mesmo com muitas compras. Um sell de 10 SOL after 30 compras de 0.1 SOL = pool drenando.<br>
+  <b>Coleta apenas</b> — gate para filtro: n≥30 com outcomes GMGN mostrando discriminação ≥10pp.
+</p>
+<table>
+  <thead><tr>
+    <th>Net flow bucket</th><th>n (traded)</th><th>Win Rate</th><th>TP</th><th>SL</th><th>Total bounces</th>
+  </tr></thead>
+  <tbody>{net_flow_rows_html}</tbody>
 </table>
 
 <br>
