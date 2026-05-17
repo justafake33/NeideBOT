@@ -30368,6 +30368,98 @@ def _analise_h24_h25_inner(conn, cur):
     </body></html>"""
 
 
+@app.route("/analise/wallet-signal")
+def analise_wallet_signal():
+    """
+    Analisa wallets_json de token_signals × migrations.recovery
+    para encontrar wallets com edge demonstrável.
+    """
+    import psycopg2, json, traceback
+    from db import DATABASE_URL
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor()
+
+        # cobertura básica
+        cur.execute("""
+            SELECT
+                COUNT(*) as total,
+                COUNT(wallets_json) as com_wallets,
+                COUNT(DISTINCT mint) as mints_unicos
+            FROM token_signals
+        """)
+        cov = cur.fetchone()
+
+        # wallets × recovery: qual wallet aparece mais em tokens recovery=TRUE?
+        cur.execute("""
+            SELECT
+                w->>'address' as wallet,
+                COUNT(*) as n_sinais,
+                SUM(CASE WHEN m.recovery = true  THEN 1 ELSE 0 END) as n_recovery,
+                SUM(CASE WHEN m.recovery = false THEN 1 ELSE 0 END) as n_no_recovery,
+                SUM(CASE WHEN m.recovery IS NULL  THEN 1 ELSE 0 END) as n_sem_dados
+            FROM token_signals ts
+            JOIN migrations m ON m.mint = ts.mint,
+            json_array_elements(ts.wallets_json::json) AS w
+            WHERE ts.wallets_json IS NOT NULL
+              AND ts.wallets_json != 'null'
+              AND ts.wallets_json != '[]'
+            GROUP BY 1
+            HAVING COUNT(*) >= 3
+            ORDER BY n_recovery DESC, n_sinais DESC
+            LIMIT 50
+        """)
+        wallet_rows = cur.fetchall()
+        conn.close()
+
+        # monta tabela
+        rows_html = ""
+        for wallet, n, nr, nn, ns in wallet_rows:
+            wr = f"{nr/n*100:.0f}%" if n else "—"
+            color = "#2a2" if n >= 5 and nr/n >= 0.5 else ("#fa0" if n >= 3 and nr/n >= 0.4 else "#888")
+            rows_html += f"""<tr>
+              <td style='font-family:monospace;font-size:.85em'>{wallet[:20]}…</td>
+              <td>{n}</td>
+              <td style='color:#2a2'>{nr}</td>
+              <td style='color:#a44'>{nn}</td>
+              <td>{ns}</td>
+              <td style='color:{color}'><b>{wr}</b></td>
+            </tr>"""
+
+        if not rows_html:
+            rows_html = "<tr><td colspan=6 style='color:#888'>Sem dados — wallets_json vazio ou sem cruzamento com migrations</td></tr>"
+
+        return f"""<!DOCTYPE html><html><head>
+        <meta charset='utf-8'><title>Wallet Signal Analysis</title>
+        <style>
+          body {{ font-family:monospace; background:#111; color:#ccc; padding:20px; }}
+          h2 {{ color:#fa0; }} h3 {{ color:#fa0; }}
+          table {{ border-collapse:collapse; width:100%; }}
+          th,td {{ padding:6px 10px; border:1px solid #333; text-align:right; }}
+          th {{ background:#222; color:#fa0; }}
+          td:first-child {{ text-align:left; }}
+        </style></head><body>
+        <h2>Wallets Smart Money × Recovery Rate</h2>
+        <p style='color:#888'>
+            token_signals total: <b>{cov[0]}</b> &nbsp;|&nbsp;
+            com wallets_json: <b>{cov[1]}</b> &nbsp;|&nbsp;
+            mints únicos: <b>{cov[2]}</b>
+        </p>
+        <h3>Wallets com ≥3 sinais (ordenado por n_recovery)</h3>
+        <table>
+          <tr><th>Wallet</th><th>n sinais</th><th>Recovery ✓</th><th>No-recovery ✗</th><th>Sem dados</th><th>WR</th></tr>
+          {rows_html}
+        </table>
+        <p style='color:#888;margin-top:16px'>
+          Verde = n≥5 e WR≥50% → candidata a filtro.<br>
+          Amarelo = n≥3 e WR≥40% → monitorar.<br>
+          Gate mínimo para usar como filtro: n≥10 e WR≥60%.
+        </p>
+        </body></html>"""
+    except Exception:
+        return f"<pre style='color:red'>{traceback.format_exc()}</pre>", 500
+
+
 @app.route("/analise/phantom-bounces")
 def analise_phantom_bounces():
     """
