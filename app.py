@@ -30700,6 +30700,267 @@ def analise_elapsed_granular():
         return f"<pre style='color:red'>{traceback.format_exc()}</pre>", 500
 
 
+@app.route("/analise/simulacao-300s")
+def analise_simulacao_300s():
+    """
+    Retroactive simulation: e se tivéssemos esperado 5min antes de comprar?
+    Para cada trade id>=338 com elapsed<300s, busca token_ticks ao redor do
+    t=300s e simula: o sinal ainda dispararia? TP ou SL?
+    """
+    import psycopg2, traceback
+    from db import DATABASE_URL
+    from datetime import timezone
+
+    SL_PCT      = 0.25   # -25%
+    TP_PCT      = 0.75   # +75% (proxy trailing)
+    BOUNCE_MIN  = 0.55
+    MIN_SEC     = 300
+    TICK_WINDOW = 90     # segundos de tolerância para achar tick em t=300s
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor()
+
+        # 1. Todos os trades id>=338, elapsed<300s, blockchain-verificados
+        cur.execute("""
+            SELECT
+                t.id,
+                t.mint,
+                t.status                         AS real_status,
+                t.pnl_pct_real                   AS real_pnl,
+                bs.elapsed_sec,
+                bs.mc_min                        AS bs_mc_min,
+                bs.mc_at_signal,
+                bs.bounce_pct                    AS bs_bounce_pct,
+                bs.drop_from_mig,
+                m.mc_migration,
+                m.ts_migration,
+                m.token_nome
+            FROM trades t
+            JOIN bounce_signals bs ON bs.mint = t.mint
+                AND bs.ts_signal BETWEEN t.created_at - INTERVAL '5 min'
+                                     AND t.created_at + INTERVAL '30 min'
+            JOIN migrations m ON m.mint = t.mint
+            WHERE t.exit_type IS NOT NULL
+              AND t.status IN ('tp','sl')
+              AND t.id >= 338
+              AND bs.elapsed_sec < 300
+            ORDER BY t.id
+        """)
+        trades = cur.fetchall()
+
+        results = []
+
+        for (tid, mint, real_status, real_pnl, elapsed_sec,
+             bs_mc_min, mc_at_signal, bs_bounce_pct, drop_from_mig,
+             mc_migration, ts_mig, token_nome) in trades:
+
+            if ts_mig is None or mc_migration is None or mc_migration <= 0:
+                results.append((tid, token_nome, elapsed_sec, real_status, real_pnl,
+                                 None, None, None, None, 'sem_dados_mig'))
+                continue
+
+            # ts em UTC para aritmética
+            ts_mig_utc = ts_mig.replace(tzinfo=timezone.utc) if ts_mig.tzinfo is None else ts_mig
+            t300 = ts_mig_utc.timestamp() + MIN_SEC  # unix epoch do t=5min
+
+            # 2. mc_min nos primeiros 300s (do banco; bounce_signals já tem o fundo real)
+            #    Complementa com token_ticks caso haja low mais baixo
+            cur.execute("""
+                SELECT MIN(COALESCE(mc_low, mc))
+                FROM token_ticks
+                WHERE mint = %s
+                  AND ts >= %s AND ts <= %s
+            """, (mint, ts_mig_utc, ts_mig_utc.replace(tzinfo=None).__class__.fromtimestamp(t300, tz=timezone.utc)))
+            row = cur.fetchone()
+            tick_mc_min = row[0] if row and row[0] else None
+            mc_min_300s = min(bs_mc_min or 0, tick_mc_min or float('inf'))
+            if mc_min_300s <= 0 or mc_min_300s == float('inf'):
+                mc_min_300s = bs_mc_min
+
+            # 3. mc em t=300s — tick mais próximo numa janela de ±TICK_WINDOW segundos
+            from datetime import datetime
+            t300_dt = datetime.fromtimestamp(t300, tz=timezone.utc)
+            t300_lo = datetime.fromtimestamp(t300 - TICK_WINDOW, tz=timezone.utc)
+            t300_hi = datetime.fromtimestamp(t300 + TICK_WINDOW, tz=timezone.utc)
+
+            cur.execute("""
+                SELECT mc, ABS(EXTRACT(EPOCH FROM (ts - %s))) AS diff
+                FROM token_ticks
+                WHERE mint = %s AND ts BETWEEN %s AND %s
+                ORDER BY diff
+                LIMIT 1
+            """, (t300_dt, mint, t300_lo, t300_hi))
+            row = cur.fetchone()
+
+            if row is None or row[0] is None:
+                results.append((tid, token_nome, elapsed_sec, real_status, real_pnl,
+                                 None, None, None, None, 'sem_tick_300s'))
+                continue
+
+            mc_300s = float(row[0])
+
+            # 4. Verificar se o sinal ainda dispararia em t=300s
+            if mc_min_300s <= 0:
+                results.append((tid, token_nome, elapsed_sec, real_status, real_pnl,
+                                 round(mc_300s), None, None, None, 'mc_min_zero'))
+                continue
+
+            bounce_300s   = (mc_300s - mc_min_300s) / mc_min_300s
+            entry_ratio   = mc_300s / mc_migration
+
+            fired = (
+                bounce_300s   >= BOUNCE_MIN and
+                entry_ratio   <  1.0 and          # A.8: abaixo da migração
+                not (0.50 <= entry_ratio <= 0.65)  # A.3: dead zone
+            )
+
+            if not fired:
+                reason = (
+                    f'bounce {bounce_300s*100:.0f}% < {BOUNCE_MIN*100:.0f}%' if bounce_300s < BOUNCE_MIN
+                    else f'entry_ratio {entry_ratio:.2f} (dead zone ou acima mig)'
+                )
+                results.append((tid, token_nome, elapsed_sec, real_status, real_pnl,
+                                 round(mc_300s), round(bounce_300s*100), round(entry_ratio*100), None,
+                                 f'nao_dispararia: {reason}'))
+                continue
+
+            # 5. Simular TP/SL com ticks APÓS t=300s
+            sl_floor = mc_300s * (1 - SL_PCT)
+            tp_ceil  = mc_300s * (1 + TP_PCT)
+
+            cur.execute("""
+                SELECT mc_low, mc_high, mc, ts
+                FROM token_ticks
+                WHERE mint = %s AND ts > %s
+                ORDER BY ts
+            """, (mint, t300_dt))
+            ticks = cur.fetchall()
+
+            sim_status = 'sem_saida'
+            sim_pnl    = None
+
+            for (mc_low, mc_high, mc_close, tick_ts) in ticks:
+                lo = float(mc_low   or mc_close or 0)
+                hi = float(mc_high  or mc_close or 0)
+                cl = float(mc_close or 0)
+
+                # SL checa mc_low (kline) ou close (trenches)
+                if lo > 0 and lo <= sl_floor:
+                    sim_status = 'sl'
+                    sim_pnl    = round((-SL_PCT) * 100, 1)
+                    break
+                if cl > 0 and cl <= sl_floor:
+                    sim_status = 'sl'
+                    sim_pnl    = round((cl / mc_300s - 1) * 100, 1)
+                    break
+                # TP checa mc_high
+                if hi > 0 and hi >= tp_ceil:
+                    sim_status = 'tp'
+                    sim_pnl    = round(TP_PCT * 100, 1)
+                    break
+                if cl > 0 and cl >= tp_ceil:
+                    sim_status = 'tp'
+                    sim_pnl    = round((cl / mc_300s - 1) * 100, 1)
+                    break
+
+            results.append((tid, token_nome, elapsed_sec, real_status, real_pnl,
+                             round(mc_300s), round(bounce_300s*100), round(entry_ratio*100),
+                             sim_pnl, sim_status))
+
+        conn.close()
+
+        # ── Estatísticas ──
+        fired        = [r for r in results if r[9] not in ('sem_tick_300s','sem_dados_mig','mc_min_zero') and not str(r[9]).startswith('nao_dispararia')]
+        nao_dispara  = [r for r in results if str(r[9]).startswith('nao_dispararia')]
+        sem_tick     = [r for r in results if r[9] in ('sem_tick_300s','sem_dados_mig','mc_min_zero')]
+        sim_tp       = [r for r in fired if r[9]=='tp']
+        sim_sl       = [r for r in fired if r[9]=='sl']
+        sim_sem      = [r for r in fired if r[9]=='sem_saida']
+
+        total_early  = len(results)
+        wr_sim       = round(len(sim_tp)/len(fired)*100,1) if fired else 0
+
+        # ── Tabela HTML ──
+        def row_html(r):
+            tid, nome, elapsed, real_st, real_pnl, mc300, bounce300, er300, sim_pnl, sim_st = r
+            real_color = '#2a2' if real_st=='tp' else '#a44'
+            if str(sim_st).startswith('nao_dispararia'):
+                sim_color, sim_label = '#888', '⛔ não dispararia'
+            elif sim_st == 'tp':
+                sim_color, sim_label = '#2a2', f'✅ TP +{sim_pnl:.0f}%'
+            elif sim_st == 'sl':
+                sim_color, sim_label = '#a44', f'❌ SL {sim_pnl:.0f}%'
+            elif sim_st == 'sem_saida':
+                sim_color, sim_label = '#fa0', '⏳ sem saída'
+            elif sim_st in ('sem_tick_300s','sem_dados_mig','mc_min_zero'):
+                sim_color, sim_label = '#555', '— sem tick'
+            else:
+                sim_color, sim_label = '#888', str(sim_st)[:30]
+
+            real_pnl_str = f"{real_pnl*100:+.0f}%" if real_pnl is not None else '—'
+            return (f"<tr>"
+                    f"<td>#{tid}</td>"
+                    f"<td>{nome or mint[:8]}</td>"
+                    f"<td>{elapsed}s ({elapsed//60}:{elapsed%60:02d})</td>"
+                    f"<td style='color:{real_color}'>{real_st.upper()} {real_pnl_str}</td>"
+                    f"<td>{f'${mc300:,}' if mc300 else '—'}</td>"
+                    f"<td>{f'{bounce300}%' if bounce300 is not None else '—'}</td>"
+                    f"<td>{f'{er300}%' if er300 is not None else '—'}</td>"
+                    f"<td style='color:{sim_color}'><b>{sim_label}</b></td>"
+                    f"</tr>")
+
+        trs = "".join(row_html(r) for r in results)
+
+        return f"""<!DOCTYPE html><html><head>
+        <meta charset='utf-8'><title>Simulação 300s</title>
+        <style>
+          body{{font-family:monospace;background:#111;color:#ccc;padding:20px}}
+          h2,h3{{color:#fa0}} table{{border-collapse:collapse;min-width:900px}}
+          th,td{{padding:5px 10px;border:1px solid #333;text-align:right}}
+          th{{background:#222;color:#fa0}} td:first-child,td:nth-child(2){{text-align:left}}
+          .box{{display:inline-block;padding:10px 20px;margin:8px;border:1px solid #444;border-radius:4px}}
+          .note{{color:#888;font-size:.9em;margin:4px 0 12px}}
+        </style></head><body>
+        <h2>Simulação: e se tivéssemos esperado 5min? (id ≥ 338, elapsed &lt; 5min)</h2>
+        <p class='note'>
+          {total_early} trades entrariam em standby |
+          {len(sem_tick)} sem tick em t=5min (saem da análise) |
+          {len(nao_dispara)} não disparariam (bounce colapsou ou dead zone) |
+          <b>{len(fired)} disparariam em t=5min</b>
+        </p>
+
+        <div>
+          <span class='box'>Disparariam<br><b>{len(fired)}</b></span>
+          <span class='box' style='color:#2a2'>TP simulado<br><b>{len(sim_tp)}</b></span>
+          <span class='box' style='color:#a44'>SL simulado<br><b>{len(sim_sl)}</b></span>
+          <span class='box' style='color:#fa0'>Sem saída<br><b>{len(sim_sem)}</b></span>
+          <span class='box'>WR simulado<br><b>{wr_sim}%</b></span>
+          <span class='box' style='color:#fa0'>WR real (mesmos trades)<br><b>{round(sum(1 for r in fired if r[3]=='tp')/len(fired)*100,1) if fired else 0}%</b></span>
+        </div>
+
+        <h3>Detalhe por trade</h3>
+        <table>
+          <tr>
+            <th>#id</th><th>Token</th><th>Elapsed original</th>
+            <th>Resultado real</th>
+            <th>MC em t=5min</th><th>Bounce em t=5min</th><th>Entry ratio</th>
+            <th>Simulação t=5min</th>
+          </tr>
+          {trs}
+        </table>
+        <p class='note' style='margin-top:12px'>
+          Bounce em t=5min = (mc_5min − mc_min_5min) / mc_min_5min.
+          Entry ratio = mc_5min / mc_migration.<br>
+          TP = +75% | SL = −25%. Tick window ±90s ao redor de t=5min.
+          Sem saída = ticks disponíveis mas nem TP nem SL atingidos na janela de 60min.
+        </p>
+        </body></html>"""
+
+    except Exception:
+        return f"<pre style='color:red'>{traceback.format_exc()}</pre>", 500
+
+
 @app.route("/analise/tp-vs-sl-recente")
 def analise_tp_vs_sl_recente():
     """Mesmo que tp-vs-sl mas filtrando apenas trades id >= 338 (filtros atuais ativos)."""
