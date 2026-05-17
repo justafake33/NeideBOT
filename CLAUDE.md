@@ -729,46 +729,68 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 125. **Pool depth em tempo real está em `pool_quote` (offset 56 do BuyEvent)**: `pool_quote < 20 SOL` no momento do bounce significa que um sell de ~$300 move o preço 25%. Com SL=25%, qualquer ruído de pool thin dispara a saída — não é price action real, é física de AMM. Isso explica por que SL=15% "disparava em segundos": o pool era pequeno demais. Salvar `pool_quote_at_signal` em `bounce_signals` usando o último valor recebido via Helius WebSocket no momento do `_check_bounce()`.
 126. **Net SOL flow = `buy_vol_sol - sell_vol_sol` (H23)**: dado já existe em `get_absorption_window()`. Mede capital real entrando vs saindo, independente de contagem de trades. Um sell de 10 SOL depois de 20 compras de 0.1 SOL = `net_flow < 0` — pool drenando apesar da maioria de trades ser compra. H22 atual (contagem de eventos) esconde essa assimetria. Gate para filtro: salvar em `bounce_signals` e correlacionar com outcomes GMGN (n≥30).
 127. **Buy concentration = `largest_buy / buy_vol` (H26)**: paper arXiv 2602.14860 sobre pump.fun confirma que "fast accumulation por poucos trades" é o preditor mais forte de sucesso. Bounce com 3 buyers de 3-5 SOL é estruturalmente melhor que 30 buyers de 0.1 SOL — o primeiro indica demanda concentrada real, o segundo pode ser bots ou wash. Campo já existe em `bounce_signals` (`absorption_lrg_buy` e `absorption_buy_vol`). Falta calcular a razão e correlacionar com outcomes GMGN (gate: n≥30).
+128. **Bug crítico H23: janela de absorção estava no momento errado (sessão 7, 2026-05-16)**: `get_absorption_window()` usava `time.time()` como fim da janela — ou seja, capturava os 60s ANTES do momento do sinal de bounce. Nesse momento o token já subiu 30-50%, então a janela mede compras DO BOUNCE (momentum), não absorção DO DUMP. A janela correta é `[ts_min - 60s → ts_min]` — os 60s que antecedem o FUNDO. Fix: parâmetro `window_end_ts: float = None` adicionado a `get_absorption_window()`. Scanner passa `state["ts_min"].timestamp()` como `window_end_ts`. Nunca usar `time.time()` como referência para janelas de absorção.
+129. **`h23_window` — campo de tag nos bounce_signals**: coluna `TEXT` adicionada ao schema. Valor `'bounce'` = janela antiga (captura momentum pós-bounce, dado inválido para H23). Valor `'bottom'` = janela correta (captura absorção do dump). Backfill histórico: `UPDATE bounce_signals SET h23_window = 'bounce' WHERE h23_window IS NULL`. Todo bounce novo gerado pelo scanner corrigido recebe `h23_window='bottom'`. 82% dos 749 registros históricos têm `'bounce'` — preservados para análise paralela de momentum, não para H23.
+130. **H23 bounce-window: correlação com bounce_pct = -0.252 (independente)**: dado que a janela bounce capta momentum, esperava-se correlação positiva alta com bounce_pct (quanto maior o bounce, mais compras). Pearson = -0.252 → correlação baixa e levemente negativa — H23 bounce não é simplesmente proxy de bounce_pct. Isso é surpreendente e sugere que mesmo a janela errada captura alguma informação estrutural independente. Não é argumento para manter — a janela bottom é metodologicamente correta.
+131. **5/12 TPs históricos (42%) tinham net_sol_flow negativo**: na faixa "bom (3-10 SOL)" — 35.7% WR — todos os 14 trades já tinham bounce ≥ 55%. Mas dos 12 TPs totais, 5 tinham H23 negativo (PENNY -25 SOL, GEGE -11 SOL, PUFF -9.22 SOL, GROX -7.93 SOL, Miss -1.65 SOL). Esses tokens com bounce explosivo (>100%) frequentemente tinham H23 negativo porque os vendedores estavam realizando lucro durante o próprio bounce. Gate para filtro H23: 42% de TPs perdidos é inaceitável — confirmar que bottom-window não tem o mesmo padrão antes de implementar como gate obrigatório.
+132. **`pnl_pct_real` está armazenado como decimal (0.75 = 75% ganho)**: display com `f"{pnl:+.1f}%"` mostra `0.75` como `+0.8%` na tela — parece 0.8% mas significa 80% de retorno. TPs mostrando "+0.9%" = +90% real. SLs mostrando "-0.3%" = -30% real. Trades suspeitos com status=sl e "+0.2%" = +20% (artefato de execução marginal acima do entry, não TP real). Nunca interpretar os valores literalmente como porcentagem — multiplicar por 100 para obter o retorno real.
+133. **`/debug/h23-grid` — grade 2D H23 × bounce_pct**: endpoint de análise cruzada. Grid com WR por célula (linhas = faixas de net_sol_flow, colunas = faixas de bounce_pct). Tabela de simulação com 8 combinações de filtros mostrando n, WR, delta pp vs base, trades bloqueados (%) e TPs perdidos (%). Descoberta: na faixa 3-10 SOL, todos os 14 trades (TPs e SLs) já tinham bounce ≥ 55% — os dois filtros são correlacionados nessa faixa, não multiplicativos.
+134. **Cruzamento wallet-monitor × NeideBOT — auditoria completa (sessão 8, 2026-05-17)**: três endpoints construídos (`/analise/cruzamento-wallets-ticks`, `/analise/wallet-entry-depth`, `/analise/wallet-token-outcome`). Conclusão: presença de wallet durante o dump NÃO prediz melhores outcomes de token. "Com qualquer wallet" tem rec200 32.4% vs baseline 36.9% (-4.5pp) e avg gain 3.14× vs 3.42×. "Sem nenhuma wallet" é melhor em ambas as métricas. Hipótese de causalidade refutada: wallets consomem buying power durante o dump, inflam o mc_min artificialmente, ou simplesmente selecionam pelos mesmos critérios não-discriminatórios (H3, H8). O sinal de wallet presence é correlação espúria com H10 — tokens que dumpam rápido atraem compradores E têm melhor recovery, mas a wallet não é a causa. Gate para qualquer filtro baseado em wallet: n≥30 tokens confirmados com metodologia token_ticks (rec75/rec200), não recovery (mc_1h).
+135. **carteira_F é a única com sinal individual relevante (n=7, rec200=57.1%, avg gain=4.99×)**: o único sinal que vale acompanhar. Todos os demais — carteira_L (avg gain 2.53×, sistematicamente pior), carteira_I (n=4 insuficiente), carteira_G (n=1) — são amostras insuficientes ou sinais negativos. carteira_S (n=301) tem sinal flat (+0.6pp rec75). Gold (n=86) é bot com padrão de compra fixo e outcome médio. A análise por wallet_ratio revela que a faixa 0.30-0.50 (comprador moderado do dump) é a única com sinal positivo em duas métricas simultaneamente: rec75 87.2% (+5.7pp) e avg gain 3.59× (+0.17×). Compradores profundos (<0.30) encontram tokens que chegam a +75% mas não explodem — avg gain 3.01× abaixo do baseline. Faixa >1.00 é reverse causality confirmada.
+136. **rec30 (98.6% baseline) é métrica trivialmente verdadeira no contexto de bounce_signals**: o sinal de bounce dispara quando o token já subiu 30-50% do fundo. Medir max gain a partir de mc_min nos 60min seguintes trivialmente captura o bounce que JÁ ACONTECEU. Métricas úteis nesse contexto são rec200 (+200% = 3× do fundo) e avg gain — essas discriminam tokens que continuam após o bounce inicial versus tokens que param exatamente no ponto do sinal.
+137. **H22 buy/sell ratio — sinal moderado via token_ticks 60min (sessão 8, 2026-05-17)**: ratio = absorption_buy_vol / absorption_sell_vol na janela [ts_min-60s → ts_min]. Via token_ticks (n=284 bounces com Helius): 1.5–3× = 16.7% WR (+4.2pp, n=24); <0.5× = 6.5% WR (-6.0pp, n=31) — sinal negativo mais claro; ∞ = 0% WR (n=3). Via trades (n=15): 1.5–3× = 33.3% (+19pp) — inflado por seleção. Sinal correto via ticks: <0.5× é candidato a filtro negativo (n≥30 atingido). Lógica: sem sellers = vacuum pump que reverte na primeira venda; <0.5× = sellers dominando = token ainda dumpando.
+138. **H23 inversão completa entre trade-view e token-view (sessão 8, 2026-05-17, FINDING CRÍTICO)**: via trades: >5 SOL = 0% WR, <-5 SOL = 18.8% WR. Via token_ticks 60min: >5 SOL = **45.5% WR (+33pp, n=11)**, <-5 SOL = 8.7% (-3.8pp, n=46). Interpretação: tokens com >5 SOL de compra no fundo SÃO ótimos — atingem TP em 45.5% das vezes. Mas nosso trade tem 0% WR porque o sinal dispara tarde (compradores já absorveram o dump, token subiu, nossa entrada em mc_at_signal é alta demais, SL dispara na primeira retração normal). Não é o sinal que é ruim — é nossa latência de entrada. "Seller exhaustion" (<-5 SOL) era hipótese errada — esses tokens genuinamente não bounceiam (8.7% via ticks). Zona pior: -5–0 SOL = 0% WR (n=16) — nem selling nem buying = token em limbo. Gate: n≥30 com h23_window='bottom' já atingido (n=84). Candidato a filtro POSITIVO (não negativo): >5 SOL prediz token bom, mas requer execução mais rápida que o sinal atual.
+139. **H24/H25 ainda insuficientes (sessão 8)**: via token_ticks: H24 n=59 distribuídos principalmente em <0.1 HHI (n=44). 0.1–0.2 tem 18.2% WR (+5.7pp, n=11) — tendência positiva mas amostra pequena. H25 n=66 concentrados em 50–100 SOL (n=63, WR 14.3% +1.8pp) — essencialmente flat. Gate: n≥30 por bucket ainda não atingido nas faixas discriminatórias.
+140. **H22 event count não discrimina nada**: 0 eventos = 13% WR, ≥11 eventos = 13% WR idêntico. A quantidade de eventos Helius por si só é irrelevante. A métrica relevante é o ratio (buy_vol/sell_vol), não a contagem de eventos. Descartar event count como preditor.
+141. **Metodologia correta para hipóteses de microestrutura**: usar token_ticks (60min) como outcome — NÃO trades. Trades medem nossa execução (entry timing, SL, filtros). Token_ticks mede o comportamento do token independentemente. Hipóteses H22–H25 via trades estavam contaminadas por: (a) H24/H25 têm 0 trades (bounces filtrados antes de virar trade); (b) H23 >5 SOL tem 0% WR em trades mas 45.5% em ticks — execução tardia, não sinal ruim. Endpoint correto: `/analise/h22-h25-ticks` (janela 60min, entry=mc_at_signal).
+142. **Causa raiz das perdas confirmada — bot comprava pumps, não bounces (sessão 9, 2026-05-17)**: Caso Napoleon documentado. 56 ticks `source=trenches`, TODOS com mc mínimo ≥ $33.8k. Mas `bounce_signals.mc_min = $21.6k`. O valor de $21.6k vinha do `_precise_bottom_tick()` ao processar o candle de transição bonding curve → pool (elapsed_sec < 90s), cujo `low` inclui preços pré-migração (da bonding curve). O token nunca chegou a $21.6k no pós-migração. O bot disparou bounce com fundo fictício — comprou em token que jamais teve dump real. Fix aplicado: `if elapsed_sec < 90: continue` em `_precise_bottom_tick`. Este bug explicava a maioria das compras "sem sentido" no histórico. Portfolio: de 1 SOL (~$170) para ~$50 — 70% perdido em trades baseados em dados de entrada corrompidos.
+143. **Bug 1 (CRÍTICO): `ts_migration` usava tempo de detecção do bot, não o timestamp on-chain (sessão 9)**. `_handle_completed` definia `ts_migration = datetime.now()` (momento em que o bot detectou o token). Token migrado 18min antes mas detectado agora entrava no HotMonitor com `ts_migration = now` → `elapsed_sec ≈ 0s` na primeira checagem → A.5 (20min) nunca bloqueava → bounce disparava imediatamente. Efeito cascata: (a) A.6 `secs_since_bottom = now - ts_min` usava ts_min = now → fundo nunca estava "estagnado" → sempre passava; (b) elapsed_sec em bounce_signals estava sistematicamente errado. Fix: `ts_mig_real = datetime.fromtimestamp(complete_timestamp, tz=utc)`. Tanto `ts_migration` no DB quanto `hot.add()` usam `ts_mig_real`. Com delay de 5min, `ts_min` inicia 5min atrás → A.6 bloqueia corretamente tokens cuja janela pós-migração já foi perdida.
+144. **Bug 3 (CRÍTICO): race condition em `bounce_fired` — double-fire de trades (sessão 9)**. `push_mc` (poll trenches, thread hot-monitor) e `_precise_bottom_tick` (kline, thread hot-precise) chamam `_check_bounce()` concorrentemente. O guard em `state.get("bounce_fired")` na linha 208 não é atômico — duas threads podem passar simultaneamente e disparar dois trades no mesmo token. Fix: check-and-set atômico sob `_lock` antes do ponto-de-não-retorno: `with self._lock: if live.get("bounce_fired"): return; live["bounce_fired"] = True`. O guard na linha 208 permanece como fast-path de otimização.
+145. **Bug 5 (ALTO): `_graduate` processava candle de transição bonding curve → pool (sessão 9)**. O loop kline em `_graduate` verificava apenas `elapsed_min < 0` para skip. Candles com `elapsed_sec` entre 0-89s (transição) tinham preços pré-migração no `low` → `db.update_bottom()` gravava mc_bottom fictício (muito baixo) no banco para todos os tokens que passavam pela graduação de 60min. Dados históricos de mc_bottom foram corrompidos sistematicamente. Fix: `if elapsed_sec < 90: continue` — idêntico ao filtro do `_precise_bottom_tick`.
+146. **Bug 6 (ALTO): `_backfill_slope_ticks` idem (sessão 9)**. O loop kline em `_backfill_slope_ticks` (chamado em thread de backfill no primeiro bounce elegível) também não tinha o filtro `elapsed_sec < 90`. Ticks históricos inseridos por esse caminho tinham mc_low do candle de transição — corrompendo tanto os gráficos de análise quanto o backtester tick-level. Fix: mesmo `if elapsed_sec < 90: continue`. Após as 4 correções, TODOS os três pontos de leitura de kline histórico (precise, graduate, backfill) são consistentes.
 
 ---
 
-## 🔄 Estado Atual: Bot ativo a $1/trade (2026-05-16, sessão 6)
+## 🔄 Estado Atual: BOT PAUSADO — aguardando deploy das correções (sessão 9, 2026-05-17)
 
-### Pipeline ativo
-`TRADING_ENABLED=true`, `CALIBRATION_AMOUNT_USD=1.0`, `CALIBRATION_MAX_TRADES=999999`.
+### Pipeline (após deploy das correções — branch `claude/audit-neidenbot-purchases-8k0Tn`)
+`TRADING_ENABLED=false` ← BOT PAUSADO para deploy seguro.
+`CALIBRATION_AMOUNT_USD=1.0`, `CALIBRATION_MAX_TRADES=999999`.
 `TRADE_SL_PCT=0.25` (testando — 15% disparava em segundos por volatilidade pAMM).
 `HELIUS_RPC_URL` configurado no Railway — `helius_rpc.py` ativo para fill + posição.
+
+**Portfolio:** ~$50 restantes de 1 SOL original (~$170). 70% perdido em trades com dados de entrada corrompidos (mc_min fictício do candle de transição).
+
+**Correções deployadas (sessão 9 — commit `aab93e9`):**
+- ✅ **Bug 1 (CRÍTICO)**: `ts_migration` agora usa `complete_timestamp` on-chain — elapsed_sec correto para todos os tokens
+- ✅ **Bug 3 (CRÍTICO)**: `bounce_fired` check-and-set atômico sob `_lock` — zero double-fire de trades
+- ✅ **Bug 5 (ALTO)**: `_graduate` agora ignora candle de transição (elapsed_sec < 90)
+- ✅ **Bug 6 (ALTO)**: `_backfill_slope_ticks` idem
+- ✅ **Fix anterior (sessão 9)**: `_precise_bottom_tick` ignora elapsed_sec < 90 — causa raiz do mc_min fictício
 
 **Filtros ativos (ordem de aplicação no _check_bounce):**
 - A.2: bloqueia bounce_pct 20-30% (redundante com A.7 mas mantido como safety net)
 - A.3: bloqueia entry 50-65% do mc_migration
 - A.5: bloqueia elapsed > 20min
-- A.6: bloqueia fundo estagnado > 5min
+- A.6: bloqueia fundo estagnado > 5min (agora com ts_min correto graças ao Bug 1 fix)
 - A.7: bloqueia bounce_pct < 30% (BOUNCE_MIN_PCT=0.30)
-- smart≥3: FILTER_SMART_MIN=3 — **⚠️ discriminação questionável** (live: smart=1→31%, smart=3→30%, flat)
 - FILTER_PUMP_ONLY: garante cobertura H22
+- smart≥3: FILTER_SMART_MIN=3 — discriminação questionável em dados live (smart=1→31%, smart=3→30%, flat)
 
-**⚠️ WR REAL CORRIGIDO (blockchain, sessão 5 2026-05-14): 10.1%** (14 TP / 125 SL / 139 trades).
-WR anterior de 32% era fictício — baseado em TradeMonitor que inferia saídas de token_ticks, nunca da blockchain.
-DRY RUN do `/debug/sell-recovery`: 573 txs escaneadas, 201 sells, 139 corrigidos, 0 não encontrados.
-Executar sem `?dry=1` para persistir no banco.
+**WR real blockchain (sessão 5, 2026-05-14): 10.1%** (14 TP / 125 SL / 139 trades — todos com dados corrompidos de mc_min).
+Dados históricos anteriores ao fix do elapsed_sec < 90 são suspeitos — mc_min estava errado em muitos tokens.
 
 **Maior discriminador live encontrado: bounce_pct >70% → WR 74% (n=23, +45pp)**
-Próxima mudança de env var: `BOUNCE_MIN_PCT=0.50` (teste) → `0.70` se confirmado.
+Próxima mudança de env var após deploy: `BOUNCE_MIN_PCT=0.50` (teste) → `0.70` se confirmado.
 
-**Análise trade-autopsy (`/analise/trade-autopsy`):**
-- Seção 2b (pré/pós exit): usa `mc` (close), não `mc_high` — spike intra-candle eliminado
-- `hit_tp_before_exit` / `hit_tp_after_exit`: flags booleanas por trade
-- `spike_suspect`: max_gain alto + <5 pre_ticks = provável spike artifact
-- GMGN trailing TP confirmado funcionando — mc_high era o dado contaminado
+**Checklist para religar o bot:**
+1. Fazer merge do branch `claude/audit-neidenbot-purchases-8k0Tn` → `main` no Railway
+2. Aguardar redeploy completo
+3. Verificar logs: ts_migration nos logs deve mostrar o timestamp on-chain (não o momento atual)
+4. Mudar `BOUNCE_MIN_PCT=0.50` no Railway (env var)
+5. Mudar `TRADING_ENABLED=true`
 
-**Pendências críticas (sessão 5):**
-- ✅ **`/debug/sell-recovery` executado** — 139 correções blockchain persistidas. Banco 100% verificado on-chain.
-- Mudar `BOUNCE_MIN_PCT=0.50` no Railway (env var, zero código)
-- Verificar discriminação smart_wallets após n≥50 trades com smart≥3
-- H22: aguardando n≥30 bounces com absorption_events > 0
-
-**Regra de ouro para novos filtros:** só implementar com n≥30 trades validados no GMGN. **Nunca usar DB WR como fonte — banco estava completamente errado antes da correção blockchain da sessão 5.**
+**Regra de ouro para novos filtros:** só implementar com n≥30 trades validados no GMGN. **Nunca usar DB WR como fonte.**
 
 **Próximos passos — ver ROADMAP.md**
 

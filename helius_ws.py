@@ -27,6 +27,7 @@ Programas suportados (Tier 1):
 Rate limit: 1 parse por 2s por token.
 """
 import base64
+import base58 as _base58
 import hashlib
 import json
 import logging
@@ -88,7 +89,7 @@ _SWAP_ONLY_DISCS: set[bytes] = _PUMP_AMM_DISCS | _METEORA_DISCS
 def _parse_pump_amm_event(raw: bytes, sol_usd: float, supply: float) -> dict | None:
     """
     Parse pump.fun pAMM BuyEvent ou SellEvent.
-    Retorna {mc, side, sol_amount} para uso em MC + absorção (H22), ou None.
+    Retorna {mc, side, sol_amount, pool_quote_sol, wallet} para uso em MC + absorção (H22/H24/H25), ou None.
 
     Layout Borsh (offset a partir do início dos bytes, incluindo 8 bytes de disc):
       offset  0: disc                          8 bytes
@@ -100,12 +101,24 @@ def _parse_pump_amm_event(raw: bytes, sol_usd: float, supply: float) -> dict | N
       offset 48: pool_base_token_reserves      u64  ← reservas de token no pool
       offset 56: pool_quote_token_reserves     u64  ← reservas de SOL no pool
       offset 64: quote_amount_in/out           u64  (SOL transacionado)
-      ... (mais campos: fees, pubkeys, ix_name, etc.)
+      offset 72: lpFeeBasisPoints              u64  (ignorado)
+      offset 80: lpFee                         u64  (ignorado)
+      offset 88: protocolFeeBasisPoints        u64  (ignorado)
+      offset 96: protocolFee                   u64  (ignorado)
+      offset 104: quoteAmountInWithLpFee       u64  (ignorado)
+      offset 112: userQuoteAmountIn            u64  (ignorado)
+      offset 120: pool                         Pubkey 32 bytes (ignorado)
+      offset 152: user                         Pubkey 32 bytes ← wallet do trader
 
     Fonte: pump-fun/pump-public-docs/idl/pump_amm.json
     """
     if len(raw) < 72:
         return None
+
+    # pump.fun tokens têm SEMPRE 1B de supply — não usar o parâmetro supply
+    # (GMGN às vezes retorna circulating_supply ou valor em unidades erradas,
+    # gerando mc_min 4× abaixo do real e entry_expected completamente errado)
+    _PUMP_SUPPLY = 1_000_000_000
 
     disc         = raw[:8]
     base_amount  = struct.unpack_from("<Q", raw, 16)[0]  # tokens
@@ -120,7 +133,7 @@ def _parse_pump_amm_event(raw: bytes, sol_usd: float, supply: float) -> dict | N
     mc = None
     if pool_base > 0 and pool_quote > 0:
         price_sol = (pool_quote / 10 ** _SOL_DECIMALS) / (pool_base / 10 ** _TOKEN_DECIMALS)
-        mc_cand   = price_sol * sol_usd * supply
+        mc_cand   = price_sol * sol_usd * _PUMP_SUPPLY
         if _MC_MIN < mc_cand < _MC_MAX:
             mc = mc_cand
 
@@ -129,20 +142,31 @@ def _parse_pump_amm_event(raw: bytes, sol_usd: float, supply: float) -> dict | N
         if side == "buy":
             tok_out = base_amount / 10 ** _TOKEN_DECIMALS
             if tok_out > 0:
-                mc_cand = (sol_amount / tok_out) * sol_usd * supply
+                mc_cand = (sol_amount / tok_out) * sol_usd * _PUMP_SUPPLY
                 if _MC_MIN < mc_cand < _MC_MAX:
                     mc = mc_cand
         else:
             tok_in = base_amount / 10 ** _TOKEN_DECIMALS
             if tok_in > 0:
-                mc_cand = (sol_amount / tok_in) * sol_usd * supply
+                mc_cand = (sol_amount / tok_in) * sol_usd * _PUMP_SUPPLY
                 if _MC_MIN < mc_cand < _MC_MAX:
                     mc = mc_cand
 
     if mc is None:
         return None
 
-    return {"mc": mc, "side": side, "sol": sol_amount}
+    # H25 — pool depth (SOL no pool no momento deste swap)
+    pool_quote_sol = pool_quote / 10 ** _SOL_DECIMALS
+
+    # H24 — wallet do usuário (offset 152, 32 bytes pubkey)
+    wallet = None
+    if len(raw) >= 184:
+        try:
+            wallet = _base58.b58encode(raw[152:184]).decode("ascii")
+        except Exception:
+            pass
+
+    return {"mc": mc, "side": side, "sol": sol_amount, "pool_quote_sol": pool_quote_sol, "wallet": wallet}
 
 
 def _parse_meteora_mc(raw: bytes, sol_usd: float, supply: float) -> float | None:
@@ -238,12 +262,14 @@ class HeliusWS:
         """on_price(mint, market_cap_usd) — compatível com HotMonitor.push_mc."""
         self._on_price = on_price
 
-        self._mint_supply:  dict[str, float] = {}   # mint → total_supply
-        self._sub_id_mint:  dict[int, str]   = {}   # ws_sub_id → mint
-        self._req_mint:     dict[int, str]   = {}   # req_id → mint (aguardando confirmação)
-        self._last_fetch:   dict[str, float] = {}   # mint → timestamp último parse
-        # H22 — rolling window de swap events por mint (side, sol, mc, ts)
-        self._swap_events:  dict[str, deque] = {}
+        self._mint_supply:    dict[str, float] = {}   # mint → total_supply
+        self._sub_id_mint:    dict[int, str]   = {}   # ws_sub_id → mint
+        self._req_mint:       dict[int, str]   = {}   # req_id → mint (aguardando confirmação)
+        self._last_fetch:     dict[str, float] = {}   # mint → timestamp último parse
+        # H22 — rolling window de swap events por mint (side, sol, mc, ts, wallet)
+        self._swap_events:    dict[str, deque] = {}
+        # H25 — pool_quote (SOL) do último swap por mint
+        self._pool_quote_last: dict[str, float] = {}
 
         self._lock      = threading.Lock()
         self._ws_lock   = threading.Lock()
@@ -284,6 +310,7 @@ class HeliusWS:
                 return
             self._mint_supply[mint] = total_supply
             self._swap_events[mint] = deque(maxlen=self._ABSORPTION_MAXLEN)
+            self._pool_quote_last[mint] = 0.0
 
         if self._connected:
             self._send_subscribe(mint)
@@ -297,6 +324,7 @@ class HeliusWS:
             self._mint_supply.pop(mint, None)
             self._last_fetch.pop(mint, None)
             self._swap_events.pop(mint, None)
+            self._pool_quote_last.pop(mint, None)
             for sid, m in list(self._sub_id_mint.items()):
                 if m == mint:
                     sub_id_to_remove = sid
@@ -422,16 +450,21 @@ class HeliusWS:
             try:
                 event = _parse_swap_event_from_logs(logs, supply, _sol_usd_cached)
                 if event and event["mc"] > 0:
-                    # H22: acumula na rolling window (só pump AMM tem side/sol confiáveis)
+                    # H22/H24/H25: acumula na rolling window (só pump AMM tem side/sol/wallet)
                     if event["side"] != "unknown":
                         with self._lock:
                             buf = self._swap_events.get(mint)
+                            # H25: pool_quote mais recente
+                            pq = event.get("pool_quote_sol", 0)
+                            if pq > 0:
+                                self._pool_quote_last[mint] = pq
                         if buf is not None:
                             buf.append({
-                                "ts":   time.time(),
-                                "side": event["side"],
-                                "sol":  event["sol"],
-                                "mc":   event["mc"],
+                                "ts":     time.time(),
+                                "side":   event["side"],
+                                "sol":    event["sol"],
+                                "mc":     event["mc"],
+                                "wallet": event.get("wallet"),  # H24
                             })
                     logger.info("HeliusWS price(anchor) %s: $%.0f MC [%s %.4f SOL]",
                                 mint[:8], event["mc"], event["side"], event["sol"])
@@ -465,18 +498,22 @@ class HeliusWS:
     # Price resolution — Anchor logs → DexScreener fallback
     # ──────────────────────────────────────────────────────────────────
 
-    def get_absorption_window(self, mint: str, window_sec: int = 60) -> dict:
+    def get_absorption_window(self, mint: str, window_sec: int = 60,
+                              window_end_ts: float = None) -> dict:
         """
-        H22 — retorna métricas de fluxo de ordens para um mint na janela de window_sec.
-        Filtra apenas eventos pump.fun pAMM (side='buy'/'sell') mais recentes que window_sec.
-        Retorna dict com buy_count, sell_count, buy_vol_sol, sell_vol_sol, etc.
-        Seguro para chamar a qualquer momento — retorna zeros se sem dados.
+        H22/H23 — retorna métricas de fluxo de ordens para um mint na janela de window_sec.
+
+        window_end_ts: timestamp Unix (float) do FIM da janela. Default = time.time() (agora).
+        Para capturar absorção REAL do dump (não momentum pós-bounce), passar
+        state["ts_min"].timestamp() — janela fica [ts_min - window_sec, ts_min].
+        Sem esse parâmetro, a janela captura o bounce subindo, não o fundo sendo absorvido.
         """
-        cutoff = time.time() - window_sec
+        end   = window_end_ts if window_end_ts is not None else time.time()
+        cutoff = end - window_sec
         with self._lock:
             events = list(self._swap_events.get(mint, []))
 
-        recent = [e for e in events if e["ts"] >= cutoff]
+        recent = [e for e in events if cutoff <= e["ts"] <= end]
         buys   = [e for e in recent if e["side"] == "buy"]
         sells  = [e for e in recent if e["side"] == "sell"]
 
@@ -492,6 +529,55 @@ class HeliusWS:
             "largest_sell":   max((e["sol"] for e in sells), default=0.0),
             "total_events":   len(recent),
             "window_sec":     window_sec,
+            "window_end_ts":  end,
+        }
+
+    def get_pool_quote(self, mint: str) -> float | None:
+        """H25 — SOL no pool no momento do último swap detectado para este mint."""
+        with self._lock:
+            v = self._pool_quote_last.get(mint, 0)
+        return v if v > 0 else None
+
+    def get_dump_seller_concentration(
+        self, mint: str, window_start_ts: float, window_end_ts: float
+    ) -> dict:
+        """H24 — concentração de sellers durante o dump [window_start_ts → window_end_ts].
+
+        Calcula HHI (Herfindahl-Hirschman Index) por volume vendido por wallet única.
+        HHI=1.0: um único seller vendeu tudo (dump finito e previsível).
+        HHI→0: muitos sellers (pressão de venda estrutural, sem exaustão).
+
+        Retorna: seller_count, seller_hhi, top_seller_frac.
+        """
+        with self._lock:
+            events = list(self._swap_events.get(mint, []))
+
+        sells = [
+            e for e in events
+            if e["side"] == "sell"
+            and window_start_ts <= e["ts"] <= window_end_ts
+            and e.get("wallet")
+        ]
+
+        if not sells:
+            return {"seller_count": 0, "seller_hhi": None, "top_seller_frac": None}
+
+        wallet_vol: dict[str, float] = {}
+        for e in sells:
+            w = e["wallet"]
+            wallet_vol[w] = wallet_vol.get(w, 0) + e["sol"]
+
+        total_vol = sum(wallet_vol.values())
+        if total_vol == 0:
+            return {"seller_count": len(wallet_vol), "seller_hhi": None, "top_seller_frac": None}
+
+        shares = [v / total_vol for v in wallet_vol.values()]
+        hhi = sum(s * s for s in shares)
+
+        return {
+            "seller_count":    len(wallet_vol),
+            "seller_hhi":      round(hhi, 4),
+            "top_seller_frac": round(max(shares), 4),
         }
 
     def get_min_mc_in_window(self, mint: str, from_ts: float, to_ts: float) -> float | None:

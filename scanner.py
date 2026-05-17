@@ -200,6 +200,7 @@ class HotMonitor:
     BOUNCE_MAX_PCT       = float(os.getenv("BOUNCE_MAX_PCT",         "9.99"))  # desativado por padrão — sem validação GMGN para threshold máximo (nota 87 CLAUDE.md)
     BOUNCE_DROP_MIN      = float(os.getenv("BOUNCE_DROP_MIN",        "0.30"))  # queda mínima da migração
     BOUNCE_TIME_MAX      = float(os.getenv("BOUNCE_TIME_MAX",        "20.0"))  # A.5: janela 30→20min (100% TPs em ≤20min)
+    BOUNCE_TIME_MIN_SEC  = int(os.getenv(  "BOUNCE_TIME_MIN_SEC",   "0"))     # A.9: janela mínima — ignora sinais muito cedo pós-migração
     BOTTOM_FRESHNESS_SEC = int(os.getenv(  "BOTTOM_FRESHNESS_SEC",  "300"))   # A.6: máx 5min desde o último mc_min
     BOUNCE_TIME_MIN_SEC  = int(os.getenv(  "BOUNCE_TIME_MIN_SEC",   "90"))    # A.9: elapsed < 90s pool em transição, usar APENAS Helius
 
@@ -232,6 +233,11 @@ class HotMonitor:
 
         # ── Boundary checks ─────────────────────────────────────────────────────────
         if elapsed_sec < 0 or elapsed_min > self.BOUNCE_TIME_MAX:
+            return
+
+        # A.9 — Janela mínima: sinais nos primeiros N segundos têm WR muito baixo (dados: 0-5min → 12.9% WR vs 5-20min → 27% WR)
+        if self.BOUNCE_TIME_MIN_SEC > 0 and elapsed_sec < self.BOUNCE_TIME_MIN_SEC:
+            logger.debug("BOUNCE skip %s — A.9 muito cedo: %ds < min=%ds", mint[:8], elapsed_sec, self.BOUNCE_TIME_MIN_SEC)
             return
         if mc_min <= 0 or mc_migration <= 0:
             return
@@ -295,38 +301,92 @@ class HotMonitor:
                 name=f"backfill-{mint[:8]}",
             ).start()
 
-        # H22 — Coleta de métricas brutas de absorção (observe-only, NÃO bloqueia o sinal)
-        # Fonte: Helius pAMM events (buy/sell) na janela de 60s anterior ao bounce.
+        # H22-H26 — Coleta de métricas brutas de absorção (observe-only, NÃO bloqueia o sinal)
+        # Fonte: Helius pAMM events (buy/sell) em múltiplas janelas.
         # Score/grade NÃO calculados aqui — fórmula não validada por dados reais.
         # Após n≥30 bounces com outcomes (TP/SL), analisar quais métricas brutas
         # discriminam e SÓ ENTÃO construir score baseado em correlações reais.
-        absorption_window = {}
-        rise_window = {}  # TODO: H26 — rise_window (janela pós-bounce) será coletado em próxima versão
+
+        # Três janelas de fluxo — visão completa do bounce:
+        # PRÉ  [ts_min-60s → ts_min]   : absorção do dump (sellers exaustos?) — H22
+        # RISE [ts_min    → ts_signal] : quem comprou durante a subida? — H26
+        # PÓS  [ts_signal → ts_signal+60s]: coleta assíncrona (+60s via scheduler)
+        now_ts     = datetime.now(timezone.utc).timestamp()
+        ts_min_obj = state.get("ts_min")
+        ts_min_ts  = ts_min_obj.timestamp() if ts_min_obj else None
+
+        absorption_window = {}  # alias para PRÉ window
+        pre_window  = {}  # absorção do dump
+        rise_window = {}  # momentum da subida
         if self._helius:
             try:
-                absorption_window = self._helius.get_absorption_window(mint, window_sec=60)
-                ev = absorption_window.get("total_events", 0)
-                if ev > 0:
-                    bv = absorption_window.get("buy_vol_sol",  0) or 0
-                    sv = absorption_window.get("sell_vol_sol", 0) or 0.0001
-                    logger.info(
-                        "H22 %s: %d eventos | buy=%.3fSOL(%d) sell=%.3fSOL(%d) "
-                        "lrg_buy=%.3f ratio=%.2f",
-                        state.get("symbol", mint[:8]), ev,
-                        bv, absorption_window.get("buy_count",    0),
-                        sv, absorption_window.get("sell_count",   0),
-                        absorption_window.get("largest_buy", 0),
-                        bv / sv,
+                # PRÉ: [ts_min-60s → ts_min]
+                pre_window = self._helius.get_absorption_window(
+                    mint, window_sec=60, window_end_ts=ts_min_ts
+                )
+                # RISE: [ts_min → ts_signal]
+                if ts_min_ts:
+                    rise_sec = max(1, int(now_ts - ts_min_ts))
+                    rise_window = self._helius.get_absorption_window(
+                        mint, window_sec=rise_sec, window_end_ts=now_ts
                     )
-                else:
-                    logger.info("H22 %s: no_data (sem eventos Helius na janela de 60s)",
-                                state.get("symbol", mint[:8]))
+
+                pre_ev  = pre_window.get("total_events",  0) or 0
+                rise_ev = rise_window.get("total_events", 0) or 0
+                pre_bv  = pre_window.get("buy_vol_sol",   0) or 0
+                pre_sv  = pre_window.get("sell_vol_sol",  0) or 0
+                rise_bv = rise_window.get("buy_vol_sol",  0) or 0
+                rise_sv = rise_window.get("sell_vol_sol", 0) or 0
+                logger.info(
+                    "FLOW %s | PRÉ: %dev buy=%.2f sell=%.2f net=%+.2f"
+                    " | RISE: %dev buy=%.2f sell=%.2f net=%+.2f",
+                    state.get("symbol", mint[:8]),
+                    pre_ev,  pre_bv,  pre_sv,  pre_bv  - pre_sv,
+                    rise_ev, rise_bv, rise_sv, rise_bv - rise_sv,
+                )
             except Exception as e:
-                logger.debug("H22 absorption %s: %s", mint[:8], e)
+                logger.debug("flow_windows %s: %s", mint[:8], e)
+
+        # alias para compatibilidade com código de insert abaixo
+        absorption_window = pre_window
+
+        # H24 — concentração de sellers durante o dump [ts_migration → ts_min]
+        # H25 — profundidade do pool no momento do sinal
+        dump_concentration   = {}
+        pool_quote_at_signal = None
+
+        if self._helius:
+            try:
+                ts_mig_ts = state["ts_migration"].timestamp()
+                dump_concentration = self._helius.get_dump_seller_concentration(
+                    mint,
+                    window_start_ts=ts_mig_ts,
+                    window_end_ts=ts_min_ts or now_ts,
+                )
+                pool_quote_at_signal = self._helius.get_pool_quote(mint)
+                logger.info(
+                    "H24/H25 %s | sellers=%d HHI=%.3f top=%.1f%% | pool=%.1f SOL",
+                    state.get("symbol", mint[:8]),
+                    dump_concentration.get("seller_count", 0),
+                    dump_concentration.get("seller_hhi") or 0,
+                    (dump_concentration.get("top_seller_frac") or 0) * 100,
+                    pool_quote_at_signal or 0,
+                )
+            except Exception as e:
+                logger.debug("H24/H25 %s: %s", mint[:8], e)
+
+        # H26 — concentração de buyers na RISE window (largest_buy / total_buy_vol)
+        buy_concentration = None
+        rise_bv = rise_window.get("buy_vol_sol") or 0
+        rise_lb = rise_window.get("largest_buy") or 0
+        if rise_bv > 0:
+            buy_concentration = round(rise_lb / rise_bv, 4)
 
         # ── Atomic bounce_fired set: todos os filtros passaram, agora commita o sinal ────
         # Usar lock novamente para garantir que nenhuma outra thread setou bounce_fired
         # entre o snapshot inicial e aqui (improvável mas possível com timing muito específico).
+        # Bug 3 fix: check-and-set atômico sob lock — evita double-fire por corrida
+        # entre push_mc (trenches) e _precise_bottom_tick (kline) em threads concorrentes.
         with self._lock:
             mint_state = self._tokens.get(mint)
             if mint_state and not mint_state.get("bounce_fired"):
@@ -362,17 +422,36 @@ class HotMonitor:
                     (absorption_window.get("buy_vol_sol") or 0) -
                     (absorption_window.get("sell_vol_sol") or 0)
                 ) if absorption_window.get("total_events") else None,
+                "h23_window":          "bottom",
+                # Janela RISE: [ts_min → ts_signal]
+                "rise_buy_vol":  rise_window.get("buy_vol_sol"),
+                "rise_sell_vol": rise_window.get("sell_vol_sol"),
+                "rise_net_flow": (
+                    (rise_window.get("buy_vol_sol")  or 0) -
+                    (rise_window.get("sell_vol_sol") or 0)
+                ) if rise_window.get("total_events") else None,
+                "rise_events":   rise_window.get("total_events"),
+                "rise_lrg_buy":  rise_window.get("largest_buy"),
+                # H25 — pool depth
+                "pool_quote_at_signal": pool_quote_at_signal,
+                # H24 — seller concentration durante o dump
+                "dump_seller_count":    dump_concentration.get("seller_count"),
+                "dump_seller_hhi":      dump_concentration.get("seller_hhi"),
+                "dump_top_seller_frac": dump_concentration.get("top_seller_frac"),
+                # H26 — buyer concentration na subida
+                "buy_concentration":    buy_concentration,
             })
         except Exception as e:
             logger.warning("insert_bounce_signal %s: %s", mint[:8], e)
 
-        # Snapshots pós-bounce: dois callbacks separados capturando os primeiros
-        # 30s e 60s reais após o sinal (window_sec=30 em t+30 = [t, t+30]).
-        # p30s = fluxo nos primeiros 30s; p60s = fluxo nos primeiros 60s.
+        # PÓS-sinal: coleta [ts_signal → ts_signal+30s] e [ts_signal → ts_signal+60s]
+        # window_end_ts = ts_signal + delay → captura apenas o período pós-sinal
         if self._helius and self.scheduler:
-            def _snap30(m=mint):
+            ts_signal_ts = now_ts
+
+            def _snap30(m=mint, t0=ts_signal_ts):
                 try:
-                    w = self._helius.get_absorption_window(m, window_sec=30)
+                    w = self._helius.get_absorption_window(m, window_sec=30, window_end_ts=t0 + 30)
                     db.update_bounce_snapshots(
                         m, "30s",
                         buy_vol=w.get("buy_vol_sol", 0) or 0,
@@ -382,9 +461,9 @@ class HotMonitor:
                 except Exception as ex:
                     logger.debug("snap30 %s: %s", m[:8], ex)
 
-            def _snap60(m=mint):
+            def _snap60(m=mint, t0=ts_signal_ts):
                 try:
-                    w = self._helius.get_absorption_window(m, window_sec=60)
+                    w = self._helius.get_absorption_window(m, window_sec=60, window_end_ts=t0 + 60)
                     db.update_bounce_snapshots(
                         m, "60s",
                         buy_vol=w.get("buy_vol_sol", 0) or 0,
@@ -455,6 +534,9 @@ class HotMonitor:
                 candle_ts   = int(c.get("time", 0)) / 1000
                 elapsed_sec = int(candle_ts - ts_mig_unix)
                 if elapsed_sec < 0 or elapsed_sec > 3660:
+                    continue
+                # Bug 6 fix: ignora o candle de transição bonding curve → pool.
+                if elapsed_sec < 90:
                     continue
                 close_p = _float(c.get("close"))
                 open_p  = _float(c.get("open"))
@@ -640,6 +722,10 @@ class HotMonitor:
                     elapsed_min = elapsed_sec / 60
                     if elapsed_sec < 0 or elapsed_sec > 3660:
                         continue
+                    # Ignora o primeiro candle (cobre transição bonding curve → pool).
+                    # O kline low desse candle inclui preços pré-migração e corrompe mc_min.
+                    if elapsed_sec < 90:
+                        continue
 
                     # 1. Atualiza mc_min com o low desta vela ANTES de checar bounce.
                     #    Garante que bounce_pct e A.6 usam o fundo correto desta vela.
@@ -766,8 +852,13 @@ class HotMonitor:
         if candles_1h:
             for c in candles_1h:
                 candle_ts   = int(c.get("time", 0)) / 1000
-                elapsed_min = (candle_ts - ts_mig_unix) / 60
-                if elapsed_min < 0:
+                elapsed_sec = int(candle_ts - ts_mig_unix)
+                elapsed_min = elapsed_sec / 60
+                if elapsed_sec < 0 or elapsed_sec > 3660:
+                    continue
+                # Bug 5 fix: ignora o candle de transição bonding curve → pool.
+                # Mesmo filtro do _precise_bottom_tick — elimina mc_min fictício.
+                if elapsed_sec < 90:
                     continue
                 low = _float(c.get("low"))
                 if low and low > 0:
@@ -1145,6 +1236,9 @@ class Scanner:
         now               = datetime.now(timezone.utc)
         now_ts            = int(now.timestamp())
         capture_delay_sec = (now_ts - complete_ts) if complete_ts > 0 else None
+        # Bug 1 fix: usar o timestamp on-chain da migração, não o momento de detecção pelo bot.
+        # Usar 'now' como ts_migration faz elapsed_sec=60s para tokens migrados há 18min → falsos bounces imediatos.
+        ts_mig_real       = datetime.fromtimestamp(complete_ts, tz=timezone.utc) if complete_ts > 0 else now
 
         # Tenta obter o preço exato no momento da migração via kline de 1m.
         # A abertura do candle mais próximo de complete_timestamp é a melhor
@@ -1230,7 +1324,7 @@ class Scanner:
             "token_nome":               token.get("symbol"),
             "ts_detected":              watchlist_entry.get("ts_detected") if watchlist_entry else None,
             "bc_progress_at_detection": watchlist_entry.get("bc_progress_at_detection") if watchlist_entry else None,
-            "ts_migration":             now,
+            "ts_migration":             ts_mig_real,
             "mc_migration":             mc_migration,
             "mc_migration_observed":    mc_observed,
             "mc_migration_bc_ref":      mc_bc_ref,
@@ -1258,7 +1352,7 @@ class Scanner:
         logger.info("Migracao %s (%s) MC_oficial=$%.0f[%s] MC_obs=$%.0f[%s] liq=$%.0f exch=%s smart=%d%s",
                     symbol, mint[:8], mc_migration, src, mc_observed, src_observed, liq, exch, smart, delay_str)
 
-        self.hot.add(mint, mc_migration, now, symbol, total_supply, exchange=token.get("exchange"))
+        self.hot.add(mint, mc_migration, ts_mig_real, symbol, total_supply, exchange=token.get("exchange"))
 
 
 # ==============================================================================

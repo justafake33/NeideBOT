@@ -226,6 +226,23 @@ def init_db():
             "ADD COLUMN IF NOT EXISTS p60s_buy_vol   FLOAT",
             "ADD COLUMN IF NOT EXISTS p60s_sell_vol  FLOAT",
             "ADD COLUMN IF NOT EXISTS p60s_events    INT",
+            # H23 window tag — 'bounce' = janela centrada no bounce (dado antigo, momentum)
+            #                   'bottom' = janela centrada no fundo (dado novo, absorção real)
+            "ADD COLUMN IF NOT EXISTS h23_window     TEXT",
+            # Janela de subida: [ts_min → ts_signal] — quem comprou durante a alta do bounce?
+            "ADD COLUMN IF NOT EXISTS rise_buy_vol   FLOAT",
+            "ADD COLUMN IF NOT EXISTS rise_sell_vol  FLOAT",
+            "ADD COLUMN IF NOT EXISTS rise_net_flow  FLOAT",
+            "ADD COLUMN IF NOT EXISTS rise_events    INT",
+            "ADD COLUMN IF NOT EXISTS rise_lrg_buy   FLOAT",
+            # H25 — profundidade do pool no momento do sinal (SOL no pool)
+            "ADD COLUMN IF NOT EXISTS pool_quote_at_signal FLOAT",
+            # H24 — concentração de sellers durante o dump (HHI)
+            "ADD COLUMN IF NOT EXISTS dump_seller_count INT",
+            "ADD COLUMN IF NOT EXISTS dump_seller_hhi   FLOAT",
+            "ADD COLUMN IF NOT EXISTS dump_top_seller_frac FLOAT",
+            # H26 — concentração de buyers na subida (largest_buy / total_buy_vol)
+            "ADD COLUMN IF NOT EXISTS buy_concentration FLOAT",
         ]:
             cur.execute(f"ALTER TABLE bounce_signals {col}")
 
@@ -237,6 +254,14 @@ def init_db():
               AND absorption_events > 0
               AND absorption_buy_vol  IS NOT NULL
               AND absorption_sell_vol IS NOT NULL
+        """)
+
+        # Backfill h23_window: rotula dados históricos como 'bounce' (janela errada)
+        # Novos bounces pós-correção recebem 'bottom' no insert do scanner.
+        cur.execute("""
+            UPDATE bounce_signals
+            SET h23_window = 'bounce'
+            WHERE h23_window IS NULL
         """)
 
         # Tabela de trades — Fase 6-lite (calibração $1/trade)
@@ -632,7 +657,11 @@ def insert_bounce_signal(data: dict):
                  absorption_buy_vol, absorption_sell_vol,
                  absorption_buy_cnt, absorption_sell_cnt,
                  absorption_lrg_buy, absorption_events,
-                 net_sol_flow)
+                 net_sol_flow, h23_window,
+                 rise_buy_vol, rise_sell_vol, rise_net_flow, rise_events, rise_lrg_buy,
+                 pool_quote_at_signal,
+                 dump_seller_count, dump_seller_hhi, dump_top_seller_frac,
+                 buy_concentration)
             VALUES
                 (%(mint)s, %(symbol)s, %(exchange)s, %(elapsed_sec)s, %(mc_migration)s, %(mc_min)s,
                  %(mc_at_signal)s, %(drop_from_mig)s, %(bounce_pct)s,
@@ -640,30 +669,57 @@ def insert_bounce_signal(data: dict):
                  %(absorption_buy_vol)s, %(absorption_sell_vol)s,
                  %(absorption_buy_cnt)s, %(absorption_sell_cnt)s,
                  %(absorption_lrg_buy)s, %(absorption_events)s,
-                 %(net_sol_flow)s)
+                 %(net_sol_flow)s, %(h23_window)s,
+                 %(rise_buy_vol)s, %(rise_sell_vol)s, %(rise_net_flow)s,
+                 %(rise_events)s, %(rise_lrg_buy)s,
+                 %(pool_quote_at_signal)s,
+                 %(dump_seller_count)s, %(dump_seller_hhi)s, %(dump_top_seller_frac)s,
+                 %(buy_concentration)s)
             ON CONFLICT (mint) DO UPDATE SET
-                absorption_score    = EXCLUDED.absorption_score,
-                absorption_grade    = EXCLUDED.absorption_grade,
-                absorption_buy_vol  = EXCLUDED.absorption_buy_vol,
-                absorption_sell_vol = EXCLUDED.absorption_sell_vol,
-                absorption_buy_cnt  = EXCLUDED.absorption_buy_cnt,
-                absorption_sell_cnt = EXCLUDED.absorption_sell_cnt,
-                absorption_lrg_buy  = EXCLUDED.absorption_lrg_buy,
-                absorption_events   = EXCLUDED.absorption_events,
-                net_sol_flow        = EXCLUDED.net_sol_flow
+                absorption_score       = EXCLUDED.absorption_score,
+                absorption_grade       = EXCLUDED.absorption_grade,
+                absorption_buy_vol     = EXCLUDED.absorption_buy_vol,
+                absorption_sell_vol    = EXCLUDED.absorption_sell_vol,
+                absorption_buy_cnt     = EXCLUDED.absorption_buy_cnt,
+                absorption_sell_cnt    = EXCLUDED.absorption_sell_cnt,
+                absorption_lrg_buy     = EXCLUDED.absorption_lrg_buy,
+                absorption_events      = EXCLUDED.absorption_events,
+                net_sol_flow           = EXCLUDED.net_sol_flow,
+                h23_window             = EXCLUDED.h23_window,
+                rise_buy_vol           = EXCLUDED.rise_buy_vol,
+                rise_sell_vol          = EXCLUDED.rise_sell_vol,
+                rise_net_flow          = EXCLUDED.rise_net_flow,
+                rise_events            = EXCLUDED.rise_events,
+                rise_lrg_buy           = EXCLUDED.rise_lrg_buy,
+                pool_quote_at_signal   = EXCLUDED.pool_quote_at_signal,
+                dump_seller_count      = EXCLUDED.dump_seller_count,
+                dump_seller_hhi        = EXCLUDED.dump_seller_hhi,
+                dump_top_seller_frac   = EXCLUDED.dump_top_seller_frac,
+                buy_concentration      = EXCLUDED.buy_concentration
             WHERE bounce_signals.absorption_events IS NULL
         """, {
             **data,
-            "exchange":            data.get("exchange"),
-            "absorption_score":    data.get("absorption_score"),
-            "absorption_grade":    data.get("absorption_grade"),
-            "absorption_buy_vol":  data.get("absorption_buy_vol"),
-            "absorption_sell_vol": data.get("absorption_sell_vol"),
-            "absorption_buy_cnt":  data.get("absorption_buy_cnt"),
-            "absorption_sell_cnt": data.get("absorption_sell_cnt"),
-            "absorption_lrg_buy":  data.get("absorption_lrg_buy"),
-            "absorption_events":   data.get("absorption_events"),
-            "net_sol_flow":        data.get("net_sol_flow"),
+            "exchange":              data.get("exchange"),
+            "absorption_score":      data.get("absorption_score"),
+            "absorption_grade":      data.get("absorption_grade"),
+            "absorption_buy_vol":    data.get("absorption_buy_vol"),
+            "absorption_sell_vol":   data.get("absorption_sell_vol"),
+            "absorption_buy_cnt":    data.get("absorption_buy_cnt"),
+            "absorption_sell_cnt":   data.get("absorption_sell_cnt"),
+            "absorption_lrg_buy":    data.get("absorption_lrg_buy"),
+            "absorption_events":     data.get("absorption_events"),
+            "net_sol_flow":          data.get("net_sol_flow"),
+            "h23_window":            data.get("h23_window"),
+            "rise_buy_vol":          data.get("rise_buy_vol"),
+            "rise_sell_vol":         data.get("rise_sell_vol"),
+            "rise_net_flow":         data.get("rise_net_flow"),
+            "rise_events":           data.get("rise_events"),
+            "rise_lrg_buy":          data.get("rise_lrg_buy"),
+            "pool_quote_at_signal":  data.get("pool_quote_at_signal"),
+            "dump_seller_count":     data.get("dump_seller_count"),
+            "dump_seller_hhi":       data.get("dump_seller_hhi"),
+            "dump_top_seller_frac":  data.get("dump_top_seller_frac"),
+            "buy_concentration":     data.get("buy_concentration"),
         })
 
 

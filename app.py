@@ -11167,11 +11167,21 @@ def debug_absorption():
 
 @app.route("/debug/h23-wr")
 def debug_h23_wr():
-    """WR por faixa de H23 net_sol_flow — trades #338+ (helius_sell_recovery)."""
-    from_id = int(request.args.get("from_id", 338))
+    """WR por faixa de H23 net_sol_flow — trades blockchain verificados.
+    Filtra por h23_window para separar absorção real (bottom) de momentum (bounce).
+    Aceita qualquer exit_type blockchain (helius_sell_recovery, helius, helius_recovery).
+    """
+    from_id  = int(request.args.get("from_id", 338))
+    win_filter = request.args.get("window", "all")  # 'bottom', 'bounce', 'all'
+
+    window_clause = ""
+    if win_filter == "bottom":
+        window_clause = "AND bs.h23_window = 'bottom'"
+    elif win_filter == "bounce":
+        window_clause = "AND (bs.h23_window = 'bounce' OR bs.h23_window IS NULL)"
 
     with db._cursor() as cur:
-        cur.execute("""
+        cur.execute(f"""
             SELECT
                 CASE
                     WHEN bs.net_sol_flow IS NULL    THEN 'sem H23'
@@ -11185,18 +11195,21 @@ def debug_h23_wr():
                 t.pnl_pct_real,
                 bs.net_sol_flow,
                 bs.bounce_pct,
-                bs.elapsed_sec / 60.0  AS elapsed_min
+                bs.elapsed_sec / 60.0  AS elapsed_min,
+                COALESCE(bs.h23_window, 'bounce') AS h23_window
             FROM trades t
             JOIN bounce_signals bs ON bs.mint = t.mint
             WHERE t.id >= %(from_id)s
-              AND t.exit_type = 'helius_sell_recovery'
+              AND t.exit_type IN ('helius_sell_recovery', 'helius', 'helius_recovery')
               AND t.status IN ('tp', 'sl')
+              {window_clause}
             ORDER BY bs.net_sol_flow NULLS FIRST, t.id
         """, {"from_id": from_id})
         rows = cur.fetchall()
 
     if not rows:
-        return f"<pre>Nenhum trade helius_sell_recovery encontrado a partir do #{from_id}</pre>"
+        return (f"<pre>Nenhum trade blockchain verificado encontrado a partir do #{from_id}.\n"
+                f"Execute /debug/sell-recovery para classificar trades recentes.</pre>")
 
     ORDER = ['sem H23', 'negativo  (< 0)', 'fraco     (0–1)',
              'sweet     (1–3)', 'bom       (3–10)', 'alto      (> 10)']
@@ -11225,11 +11238,35 @@ def debug_h23_wr():
     .dim{color:#6e7681}
     </style>"""
 
+    # Contagem de bottom vs bounce no conjunto filtrado
+    n_bottom = sum(1 for r in rows if r.get('h23_window') == 'bottom')
+    n_bounce = len(rows) - n_bottom
+
+    win_label = {"all": "todos", "bottom": "✅ bottom (absorção)", "bounce": "⚠ bounce (momentum)"}.get(win_filter, "todos")
+
     H = f"<!DOCTYPE html><html><head><title>H23 WR</title>{css}</head><body>"
     H += f"<h2>🔬 H23 net_sol_flow — WR por faixa (trades #{from_id}+)</h2>"
+
+    # Banner de aviso sobre h23_window
+    if win_filter != "bottom":
+        H += ("<div style='background:#2d1f00;border:1px solid #e3b341;border-radius:4px;padding:8px 12px;margin-bottom:12px'>"
+              "⚠ <b>Atenção:</b> dados históricos (<code>h23_window='bounce'</code>) capturam <b>momentum pós-bounce</b>, "
+              "não absorção real do dump. Análise misturada com dados inválidos.<br>"
+              f"Este conjunto: <b>{n_bottom} bottom</b> (válidos) + <b>{n_bounce} bounce</b> (momentum).<br>"
+              "Filtre por <a href='?window=bottom' style='color:#58a6ff'>?window=bottom</a> para ver apenas dados corretos."
+              "</div>")
+    else:
+        H += (f"<div style='background:#0d1f0d;border:1px solid #3fb950;border-radius:4px;padding:8px 12px;margin-bottom:12px'>"
+              f"✅ Mostrando apenas <b>h23_window='bottom'</b> — absorção real do fundo. n={n_bottom} trades.</div>")
+
+    H += (f"<p style='font-size:12px;color:#8b949e'>Janela: <b>{win_label}</b> &nbsp;|&nbsp; "
+          f"<a href='?window=all&from_id={from_id}' style='color:#58a6ff'>Todos</a> &nbsp; "
+          f"<a href='?window=bottom&from_id={from_id}' style='color:#3fb950'>✅ bottom</a> &nbsp; "
+          f"<a href='?window=bounce&from_id={from_id}' style='color:#8b949e'>⚠ bounce</a></p>")
+
     H += (f"<div class='box'><b>Total:</b> {n_total} trades | {tp_total} TP | {n_total-tp_total} SL | "
           f"WR base: <b>{wr_base:.1f}%</b> &nbsp; Break-even: 25%<br>"
-          f"<span style='color:#8b949e;font-size:12px'>Apenas trades com exit_type=helius_sell_recovery (blockchain verificado)</span></div>")
+          f"<span style='color:#8b949e;font-size:12px'>Trades blockchain verificados (helius_sell_recovery + helius + helius_recovery)</span></div>")
 
     # ── Tabela por bucket ─────────────────────────────────────────────────────
     H += "<h3>📊 WR por faixa de net_sol_flow</h3>"
@@ -11321,6 +11358,225 @@ def debug_h23_wr():
               f"<td class='sl'>{pnl_s}</td></tr>")
     H += "</table>"
 
+    # ── Correlação net_sol_flow vs bounce_pct (causalidade reversa?) ─────────
+    H += "<h3>📐 Correlação net_sol_flow × bounce_pct — causalidade reversa?</h3>"
+    H += ("<p style='font-size:12px;color:#8b949e'>Se bounce maior → mais compras no pAMM → net_sol_flow alto, "
+          "então H23 é apenas um proxy de bounce_pct (redundante). "
+          "Correlação alta (>0.6) = causalidade reversa. Correlação baixa = H23 tem informação independente.</p>")
+
+    corr_rows = [(r['net_sol_flow'], r['bounce_pct'])
+                 for r in rows if r['net_sol_flow'] is not None and r['bounce_pct'] is not None]
+    if len(corr_rows) >= 5:
+        import math
+        xs = [x for x, _ in corr_rows]
+        ys = [y for _, y in corr_rows]
+        n_c = len(xs)
+        mx, my = sum(xs)/n_c, sum(ys)/n_c
+        cov  = sum((x-mx)*(y-my) for x, y in zip(xs, ys)) / n_c
+        sx   = math.sqrt(sum((x-mx)**2 for x in xs) / n_c)
+        sy   = math.sqrt(sum((y-my)**2 for y in ys) / n_c)
+        corr = cov / (sx * sy) if sx and sy else 0.0
+        interp = ("🔴 correlação alta — H23 é proxy de bounce_pct (causalidade reversa provável)"
+                  if abs(corr) > 0.6 else
+                  "🟡 correlação moderada — H23 tem alguma informação independente"
+                  if abs(corr) > 0.3 else
+                  "🟢 correlação baixa — H23 captura informação independente do bounce_pct")
+        corr_color = "#f85149" if abs(corr) > 0.6 else "#e3b341" if abs(corr) > 0.3 else "#3fb950"
+        by_window = {}
+        for r in rows:
+            if r['net_sol_flow'] is None or r['bounce_pct'] is None:
+                continue
+            w = r.get('h23_window', 'bounce')
+            by_window.setdefault(w, []).append((r['net_sol_flow'], r['bounce_pct']))
+
+        H += f"<div class='box'>"
+        H += (f"<b>Pearson r (todos):</b> "
+              f"<span style='color:{corr_color};font-size:16px'><b>{corr:+.3f}</b></span> "
+              f"(n={n_c}) &nbsp; {interp}</div>")
+
+        # Por janela
+        H += "<table><tr><th>Janela</th><th>n</th><th>Pearson r</th><th>Interpretação</th></tr>"
+        for w_name, pairs in by_window.items():
+            if len(pairs) < 3:
+                H += f"<tr><td>{w_name}</td><td>{len(pairs)}</td><td colspan=2 class='dim'>n insuficiente</td></tr>"
+                continue
+            xs2 = [x for x, _ in pairs]; ys2 = [y for _, y in pairs]
+            n2 = len(xs2); mx2, my2 = sum(xs2)/n2, sum(ys2)/n2
+            cov2 = sum((x-mx2)*(y-my2) for x,y in zip(xs2,ys2))/n2
+            sx2  = math.sqrt(sum((x-mx2)**2 for x in xs2)/n2)
+            sy2  = math.sqrt(sum((y-my2)**2 for y in ys2)/n2)
+            r2   = cov2/(sx2*sy2) if sx2 and sy2 else 0.0
+            rc   = "#f85149" if abs(r2)>0.6 else "#e3b341" if abs(r2)>0.3 else "#3fb950"
+            interp2 = ("proxy (alta)" if abs(r2)>0.6 else "moderada" if abs(r2)>0.3 else "independente (baixa)")
+            H += (f"<tr><td><code>{w_name}</code></td><td>{n2}</td>"
+                  f"<td><span style='color:{rc}'><b>{r2:+.3f}</b></span></td>"
+                  f"<td>{interp2}</td></tr>")
+        H += "</table>"
+    else:
+        H += f"<div class='box dim'>n insuficiente para correlação (n={len(corr_rows)} com ambos os campos)</div>"
+
+    # ── Trades suspeitos: status=sl mas pnl>0 ─────────────────────────────────
+    suspicious = [r for r in rows if r['status'] == 'sl' and r.get('pnl_pct_real') and r['pnl_pct_real'] > 0]
+    if suspicious:
+        H += f"<h3>⚠ Trades suspeitos — status=SL mas P&amp;L positivo ({len(suspicious)})</h3>"
+        H += ("<p style='font-size:12px;color:#e3b341'>Estes trades têm status='sl' mas pnl_pct_real > 0. "
+              "Possível erro de categorização no sell-recovery.</p>")
+        H += "<table><tr><th>#</th><th>Token</th><th>P&amp;L</th><th>net_flow</th><th>h23_window</th></tr>"
+        for r in suspicious:
+            nf = r['net_sol_flow']
+            nf_s = f"{nf:+.2f}◎" if nf is not None else "—"
+            H += (f"<tr style='background:#2d1f00'><td>{r['id']}</td><td><b>{r['symbol'] or ''}</b></td>"
+                  f"<td class='pos'>{r['pnl_pct_real']:+.1f}%</td>"
+                  f"<td>{nf_s}</td><td><code>{r.get('h23_window','?')}</code></td></tr>")
+        H += "</table>"
+
+    H += "</body></html>"
+    return H
+
+
+@app.route("/debug/h23-grid")
+def debug_h23_grid():
+    """Grid 2D: H23 absorption × bounce_pct — WR por célula (trades #338+ blockchain)."""
+    from_id = int(request.args.get("from_id", 338))
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                t.status,
+                bs.net_sol_flow,
+                bs.bounce_pct,
+                t.symbol,
+                t.id,
+                COALESCE(bs.h23_window, 'bounce') AS h23_window
+            FROM trades t
+            JOIN bounce_signals bs ON bs.mint = t.mint
+            WHERE t.id >= %(from_id)s
+              AND t.exit_type IN ('helius_sell_recovery', 'helius', 'helius_recovery')
+              AND t.status IN ('tp', 'sl')
+        """, {"from_id": from_id})
+        rows = cur.fetchall()
+
+    if not rows:
+        return (f"<pre>Nenhum trade blockchain verificado encontrado a partir do #{from_id}.\n"
+                f"Execute /debug/sell-recovery para classificar trades recentes.</pre>")
+
+    css = """<style>
+    body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+    h2{color:#58a6ff}h3{color:#79c0ff;margin-top:24px}
+    table{border-collapse:collapse;margin-bottom:16px}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:center;min-width:90px}
+    th.row-h{text-align:left;min-width:130px}
+    td{padding:5px 10px;border:1px solid #21262d;text-align:center}
+    .tp{color:#3fb950;font-weight:bold}.sl{color:#f85149}
+    .pos{color:#3fb950;font-weight:bold}.neg{color:#f85149;font-weight:bold}
+    .best{background:#1a3a1a}.ok{background:#1a2a1a}.bad{background:#2d1f1f}.zero{background:#161b22}
+    .box{background:#161b22;border:1px solid #30363d;padding:12px 16px;margin-bottom:14px;border-radius:6px}
+    .dim{color:#6e7681}.warn{background:#2d1f00;border:1px solid #e3b341;border-radius:4px;padding:8px 12px;margin-bottom:12px}
+    </style>"""
+
+    H = f"<!DOCTYPE html><html><head><title>H23 Grid</title>{css}</head><body>"
+    H += "<h2>🔬 Grid 2D: H23 absorção × bounce_pct</h2>"
+    H += ("<div class='warn'>⚠ Todos os 61 trades têm <code>h23_window='bounce'</code> (janela errada — momentum, não absorção). "
+          "Use como exploração, não como base de filtro.</div>")
+
+    n_total = len(rows)
+    tp_total = sum(1 for r in rows if r['status'] == 'tp')
+    wr_base  = tp_total / n_total * 100
+    H += (f"<div class='box'><b>Base:</b> {n_total} trades | {tp_total} TP | {n_total-tp_total} SL | "
+          f"WR base: <b>{wr_base:.1f}%</b> | Break-even: 25%</div>")
+
+    # Definição das faixas
+    h23_bands = [
+        ("< 0 SOL",   lambda x: x is not None and x < 0),
+        ("0–3 SOL",   lambda x: x is not None and 0 <= x < 3),
+        ("3–10 SOL",  lambda x: x is not None and 3 <= x < 10),
+        ("> 10 SOL",  lambda x: x is not None and x >= 10),
+        ("sem dados", lambda x: x is None),
+    ]
+    bounce_bands = [
+        ("30–55%",  lambda b: b is not None and 0.30 <= b < 0.55),
+        ("55–75%",  lambda b: b is not None and 0.55 <= b < 0.75),
+        ("75–120%", lambda b: b is not None and 0.75 <= b < 1.20),
+        ("> 120%",  lambda b: b is not None and b >= 1.20),
+    ]
+
+    def cell(rs):
+        n = len(rs)
+        if n == 0: return "<td class='zero'><span class='dim'>—</span></td>"
+        tp = sum(1 for r in rs if r['status'] == 'tp')
+        wr = tp / n * 100
+        delta = wr - wr_base
+        cls = "best" if delta >= 12 else "ok" if delta >= 0 else "bad"
+        col = "#3fb950" if wr >= 25 else "#f85149" if wr < 15 else "#c9d1d9"
+        return (f"<td class='{cls}'>"
+                f"<span style='color:{col};font-weight:bold'>{wr:.0f}%</span>"
+                f"<br><span class='dim' style='font-size:11px'>{tp}TP/{n-tp}SL</span></td>")
+
+    # ── Grid principal ─────────────────────────────────────────────────────────
+    H += "<h3>📊 WR por célula (linhas = H23, colunas = bounce)</h3>"
+    H += "<p style='font-size:12px;color:#8b949e'>Verde = acima de 25% break-even. Fundo escuro-verde = +12pp vs base.</p>"
+    H += "<table><tr><th class='row-h'>H23 \\ bounce</th>"
+    for bl, _ in bounce_bands:
+        H += f"<th>{bl}</th>"
+    H += "<th>TOTAL</th></tr>"
+
+    for h23_label, h23_fn in h23_bands:
+        h23_rows = [r for r in rows if h23_fn(r['net_sol_flow'])]
+        H += f"<tr><td style='text-align:left'><b>{h23_label}</b></td>"
+        for _, b_fn in bounce_bands:
+            cell_rows = [r for r in h23_rows if b_fn(r['bounce_pct'])]
+            H += cell(cell_rows)
+        H += cell(h23_rows) + "</tr>"
+
+    # Linha totais por coluna
+    H += "<tr style='border-top:2px solid #30363d'><td style='text-align:left'><b>TOTAL</b></td>"
+    for _, b_fn in bounce_bands:
+        col_rows = [r for r in rows if b_fn(r['bounce_pct'])]
+        H += cell(col_rows)
+    H += cell(rows) + "</tr></table>"
+
+    # ── Simulação de filtros combinados ────────────────────────────────────────
+    H += "<h3>⚡ Simulação: filtros combinados vs base</h3>"
+    combos = [
+        ("Base (sem filtro)",           rows),
+        ("bounce ≥ 55%",                [r for r in rows if r['bounce_pct'] and r['bounce_pct'] >= 0.55]),
+        ("H23 3–10 SOL",                [r for r in rows if r['net_sol_flow'] and 3 <= r['net_sol_flow'] < 10]),
+        ("H23 ≥ 1 SOL",                 [r for r in rows if r['net_sol_flow'] and r['net_sol_flow'] >= 1]),
+        ("bounce ≥ 55% + H23 3–10",    [r for r in rows if r['bounce_pct'] and r['bounce_pct'] >= 0.55
+                                         and r['net_sol_flow'] and 3 <= r['net_sol_flow'] < 10]),
+        ("bounce ≥ 55% + H23 ≥ 1",     [r for r in rows if r['bounce_pct'] and r['bounce_pct'] >= 0.55
+                                         and r['net_sol_flow'] and r['net_sol_flow'] >= 1]),
+        ("bounce ≥ 75%",                [r for r in rows if r['bounce_pct'] and r['bounce_pct'] >= 0.75]),
+        ("bounce ≥ 75% + H23 ≥ 1",     [r for r in rows if r['bounce_pct'] and r['bounce_pct'] >= 0.75
+                                         and r['net_sol_flow'] and r['net_sol_flow'] >= 1]),
+    ]
+
+    H += ("<table><tr><th style='text-align:left;min-width:250px'>Filtro</th>"
+          "<th>n</th><th>TP</th><th>SL</th><th>WR</th><th>vs base</th>"
+          "<th>Trades bloqueados</th><th>TPs perdidos</th></tr>")
+    tp_base_ids = {r['id'] for r in rows if r['status'] == 'tp'}
+    for label, rs in combos:
+        n = len(rs); tp = sum(1 for r in rs if r['status'] == 'tp')
+        wr = tp / n * 100 if n else 0
+        delta = wr - wr_base
+        blocked = n_total - n
+        lost_tp = len(tp_base_ids - {r['id'] for r in rs if r['status'] == 'tp'})
+        wr_c = "#3fb950" if wr >= 25 else "#f85149" if wr < 15 else "#c9d1d9"
+        d_c  = "#3fb950" if delta > 0 else "#f85149"
+        wr_s = (f"<span style='color:{wr_c};font-weight:bold'>{wr:.1f}%</span>"
+                if n >= 3 else f"<span class='dim'>— (n={n})</span>")
+        d_s  = (f"<span style='color:{d_c}'>{delta:+.1f}pp</span>" if n >= 3 else "—")
+        H += (f"<tr><td><b>{label}</b></td><td>{n}</td>"
+              f"<td class='tp'>{tp}</td><td class='sl'>{n-tp}</td>"
+              f"<td>{wr_s}</td><td>{d_s}</td>"
+              f"<td class='dim'>{blocked} (-{blocked/n_total*100:.0f}%)</td>"
+              f"<td class='{'sl' if lost_tp else 'tp'}'>{lost_tp} ({lost_tp/len(tp_base_ids)*100:.0f}%)</td></tr>")
+    H += "</table>"
+
+    H += ("<div class='box' style='margin-top:16px;font-size:12px;color:#8b949e'>"
+          "⚠ Lembrete: estes dados têm <code>h23_window='bounce'</code> (janela no momento do bounce, não do fundo). "
+          "H23 mede momentum, não absorção real. Gate para filtro: n≥30 com <code>h23_window='bottom'</code> + GMGN outcomes.</div>")
+
     H += "</body></html>"
     return H
 
@@ -11351,6 +11607,7 @@ def _debug_bounce_wr_inner():
                 bs.bounce_pct,
                 bs.elapsed_sec / 60.0          AS elapsed_min,
                 bs.net_sol_flow,
+                COALESCE(bs.h23_window, 'bounce') AS h23_window,
                 bs.mc_at_signal,
                 bs.absorption_events,
                 bs.absorption_buy_vol          AS buy_vol,
@@ -11369,14 +11626,15 @@ def _debug_bounce_wr_inner():
             JOIN bounce_signals bs ON bs.mint = t.mint
             LEFT JOIN migrations m  ON m.mint = t.mint
             WHERE t.id >= %(from_id)s
-              AND t.exit_type = 'helius_sell_recovery'
+              AND t.exit_type IN ('helius_sell_recovery', 'helius', 'helius_recovery')
               AND t.status IN ('tp', 'sl')
             ORDER BY bs.bounce_pct ASC NULLS LAST
         """, {"from_id": from_id})
         rows = cur.fetchall()
 
     if not rows:
-        return f"<pre>Nenhum trade helius_sell_recovery a partir do #{from_id}</pre>"
+        return (f"<pre>Nenhum trade blockchain verificado a partir do #{from_id}.\n"
+                f"Execute /debug/sell-recovery para classificar trades recentes.</pre>")
 
     n_total = len(rows)
     tp_all  = sum(1 for r in rows if r['status'] == 'tp')
@@ -11401,11 +11659,27 @@ def _debug_bounce_wr_inner():
     .dim{color:#484f58}.warn{color:#e3b341}
     </style>"""
 
+    n_bottom_rs = sum(1 for r in rs if r.get('h23_window') == 'bottom')
+    n_bounce_rs = len(rs) - n_bottom_rs
+
     H = f"<!DOCTYPE html><html><head><title>Bounce WR</title>{CSS}</head><body>"
     H += f"<h2>📊 WR por Faixa de Bounce — Trades #{from_id}+</h2>"
     H += (f"<div class='box'><b>Total</b>: {n_total} trades | "
           f"<span class='tp'>{tp_all} TP</span> | <span class='sl'>{n_total-tp_all} SL</span> | "
           f"WR base: <b>{wr_base:.1f}%</b> | Break-even: 25%</div>")
+    if n_bottom_rs > 0:
+        H += (f"<div style='background:#0d1f0d;border:1px solid #3fb950;border-radius:4px;"
+              f"padding:6px 12px;margin-bottom:8px;font-size:12px'>"
+              f"✅ <b>{n_bottom_rs}</b> trades com H23 correto (<code>h23_window='bottom'</code>) "
+              f"| <span style='color:#8b949e'>{n_bounce_rs} com janela antiga (momentum)</span><br>"
+              f"Ver WR segregado por janela: "
+              f"<a href='/debug/h23-wr?window=bottom&from_id={from_id}' style='color:#3fb950'>?window=bottom</a>"
+              f" | <a href='/debug/h23-wr?window=all&from_id={from_id}' style='color:#58a6ff'>?window=all</a></div>")
+    else:
+        H += (f"<div style='background:#2d1f00;border:1px solid #e3b341;border-radius:4px;"
+              f"padding:6px 12px;margin-bottom:8px;font-size:12px'>"
+              f"⚠ Nenhum trade com <code>h23_window='bottom'</code> ainda — aguardando bounces pós-deploy.<br>"
+              f"Todos os {n_bounce_rs} trades têm H23 medido na janela do bounce (momentum), não do fundo.</div>")
     H += "<p class='dim' style='font-size:11px'>Apenas exit_type=helius_sell_recovery. Bounce = (mc_at_signal − mc_bottom) / mc_bottom.</p>"
 
     # ── 1. Tabela por faixa de bounce ────────────────────────────────────────
@@ -11857,6 +12131,453 @@ def debug_h23():
   <tbody>{live_rows_html}</tbody>
 </table>
 
+</body></html>"""
+        return html
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
+@app.route("/debug/flow-timeline")
+def debug_flow_timeline():
+    """Timeline de fluxo: PRÉ (absorção dump) + RISE (subida) + PÓS (sustentação)."""
+    from_id = int(request.args.get("from_id", 338))
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                bs.mint, bs.symbol, bs.ts_signal,
+                bs.bounce_pct, bs.elapsed_sec,
+                bs.h23_window,
+                -- PRÉ: [ts_min-60s → ts_min]
+                bs.absorption_buy_vol   AS pre_buy,
+                bs.absorption_sell_vol  AS pre_sell,
+                bs.absorption_events    AS pre_ev,
+                bs.net_sol_flow         AS pre_net,
+                -- RISE: [ts_min → ts_signal]
+                bs.rise_buy_vol,
+                bs.rise_sell_vol,
+                bs.rise_net_flow,
+                bs.rise_events,
+                -- PÓS-60s: [ts_signal → ts_signal+60s]
+                bs.p60s_buy_vol  AS pos_buy,
+                bs.p60s_sell_vol AS pos_sell,
+                bs.p60s_events   AS pos_ev,
+                -- Outcome do trade (se houver)
+                t.status, t.pnl_pct_real,
+                t.exit_type
+            FROM bounce_signals bs
+            LEFT JOIN trades t ON t.mint = bs.mint
+                AND t.exit_type IN ('helius_sell_recovery','helius','helius_recovery')
+                AND t.status IN ('tp','sl')
+                AND t.id >= %(from_id)s
+            WHERE bs.ts_signal >= NOW() - INTERVAL '7 days'
+              AND bs.h23_window = 'bottom'
+            ORDER BY bs.ts_signal DESC
+            LIMIT 100
+        """, {"from_id": from_id})
+        rows = cur.fetchall()
+
+    css = """<style>
+    body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:12px}
+    h2{color:#58a6ff}h3{color:#79c0ff;margin-top:20px}
+    table{border-collapse:collapse;width:100%;margin-bottom:16px}
+    th{background:#161b22;color:#8b949e;padding:5px 8px;border:1px solid #30363d;text-align:center;white-space:nowrap}
+    th.left{text-align:left}
+    td{padding:4px 8px;border:1px solid #21262d;text-align:center}
+    td.left{text-align:left}
+    .pos{color:#3fb950;font-weight:bold}.neg{color:#f85149;font-weight:bold}
+    .dim{color:#6e7681}.tp{color:#3fb950}.sl{color:#f85149}
+    .win{background:#1a2a1a}.lose{background:#2d1a1a}.pend{background:#1a1a2a}
+    .sep{border-left:2px solid #58a6ff !important}
+    </style>"""
+
+    H = f"<!DOCTYPE html><html><head><title>Flow Timeline</title>{css}</head><body>"
+    H += "<h2>🌊 Flow Timeline — PRÉ + RISE + PÓS por bounce</h2>"
+    H += ("<p style='color:#8b949e;font-size:11px'>"
+          "<b>PRÉ</b> [ts_min−60s → ts_min] = absorção do dump (exaustão dos sellers?)<br>"
+          "<b>RISE</b> [ts_min → ts_signal] = quem comprou durante a subida?<br>"
+          "<b>PÓS</b> [ts_signal → ts_signal+60s] = compra sustentando após o sinal?<br>"
+          "Apenas <code>h23_window='bottom'</code> — dados com janela correta.</p>")
+
+    if not rows:
+        H += "<p style='color:#e3b341'>Nenhum bounce com h23_window='bottom' nos últimos 7 dias. Aguardar deploy.</p>"
+        H += "</body></html>"
+        return H
+
+    def _flow(buy, sell, ev):
+        if ev is None or ev == 0:
+            return "<span class='dim'>—</span>"
+        net = (buy or 0) - (sell or 0)
+        nc  = "pos" if net >= 0 else "neg"
+        return (f"<span class='{nc}'>{net:+.2f}◎</span>"
+                f"<span class='dim' style='font-size:10px'> {int(ev)}ev</span>")
+
+    def _vol(v):
+        if v is None: return "<span class='dim'>—</span>"
+        c = "pos" if v >= 0 else "neg"
+        return f"<span class='{c}'>{v:+.2f}◎</span>"
+
+    DIM = "<span class='dim'>—</span>"
+
+    H += ("<table><tr>"
+          "<th class='left'>Token</th><th>bounce%</th><th>elapsed</th><th>janela</th>"
+          "<th class='sep'>PRÉ net</th><th>PRÉ buy</th><th>PRÉ sell</th>"
+          "<th class='sep'>RISE net</th><th>RISE buy</th><th>RISE sell</th>"
+          "<th class='sep'>PÓS net</th><th>PÓS buy</th><th>PÓS sell</th>"
+          "<th class='sep'>Outcome</th></tr>")
+
+    for r in rows:
+        bp    = f"{r['bounce_pct']*100:.0f}%" if r['bounce_pct'] else "—"
+        el    = f"{(r['elapsed_sec'] or 0)/60:.1f}m"
+        win   = r.get('h23_window', '—')
+        win_c = "#3fb950" if win == "bottom" else "#8b949e"
+
+        pre_net  = (r['pre_buy']  or 0) - (r['pre_sell']  or 0) if r['pre_ev']  else None
+        rise_net = r['rise_net_flow']
+        pos_net  = (r['pos_buy']  or 0) - (r['pos_sell']  or 0) if r['pos_ev']  else None
+
+        st = r.get('status')
+        if st == 'tp':
+            row_cls = "win"
+            pnl_s = f"<span class='tp'>TP {(r['pnl_pct_real'] or 0)*100:+.0f}%</span>"
+        elif st == 'sl':
+            row_cls = "lose"
+            pnl_s = f"<span class='sl'>SL {(r['pnl_pct_real'] or 0)*100:+.0f}%</span>"
+        else:
+            row_cls = "pend"
+            pnl_s = "<span class='dim'>—</span>"
+
+        H += (f"<tr class='{row_cls}'>"
+              f"<td class='left'><b>{r['symbol'] or r['mint'][:8]}</b></td>"
+              f"<td>{bp}</td><td>{el}</td>"
+              f"<td><span style='color:{win_c}'>{win}</span></td>"
+              f"<td class='sep'>{_vol(pre_net)}</td>"
+              f"<td>{_vol(r['pre_buy'])}</td><td>{_vol(-(r['pre_sell'] or 0)) if r['pre_sell'] else DIM}</td>"
+              f"<td class='sep'>{_vol(rise_net)}</td>"
+              f"<td>{_vol(r['rise_buy_vol'])}</td><td>{_vol(-(r['rise_sell_vol'] or 0)) if r['rise_sell_vol'] else DIM}</td>"
+              f"<td class='sep'>{_vol(pos_net)}</td>"
+              f"<td>{_vol(r['pos_buy'])}</td><td>{_vol(-(r['pos_sell'] or 0)) if r['pos_sell'] else DIM}</td>"
+              f"<td class='sep'>{pnl_s}</td></tr>")
+
+    H += "</table>"
+    H += ("<div style='background:#161b22;border:1px solid #30363d;padding:10px;border-radius:4px;"
+          "font-size:11px;color:#8b949e;margin-top:12px'>"
+          "🧠 <b>O que procurar:</b> PRÉ negativo + RISE positivo + PÓS positivo = dump absorvido, "
+          "subida com compradores reais, demanda sustentando. "
+          "PRÉ negativo + RISE positivo + PÓS negativo = spike de momentum sem demanda real."
+          "</div>")
+    H += "</body></html>"
+    return H
+
+
+@app.route("/debug/h23-window")
+def debug_h23_window():
+    """H23 — Diagnóstico da janela de absorção: fundo vs bounce.
+    Mostra side-by-side para cada token ativo:
+      - Janela CORRETA: [ts_min - 60s → ts_min] (absorção real do dump)
+      - Janela ANTIGA:  [now - 60s → now]       (momentum pós-bounce — ERRADA)
+    Permite verificar empiricamente se a correção muda os dados.
+    Também mostra o gap ts_min → ts_signal dos últimos bounce_signals para
+    quantificar o erro sistemático que existia antes da correção.
+    """
+    import traceback, time as _time
+    try:
+        CSS = ("<style>body{background:#0d1117;color:#e6edf3;font:13px/1.6 monospace;padding:20px}"
+               "a{color:#58a6ff;text-decoration:none}table{border-collapse:collapse;width:100%}"
+               "th{background:#161b22;padding:6px 10px;text-align:left;font-size:11px;color:#8b949e}"
+               "td{padding:5px 10px;border-bottom:1px solid #21262d;font-size:12px}"
+               ".box{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px 16px;"
+               "margin:8px 4px;display:inline-block;vertical-align:top}"
+               ".lbl{color:#8b949e;font-size:11px}.val{font-size:18px;font-weight:bold}"
+               ".green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}.dim{color:#484f58}"
+               ".warn{background:#2d1f00;border:1px solid #e3b341;border-radius:4px;padding:8px 12px;margin:8px 0}"
+               "h2{color:#8b949e;font-size:12px;margin:20px 0 6px;text-transform:uppercase}"
+               "h1{color:#58a6ff;font-size:16px;margin-bottom:4px}</style>")
+
+        def _box(label, val, color="#e6edf3"):
+            return f"<div class='box'><div class='lbl'>{label}</div><div class='val' style='color:{color}'>{val}</div></div>"
+
+        def _flow_fmt(bv, sv, ev):
+            if ev == 0:
+                return "<span class='dim'>—</span>", "<span class='dim'>—</span>", "<span class='dim'>—</span>"
+            flow = bv - sv
+            ratio = bv / sv if sv > 0 else float("inf")
+            fc = "#3fb950" if flow > 0 else "#f85149"
+            rc = "#3fb950" if ratio >= 1.5 else ("#d29922" if ratio >= 1.0 else "#f85149")
+            flow_s  = f"<span style='color:{fc}'>{flow:+.3f}◎</span>"
+            ratio_s = f"<span style='color:{rc}'>{'∞' if ratio == float('inf') else f'{ratio:.1f}×'}</span>"
+            ev_s    = f"{ev} ev"
+            return flow_s, ratio_s, ev_s
+
+        # ── Seção 1: tokens ativos no HotMonitor ──────────────────────────────
+        live_rows_html = ""
+        n_active = 0
+        n_with_gap = 0
+        total_gap_sec = 0.0
+
+        if scanner and hasattr(scanner, "hot") and scanner.hot._helius:
+            with scanner.hot._lock:
+                active = dict(scanner.hot._tokens)
+            n_active = len(active)
+
+            for mint, state in active.items():
+                sym     = state.get("symbol", mint[:8])
+                ts_min  = state.get("ts_min")
+                ts_mig  = state.get("ts_migration")
+                now_ts  = _time.time()
+
+                # Janela correta: centrada no fundo
+                try:
+                    w_bottom = scanner.hot._helius.get_absorption_window(
+                        mint, window_sec=60,
+                        window_end_ts=ts_min.timestamp() if ts_min else None
+                    )
+                except Exception:
+                    w_bottom = {}
+
+                # Janela antiga: centrada em agora
+                try:
+                    w_now = scanner.hot._helius.get_absorption_window(mint, window_sec=60)
+                except Exception:
+                    w_now = {}
+
+                bv_b = w_bottom.get("buy_vol_sol", 0) or 0
+                sv_b = w_bottom.get("sell_vol_sol", 0) or 0
+                ev_b = w_bottom.get("total_events", 0) or 0
+
+                bv_n = w_now.get("buy_vol_sol", 0) or 0
+                sv_n = w_now.get("sell_vol_sol", 0) or 0
+                ev_n = w_now.get("total_events", 0) or 0
+
+                flow_b, ratio_b, ev_b_s = _flow_fmt(bv_b, sv_b, ev_b)
+                flow_n, ratio_n, ev_n_s = _flow_fmt(bv_n, sv_n, ev_n)
+
+                # Gap ts_min → agora (proxy para ts_signal)
+                gap_sec = (datetime.now(timezone.utc) - ts_min).total_seconds() if ts_min else None
+                gap_str = f"{gap_sec:.0f}s" if gap_sec is not None else "—"
+                gap_color = "#f85149" if (gap_sec and gap_sec > 60) else "#3fb950"
+
+                if gap_sec is not None:
+                    n_with_gap += 1
+                    total_gap_sec += gap_sec
+
+                # Diferença entre as duas janelas
+                diff_flow = (bv_b - sv_b) - (bv_n - sv_n) if (ev_b > 0 or ev_n > 0) else None
+                if diff_flow is not None:
+                    diff_color = "#e3b341" if abs(diff_flow) > 0.01 else "#484f58"
+                    diff_str = f"<span style='color:{diff_color}'>{diff_flow:+.3f}◎</span>"
+                else:
+                    diff_str = "<span class='dim'>—</span>"
+
+                live_rows_html += (
+                    f"<tr>"
+                    f"<td><b>{sym}</b></td>"
+                    f"<td style='color:{gap_color}'>{gap_str}</td>"
+                    f"<td>{ev_b_s}</td>"
+                    f"<td>{flow_b}</td>"
+                    f"<td>{ratio_b}</td>"
+                    f"<td class='dim'>|</td>"
+                    f"<td>{ev_n_s}</td>"
+                    f"<td>{flow_n}</td>"
+                    f"<td>{ratio_n}</td>"
+                    f"<td>{diff_str}</td>"
+                    f"<td style='color:#484f58;font-size:10px'>{mint[:12]}…</td>"
+                    f"</tr>"
+                )
+
+        if not live_rows_html:
+            live_rows_html = "<tr><td colspan='11' class='dim'>Nenhum token ativo no HotMonitor agora</td></tr>"
+
+        avg_gap = total_gap_sec / n_with_gap if n_with_gap > 0 else None
+
+        # ── Seção 2: histórico por h23_window ─────────────────────────────────────
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT
+                    symbol, ts_signal, elapsed_sec, bounce_pct,
+                    absorption_events, absorption_buy_vol, absorption_sell_vol,
+                    net_sol_flow, h23_window
+                FROM bounce_signals
+                WHERE ts_signal IS NOT NULL AND elapsed_sec IS NOT NULL
+                ORDER BY ts_signal DESC
+                LIMIT 40
+            """)
+            hist = [dict(r) for r in cur.fetchall()]
+
+            # Contagem por grupo
+            cur.execute("""
+                SELECT
+                    COALESCE(h23_window, 'bounce') AS win,
+                    COUNT(*) AS n,
+                    COUNT(CASE WHEN absorption_events > 0 THEN 1 END) AS n_helius,
+                    ROUND(AVG(elapsed_sec)::numeric, 1) AS avg_gap_sec,
+                    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY elapsed_sec)::numeric, 1) AS p50_gap_sec
+                FROM bounce_signals
+                WHERE elapsed_sec IS NOT NULL
+                GROUP BY 1 ORDER BY 1
+            """)
+            window_groups = [dict(r) for r in cur.fetchall()]
+
+            # Gap stats totais
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS n,
+                    ROUND(AVG(elapsed_sec)::numeric, 1)                                         AS avg_gap_sec,
+                    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY elapsed_sec)::numeric, 1) AS p50_gap_sec,
+                    COUNT(CASE WHEN elapsed_sec <= 60 THEN 1 END)                               AS within_60s,
+                    COUNT(CASE WHEN elapsed_sec  > 60 THEN 1 END)                               AS beyond_60s
+                FROM bounce_signals
+                WHERE ts_signal IS NOT NULL AND elapsed_sec IS NOT NULL
+            """)
+            gap_stats = dict(cur.fetchone())
+
+        hist_rows_html = ""
+        for r in hist:
+            sym     = r.get("symbol") or "?"
+            ts_sig  = r.get("ts_signal")
+            ts_str  = ts_sig.strftime("%m-%d %H:%M") if ts_sig else "—"
+            gap_s   = float(r.get("elapsed_sec") or 0)
+            bounce  = r.get("bounce_pct") or 0
+            ev      = r.get("absorption_events") or 0
+            bv      = r.get("absorption_buy_vol") or 0
+            sv      = r.get("absorption_sell_vol") or 0
+            nf      = r.get("net_sol_flow")
+
+            # Gap: se > 60s, a janela antiga NÃO capturou o fundo
+            gap_color = "#f85149" if gap_s > 60 else ("#d29922" if gap_s > 30 else "#3fb950")
+            gap_str = f"<span style='color:{gap_color}'>{gap_s:.0f}s</span>"
+
+            # O que a janela CORRETA (centrada no ts_min) capturaria vs o que foi salvo
+            # ts_min ≈ ts_signal - elapsed (dentro do bounce)
+            # Estimativa de qual fração dos eventos foi capturada com janela antiga
+            # Se gap > 60s: janela antiga capturou ZERO dos eventos do fundo
+            if gap_s > 60:
+                coverage_note = "<span class='red'>❌ fundo fora da janela (gap > 60s)</span>"
+            elif gap_s > 30:
+                coverage_note = "<span class='yellow'>⚠ cobertura parcial do fundo</span>"
+            else:
+                coverage_note = "<span class='green'>✓ fundo na janela</span>"
+
+            nf_color = "#3fb950" if nf and nf > 0 else "#f85149"
+            nf_str = f"<span style='color:{nf_color}'>{nf:+.3f}◎</span>" if nf is not None else "<span class='dim'>NULL</span>"
+
+            win = r.get("h23_window") or "bounce"
+            win_badge = ("<span style='color:#3fb950;font-size:10px'>●bottom</span>" if win == "bottom"
+                         else "<span style='color:#8b949e;font-size:10px'>●bounce</span>")
+
+            hist_rows_html += (
+                f"<tr>"
+                f"<td>{ts_str}</td>"
+                f"<td><b>{sym}</b></td>"
+                f"<td>{bounce*100:.0f}%</td>"
+                f"<td>{gap_str}</td>"
+                f"<td>{win_badge}</td>"
+                f"<td>{ev}</td>"
+                f"<td>{bv:.3f}</td>"
+                f"<td>{sv:.3f}</td>"
+                f"<td>{nf_str}</td>"
+                f"<td>{coverage_note}</td>"
+                f"</tr>"
+            )
+
+        n_beyond  = gap_stats.get("beyond_60s") or 0
+        n_total   = gap_stats.get("n") or 1
+        pct_wrong = n_beyond / n_total * 100
+
+        # Boxes por grupo
+        group_boxes = ""
+        for g in window_groups:
+            win   = g["win"]
+            color = "#3fb950" if win == "bottom" else "#8b949e"
+            label = "✅ bottom (correto)" if win == "bottom" else "⚠ bounce (antigo)"
+            group_boxes += _box(label, f"{g['n']} bounces | {g['n_helius']} Helius | P50 gap {g['p50_gap_sec']}s", color)
+
+        html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>H23 Window Debug</title>{CSS}
+<meta http-equiv='refresh' content='10'>
+</head><body>
+<h1>H23 — Diagnóstico da Janela de Absorção</h1>
+<p style='color:#8b949e;font-size:11px'>
+  auto-refresh 10s · compara janela CORRETA [ts_min−60s → ts_min] vs ANTIGA [now−60s → now]<br>
+  Dois sinais distintos: <b style='color:#3fb950'>bottom</b> = absorção do dump | <b style='color:#8b949e'>bounce</b> = momentum pós-bounce.
+</p>
+<div>
+  <a href='/debug/h23' style='color:#58a6ff;margin-right:14px;font-size:12px'>Debug H23</a>
+  <a href='/debug/absorption' style='color:#58a6ff;margin-right:14px;font-size:12px'>Absorption</a>
+  <a href='/debug/h23-wr' style='color:#58a6ff;font-size:12px'>H23 WR</a>
+</div>
+<br>
+
+<div class='warn'>
+  ⚠ <b>Bug corrigido neste deploy:</b> a janela de absorção agora usa <code>window_end_ts = ts_min</code>
+  (fundo) em vez de <code>time.time()</code> (momento do bounce).<br>
+  Dados históricos no banco foram coletados com a janela errada — somente novos bounces terão H23 correto.
+  <br>Gap médio ts_min→ts_signal: <b>{gap_stats.get('avg_gap_sec') or '—'}s</b> (P50: {gap_stats.get('p50_gap_sec') or '—'}s).
+  <b style='color:#f85149'>{pct_wrong:.0f}% dos bounces históricos tinham gap > 60s</b> —
+  ou seja, a janela antiga não capturava nenhum evento do período real de absorção.
+</div>
+<br>
+
+{_box("Tokens ativos", n_active)}
+{_box("Gap médio ts_min→agora", f"{avg_gap:.0f}s" if avg_gap else "—", "#e3b341" if avg_gap and avg_gap > 60 else "#3fb950")}
+{_box("Bounces com gap > 60s", f"{n_beyond}/{n_total} ({pct_wrong:.0f}%)", "#f85149" if pct_wrong > 30 else "#d29922")}
+<br>{group_boxes}
+
+<br><br>
+<h2>▸ Tokens ativos no HotMonitor — comparação janela CORRETA vs ANTIGA</h2>
+<p style='color:#484f58;font-size:11px'>
+  "Gap ts_min→agora" = tempo desde o fundo até agora. Se > 60s, a janela antiga não capturava o fundo.<br>
+  "Diff" = (flow correto) − (flow antigo). Valor ≠ 0 confirma que a correção muda os dados.
+</p>
+<table>
+  <thead><tr>
+    <th>Token</th>
+    <th>Gap fundo→agora</th>
+    <th colspan='3' style='background:#1a2d1a'>✅ JANELA CORRETA (ts_min)</th>
+    <th></th>
+    <th colspan='3' style='background:#2d1a1a'>❌ JANELA ANTIGA (now)</th>
+    <th>Diff flow</th>
+    <th>Mint</th>
+  </tr>
+  <tr>
+    <th></th><th></th>
+    <th style='background:#0d1f0d'>Eventos</th>
+    <th style='background:#0d1f0d'>Net flow</th>
+    <th style='background:#0d1f0d'>Ratio</th>
+    <th></th>
+    <th style='background:#1f0d0d'>Eventos</th>
+    <th style='background:#1f0d0d'>Net flow</th>
+    <th style='background:#1f0d0d'>Ratio</th>
+    <th></th><th></th>
+  </tr></thead>
+  <tbody>{live_rows_html}</tbody>
+</table>
+
+<br>
+<h2>▸ Últimos 40 bounce_signals — janela usada e cobertura do fundo</h2>
+<p style='color:#484f58;font-size:11px'>
+  <b style='color:#3fb950'>●bottom</b> = janela centrada no fundo (absorção real — pós-correção)<br>
+  <b style='color:#8b949e'>●bounce</b> = janela centrada no bounce (momentum — dados históricos)<br>
+  gap = elapsed_sec = segundos da migração até o sinal. Proxy do gap real ts_min→ts_signal (que é menor).
+</p>
+<table>
+  <thead><tr>
+    <th>Hora</th><th>Token</th><th>Bounce%</th>
+    <th>Gap mig→sinal</th><th>Janela</th>
+    <th>Ev</th><th>Buy◎</th><th>Sell◎</th>
+    <th>net_sol_flow (salvo)</th>
+    <th>Cobertura da janela</th>
+  </tr></thead>
+  <tbody>{hist_rows_html}</tbody>
+</table>
+
+<p style='color:#484f58;font-size:11px;margin-top:20px'>
+  ⚠ "Gap" usa elapsed_sec (migração → sinal) como proxy. O gap real ts_min → ts_signal é menor.<br>
+  Dados <b style='color:#3fb950'>bottom</b> são os únicos válidos para testar H23 como hipótese de absorção.<br>
+  Dados <b style='color:#8b949e'>bounce</b> representam outro sinal (momentum) — preservados para análise paralela futura.<br>
+  Gate para filtro: n≥30 com h23_window='bottom' + outcomes GMGN + discriminação ≥10pp.
+</p>
 </body></html>"""
         return html
 
@@ -23792,8 +24513,8 @@ Verificar: <code>strategy_id</code> salvo na tabela trades — deve diferir do o
     H += """<div class='box'>
 <b>Razões possíveis identificadas no código:</b><br><br>
 
-<b>1. state nunca virou "processed/confirmed" em 120s:</b><br>
-&nbsp;&nbsp;_execute() faz poll por FILL_TIMEOUT_SEC=120s. Se GMGN demorou mais, fill fica NULL.<br>
+<b>1. state nunca virou "processed/confirmed" dentro do timeout:</b><br>
+&nbsp;&nbsp;_execute() faz poll por FILL_TIMEOUT_SEC (default atual: 300s). Se GMGN demorar mais, fill fica NULL até recovery posterior.<br>
 &nbsp;&nbsp;Verificar: ts_order_confirmed NULL + order_id presente → timeout aconteceu.<br><br>
 
 <b>2. extract_tx_signature retornou None:</b><br>
@@ -23819,14 +24540,14 @@ Verificar: <code>strategy_id</code> salvo na tabela trades — deve diferir do o
 </div>"""
 
     # ── Task 10: summary ───────────────────────────────────────────────────────
-    H += "<h3>Task 10 — Patch proposto (ver /debug/fill-pipeline#patch)</h3>"
+    H += "<h3>Task 10 — Patch aplicado (ver /debug/fill-pipeline#patch)</h3>"
     H += """<div class='box' id='patch'>
-<b>1. extract_tx_signature — busca regex em toda a resposta:</b> já implementado neste endpoint como extract_tx_sig_extended.<br>
-<b>2. get_swap_fill — retornar block_time:</b> adicionar campo ao dict de retorno.<br>
-<b>3. _recover_fill para qualquer status:</b> chamar também para trailing_active/tp/sl sem fill.<br>
-<b>4. Impedir trailing_active sem fill:</b> _check_position_closed() só marca trailing_active se entry_price_usd != NULL.<br>
-<b>5. save_raw_qr:</b> log de warning com raw response quando state=confirmed mas sem sig extraída.<br>
-<b>6. FILL_TIMEOUT_SEC aumentar de 120 para 300s</b> — GMGN pode demorar mais para confirmar.<br>
+<b>1. extract_tx_signature — busca regex em toda a resposta:</b> implementado em helius_rpc.extract_tx_signature.<br>
+<b>2. get_swap_fill — retornar block_time:</b> campo adicionado ao dict de retorno.<br>
+<b>3. _recover_fill para qualquer status:</b> TradeMonitor chama recovery também para trades sem fill fora de status='open'.<br>
+<b>4. Impedir trailing_active sem fill:</b> _check_position_closed() tenta recovery e adia fechamento se entry_price_usd continuar NULL.<br>
+<b>5. save_raw_qr:</b> warning com chaves da resposta quando state=confirmed mas sem sig extraída.<br>
+<b>6. FILL_TIMEOUT_SEC default 300s</b> — GMGN pode demorar mais para confirmar.<br>
 <b>7. Dashboard PnL:</b> exibir asterisco ou "sem fill" quando pnl_pct_real calculado sem entry real.<br>
 </div>"""
 
@@ -29461,6 +30182,4414 @@ def analise_h23_deep():
 
     except Exception:
         return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
+@app.route("/analise/h24-h25")
+def analise_h24_h25():
+    """
+    Correlação H24 (seller concentration) + H25 (pool depth) + H23 (net flow bottom)
+    vs outcomes blockchain-verificados.
+    """
+    import psycopg2, traceback
+    from db import DATABASE_URL
+
+    try:
+     conn = psycopg2.connect(DATABASE_URL)
+     cur  = conn.cursor()
+    except Exception as e:
+        return f"<pre>DB connect error: {e}</pre>", 500
+
+    try:
+     return _analise_h24_h25_inner(conn, cur)
+    except Exception as e:
+        conn.close()
+        return f"<pre style='color:red'>{traceback.format_exc()}</pre>", 500
+
+def _analise_h24_h25_inner(conn, cur):
+    # LEFT JOIN — bounces sem trade aparecem com t.status = NULL (não tradado)
+    # Inclui todos os exit_types blockchain-verificados:
+    #   helius_sell_recovery = auditoria retroativa (sessão 5, 139 trades)
+    #   helius               = fill detectado em tempo real pelo helius_rpc
+    #   helius_recovery      = fill detectado pós-timeout pelo _recover_fill()
+    TRADE_JOIN = """
+        LEFT JOIN LATERAL (
+            SELECT status, pnl_pct_real
+            FROM trades
+            WHERE mint = bs.mint
+              AND exit_type IN ('helius_sell_recovery', 'helius', 'helius_recovery')
+              AND status IN ('tp', 'sl')
+            ORDER BY created_at ASC LIMIT 1
+        ) t ON true
+    """
+
+    # cobertura geral: quantos bounces têm dados H24/H25/H23, e quantos foram tradados
+    cur.execute(f"""
+        SELECT
+            COUNT(*) FILTER (WHERE bs.dump_seller_hhi IS NOT NULL)                          AS n_h24,
+            COUNT(*) FILTER (WHERE bs.pool_quote_at_signal IS NOT NULL)                      AS n_h25,
+            COUNT(*) FILTER (WHERE bs.net_sol_flow IS NOT NULL AND bs.h23_window='bottom')   AS n_h23,
+            COUNT(*) FILTER (WHERE t.status IS NOT NULL)                                     AS n_traded,
+            COUNT(*) FILTER (WHERE t.status = 'tp')                                          AS n_tp,
+            COUNT(*) FILTER (WHERE t.status = 'sl')                                          AS n_sl
+        FROM bounce_signals bs {TRADE_JOIN}
+        WHERE bs.dump_seller_hhi IS NOT NULL
+           OR bs.pool_quote_at_signal IS NOT NULL
+           OR (bs.net_sol_flow IS NOT NULL AND bs.h23_window = 'bottom')
+    """)
+    cov = cur.fetchone()
+    base_n  = cov[3] or 0
+    base_tp = cov[4] or 0
+    base_wr = round(base_tp / base_n * 100, 1) if base_n else 0
+
+    CSS = """<style>
+      body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+      h1{color:#58a6ff}h2{color:#79c0ff;margin-top:28px}h3{color:#8b949e;margin-top:20px}
+      table{border-collapse:collapse;width:100%;max-width:700px;margin-bottom:16px}
+      th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:left}
+      th:not(:first-child){text-align:right}
+      td{padding:5px 10px;border:1px solid #21262d;white-space:nowrap}
+      td:not(:first-child){text-align:right}
+      .note{color:#8b949e;font-size:12px;margin:4px 0 14px}
+      .box{background:#161b22;border:1px solid #30363d;padding:10px 14px;
+           border-radius:4px;margin:10px 0;font-size:12px}
+      a{color:#58a6ff}
+    </style>"""
+
+    def wr_color(wr, base):
+        if wr is None: return "#8b949e"
+        return "#3fb950" if wr >= base + 8 else ("#f85149" if wr <= base - 8 else "#e3b341")
+
+    def delta_html(wr, base):
+        if wr is None: return "—"
+        d = wr - base
+        c = "#3fb950" if d >= 5 else ("#f85149" if d <= -5 else "#8b949e")
+        return f"<span style='color:{c}'>{d:+.1f}pp</span>"
+
+    def table_html(title, note, rows):
+        hdrs = ["Faixa", "n total", "n tradados", "TP", "SL", "WR%", "Δ base", "P&L médio"]
+        ths  = "".join(f"<th>{h}</th>" for h in hdrs)
+        body = ""
+        for r in rows:
+            faixa, n_all, n_trd, tp, sl, wr, pnl = r
+            wr_s  = f"{wr:.1f}%" if wr is not None else "—"
+            pnl_s = f"{pnl:+.1f}%" if pnl is not None else "—"
+            wrc   = wr_color(wr, base_wr)
+            body += (
+                f"<tr>"
+                f"<td>{faixa}</td>"
+                f"<td>{n_all}</td><td>{n_trd}</td><td>{tp}</td><td>{sl}</td>"
+                f"<td style='color:{wrc}'>{wr_s}</td>"
+                f"<td>{delta_html(wr, base_wr)}</td>"
+                f"<td>{pnl_s}</td>"
+                f"</tr>"
+            )
+        note_html = f"<p class='note'>{note}</p>" if note else ""
+        return f"<h2>{title}</h2>{note_html}<table><tr>{ths}</tr>{body}</table>"
+
+    def run_query(sql):
+        cur.execute(sql)
+        rows = []
+        for faixa, n_all, n_trd, tp, sl, pnl in cur.fetchall():
+            tp    = tp or 0
+            sl    = sl or 0
+            n_trd = n_trd or 0
+            wr    = round(tp / n_trd * 100, 1) if n_trd else None
+            pnl_v = round(float(pnl) * 100, 1) if pnl is not None else None
+            rows.append((faixa, n_all, n_trd, tp, sl, wr, pnl_v))
+        return rows
+
+    # ── H24 — seller HHI ──────────────────────────────────────────────────────
+    h24_rows = run_query(f"""
+        SELECT
+            CASE
+                WHEN bs.dump_seller_hhi >= 0.5 THEN '≥0.5  (1-2 sellers dominam)'
+                WHEN bs.dump_seller_hhi >= 0.2 THEN '0.2-0.5  (poucos sellers)'
+                WHEN bs.dump_seller_hhi >= 0.1 THEN '0.1-0.2  (distribuído)'
+                ELSE                                 '<0.1  (muito distribuído)'
+            END                                                        AS faixa,
+            COUNT(*)                                                    AS n_all,
+            COUNT(t.status)                                             AS n_trd,
+            SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)             AS tp,
+            SUM(CASE WHEN t.status='sl' THEN 1 ELSE 0 END)             AS sl,
+            AVG(t.pnl_pct_real)                                        AS pnl
+        FROM bounce_signals bs {TRADE_JOIN}
+        WHERE bs.dump_seller_hhi IS NOT NULL
+        GROUP BY 1 ORDER BY MIN(bs.dump_seller_hhi) DESC
+    """)
+
+    # ── H25 — pool depth ─────────────────────────────────────────────────────
+    h25_rows = run_query(f"""
+        SELECT
+            CASE
+                WHEN bs.pool_quote_at_signal >= 100 THEN '≥100 SOL  (pool fundo)'
+                WHEN bs.pool_quote_at_signal >= 50  THEN '50-100 SOL'
+                WHEN bs.pool_quote_at_signal >= 20  THEN '20-50 SOL'
+                ELSE                                     '<20 SOL  (pool fino)'
+            END                                                        AS faixa,
+            COUNT(*)                                                    AS n_all,
+            COUNT(t.status)                                             AS n_trd,
+            SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)             AS tp,
+            SUM(CASE WHEN t.status='sl' THEN 1 ELSE 0 END)             AS sl,
+            AVG(t.pnl_pct_real)                                        AS pnl
+        FROM bounce_signals bs {TRADE_JOIN}
+        WHERE bs.pool_quote_at_signal IS NOT NULL
+        GROUP BY 1 ORDER BY MIN(bs.pool_quote_at_signal) DESC
+    """)
+
+    # ── H23 bottom window ─────────────────────────────────────────────────────
+    h23_rows = run_query(f"""
+        SELECT
+            CASE
+                WHEN bs.net_sol_flow >  5  THEN '>5 SOL  (compra forte no fundo)'
+                WHEN bs.net_sol_flow >  0  THEN '0-5 SOL  (compra leve)'
+                WHEN bs.net_sol_flow > -5  THEN '-5-0 SOL  (venda leve)'
+                ELSE                            '<-5 SOL  (venda forte / seller exhaustion)'
+            END                                                        AS faixa,
+            COUNT(*)                                                    AS n_all,
+            COUNT(t.status)                                             AS n_trd,
+            SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)             AS tp,
+            SUM(CASE WHEN t.status='sl' THEN 1 ELSE 0 END)             AS sl,
+            AVG(t.pnl_pct_real)                                        AS pnl
+        FROM bounce_signals bs {TRADE_JOIN}
+        WHERE bs.net_sol_flow IS NOT NULL AND bs.h23_window = 'bottom'
+        GROUP BY 1 ORDER BY MIN(bs.net_sol_flow) DESC
+    """)
+
+    # ── H22 ratio buy/sell (pre-window = [ts_min-60s → ts_min]) ──────────────
+    h22_rows = run_query(f"""
+        SELECT
+            CASE
+                WHEN bs.absorption_sell_vol IS NULL OR bs.absorption_sell_vol = 0
+                    THEN '∞  (só compra — vacuum pump)'
+                WHEN bs.absorption_buy_vol / NULLIF(bs.absorption_sell_vol,0) >= 3
+                    THEN '≥3×  (compra domina)'
+                WHEN bs.absorption_buy_vol / NULLIF(bs.absorption_sell_vol,0) >= 1.5
+                    THEN '1.5-3×  (zona ideal)'
+                WHEN bs.absorption_buy_vol / NULLIF(bs.absorption_sell_vol,0) >= 1.0
+                    THEN '1-1.5×  (equilibrado)'
+                WHEN bs.absorption_buy_vol / NULLIF(bs.absorption_sell_vol,0) >= 0.5
+                    THEN '0.5-1×  (leve venda)'
+                ELSE '< 0.5×  (venda domina)'
+            END                                                        AS faixa,
+            COUNT(*)                                                    AS n_all,
+            COUNT(t.status)                                             AS n_trd,
+            SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)             AS tp,
+            SUM(CASE WHEN t.status='sl' THEN 1 ELSE 0 END)             AS sl,
+            AVG(t.pnl_pct_real)                                        AS pnl
+        FROM bounce_signals bs {TRADE_JOIN}
+        WHERE bs.absorption_events > 0
+          AND bs.absorption_buy_vol IS NOT NULL
+        GROUP BY 1
+        ORDER BY
+            MIN(CASE
+                WHEN bs.absorption_sell_vol IS NULL OR bs.absorption_sell_vol = 0 THEN 0
+                ELSE bs.absorption_buy_vol / NULLIF(bs.absorption_sell_vol, 0)
+            END) DESC
+    """)
+
+    # ── Overhead Supply ───────────────────────────────────────────────────────
+    os_rows = run_query(f"""
+        SELECT
+            CASE
+                WHEN bs.mc_at_signal / NULLIF(m.mc_peak,0) >= 0.7 THEN '≥70% do pico  (overhead alto)'
+                WHEN bs.mc_at_signal / NULLIF(m.mc_peak,0) >= 0.5 THEN '50-70% do pico'
+                WHEN bs.mc_at_signal / NULLIF(m.mc_peak,0) >= 0.3 THEN '30-50% do pico'
+                ELSE                                                     '<30% do pico  (overhead baixo)'
+            END                                                        AS faixa,
+            COUNT(*)                                                    AS n_all,
+            COUNT(t.status)                                             AS n_trd,
+            SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)             AS tp,
+            SUM(CASE WHEN t.status='sl' THEN 1 ELSE 0 END)             AS sl,
+            AVG(t.pnl_pct_real)                                        AS pnl
+        FROM bounce_signals bs
+        JOIN migrations m ON m.mint = bs.mint
+        {TRADE_JOIN}
+        WHERE m.mc_peak > 0 AND bs.mc_at_signal IS NOT NULL
+        GROUP BY 1 ORDER BY MIN(bs.mc_at_signal / NULLIF(m.mc_peak,0)) DESC
+    """)
+
+    conn.close()
+
+    n_h24, n_h25, n_h23 = cov[0], cov[1], cov[2]
+
+    h24_html = table_html(
+        f"H24 — Concentração de Sellers no Dump (n_bounces={n_h24}, n_tradados={base_n})",
+        "HHI alto (≥0.5) = 1-2 wallets dominaram o dump → sellers concentrados → exaurem rápido → bounce mais sustentado?",
+        h24_rows) if h24_rows else "<p class='note'>Sem dados H24 ainda</p>"
+
+    h25_html = table_html(
+        f"H25 — Profundidade do Pool no Sinal (n_bounces={n_h25})",
+        "Pool fino (<20 SOL): qualquer compra move o preço muito → spikes artificiais → SL disparado por ruído, não por direção real.",
+        h25_rows) if h25_rows else "<p class='note'>Sem dados H25 ainda</p>"
+
+    h23_html = table_html(
+        f"H23 — Net SOL Flow no Fundo / janela bottom (n_bounces={n_h23})",
+        "Janela [ts_min-60s → ts_min]. Hipótese reformulada: net_flow negativo = sellers ainda ativos até o fundo = seller exhaustion real. Net_flow positivo = token já recuperando antes da detecção = sinal dispara tarde.",
+        h23_rows) if h23_rows else "<p class='note'>Sem dados H23 bottom ainda</p>"
+
+    h22_html = table_html(
+        "H22 — Ratio Buy/Sell na janela pré-fundo [ts_min-60s → ts_min]",
+        "Zona ideal: 1.5–3× (compradores vencendo a batalha, mas sellers presentes = price discovery real). Extremos ∞/≥3× = vacuum pump sem sellers = SL imediato.",
+        h22_rows) if h22_rows else "<p class='note'>Sem dados H22 ainda</p>"
+
+    os_html = table_html(
+        "Overhead Supply — entrada como % do pico histórico",
+        "Entrada a 70%+ do pico = muitos holders acima de nós querendo recuperar capital = resistência de venda.",
+        os_rows) if os_rows else ""
+
+    return f"""<!DOCTYPE html><html><head>
+    <meta charset='utf-8'><title>H22/H23/H24/H25 vs Outcomes</title>
+    {CSS}</head><body>
+    <h1>H22 / H23 / H24 / H25 — Correlação com Outcomes</h1>
+    <div class='box'>
+      Baseline: {base_n} trades blockchain-verificados (helius_sell_recovery) |
+      {base_tp} TP | {base_n - base_tp} SL | WR base = <b>{base_wr}%</b><br>
+      n_h24={n_h24} bounces | n_h25={n_h25} | n_h23={n_h23} (bottom-window)
+    </div>
+    <p><a href='/analise/h22-correlation'>H22 Correlation</a> &nbsp;|&nbsp;
+       <a href='/debug/h23-wr?window=bottom'>H23 WR Debug</a> &nbsp;|&nbsp;
+       <a href='/analise/sinal-puro'>Sinal Puro</a></p>
+    {h22_html}
+    {h23_html}
+    {h24_html}
+    {h25_html}
+    {os_html}
+    </body></html>"""
+
+
+@app.route("/analise/tp-vs-sl")
+def analise_tp_vs_sl():
+    """40 TPs vs 258 SLs — o que os diferencia nos dados reais."""
+    import psycopg2, traceback
+    from db import DATABASE_URL
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor()
+
+        JOIN = """
+            FROM trades t
+            JOIN bounce_signals bs ON bs.mint = t.mint
+                AND bs.ts_signal BETWEEN t.created_at - INTERVAL '5 min' AND t.created_at + INTERVAL '30 min'
+            JOIN migrations m ON m.mint = t.mint
+            WHERE t.exit_type IS NOT NULL AND t.status IN ('tp','sl')
+        """
+
+        sections = []
+
+        def section(title, headers, rows, note=""):
+            ths = "".join(f"<th>{h}</th>" for h in headers)
+            trs = ""
+            for r in rows:
+                tds = "".join(f"<td>{v if v is not None else '—'}</td>" for v in r)
+                trs += f"<tr>{tds}</tr>"
+            n = f"<p class='note'>{note}</p>" if note else ""
+            return f"<h3>{title}</h3><table><tr>{ths}</tr>{trs}</table>{n}"
+
+        # 1. bounce_pct por faixa
+        cur.execute(f"""
+            SELECT
+                CASE
+                    WHEN bs.bounce_pct < 0.70  THEN '55-70%'
+                    WHEN bs.bounce_pct < 1.00  THEN '70-100%'
+                    WHEN bs.bounce_pct < 1.50  THEN '100-150%'
+                    WHEN bs.bounce_pct < 2.50  THEN '150-250%'
+                    ELSE '250%+'
+                END as faixa,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1) as wr
+            {JOIN}
+            GROUP BY 1 ORDER BY MIN(bs.bounce_pct)
+        """)
+        sections.append(section("1. WR por faixa de bounce_pct",
+            ["bounce_pct", "n", "TP", "WR%"], cur.fetchall(),
+            "Maior discriminador conhecido: bounce >70% tinha WR 74% (n=23 histórico)"))
+
+        # 2. elapsed (tempo migração→sinal)
+        cur.execute(f"""
+            SELECT
+                CASE
+                    WHEN bs.elapsed_sec < 300  THEN '0-5min'
+                    WHEN bs.elapsed_sec < 600  THEN '5-10min'
+                    WHEN bs.elapsed_sec < 900  THEN '10-15min'
+                    WHEN bs.elapsed_sec < 1200 THEN '15-20min'
+                    ELSE '>20min'
+                END as faixa,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1) as wr
+            {JOIN}
+            GROUP BY 1 ORDER BY MIN(bs.elapsed_sec)
+        """)
+        sections.append(section("2. WR por tempo migração→sinal (elapsed)",
+            ["elapsed", "n", "TP", "WR%"], cur.fetchall(),
+            "H10: fundo em <25min tem recovery rate maior"))
+
+        # 3. smart wallets
+        cur.execute(f"""
+            SELECT
+                CASE
+                    WHEN m.smart_wallets >= 10 THEN '>=10'
+                    WHEN m.smart_wallets >= 5  THEN '5-9'
+                    WHEN m.smart_wallets >= 3  THEN '3-4'
+                    ELSE '1-2'
+                END as smart,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1) as wr
+            {JOIN}
+            GROUP BY 1 ORDER BY MIN(m.smart_wallets) DESC
+        """)
+        sections.append(section("3. WR por smart_wallets",
+            ["smart_wallets", "n", "TP", "WR%"], cur.fetchall(),
+            "Filtro atual: smart>=3. Live data: smart=3→57% WR (n pequeno)"))
+
+        # 4. drop_from_mig (profundidade do dump)
+        cur.execute(f"""
+            SELECT
+                CASE
+                    WHEN bs.drop_from_mig >= 0.80 THEN '>=80% dump'
+                    WHEN bs.drop_from_mig >= 0.70 THEN '70-80%'
+                    WHEN bs.drop_from_mig >= 0.60 THEN '60-70%'
+                    WHEN bs.drop_from_mig >= 0.50 THEN '50-60%'
+                    ELSE '<50%'
+                END as faixa,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1) as wr
+            {JOIN}
+            GROUP BY 1 ORDER BY MIN(bs.drop_from_mig) DESC
+        """)
+        sections.append(section("4. WR por profundidade do dump (drop_from_mig)",
+            ["dump depth", "n", "TP", "WR%"], cur.fetchall(),
+            "Mediana histórica de dump: 72%. Tokens mais dumpados têm recovery mais real?"))
+
+        # 5. mc_migration (tamanho do token)
+        cur.execute(f"""
+            SELECT
+                CASE
+                    WHEN m.mc_migration >= 150000 THEN '>$150k'
+                    WHEN m.mc_migration >= 100000 THEN '$100-150k'
+                    WHEN m.mc_migration >= 60000  THEN '$60-100k'
+                    WHEN m.mc_migration >= 30000  THEN '$30-60k'
+                    ELSE '<$30k'
+                END as faixa,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1) as wr
+            {JOIN}
+            GROUP BY 1 ORDER BY MIN(m.mc_migration) DESC
+        """)
+        sections.append(section("5. WR por MC de migração",
+            ["mc_migration", "n", "TP", "WR%"], cur.fetchall(),
+            "Tokens maiores têm mais liquidez e holders — bounce mais sustentável?"))
+
+        # 6. renowned_wallets (KOLs)
+        cur.execute(f"""
+            SELECT
+                CASE
+                    WHEN m.renowned_wallets >= 3 THEN '>=3 KOLs'
+                    WHEN m.renowned_wallets >= 1 THEN '1-2 KOLs'
+                    ELSE '0 KOLs'
+                END as kols,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1) as wr
+            {JOIN}
+            GROUP BY 1 ORDER BY MIN(m.renowned_wallets) DESC
+        """)
+        sections.append(section("6. WR por KOL wallets (renowned)",
+            ["KOLs", "n", "TP", "WR%"], cur.fetchall(),
+            "KOLs = influencers com histórico. Presença deles indica interesse real?"))
+
+        # 7. pnl dos TPs
+        cur.execute("""
+            SELECT
+                ROUND((MIN(pnl_pct_real)*100)::numeric,0),
+                ROUND((PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY pnl_pct_real)*100)::numeric,0),
+                ROUND((PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY pnl_pct_real)*100)::numeric,0),
+                ROUND((AVG(pnl_pct_real)*100)::numeric,0),
+                ROUND((MAX(pnl_pct_real)*100)::numeric,0),
+                COUNT(*)
+            FROM trades WHERE exit_type IS NOT NULL AND status='tp'
+        """)
+        sections.append(section("7. Distribuição de P&L nos 40 TPs",
+            ["min%", "p25%", "median%", "avg%", "max%", "n"], cur.fetchall()))
+
+        # 8. os 40 TPs individuais
+        cur.execute(f"""
+            SELECT
+                t.created_at::date,
+                m.token_nome,
+                ROUND((bs.bounce_pct*100)::numeric,0) as bounce,
+                ROUND((bs.drop_from_mig*100)::numeric,0) as dump,
+                bs.elapsed_sec/60 as elapsed_min,
+                m.smart_wallets,
+                m.renowned_wallets,
+                ROUND(m.mc_migration::numeric/1000,1) as mc_mig_k,
+                ROUND((t.pnl_pct_real*100)::numeric,0) as pnl
+            {JOIN}
+            AND t.status='tp'
+            ORDER BY t.pnl_pct_real DESC
+        """)
+        sections.append(section("8. Os 40 TPs — lista completa (maior P&L primeiro)",
+            ["data","token","bounce%","dump%","elapsed min","smart","KOL","mc_mig $k","pnl%"],
+            cur.fetchall()))
+
+        conn.close()
+
+        body = "".join(sections)
+        return f"""<!DOCTYPE html><html><head>
+        <meta charset='utf-8'><title>TP vs SL Analysis</title>
+        <style>
+          body{{font-family:monospace;background:#111;color:#ccc;padding:20px}}
+          h2{{color:#fa0}} h3{{color:#fa0;margin-top:28px}}
+          table{{border-collapse:collapse;margin-bottom:6px;min-width:500px}}
+          th,td{{padding:5px 10px;border:1px solid #333;text-align:right}}
+          th{{background:#222;color:#fa0}} td:first-child{{text-align:left}}
+          .note{{color:#888;font-size:.9em;margin:4px 0 16px}}
+        </style></head><body>
+        <h2>40 TPs vs 258 SLs — o que os diferencia</h2>
+        <p class='note'>Base: trades blockchain-verificados (exit_type IS NOT NULL). WR base: 13.4%</p>
+        {body}
+        </body></html>"""
+    except Exception:
+        return f"<pre style='color:red'>{traceback.format_exc()}</pre>", 500
+
+
+@app.route("/analise/elapsed-granular")
+def analise_elapsed_granular():
+    """WR por minuto exato pós-migração — pente fino 0-20min."""
+    import psycopg2, traceback
+    from db import DATABASE_URL
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor()
+
+        # minuto a minuto 0-20 + bucket 20+
+        cur.execute("""
+            SELECT
+                CASE
+                    WHEN bs.elapsed_sec <  60  THEN '0-1min'
+                    WHEN bs.elapsed_sec < 120  THEN '1-2min'
+                    WHEN bs.elapsed_sec < 180  THEN '2-3min'
+                    WHEN bs.elapsed_sec < 240  THEN '3-4min'
+                    WHEN bs.elapsed_sec < 300  THEN '4-5min'
+                    WHEN bs.elapsed_sec < 360  THEN '5-6min'
+                    WHEN bs.elapsed_sec < 420  THEN '6-7min'
+                    WHEN bs.elapsed_sec < 480  THEN '7-8min'
+                    WHEN bs.elapsed_sec < 540  THEN '8-9min'
+                    WHEN bs.elapsed_sec < 600  THEN '9-10min'
+                    WHEN bs.elapsed_sec < 720  THEN '10-12min'
+                    WHEN bs.elapsed_sec < 900  THEN '12-15min'
+                    WHEN bs.elapsed_sec < 1200 THEN '15-20min'
+                    ELSE '>20min'
+                END as faixa,
+                MIN(bs.elapsed_sec)                                                        as _sort,
+                COUNT(*)                                                                   as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)                            as tp,
+                SUM(CASE WHEN t.status='sl' THEN 1 ELSE 0 END)                            as sl,
+                ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1) as wr,
+                ROUND((AVG(bs.bounce_pct)*100)::numeric,1)                                as avg_bounce,
+                ROUND((AVG(bs.drop_from_mig)*100)::numeric,1)                             as avg_dump,
+                ROUND((AVG(CASE WHEN t.status='tp' THEN t.pnl_pct_real END)*100)::numeric,1) as avg_pnl_tp,
+                ROUND((AVG(CASE WHEN t.status='sl' THEN t.pnl_pct_real END)*100)::numeric,1) as avg_pnl_sl
+            FROM trades t
+            JOIN bounce_signals bs ON bs.mint = t.mint
+                AND bs.ts_signal BETWEEN t.created_at - INTERVAL '5 min' AND t.created_at + INTERVAL '30 min'
+            JOIN migrations m ON m.mint = t.mint
+            WHERE t.exit_type IS NOT NULL AND t.status IN ('tp','sl')
+              AND t.id >= 338
+            GROUP BY 1
+            ORDER BY 2
+        """)
+        rows = cur.fetchall()
+
+        # totais
+        cur.execute("""
+            SELECT COUNT(*),
+                   SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END),
+                   ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1)
+            FROM trades t
+            JOIN bounce_signals bs ON bs.mint = t.mint
+                AND bs.ts_signal BETWEEN t.created_at - INTERVAL '5 min' AND t.created_at + INTERVAL '30 min'
+            WHERE t.exit_type IS NOT NULL AND t.status IN ('tp','sl')
+              AND t.id >= 338
+        """)
+        total, tps, wr_base = cur.fetchone()
+
+        conn.close()
+
+        # monta tabela com highlight por WR
+        trs = ""
+        for faixa, _sort, n, tp, sl, wr, avg_bounce, avg_dump, avg_pnl_tp, avg_pnl_sl in rows:
+            if wr is None:
+                wr_color = "#888"
+            elif wr >= 25:
+                wr_color = "#2a2"
+            elif wr >= 15:
+                wr_color = "#fa0"
+            else:
+                wr_color = "#a44"
+
+            bar_w = int((n / max(r[2] for r in rows)) * 120)
+            bar = f"<span style='display:inline-block;width:{bar_w}px;height:10px;background:#333;vertical-align:middle'></span>"
+
+            trs += f"""<tr>
+              <td><b>{faixa}</b></td>
+              <td>{bar} {n}</td>
+              <td style='color:#2a2'>{tp}</td>
+              <td style='color:#a44'>{sl}</td>
+              <td style='color:{wr_color}'><b>{wr}%</b></td>
+              <td>{avg_bounce if avg_bounce is not None else '—'}%</td>
+              <td>{avg_dump if avg_dump is not None else '—'}%</td>
+              <td style='color:#2a2'>{f"+{avg_pnl_tp:.0f}%" if avg_pnl_tp is not None else "—"}</td>
+              <td style='color:#a44'>{f"{avg_pnl_sl:.0f}%" if avg_pnl_sl is not None else "—"}</td>
+            </tr>"""
+
+        return f"""<!DOCTYPE html><html><head>
+        <meta charset='utf-8'><title>Elapsed Granular</title>
+        <meta http-equiv='refresh' content='60'>
+        <style>
+          body{{font-family:monospace;background:#111;color:#ccc;padding:20px}}
+          h2{{color:#fa0}} h3{{color:#fa0;margin-top:20px}}
+          table{{border-collapse:collapse;min-width:700px}}
+          th,td{{padding:6px 12px;border:1px solid #333;text-align:right}}
+          th{{background:#222;color:#fa0}} td:first-child{{text-align:left}}
+          .note{{color:#888;font-size:.9em;margin:4px 0 12px}}
+        </style></head><body>
+        <h2>Elapsed Granular — pente fino por minuto (id ≥ 338)</h2>
+        <p class='note'>
+          Total blockchain-verificado: <b>{total}</b> trades &nbsp;|&nbsp;
+          TPs: <b>{tps}</b> &nbsp;|&nbsp;
+          WR base: <b>{wr_base}%</b><br>
+          Verde = WR ≥ 25% &nbsp; Amarelo = 15-25% &nbsp; Vermelho = &lt;15%
+        </p>
+        <table>
+          <tr>
+            <th>Minuto pós-migração</th>
+            <th>n trades</th>
+            <th>TP</th>
+            <th>SL</th>
+            <th>WR%</th>
+            <th>avg bounce%</th>
+            <th>avg dump%</th>
+            <th>avg P&amp;L (TP)</th>
+            <th>avg P&amp;L (SL)</th>
+          </tr>
+          {trs}
+        </table>
+        <p class='note' style='margin-top:16px'>
+          Auto-refresh 60s. Verde = faixas a manter. Vermelho = candidatas a bloquear com BOUNCE_TIME_MIN_SEC.<br>
+          avg bounce% = bounce médio dos trades nessa janela (TP e SL juntos).<br>
+          avg dump% = queda média da migração até o fundo nesses trades.
+        </p>
+        </body></html>"""
+    except Exception:
+        return f"<pre style='color:red'>{traceback.format_exc()}</pre>", 500
+
+
+@app.route("/analise/simulacao-300s")
+def analise_simulacao_300s():
+    """
+    Retroactive simulation: e se tivéssemos esperado 5min antes de comprar?
+    Para cada trade id>=338 com elapsed<300s, busca token_ticks ao redor do
+    t=300s e simula: o sinal ainda dispararia? TP ou SL?
+    """
+    import psycopg2, traceback
+    from db import DATABASE_URL
+    from datetime import timezone
+
+    SL_PCT      = 0.25   # -25%
+    TP_PCT      = 0.75   # +75% (proxy trailing)
+    BOUNCE_MIN  = 0.55
+    MIN_SEC     = 300
+    TICK_WINDOW = 90     # segundos de tolerância para achar tick em t=300s
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor()
+
+        # 1. Todos os trades id>=338, elapsed<300s, blockchain-verificados
+        cur.execute("""
+            SELECT
+                t.id,
+                t.mint,
+                t.status                         AS real_status,
+                t.pnl_pct_real                   AS real_pnl,
+                bs.elapsed_sec,
+                bs.mc_min                        AS bs_mc_min,
+                bs.mc_at_signal,
+                bs.bounce_pct                    AS bs_bounce_pct,
+                bs.drop_from_mig,
+                m.mc_migration,
+                m.ts_migration,
+                m.token_nome
+            FROM trades t
+            JOIN bounce_signals bs ON bs.mint = t.mint
+                AND bs.ts_signal BETWEEN t.created_at - INTERVAL '5 min'
+                                     AND t.created_at + INTERVAL '30 min'
+            JOIN migrations m ON m.mint = t.mint
+            WHERE t.exit_type IS NOT NULL
+              AND t.status IN ('tp','sl')
+              AND t.id >= 338
+              AND bs.elapsed_sec < 300
+            ORDER BY t.id
+        """)
+        trades = cur.fetchall()
+
+        results = []
+
+        for (tid, mint, real_status, real_pnl, elapsed_sec,
+             bs_mc_min, mc_at_signal, bs_bounce_pct, drop_from_mig,
+             mc_migration, ts_mig, token_nome) in trades:
+
+            if ts_mig is None or mc_migration is None or mc_migration <= 0:
+                results.append((tid, token_nome, elapsed_sec, real_status, real_pnl,
+                                 None, None, None, None, 'sem_dados_mig'))
+                continue
+
+            # ts em UTC para aritmética
+            ts_mig_utc = ts_mig.replace(tzinfo=timezone.utc) if ts_mig.tzinfo is None else ts_mig
+            t300 = ts_mig_utc.timestamp() + MIN_SEC  # unix epoch do t=5min
+
+            # 2. mc_min nos primeiros 300s
+            from datetime import datetime
+            t300_dt = datetime.fromtimestamp(t300, tz=timezone.utc)
+
+            cur.execute("""
+                SELECT MIN(COALESCE(mc_low, mc))
+                FROM token_ticks
+                WHERE mint = %s
+                  AND tick_ts >= %s AND tick_ts <= %s
+            """, (mint, ts_mig_utc, t300_dt))
+            row = cur.fetchone()
+            tick_mc_min = row[0] if row and row[0] else None
+            mc_min_300s = min(bs_mc_min or 0, tick_mc_min or float('inf'))
+            if mc_min_300s <= 0 or mc_min_300s == float('inf'):
+                mc_min_300s = bs_mc_min
+
+            # 3. mc em t=300s — tick mais próximo numa janela de ±TICK_WINDOW segundos
+            t300_lo = datetime.fromtimestamp(t300 - TICK_WINDOW, tz=timezone.utc)
+            t300_hi = datetime.fromtimestamp(t300 + TICK_WINDOW, tz=timezone.utc)
+
+            cur.execute("""
+                SELECT mc, ABS(EXTRACT(EPOCH FROM (tick_ts - %s))) AS diff
+                FROM token_ticks
+                WHERE mint = %s AND tick_ts BETWEEN %s AND %s
+                ORDER BY diff
+                LIMIT 1
+            """, (t300_dt, mint, t300_lo, t300_hi))
+            row = cur.fetchone()
+
+            if row is None or row[0] is None:
+                results.append((tid, token_nome, elapsed_sec, real_status, real_pnl,
+                                 None, None, None, None, 'sem_tick_300s'))
+                continue
+
+            mc_300s = float(row[0])
+
+            # 4. Verificar se o sinal ainda dispararia em t=300s
+            if mc_min_300s <= 0:
+                results.append((tid, token_nome, elapsed_sec, real_status, real_pnl,
+                                 round(mc_300s), None, None, None, 'mc_min_zero'))
+                continue
+
+            bounce_300s   = (mc_300s - mc_min_300s) / mc_min_300s
+            entry_ratio   = mc_300s / mc_migration
+
+            fired = (
+                bounce_300s   >= BOUNCE_MIN and
+                entry_ratio   <  1.0 and          # A.8: abaixo da migração
+                not (0.50 <= entry_ratio <= 0.65)  # A.3: dead zone
+            )
+
+            if not fired:
+                reason = (
+                    f'bounce {bounce_300s*100:.0f}% < {BOUNCE_MIN*100:.0f}%' if bounce_300s < BOUNCE_MIN
+                    else f'entry_ratio {entry_ratio:.2f} (dead zone ou acima mig)'
+                )
+                results.append((tid, token_nome, elapsed_sec, real_status, real_pnl,
+                                 round(mc_300s), round(bounce_300s*100), round(entry_ratio*100), None,
+                                 f'nao_dispararia: {reason}'))
+                continue
+
+            # 5. Simular TP/SL com ticks APÓS t=300s
+            sl_floor = mc_300s * (1 - SL_PCT)
+            tp_ceil  = mc_300s * (1 + TP_PCT)
+
+            cur.execute("""
+                SELECT mc_low, mc_high, mc, tick_ts
+                FROM token_ticks
+                WHERE mint = %s AND tick_ts > %s
+                ORDER BY tick_ts
+            """, (mint, t300_dt))
+            ticks = cur.fetchall()
+
+            sim_status = 'sem_saida'
+            sim_pnl    = None
+
+            for (mc_low, mc_high, mc_close, tick_ts) in ticks:
+                lo = float(mc_low   or mc_close or 0)
+                hi = float(mc_high  or mc_close or 0)
+                cl = float(mc_close or 0)
+
+                # SL checa mc_low (kline) ou close (trenches)
+                if lo > 0 and lo <= sl_floor:
+                    sim_status = 'sl'
+                    sim_pnl    = round((-SL_PCT) * 100, 1)
+                    break
+                if cl > 0 and cl <= sl_floor:
+                    sim_status = 'sl'
+                    sim_pnl    = round((cl / mc_300s - 1) * 100, 1)
+                    break
+                # TP checa mc_high
+                if hi > 0 and hi >= tp_ceil:
+                    sim_status = 'tp'
+                    sim_pnl    = round(TP_PCT * 100, 1)
+                    break
+                if cl > 0 and cl >= tp_ceil:
+                    sim_status = 'tp'
+                    sim_pnl    = round((cl / mc_300s - 1) * 100, 1)
+                    break
+
+            results.append((tid, token_nome, elapsed_sec, real_status, real_pnl,
+                             round(mc_300s), round(bounce_300s*100), round(entry_ratio*100),
+                             sim_pnl, sim_status))
+
+        conn.close()
+
+        # ── Estatísticas ──
+        fired        = [r for r in results if r[9] not in ('sem_tick_300s','sem_dados_mig','mc_min_zero') and not str(r[9]).startswith('nao_dispararia')]
+        nao_dispara  = [r for r in results if str(r[9]).startswith('nao_dispararia')]
+        sem_tick     = [r for r in results if r[9] in ('sem_tick_300s','sem_dados_mig','mc_min_zero')]
+        sim_tp       = [r for r in fired if r[9]=='tp']
+        sim_sl       = [r for r in fired if r[9]=='sl']
+        sim_sem      = [r for r in fired if r[9]=='sem_saida']
+
+        total_early  = len(results)
+        wr_sim       = round(len(sim_tp)/len(fired)*100,1) if fired else 0
+
+        # ── Tabela HTML ──
+        def row_html(r):
+            tid, nome, elapsed, real_st, real_pnl, mc300, bounce300, er300, sim_pnl, sim_st = r
+            real_color = '#2a2' if real_st=='tp' else '#a44'
+            if str(sim_st).startswith('nao_dispararia'):
+                sim_color, sim_label = '#888', '⛔ não dispararia'
+            elif sim_st == 'tp':
+                sim_color, sim_label = '#2a2', f'✅ TP +{sim_pnl:.0f}%'
+            elif sim_st == 'sl':
+                sim_color, sim_label = '#a44', f'❌ SL {sim_pnl:.0f}%'
+            elif sim_st == 'sem_saida':
+                sim_color, sim_label = '#fa0', '⏳ sem saída'
+            elif sim_st in ('sem_tick_300s','sem_dados_mig','mc_min_zero'):
+                sim_color, sim_label = '#555', '— sem tick'
+            else:
+                sim_color, sim_label = '#888', str(sim_st)[:30]
+
+            real_pnl_str = f"{real_pnl*100:+.0f}%" if real_pnl is not None else '—'
+            return (f"<tr>"
+                    f"<td>#{tid}</td>"
+                    f"<td>{nome or mint[:8]}</td>"
+                    f"<td>{elapsed}s ({elapsed//60}:{elapsed%60:02d})</td>"
+                    f"<td style='color:{real_color}'>{real_st.upper()} {real_pnl_str}</td>"
+                    f"<td>{f'${mc300:,}' if mc300 else '—'}</td>"
+                    f"<td>{f'{bounce300}%' if bounce300 is not None else '—'}</td>"
+                    f"<td>{f'{er300}%' if er300 is not None else '—'}</td>"
+                    f"<td style='color:{sim_color}'><b>{sim_label}</b></td>"
+                    f"</tr>")
+
+        trs = "".join(row_html(r) for r in results)
+
+        return f"""<!DOCTYPE html><html><head>
+        <meta charset='utf-8'><title>Simulação 300s</title>
+        <style>
+          body{{font-family:monospace;background:#111;color:#ccc;padding:20px}}
+          h2,h3{{color:#fa0}} table{{border-collapse:collapse;min-width:900px}}
+          th,td{{padding:5px 10px;border:1px solid #333;text-align:right}}
+          th{{background:#222;color:#fa0}} td:first-child,td:nth-child(2){{text-align:left}}
+          .box{{display:inline-block;padding:10px 20px;margin:8px;border:1px solid #444;border-radius:4px}}
+          .note{{color:#888;font-size:.9em;margin:4px 0 12px}}
+        </style></head><body>
+        <h2>Simulação: e se tivéssemos esperado 5min? (id ≥ 338, elapsed &lt; 5min)</h2>
+        <p class='note'>
+          {total_early} trades entrariam em standby |
+          {len(sem_tick)} sem tick em t=5min (saem da análise) |
+          {len(nao_dispara)} não disparariam (bounce colapsou ou dead zone) |
+          <b>{len(fired)} disparariam em t=5min</b>
+        </p>
+
+        <div>
+          <span class='box'>Disparariam<br><b>{len(fired)}</b></span>
+          <span class='box' style='color:#2a2'>TP simulado<br><b>{len(sim_tp)}</b></span>
+          <span class='box' style='color:#a44'>SL simulado<br><b>{len(sim_sl)}</b></span>
+          <span class='box' style='color:#fa0'>Sem saída<br><b>{len(sim_sem)}</b></span>
+          <span class='box'>WR simulado<br><b>{wr_sim}%</b></span>
+          <span class='box' style='color:#fa0'>WR real (mesmos trades)<br><b>{round(sum(1 for r in fired if r[3]=='tp')/len(fired)*100,1) if fired else 0}%</b></span>
+        </div>
+
+        <h3>Detalhe por trade</h3>
+        <table>
+          <tr>
+            <th>#id</th><th>Token</th><th>Elapsed original</th>
+            <th>Resultado real</th>
+            <th>MC em t=5min</th><th>Bounce em t=5min</th><th>Entry ratio</th>
+            <th>Simulação t=5min</th>
+          </tr>
+          {trs}
+        </table>
+        <p class='note' style='margin-top:12px'>
+          Bounce em t=5min = (mc_5min − mc_min_5min) / mc_min_5min.
+          Entry ratio = mc_5min / mc_migration.<br>
+          TP = +75% | SL = −25%. Tick window ±90s ao redor de t=5min.
+          Sem saída = ticks disponíveis mas nem TP nem SL atingidos na janela de 60min.
+        </p>
+        </body></html>"""
+
+    except Exception:
+        return f"<pre style='color:red'>{traceback.format_exc()}</pre>", 500
+
+
+@app.route("/analise/simulacao-er")
+def analise_simulacao_er():
+    """
+    Variante da simulação 300s sem o filtro A.8 (entry_ratio < 1.0).
+    Mostra WR simulado por faixa de entry_ratio para encontrar o teto ideal.
+    """
+    import psycopg2, traceback
+    from db import DATABASE_URL
+    from datetime import datetime, timezone
+
+    SL_PCT     = 0.25
+    TP_PCT     = 0.75
+    BOUNCE_MIN = 0.55
+    MIN_SEC    = 300
+    TICK_WIN   = 90
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor()
+
+        cur.execute("""
+            SELECT t.id, t.mint, t.status, t.pnl_pct_real,
+                   bs.elapsed_sec, bs.mc_min,
+                   m.mc_migration, m.ts_migration, m.token_nome
+            FROM trades t
+            JOIN bounce_signals bs ON bs.mint = t.mint
+                AND bs.ts_signal BETWEEN t.created_at - INTERVAL '5 min'
+                                     AND t.created_at + INTERVAL '30 min'
+            JOIN migrations m ON m.mint = t.mint
+            WHERE t.exit_type IS NOT NULL AND t.status IN ('tp','sl')
+              AND t.id >= 338 AND bs.elapsed_sec < 300
+            ORDER BY t.id
+        """)
+        trades = cur.fetchall()
+
+        rows = []  # (id, nome, elapsed, real_status, real_pnl, er_bucket, sim_status, sim_pnl)
+
+        for (tid, mint, real_status, real_pnl, elapsed_sec,
+             bs_mc_min, mc_migration, ts_mig, token_nome) in trades:
+
+            if not ts_mig or not mc_migration or mc_migration <= 0:
+                continue
+
+            ts_mig_utc = ts_mig.replace(tzinfo=timezone.utc) if ts_mig.tzinfo is None else ts_mig
+            t300       = ts_mig_utc.timestamp() + MIN_SEC
+            t300_dt    = datetime.fromtimestamp(t300, tz=timezone.utc)
+
+            # mc_min nos primeiros 300s
+            cur.execute("""
+                SELECT MIN(COALESCE(mc_low, mc)) FROM token_ticks
+                WHERE mint=%s AND tick_ts BETWEEN %s AND %s
+            """, (mint, ts_mig_utc, t300_dt))
+            r = cur.fetchone()
+            mc_min_300s = min(bs_mc_min or 0, r[0] or float('inf'))
+            if mc_min_300s <= 0 or mc_min_300s == float('inf'):
+                mc_min_300s = bs_mc_min or 0
+
+            # mc em t=300s
+            cur.execute("""
+                SELECT mc FROM token_ticks
+                WHERE mint=%s AND tick_ts BETWEEN %s AND %s
+                ORDER BY ABS(EXTRACT(EPOCH FROM (tick_ts-%s)))
+                LIMIT 1
+            """, (mint,
+                  datetime.fromtimestamp(t300 - TICK_WIN, tz=timezone.utc),
+                  datetime.fromtimestamp(t300 + TICK_WIN, tz=timezone.utc),
+                  t300_dt))
+            r = cur.fetchone()
+            if not r or not r[0]:
+                continue
+
+            mc_300s = float(r[0])
+            if mc_min_300s <= 0:
+                continue
+
+            bounce_300s = (mc_300s - mc_min_300s) / mc_min_300s
+            entry_ratio = mc_300s / mc_migration
+
+            # filtros mantidos: bounce mínimo + A.3 dead zone (abaixo da migração)
+            # A.8 (entry_ratio < 1.0) REMOVIDO — aqui está o estudo
+            if bounce_300s < BOUNCE_MIN:
+                continue
+            if 0.50 <= entry_ratio <= 0.65:
+                continue
+
+            # bucket de entry_ratio
+            if   entry_ratio < 1.00: er_bucket = '<100%'
+            elif entry_ratio < 1.10: er_bucket = '100-110%'
+            elif entry_ratio < 1.20: er_bucket = '110-120%'
+            elif entry_ratio < 1.50: er_bucket = '120-150%'
+            elif entry_ratio < 2.00: er_bucket = '150-200%'
+            else:                    er_bucket = '>200%'
+
+            # simular TP/SL com ticks após t=300s
+            sl_floor = mc_300s * (1 - SL_PCT)
+            tp_ceil  = mc_300s * (1 + TP_PCT)
+
+            cur.execute("""
+                SELECT mc_low, mc_high, mc FROM token_ticks
+                WHERE mint=%s AND tick_ts > %s ORDER BY tick_ts
+            """, (mint, t300_dt))
+            ticks = cur.fetchall()
+
+            sim_status = 'sem_saida'
+            sim_pnl    = None
+            for (mc_low, mc_high, mc_close) in ticks:
+                lo = float(mc_low   or mc_close or 0)
+                hi = float(mc_high  or mc_close or 0)
+                cl = float(mc_close or 0)
+                if lo > 0 and lo <= sl_floor:
+                    sim_status = 'sl'; sim_pnl = round(-SL_PCT*100, 1); break
+                if cl > 0 and cl <= sl_floor:
+                    sim_status = 'sl'; sim_pnl = round((cl/mc_300s-1)*100, 1); break
+                if hi > 0 and hi >= tp_ceil:
+                    sim_status = 'tp'; sim_pnl = round(TP_PCT*100, 1); break
+                if cl > 0 and cl >= tp_ceil:
+                    sim_status = 'tp'; sim_pnl = round((cl/mc_300s-1)*100, 1); break
+
+            rows.append((tid, token_nome or mint[:8], elapsed_sec,
+                         real_status, real_pnl, er_bucket,
+                         round(entry_ratio*100), round(bounce_300s*100),
+                         round(mc_300s), sim_status, sim_pnl))
+
+        conn.close()
+
+        # ── Resumo por bucket ──
+        from collections import defaultdict
+        ER_ORDER = ['<100%','100-110%','110-120%','120-150%','150-200%','>200%']
+        buckets  = defaultdict(list)
+        for r in rows:
+            buckets[r[5]].append(r)
+
+        summary_rows = ""
+        for bkt in ER_ORDER:
+            group = buckets.get(bkt, [])
+            if not group: continue
+            n      = len(group)
+            tp_sim = sum(1 for r in group if r[9]=='tp')
+            sl_sim = sum(1 for r in group if r[9]=='sl')
+            no_ex  = sum(1 for r in group if r[9]=='sem_saida')
+            wr_sim = round(tp_sim/n*100,1) if n else 0
+            tp_rl  = sum(1 for r in group if r[3]=='tp')
+            wr_rl  = round(tp_rl/n*100,1) if n else 0
+            avg_er = round(sum(r[6] for r in group)/n)
+            avg_b  = round(sum(r[7] for r in group)/n)
+            color  = '#2a2' if wr_sim >= 25 else ('#fa0' if wr_sim >= 15 else '#a44')
+            summary_rows += f"""<tr>
+              <td><b>{bkt}</b></td>
+              <td>{n}</td>
+              <td style='color:{color}'><b>{wr_sim}%</b></td>
+              <td>{tp_sim}</td><td>{sl_sim}</td><td>{no_ex}</td>
+              <td style='color:#888'>{wr_rl}%</td>
+              <td>{avg_er}%</td><td>{avg_b}%</td>
+            </tr>"""
+
+        total_fired = len(rows)
+        total_tp    = sum(1 for r in rows if r[9]=='tp')
+        wr_total    = round(total_tp/total_fired*100,1) if total_fired else 0
+
+        # ── Tabela detalhada ──
+        detail_rows = ""
+        for r in sorted(rows, key=lambda x: (x[5], x[0])):
+            tid, nome, elapsed, real_st, real_pnl, er_bkt, er_pct, b_pct, mc300, sim_st, sim_pnl = r
+            rc = '#2a2' if real_st=='tp' else '#a44'
+            if sim_st=='tp':   sc,sl = '#2a2', f'✅ TP +{sim_pnl:.0f}%'
+            elif sim_st=='sl': sc,sl = '#a44', f'❌ SL {sim_pnl:.0f}%'
+            else:              sc,sl = '#fa0', '⏳ sem saída'
+            rpnl = f"{real_pnl*100:+.0f}%" if real_pnl is not None else '—'
+            detail_rows += (f"<tr><td>#{tid}</td><td>{nome}</td>"
+                f"<td>{elapsed}s</td>"
+                f"<td style='color:{rc}'>{real_st.upper()} {rpnl}</td>"
+                f"<td>{er_pct}%</td><td>{b_pct}%</td><td>${mc300:,}</td>"
+                f"<td style='color:{sc}'><b>{sl}</b></td></tr>")
+
+        return f"""<!DOCTYPE html><html><head>
+        <meta charset='utf-8'><title>Simulação ER Study</title>
+        <style>
+          body{{font-family:monospace;background:#111;color:#ccc;padding:20px}}
+          h2,h3{{color:#fa0}} table{{border-collapse:collapse;min-width:700px;margin-bottom:24px}}
+          th,td{{padding:5px 10px;border:1px solid #333;text-align:right}}
+          th{{background:#222;color:#fa0}} td:first-child,td:nth-child(2){{text-align:left}}
+          .note{{color:#888;font-size:.9em;margin:4px 0 12px}}
+        </style></head><body>
+        <h2>Estudo de entry_ratio — standby 5min sem A.8</h2>
+        <p class='note'>
+          Trades id≥338, elapsed&lt;5min. A.8 removido — tokens acima da migração permitidos.<br>
+          Mantidos: bounce≥55%, A.3 dead zone. <b>{total_fired} disparariam</b> | WR simulado total: <b>{wr_total}%</b>
+        </p>
+
+        <h3>Resumo por faixa de entry_ratio em t=5min</h3>
+        <table>
+          <tr><th>entry_ratio</th><th>n</th><th>WR sim</th>
+              <th>TP sim</th><th>SL sim</th><th>sem saída</th>
+              <th>WR real</th><th>avg ER</th><th>avg bounce</th></tr>
+          {summary_rows}
+        </table>
+        <p class='note'>
+          WR sim = resultado simulado comprando em mc_5min.<br>
+          WR real = resultado real desses mesmos trades (comprados na hora certa, 0-5min).<br>
+          Se WR sim &lt; WR real → comprar mais cedo era melhor.<br>
+          Se WR sim &gt; WR real → esperar 5min melhora o resultado.
+        </p>
+
+        <h3>Detalhe por trade (ordenado por bucket)</h3>
+        <table>
+          <tr><th>#id</th><th>Token</th><th>Elapsed</th><th>Real</th>
+              <th>Entry ratio</th><th>Bounce t=5min</th><th>MC t=5min</th><th>Simulação</th></tr>
+          {detail_rows}
+        </table>
+        </body></html>"""
+
+    except Exception:
+        return f"<pre style='color:red'>{traceback.format_exc()}</pre>", 500
+
+
+@app.route("/analise/smart-wallet")
+def analise_smart_wallet():
+    """
+    Analisa carteira smart money cruzando com TODOS os nossos mints monitorados.
+    Métrica correta: performance DO TOKEN (pct_gain, recovery), não nosso trade.
+    """
+    import psycopg2, traceback, time
+    from db import DATABASE_URL
+    from flask import request, Response, stream_with_context
+    import helius_rpc, requests as req_lib
+
+    WALLET = request.args.get("wallet", "VJSDW6S74YXR4rRR9P4xwhMvLZJQMhrUb8XMFirUsy1")
+    PAD    = " " * 2048
+
+    def generate():
+        yield (f"<html><head><meta charset='utf-8'><title>Smart Wallet</title>"
+               f"<style>body{{font-family:monospace;background:#111;color:#ccc;padding:20px}}"
+               f"h2,h3{{color:#fa0}} .note{{color:#888;font-size:.9em}}"
+               f"table{{border-collapse:collapse;min-width:800px;margin-top:12px}}"
+               f"th,td{{padding:5px 10px;border:1px solid #333;text-align:right}}"
+               f"th{{background:#222;color:#fa0}} td:first-child,td:nth-child(2){{text-align:left}}"
+               f"</style></head><body>"
+               f"<h2>Smart Wallet — Performance do Token</h2>"
+               f"<p class='note'>Carteira: <b>{WALLET}</b><br>"
+               f"Métrica: pct_gain e recovery do token (não resultado do nosso trade)</p>{PAD}")
+
+        rpc_url = helius_rpc.HELIUS_RPC_URL
+        if not rpc_url:
+            yield "<p style='color:#a44'>HELIUS_RPC_URL não configurado.</p></body></html>"
+            return
+
+        # ── 1. Carregar TODOS os mints da migrations (não só os que tradamos) ──
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            cur  = conn.cursor()
+            cur.execute("""
+                SELECT m.mint, m.token_nome, m.mc_migration, m.mc_peak, m.mc_bottom,
+                       m.pct_gain, m.pct_drop, m.recovery, m.time_to_peak, m.time_to_bottom,
+                       m.smart_wallets, m.renowned_wallets, m.ts_migration,
+                       t.id as trade_id, t.status as trade_status, t.pnl_pct_real
+                FROM migrations m
+                LEFT JOIN bounce_signals bs ON bs.mint = m.mint
+                LEFT JOIN trades t ON t.mint = m.mint
+                    AND t.exit_type IS NOT NULL AND t.status IN ('tp','sl') AND t.id >= 338
+                    AND bs.ts_signal BETWEEN t.created_at - INTERVAL '5 min'
+                                         AND t.created_at + INTERVAL '30 min'
+                WHERE m.ts_migration >= '2026-05-06'
+                  AND m.mc_peak IS NOT NULL
+                ORDER BY m.ts_migration DESC
+            """)
+            all_migs = cur.fetchall()
+            conn.close()
+        except Exception as e:
+            yield f"<p style='color:#a44'>DB error: {e}</p></body></html>"
+            return
+
+        unique_mints = list({r[0] for r in all_migs})
+        yield f"<p>Verificando <b>{len(unique_mints)}</b> mints monitorados contra a carteira...</p>{PAD}"
+
+        # ── 2. Para cada mint, verificar se wallet tem token account ──
+        wallet_mints = set()
+        processed    = 0
+
+        for mint in unique_mints:
+            processed += 1
+            if processed % 20 == 0:
+                yield f"<p class='note'>{processed}/{len(unique_mints)} verificados... ({len(wallet_mints)} encontrados)</p>{PAD}"
+
+            body = {"jsonrpc": "2.0", "id": 1,
+                    "method": "getTokenAccountsByOwner",
+                    "params": [WALLET, {"mint": mint}, {"encoding": "jsonParsed"}]}
+            try:
+                resp  = req_lib.post(rpc_url, json=body, timeout=10)
+                value = resp.json().get("result", {}).get("value", [])
+                if value:
+                    wallet_mints.add(mint)
+            except Exception:
+                pass
+            time.sleep(0.05)
+
+        yield f"<p><b>{len(wallet_mints)}</b> tokens onde a wallet esteve presente.</p>{PAD}"
+
+        # ── 3. Separar com/sem wallet — métrica = token performance ──
+        # deduplica por mint (pode ter múltiplos trades no mesmo mint)
+        seen = set()
+        with_wallet    = []
+        without_wallet = []
+
+        for row in all_migs:
+            mint = row[0]
+            if mint in seen:
+                continue
+            seen.add(mint)
+            if mint in wallet_mints:
+                with_wallet.append(row)
+            else:
+                without_wallet.append(row)
+
+        def token_stats(group):
+            n         = len(group)
+            n_rec     = sum(1 for r in group if r[7] is True)   # recovery
+            avg_gain  = sum((r[5] or 0) for r in group) / n if n else 0
+            avg_drop  = sum((r[6] or 0) for r in group) / n if n else 0
+            avg_peak_t = sum((r[8] or 0) for r in group) / n if n else 0
+            return n, n_rec, avg_gain, avg_drop, avg_peak_t
+
+        n_w,  nr_w,  ag_w,  ad_w,  ap_w  = token_stats(with_wallet)
+        n_wo, nr_wo, ag_wo, ad_wo, ap_wo = token_stats(without_wallet)
+
+        rec_w  = round(nr_w  / n_w  * 100, 1) if n_w  else 0
+        rec_wo = round(nr_wo / n_wo * 100, 1) if n_wo else 0
+        delta_rec  = round(rec_w - rec_wo, 1)
+        delta_gain = round((ag_w - ag_wo) * 100, 1)
+        color = '#2a2' if delta_rec >= 10 else ('#fa0' if delta_rec >= 0 else '#a44')
+
+        yield f"""
+        <h3>Performance do token: com vs sem a smart wallet</h3>
+        <table>
+          <tr><th></th><th>n tokens</th><th>Recovery rate</th><th>avg pct_gain</th><th>avg dump%</th><th>avg time_to_peak</th></tr>
+          <tr><td><b>Com smart wallet</b></td>
+              <td>{n_w}</td>
+              <td style='color:{color}'><b>{rec_w}%</b></td>
+              <td style='color:#2a2'>+{ag_w*100:.0f}%</td>
+              <td>-{ad_w*100:.0f}%</td>
+              <td>{ap_w:.1f}min</td></tr>
+          <tr><td><b>Sem smart wallet</b></td>
+              <td>{n_wo}</td>
+              <td>{rec_wo}%</td>
+              <td>+{ag_wo*100:.0f}%</td>
+              <td>-{ad_wo*100:.0f}%</td>
+              <td>{ap_wo:.1f}min</td></tr>
+        </table>
+        <p class='note'>
+          Delta recovery: <span style='color:{color}'><b>{delta_rec:+.1f}pp</b></span> &nbsp;|&nbsp;
+          Delta avg gain: <span style='color:#fa0'><b>{delta_gain:+.0f}pp</b></span><br>
+          Recovery = mc_1h &gt; mc_bottom × 1.3. Gate para filtro: n≥10 e +15pp recovery.
+        </p>{PAD}
+        """
+
+        # ── 4. Tabela detalhada dos tokens com wallet presente ──
+        if with_wallet:
+            trs = ""
+            for (mint, nome, mc_mig, mc_peak, mc_bot, pct_gain, pct_drop, recovery,
+                 ttp, ttb, smart_cnt, renowned, ts_mig,
+                 trade_id, trade_status, trade_pnl) in sorted(with_wallet, key=lambda x: -(x[5] or 0)):
+
+                rec_str   = '✅' if recovery is True else ('❌' if recovery is False else '—')
+                gain_str  = f"+{pct_gain*100:.0f}%" if pct_gain else '—'
+                drop_str  = f"-{pct_drop*100:.0f}%" if pct_drop else '—'
+                gain_col  = '#2a2' if pct_gain and pct_gain > 0.5 else '#fa0' if pct_gain else '#888'
+
+                if trade_id:
+                    tc = '#2a2' if trade_status == 'tp' else '#a44'
+                    t_str = f"<span style='color:{tc}'>#{trade_id} {trade_status.upper()} {trade_pnl*100:+.0f}%</span>" if trade_pnl else f"<span style='color:{tc}'>#{trade_id}</span>"
+                else:
+                    t_str = "<span style='color:#555'>não tradado</span>"
+
+                trs += (f"<tr><td>{nome or mint[:8]}</td>"
+                        f"<td style='color:{gain_col}'>{gain_str}</td>"
+                        f"<td>{drop_str}</td>"
+                        f"<td>{rec_str}</td>"
+                        f"<td>{f'{ttp:.0f}min' if ttp else '—'}</td>"
+                        f"<td>{smart_cnt}</td><td>{renowned}</td>"
+                        f"<td>{t_str}</td></tr>")
+
+            yield f"""
+            <h3>Tokens onde a smart wallet esteve presente ({n_w})</h3>
+            <p class='note'>pct_gain = (mc_peak − mc_migration) / mc_migration. Nosso trade é separado — o token pode ter ido 500% mesmo que tenhamos SL.</p>
+            <table>
+              <tr><th>Token</th><th>pct_gain</th><th>dump%</th><th>Recovery</th>
+                  <th>time_to_peak</th><th>smart</th><th>KOL</th><th>Nosso trade</th></tr>
+              {trs}
+            </table>{PAD}
+            """
+
+        yield "<p style='color:#888;margin-top:20px'>Análise concluída.</p></body></html>"
+
+    return Response(stream_with_context(generate()), content_type="text/html")
+
+
+@app.route("/analise/tp-vs-sl-recente")
+def analise_tp_vs_sl_recente():
+    """Mesmo que tp-vs-sl mas filtrando apenas trades id >= 338 (filtros atuais ativos)."""
+    import psycopg2, traceback
+    from db import DATABASE_URL
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor()
+
+        JOIN = """
+            FROM trades t
+            JOIN bounce_signals bs ON bs.mint = t.mint
+                AND bs.ts_signal BETWEEN t.created_at - INTERVAL '5 min' AND t.created_at + INTERVAL '30 min'
+            JOIN migrations m ON m.mint = t.mint
+            WHERE t.exit_type IS NOT NULL AND t.status IN ('tp','sl')
+              AND t.id >= 338
+        """
+
+        sections = []
+
+        def section(title, headers, rows, note=""):
+            ths = "".join(f"<th>{h}</th>" for h in headers)
+            trs = ""
+            for r in rows:
+                tds = "".join(f"<td>{v if v is not None else '—'}</td>" for v in r)
+                trs += f"<tr>{tds}</tr>"
+            n = f"<p class='note'>{note}</p>" if note else ""
+            return f"<h3>{title}</h3><table><tr>{ths}</tr>{trs}</table>{n}"
+
+        # stats base
+        cur.execute(f"""
+            SELECT COUNT(*),
+                   SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END),
+                   ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1)
+            {JOIN}
+        """)
+        base = cur.fetchone()
+        total, tps, wr_base = base
+
+        # 1. bounce_pct por faixa
+        cur.execute(f"""
+            SELECT
+                CASE
+                    WHEN bs.bounce_pct < 0.70  THEN '55-70%'
+                    WHEN bs.bounce_pct < 1.00  THEN '70-100%'
+                    WHEN bs.bounce_pct < 1.50  THEN '100-150%'
+                    WHEN bs.bounce_pct < 2.50  THEN '150-250%'
+                    ELSE '250%+'
+                END as faixa,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1) as wr
+            {JOIN}
+            GROUP BY 1 ORDER BY MIN(bs.bounce_pct)
+        """)
+        sections.append(section("1. WR por faixa de bounce_pct",
+            ["bounce_pct", "n", "TP", "WR%"], cur.fetchall(),
+            f"Filtro ativo: BOUNCE_MIN_PCT=0.55 — sem bounces abaixo de 55%"))
+
+        # 2. elapsed (tempo migração→sinal)
+        cur.execute(f"""
+            SELECT
+                CASE
+                    WHEN bs.elapsed_sec < 300  THEN '0-5min'
+                    WHEN bs.elapsed_sec < 600  THEN '5-10min'
+                    WHEN bs.elapsed_sec < 900  THEN '10-15min'
+                    WHEN bs.elapsed_sec < 1200 THEN '15-20min'
+                    ELSE '>20min'
+                END as faixa,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1) as wr
+            {JOIN}
+            GROUP BY 1 ORDER BY MIN(bs.elapsed_sec)
+        """)
+        sections.append(section("2. WR por tempo migração→sinal (elapsed)",
+            ["elapsed", "n", "TP", "WR%"], cur.fetchall(),
+            "Análise geral: 10-20min → WR 22%. Confirma aqui?"))
+
+        # 3. smart wallets
+        cur.execute(f"""
+            SELECT
+                CASE
+                    WHEN m.smart_wallets >= 10 THEN '>=10'
+                    WHEN m.smart_wallets >= 5  THEN '5-9'
+                    WHEN m.smart_wallets >= 3  THEN '3-4'
+                    ELSE '1-2'
+                END as smart,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1) as wr
+            {JOIN}
+            GROUP BY 1 ORDER BY MIN(m.smart_wallets) DESC
+        """)
+        sections.append(section("3. WR por smart_wallets",
+            ["smart_wallets", "n", "TP", "WR%"], cur.fetchall(),
+            "Filtro ativo: smart>=3"))
+
+        # 4. drop_from_mig
+        cur.execute(f"""
+            SELECT
+                CASE
+                    WHEN bs.drop_from_mig >= 0.80 THEN '>=80% dump'
+                    WHEN bs.drop_from_mig >= 0.70 THEN '70-80%'
+                    WHEN bs.drop_from_mig >= 0.60 THEN '60-70%'
+                    WHEN bs.drop_from_mig >= 0.50 THEN '50-60%'
+                    ELSE '<50%'
+                END as faixa,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1) as wr
+            {JOIN}
+            GROUP BY 1 ORDER BY MIN(bs.drop_from_mig) DESC
+        """)
+        sections.append(section("4. WR por profundidade do dump (drop_from_mig)",
+            ["dump depth", "n", "TP", "WR%"], cur.fetchall()))
+
+        # 5. mc_migration
+        cur.execute(f"""
+            SELECT
+                CASE
+                    WHEN m.mc_migration >= 150000 THEN '>$150k'
+                    WHEN m.mc_migration >= 100000 THEN '$100-150k'
+                    WHEN m.mc_migration >= 60000  THEN '$60-100k'
+                    WHEN m.mc_migration >= 30000  THEN '$30-60k'
+                    ELSE '<$30k'
+                END as faixa,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1) as wr
+            {JOIN}
+            GROUP BY 1 ORDER BY MIN(m.mc_migration) DESC
+        """)
+        sections.append(section("5. WR por MC de migração",
+            ["mc_migration", "n", "TP", "WR%"], cur.fetchall()))
+
+        # 6. renowned_wallets (KOLs)
+        cur.execute(f"""
+            SELECT
+                CASE
+                    WHEN m.renowned_wallets >= 3 THEN '>=3 KOLs'
+                    WHEN m.renowned_wallets >= 1 THEN '1-2 KOLs'
+                    ELSE '0 KOLs'
+                END as kols,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1) as wr
+            {JOIN}
+            GROUP BY 1 ORDER BY MIN(m.renowned_wallets) DESC
+        """)
+        sections.append(section("6. WR por KOL wallets (renowned)",
+            ["KOLs", "n", "TP", "WR%"], cur.fetchall()))
+
+        # 7. pnl dos TPs recentes
+        cur.execute("""
+            SELECT
+                ROUND((MIN(pnl_pct_real)*100)::numeric,0),
+                ROUND((PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY pnl_pct_real)*100)::numeric,0),
+                ROUND((PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY pnl_pct_real)*100)::numeric,0),
+                ROUND((AVG(pnl_pct_real)*100)::numeric,0),
+                ROUND((MAX(pnl_pct_real)*100)::numeric,0),
+                COUNT(*)
+            FROM trades WHERE exit_type IS NOT NULL AND status='tp' AND id >= 338
+        """)
+        sections.append(section("7. Distribuição de P&L nos TPs recentes",
+            ["min%", "p25%", "median%", "avg%", "max%", "n"], cur.fetchall()))
+
+        # 8. lista individual dos TPs
+        cur.execute(f"""
+            SELECT
+                t.id,
+                t.created_at::date,
+                m.token_nome,
+                ROUND((bs.bounce_pct*100)::numeric,0) as bounce,
+                ROUND((bs.drop_from_mig*100)::numeric,0) as dump,
+                bs.elapsed_sec/60 as elapsed_min,
+                m.smart_wallets,
+                m.renowned_wallets,
+                ROUND(m.mc_migration::numeric/1000,1) as mc_mig_k,
+                ROUND((t.pnl_pct_real*100)::numeric,0) as pnl
+            {JOIN}
+            AND t.status='tp'
+            ORDER BY t.pnl_pct_real DESC
+        """)
+        sections.append(section("8. TPs recentes — lista completa (maior P&L primeiro)",
+            ["id","data","token","bounce%","dump%","elapsed min","smart","KOL","mc_mig $k","pnl%"],
+            cur.fetchall()))
+
+        # 9. SLs recentes por elapsed (diagnóstico)
+        cur.execute(f"""
+            SELECT
+                CASE
+                    WHEN bs.elapsed_sec < 300  THEN '0-5min'
+                    WHEN bs.elapsed_sec < 600  THEN '5-10min'
+                    WHEN bs.elapsed_sec < 900  THEN '10-15min'
+                    WHEN bs.elapsed_sec < 1200 THEN '15-20min'
+                    ELSE '>20min'
+                END as faixa,
+                COUNT(*) as n,
+                ROUND((AVG(bs.bounce_pct)*100)::numeric,1) as avg_bounce,
+                ROUND((AVG(t.pnl_pct_real)*100)::numeric,1) as avg_pnl,
+                ROUND((AVG(bs.elapsed_sec)/60)::numeric,1) as avg_elapsed
+            {JOIN}
+            AND t.status='sl'
+            GROUP BY 1 ORDER BY MIN(bs.elapsed_sec)
+        """)
+        sections.append(section("9. SLs por elapsed — diagnóstico",
+            ["elapsed", "n SLs", "avg bounce%", "avg pnl%", "avg elapsed min"], cur.fetchall(),
+            "Onde estão concentrados os SLs? avg_pnl mostra quão fundo foi cada SL"))
+
+        conn.close()
+
+        body = "".join(sections)
+        return f"""<!DOCTYPE html><html><head>
+        <meta charset='utf-8'><title>TP vs SL Recente (id≥338)</title>
+        <style>
+          body{{font-family:monospace;background:#111;color:#ccc;padding:20px}}
+          h2{{color:#fa0}} h3{{color:#fa0;margin-top:28px}}
+          table{{border-collapse:collapse;margin-bottom:6px;min-width:500px}}
+          th,td{{padding:5px 10px;border:1px solid #333;text-align:right}}
+          th{{background:#222;color:#fa0}} td:first-child{{text-align:left}}
+          .note{{color:#888;font-size:.9em;margin:4px 0 16px}}
+        </style></head><body>
+        <h2>TP vs SL — Trades Recentes (id ≥ 338)</h2>
+        <p class='note'>Filtros ativos: BOUNCE_MIN_PCT=0.55, smart≥3, FILTER_PUMP_ONLY, A.2+A.3+A.5+A.6+A.7<br>
+        Total: <b>{total}</b> trades | TPs: <b>{tps}</b> | WR: <b>{wr_base}%</b> &nbsp;(compare com 13.4% histórico)</p>
+        {body}
+        </body></html>"""
+    except Exception:
+        return f"<pre style='color:red'>{traceback.format_exc()}</pre>", 500
+
+
+@app.route("/analise/wallet-signal")
+def analise_wallet_signal():
+    """
+    Analisa wallets_json de token_signals × migrations.recovery
+    para encontrar wallets com edge demonstrável.
+    """
+    import psycopg2, json, traceback
+    from db import DATABASE_URL
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor()
+
+        # cobertura básica
+        cur.execute("""
+            SELECT
+                COUNT(*) as total,
+                COUNT(wallets_json) as com_wallets,
+                COUNT(DISTINCT mint) as mints_unicos
+            FROM token_signals
+        """)
+        cov = cur.fetchone()
+
+        # wallets × recovery: qual wallet aparece mais em tokens recovery=TRUE?
+        cur.execute("""
+            SELECT
+                w->>'address' as wallet,
+                COUNT(*) as n_sinais,
+                SUM(CASE WHEN m.recovery = true  THEN 1 ELSE 0 END) as n_recovery,
+                SUM(CASE WHEN m.recovery = false THEN 1 ELSE 0 END) as n_no_recovery,
+                SUM(CASE WHEN m.recovery IS NULL  THEN 1 ELSE 0 END) as n_sem_dados
+            FROM token_signals ts
+            JOIN migrations m ON m.mint = ts.mint,
+            json_array_elements(ts.wallets_json::json) AS w
+            WHERE ts.wallets_json IS NOT NULL
+              AND ts.wallets_json != 'null'
+              AND ts.wallets_json != '[]'
+            GROUP BY 1
+            HAVING COUNT(*) >= 3
+            ORDER BY n_recovery DESC, n_sinais DESC
+            LIMIT 50
+        """)
+        wallet_rows = cur.fetchall()
+        conn.close()
+
+        # monta tabela
+        rows_html = ""
+        for wallet, n, nr, nn, ns in wallet_rows:
+            wr = f"{nr/n*100:.0f}%" if n else "—"
+            color = "#2a2" if n >= 5 and nr/n >= 0.5 else ("#fa0" if n >= 3 and nr/n >= 0.4 else "#888")
+            rows_html += f"""<tr>
+              <td style='font-family:monospace;font-size:.85em'>{wallet[:20]}…</td>
+              <td>{n}</td>
+              <td style='color:#2a2'>{nr}</td>
+              <td style='color:#a44'>{nn}</td>
+              <td>{ns}</td>
+              <td style='color:{color}'><b>{wr}</b></td>
+            </tr>"""
+
+        if not rows_html:
+            rows_html = "<tr><td colspan=6 style='color:#888'>Sem dados — wallets_json vazio ou sem cruzamento com migrations</td></tr>"
+
+        return f"""<!DOCTYPE html><html><head>
+        <meta charset='utf-8'><title>Wallet Signal Analysis</title>
+        <style>
+          body {{ font-family:monospace; background:#111; color:#ccc; padding:20px; }}
+          h2 {{ color:#fa0; }} h3 {{ color:#fa0; }}
+          table {{ border-collapse:collapse; width:100%; }}
+          th,td {{ padding:6px 10px; border:1px solid #333; text-align:right; }}
+          th {{ background:#222; color:#fa0; }}
+          td:first-child {{ text-align:left; }}
+        </style></head><body>
+        <h2>Wallets Smart Money × Recovery Rate</h2>
+        <p style='color:#888'>
+            token_signals total: <b>{cov[0]}</b> &nbsp;|&nbsp;
+            com wallets_json: <b>{cov[1]}</b> &nbsp;|&nbsp;
+            mints únicos: <b>{cov[2]}</b>
+        </p>
+        <h3>Wallets com ≥3 sinais (ordenado por n_recovery)</h3>
+        <table>
+          <tr><th>Wallet</th><th>n sinais</th><th>Recovery ✓</th><th>No-recovery ✗</th><th>Sem dados</th><th>WR</th></tr>
+          {rows_html}
+        </table>
+        <p style='color:#888;margin-top:16px'>
+          Verde = n≥5 e WR≥50% → candidata a filtro.<br>
+          Amarelo = n≥3 e WR≥40% → monitorar.<br>
+          Gate mínimo para usar como filtro: n≥10 e WR≥60%.
+        </p>
+        </body></html>"""
+    except Exception:
+        return f"<pre style='color:red'>{traceback.format_exc()}</pre>", 500
+
+
+@app.route("/analise/phantom-bounces")
+def analise_phantom_bounces():
+    """
+    Retroactive supply-bug analysis.
+    Compara mc_min usado na detecção vs mc_bottom real (kline).
+    Se mc_min < mc_bottom * 0.6 → phantom bounce (supply 250M ao invés de 1B).
+    Mostra WR separado: phantom vs real.
+    """
+    import psycopg2
+    from db import DATABASE_URL
+
+    THRESHOLD = 0.60  # mc_min < mc_bottom * threshold → phantom
+
+    conn = psycopg2.connect(DATABASE_URL)
+    cur  = conn.cursor()
+
+    # Todos os bounces com trade blockchain-verificado + mc_bottom disponível
+    cur.execute("""
+        SELECT
+            bs.ts_signal,
+            bs.symbol,
+            bs.mint,
+            bs.mc_min,
+            bs.mc_at_signal,
+            bs.bounce_pct,
+            bs.mc_migration,
+            m.mc_bottom,
+            t.status,
+            t.pnl_pct_real,
+            t.exit_type
+        FROM bounce_signals bs
+        JOIN migrations m ON m.mint = bs.mint
+        JOIN LATERAL (
+            SELECT status, pnl_pct_real, exit_type
+            FROM trades
+            WHERE mint = bs.mint
+              AND created_at > bs.ts_signal - INTERVAL '5 minutes'
+              AND created_at < bs.ts_signal + INTERVAL '30 minutes'
+              AND exit_type IS NOT NULL
+            ORDER BY created_at ASC LIMIT 1
+        ) t ON true
+        WHERE bs.mc_min IS NOT NULL
+          AND m.mc_bottom IS NOT NULL
+          AND m.mc_bottom > 0
+        ORDER BY bs.ts_signal DESC
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    phantoms, reals = [], []
+    for r in rows:
+        (ts, sym, mint, mc_min, mc_sig, bpct, mc_mig, mc_bottom,
+         status, pnl, exit_type) = r
+        ratio = mc_min / mc_bottom if mc_bottom else None
+        is_phantom = ratio is not None and ratio < THRESHOLD
+        rec = {
+            "ts": ts, "sym": sym, "mint": mint,
+            "mc_min": mc_min, "mc_bottom": mc_bottom,
+            "ratio": ratio, "mc_sig": mc_sig,
+            "bpct": bpct, "mc_mig": mc_mig,
+            "status": status, "pnl": pnl,
+        }
+        (phantoms if is_phantom else reals).append(rec)
+
+    def stats(lst):
+        if not lst:
+            return {"n": 0, "tp": 0, "sl": 0, "wr": None, "avg_pnl": None}
+        tp = sum(1 for r in lst if r["status"] == "tp")
+        sl = sum(1 for r in lst if r["status"] in ("sl", "error"))
+        pnls = [r["pnl"] for r in lst if r["pnl"] is not None]
+        return {
+            "n": len(lst), "tp": tp, "sl": sl,
+            "wr": tp / len(lst) if lst else None,
+            "avg_pnl": sum(pnls) / len(pnls) if pnls else None,
+        }
+
+    ps = stats(phantoms)
+    rs = stats(reals)
+
+    def fmt_pct(v):
+        return f"{v*100:.1f}%" if v is not None else "—"
+    def fmt_usd(v):
+        return f"${v/1000:.1f}k" if v else "—"
+
+    def rows_html(lst, color):
+        out = ""
+        for r in lst:
+            ratio_str = f"{r['ratio']:.2f}×" if r['ratio'] else "—"
+            bpct_str  = f"{r['bpct']*100:.0f}%" if r['bpct'] else "—"
+            oc = "#2a2" if r["status"] == "tp" else "#a44"
+            pnl_str = f"{r['pnl']*100:+.0f}%" if r["pnl"] else "—"
+            out += f"""<tr>
+              <td>{r['ts'].strftime('%m-%d %H:%M') if r['ts'] else '—'}</td>
+              <td><b>{r['sym'] or '?'}</b></td>
+              <td>{fmt_usd(r['mc_min'])}</td>
+              <td>{fmt_usd(r['mc_bottom'])}</td>
+              <td style='color:{color}'>{ratio_str}</td>
+              <td>{bpct_str}</td>
+              <td style='color:{oc}'>{r['status']} {pnl_str}</td>
+            </tr>"""
+        return out or "<tr><td colspan=7>Nenhum</td></tr>"
+
+    ph_rows = rows_html(phantoms, "#a44")
+    re_rows = rows_html(reals,    "#2a2")
+
+    total_n = ps["n"] + rs["n"]
+
+    return f"""<!DOCTYPE html><html><head>
+    <meta charset='utf-8'>
+    <title>Phantom Bounces</title>
+    <style>
+      body {{ font-family: monospace; background: #111; color: #ccc; padding: 20px; }}
+      h2 {{ color: #fa0; }}
+      table {{ border-collapse: collapse; width: 100%; margin-bottom: 30px; }}
+      th, td {{ padding: 6px 10px; border: 1px solid #333; text-align: right; }}
+      th {{ background: #222; color: #fa0; }}
+      td:first-child, td:nth-child(2) {{ text-align: left; }}
+      .card {{ background: #1a1a1a; border: 1px solid #333; border-radius: 6px;
+               padding: 16px; margin-bottom: 24px; display: inline-block;
+               min-width: 220px; vertical-align: top; margin-right: 16px; }}
+      .big {{ font-size: 2em; font-weight: bold; }}
+    </style></head><body>
+    <h2>Phantom Bounces — Análise Retroativa do Supply Bug</h2>
+    <p style='color:#888'>
+      Supply bug: GMGN retornava total_supply=250M em vez de 1B → Helius calculava MC 4× abaixo do real
+      → mc_min fantasma → bounce_pct inflado → bot entrava em tokens que não tinham bounceado.<br>
+      <b>Critério phantom:</b> mc_min_usado / mc_bottom_real &lt; {THRESHOLD:.0%}
+      &nbsp;|&nbsp; Base: {total_n} trades blockchain-verificados com mc_bottom disponível
+    </p>
+
+    <div>
+      <div class='card'>
+        <div style='color:#a44'>🔴 Phantom (supply bug)</div>
+        <div class='big' style='color:#a44'>{ps['n']}</div>
+        <div>trades ({ps['n']/total_n*100:.0f}% do total)' if total_n else ''</div>
+        <div style='margin-top:8px'>TP: {ps['tp']} &nbsp; SL: {ps['sl']}</div>
+        <div>WR: <b style='color:#a44'>{fmt_pct(ps['wr'])}</b></div>
+        <div>P&L médio: <b>{fmt_pct(ps['avg_pnl'])}</b></div>
+      </div>
+      <div class='card'>
+        <div style='color:#2a2'>🟢 Real (sinal legítimo)</div>
+        <div class='big' style='color:#2a2'>{rs['n']}</div>
+        <div>trades ({rs['n']/total_n*100:.0f}% do total)' if total_n else ''</div>
+        <div style='margin-top:8px'>TP: {rs['tp']} &nbsp; SL: {rs['sl']}</div>
+        <div>WR: <b style='color:#2a2'>{fmt_pct(rs['wr'])}</b></div>
+        <div>P&L médio: <b>{fmt_pct(rs['avg_pnl'])}</b></div>
+      </div>
+    </div>
+
+    <h3 style='color:#a44'>Phantom Bounces — mc_min era fantasma</h3>
+    <table>
+      <tr><th>Data</th><th>Token</th><th>mc_min usado</th>
+          <th>mc_bottom real</th><th>ratio</th><th>bounce_pct</th><th>Outcome</th></tr>
+      {ph_rows}
+    </table>
+
+    <h3 style='color:#2a2'>Sinais Reais — mc_min era legítimo</h3>
+    <table>
+      <tr><th>Data</th><th>Token</th><th>mc_min usado</th>
+          <th>mc_bottom real</th><th>ratio</th><th>bounce_pct</th><th>Outcome</th></tr>
+      {re_rows}
+    </table>
+    </body></html>"""
+
+
+@app.route("/debug/microstructure")
+def debug_microstructure():
+    """
+    Verifica coleta H24/H25/H26 em tempo real.
+    - Seção 1: estado live do HeliusWS (pool quotes + eventos com wallet por mint ativo)
+    - Seção 2: últimos 30 bounce_signals com cobertura dos novos campos
+    - Seção 3: estatísticas de cobertura globais
+    """
+    import traceback
+    try:
+        import psycopg2
+        from db import DATABASE_URL
+
+        # ── Seção 1: estado live do HeliusWS ─────────────────────────────
+        live_rows = ""
+        helius = getattr(scanner, "_hot", None)
+        helius = getattr(helius, "_helius", None) if helius else None
+        if helius is None:
+            helius = getattr(scanner, "_helius", None)
+
+        if helius:
+            with helius._lock:
+                active_mints = list(helius._mint_supply.keys())
+                pool_quotes  = dict(helius._pool_quote_last)
+                swap_events  = {m: list(helius._swap_events.get(m, [])) for m in active_mints}
+
+            for mint in active_mints:
+                evs     = swap_events.get(mint, [])
+                pq      = pool_quotes.get(mint, 0)
+                n_ev    = len(evs)
+                n_w     = sum(1 for e in evs if e.get("wallet"))
+                n_sells = sum(1 for e in evs if e.get("side") == "sell" and e.get("wallet"))
+                n_buys  = sum(1 for e in evs if e.get("side") == "buy"  and e.get("wallet"))
+                pq_str  = f"{pq:.2f} SOL" if pq else "—"
+                cov_str = f"{n_w}/{n_ev}" if n_ev else "0 evs"
+                color   = "#2a2" if n_w > 0 else "#888"
+                live_rows += f"""<tr>
+                  <td style='font-family:monospace'>{mint[:12]}…</td>
+                  <td style='color:{color}'>{cov_str} c/wallet</td>
+                  <td>{n_buys}buy / {n_sells}sell</td>
+                  <td>{pq_str}</td>
+                </tr>"""
+            if not active_mints:
+                live_rows = "<tr><td colspan=4>Nenhum token ativo no HotMonitor</td></tr>"
+        else:
+            live_rows = "<tr><td colspan=4>HeliusWS não inicializado (sem HELIUS_API_KEY?)</td></tr>"
+
+        # ── Seção 2: últimos 30 bounce_signals com novos campos ───────────
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT
+                bs.ts_signal, bs.symbol, bs.bounce_pct, bs.drop_from_mig,
+                bs.h23_window,
+                bs.pool_quote_at_signal,
+                bs.dump_seller_count, bs.dump_seller_hhi, bs.dump_top_seller_frac,
+                bs.rise_events, bs.rise_lrg_buy, bs.rise_buy_vol,
+                bs.buy_concentration,
+                bs.absorption_events,
+                t.status, t.pnl_pct_real, t.exit_type
+            FROM bounce_signals bs
+            LEFT JOIN LATERAL (
+                SELECT status, pnl_pct_real, exit_type
+                FROM trades
+                WHERE mint = bs.mint
+                  AND created_at > bs.ts_signal - INTERVAL '5 minutes'
+                  AND created_at < bs.ts_signal + INTERVAL '30 minutes'
+                ORDER BY created_at ASC LIMIT 1
+            ) t ON true
+            WHERE bs.ts_signal > NOW() - INTERVAL '48 hours'
+            ORDER BY bs.ts_signal DESC
+            LIMIT 30
+        """)
+        rows = cur.fetchall()
+        conn.close()
+
+        def _pct(v):
+            return f"{v*100:.1f}%" if v is not None else "—"
+        def _f(v, fmt=".2f"):
+            return f"{v:{fmt}}" if v is not None else "—"
+
+        bounce_rows = ""
+        for r in rows:
+            (ts, sym, bpct, drop, win, pq, dsc, hhi, tsf, rev, rlb, rbv, buyc,
+             abs_ev, status, pnl, exit_type) = r
+
+            # Cobertura: verde se tem dados, vermelho se NULL
+            def cell(v, label=None, fmt=None):
+                if v is None:
+                    return "<td style='color:#a44'>—</td>"
+                txt = label or (f"{v:{fmt}}" if fmt else str(v))
+                return f"<td style='color:#2a2'>{txt}</td>"
+
+            pq_cell  = cell(pq,  f"{pq:.1f}◎"   if pq  else None)
+            hhi_cell = cell(hhi, f"{hhi:.3f}"     if hhi else None)
+            tsf_cell = cell(tsf, f"{tsf*100:.0f}%" if tsf else None)
+            bc_cell  = cell(buyc,f"{buyc:.3f}"    if buyc else None)
+            rev_cell = cell(rev, str(rev))
+
+            # Só mostra outcome se confirmado on-chain (exit_type preenchido)
+            outcome = "—"
+            if exit_type and status == "tp":
+                outcome = f"<span style='color:#2a2'>TP {pnl*100:+.0f}%</span>" if pnl else "<span style='color:#2a2'>TP</span>"
+            elif exit_type and status in ("sl", "error"):
+                outcome = f"<span style='color:#a44'>SL {pnl*100:+.0f}%</span>" if pnl else "<span style='color:#a44'>SL</span>"
+            elif status and not exit_type:
+                outcome = f"<span style='color:#888'>{status}</span>"
+
+            bounce_rows += f"""<tr>
+              <td>{ts.strftime('%H:%M') if ts else '—'}</td>
+              <td><b>{sym or '?'}</b></td>
+              <td>{_pct(bpct)}</td>
+              <td style='color:{"#2a2" if win=="bottom" else "#fa0"}'>{win or '—'}</td>
+              {pq_cell}
+              <td>{dsc or '—'}</td>
+              {hhi_cell}
+              {tsf_cell}
+              {rev_cell}
+              {bc_cell}
+              <td>{outcome}</td>
+            </tr>"""
+
+        if not rows:
+            bounce_rows = "<tr><td colspan=11>Nenhum bounce nas últimas 48h</td></tr>"
+
+        # ── Seção 3: cobertura global dos novos campos ────────────────────
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT
+                COUNT(*) AS total,
+                COUNT(pool_quote_at_signal) AS n_h25,
+                COUNT(dump_seller_count) FILTER (WHERE dump_seller_count > 0) AS n_h24,
+                COUNT(dump_seller_hhi)   AS n_hhi,
+                COUNT(buy_concentration) AS n_h26,
+                COUNT(*) FILTER (WHERE h23_window = 'bottom') AS n_bottom,
+                COUNT(*) FILTER (WHERE ts_signal > NOW() - INTERVAL '24 hours') AS n_24h
+            FROM bounce_signals
+        """)
+        cov = cur.fetchone()
+        conn.close()
+
+        total, n_h25, n_h24, n_hhi, n_h26, n_bot, n_24h = cov
+        def pct_cov(n):
+            return f"{n}/{total} ({n*100//total if total else 0}%)"
+
+        html = f"""<!DOCTYPE html>
+<html><head><title>Microstructure Debug</title>
+<meta http-equiv='refresh' content='15'>
+<style>
+  body{{background:#111;color:#ddd;font-family:monospace;padding:20px}}
+  h2{{color:#fa0;margin-top:24px}}
+  table{{border-collapse:collapse;width:100%;margin-top:8px}}
+  th{{background:#222;color:#fa0;padding:6px 10px;text-align:left}}
+  td{{padding:5px 10px;border-bottom:1px solid #222}}
+  .ok{{color:#2a2}} .miss{{color:#a44}} .warn{{color:#fa0}}
+  .sep{{border-top:1px solid #333;margin:20px 0}}
+</style></head><body>
+<h1>Microstructure Debug — H24/H25/H26</h1>
+<p style='color:#888'>Auto-refresh 15s · {len(rows)} bounces nas últimas 48h · {len(active_mints) if helius else 0} tokens ativos</p>
+
+<div class='sep'></div>
+<h2>▸ 1. HeliusWS — Estado Live por Token</h2>
+<p style='color:#888'>Eventos com wallet = dados disponíveis para H24. Pool quote = H25.</p>
+<table>
+  <thead><tr>
+    <th>Mint</th><th>Eventos c/wallet</th><th>Buys/Sells</th><th>Pool Depth (H25)</th>
+  </tr></thead>
+  <tbody>{live_rows}</tbody>
+</table>
+
+<div class='sep'></div>
+<h2>▸ 2. Últimos 30 Bounces — Cobertura H24/H25/H26</h2>
+<p style='color:#888'>Verde = dado coletado · Vermelho = NULL · window=bottom = janela correta</p>
+<table>
+  <thead><tr>
+    <th>Hora</th><th>Token</th><th>Bounce</th><th>window</th>
+    <th>H25 pool◎</th><th>H24 sellers</th><th>HHI</th><th>Top seller</th>
+    <th>RISE evs</th><th>H26 buyconc</th><th>Outcome</th>
+  </tr></thead>
+  <tbody>{bounce_rows}</tbody>
+</table>
+
+<div class='sep'></div>
+<h2>▸ 3. Cobertura Global</h2>
+<table>
+  <thead><tr><th>Métrica</th><th>Cobertura</th><th>Interpretação</th></tr></thead>
+  <tbody>
+    <tr><td>Total bounce_signals</td><td>{total}</td><td></td></tr>
+    <tr><td>Últimas 24h</td><td>{n_24h}</td><td>taxa de novos bounces</td></tr>
+    <tr><td>H25 pool_quote_at_signal</td>
+        <td class='{"ok" if n_h25 > 0 else "miss"}'>{pct_cov(n_h25)}</td>
+        <td>Deve crescer com bounces novos post-deploy</td></tr>
+    <tr><td>H24 dump_seller_count > 0</td>
+        <td class='{"ok" if n_h24 > 0 else "miss"}'>{pct_cov(n_h24)}</td>
+        <td>Wallets identificados durante o dump</td></tr>
+    <tr><td>H24 dump_seller_hhi</td>
+        <td class='{"ok" if n_hhi > 0 else "miss"}'>{pct_cov(n_hhi)}</td>
+        <td>HHI calculado (requer ≥1 sell com wallet)</td></tr>
+    <tr><td>H26 buy_concentration</td>
+        <td class='{"ok" if n_h26 > 0 else "miss"}'>{pct_cov(n_h26)}</td>
+        <td>RISE window com ≥1 buy event</td></tr>
+    <tr><td>h23_window = bottom</td>
+        <td class='{"ok" if n_bot > 0 else "miss"}'>{pct_cov(n_bot)}</td>
+        <td>Janela correta (pós-fix do bug H23)</td></tr>
+  </tbody>
+</table>
+
+<p style='color:#555;margin-top:24px'>
+  H24 requer sells durante o dump com wallet parseable (≥184 bytes raw).<br>
+  H25 requer qualquer evento Anchor do pAMM.<br>
+  H26 requer pelo menos 1 buy na RISE window [ts_min → ts_signal].
+</p>
+</body></html>"""
+        return html
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
+@app.route("/analise/cruzamento-wallets")
+def analise_cruzamento_wallets():
+    """
+    Cruzamento NeideBOT × wallet-monitor no mesmo banco.
+    Wallets monitoradas que compraram tokens DURANTE o dump (antes do bounce).
+    """
+    import psycopg2, psycopg2.extras, traceback, csv, io
+    from db import DATABASE_URL
+
+    fmt = request.args.get("format", "html")
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # Verifica se quarentena_trades existe
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_name = 'quarentena_trades'
+            ) AS exists
+        """)
+        if not cur.fetchone()["exists"]:
+            return "<h2>Tabela quarentena_trades não encontrada neste banco.</h2>", 404
+
+        # ── Contagem total de bounces e compras disponíveis ──────────────────
+        cur.execute("SELECT COUNT(*) AS n FROM bounce_signals")
+        n_bounces = cur.fetchone()["n"]
+
+        cur.execute("SELECT COUNT(*) AS n FROM quarentena_trades WHERE tipo='COMPRA'")
+        n_compras = cur.fetchone()["n"]
+
+        # ── Cruzamento principal ─────────────────────────────────────────────
+        cur.execute("""
+            SELECT
+                bs.mint,
+                bs.ts_signal,
+                bs.bounce_pct,
+                bs.elapsed_sec,
+                bs.drop_from_mig,
+                bs.mc_migration,
+                bs.mc_min,
+                bs.mc_at_signal,
+                m.recovery,
+                m.pct_gain,
+                m.time_to_bottom,
+                qt.carteira,
+                qt.ts                                                      AS ts_compra,
+                ROUND(EXTRACT(EPOCH FROM (bs.ts_signal - qt.ts))::numeric/60, 1)
+                                                                           AS mins_antes,
+                qt.mc_t0,
+                qt.sol_entrada,
+                ROUND((qt.mc_t0 / NULLIF(bs.mc_migration, 0))::numeric, 2)
+                                                                           AS entry_ratio,
+                qt.mc_t1, qt.mc_t2, qt.mc_t3,
+                t.status    AS trade_status,
+                ROUND((t.pnl_pct_real * 100)::numeric, 1) AS trade_pnl,
+                t.exit_type AS trade_exit_type
+            FROM bounce_signals bs
+            JOIN quarentena_trades qt
+                ON  qt.token_mint = bs.mint
+                AND qt.tipo = 'COMPRA'
+                AND qt.ts < bs.ts_signal
+                AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+            LEFT JOIN migrations m ON m.mint = bs.mint
+            LEFT JOIN trades t
+                ON  t.mint = bs.mint
+                AND t.ts_signal BETWEEN bs.ts_signal - INTERVAL '60 seconds'
+                                    AND bs.ts_signal + INTERVAL '60 seconds'
+            ORDER BY bs.ts_signal DESC
+        """)
+        rows = cur.fetchall()
+
+        # ── Recovery rate: com vs sem cruzamento ─────────────────────────────
+        cur.execute("""
+            WITH cruzados AS (
+                SELECT DISTINCT bs.mint
+                FROM bounce_signals bs
+                JOIN quarentena_trades qt
+                    ON  qt.token_mint = bs.mint
+                    AND qt.tipo = 'COMPRA'
+                    AND qt.ts < bs.ts_signal
+                    AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+            )
+            SELECT
+                'com_wallet'            AS grupo,
+                COUNT(*)                AS n,
+                ROUND(AVG(CASE WHEN m.recovery THEN 1.0 ELSE 0 END)::numeric * 100, 1)
+                                        AS recovery_pct,
+                ROUND(AVG(m.pct_gain)::numeric, 0) AS avg_gain
+            FROM bounce_signals bs
+            JOIN cruzados c ON c.mint = bs.mint
+            LEFT JOIN migrations m ON m.mint = bs.mint
+            WHERE m.recovery IS NOT NULL
+
+            UNION ALL
+
+            SELECT
+                'sem_wallet'            AS grupo,
+                COUNT(*)                AS n,
+                ROUND(AVG(CASE WHEN m.recovery THEN 1.0 ELSE 0 END)::numeric * 100, 1)
+                                        AS recovery_pct,
+                ROUND(AVG(m.pct_gain)::numeric, 0) AS avg_gain
+            FROM bounce_signals bs
+            LEFT JOIN migrations m ON m.mint = bs.mint
+            WHERE m.recovery IS NOT NULL
+              AND bs.mint NOT IN (SELECT mint FROM cruzados)
+        """)
+        stats = {r["grupo"]: r for r in cur.fetchall()}
+
+        # ── WR blockchain verificado: com vs sem ─────────────────────────────
+        cur.execute("""
+            WITH cruzados AS (
+                SELECT DISTINCT bs.mint
+                FROM bounce_signals bs
+                JOIN quarentena_trades qt
+                    ON  qt.token_mint = bs.mint
+                    AND qt.tipo = 'COMPRA'
+                    AND qt.ts < bs.ts_signal
+                    AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+            )
+            SELECT
+                CASE WHEN c.mint IS NOT NULL THEN 'com_wallet' ELSE 'sem_wallet' END AS grupo,
+                COUNT(*)                                                    AS n,
+                ROUND(AVG(CASE WHEN t.status='tp' THEN 1.0 ELSE 0 END)::numeric*100,1)
+                                                                            AS wr_pct,
+                ROUND(AVG(t.pnl_pct_real*100)::numeric, 1)                 AS avg_pnl
+            FROM trades t
+            LEFT JOIN cruzados c ON c.mint = t.mint
+            WHERE t.exit_type = 'helius_sell_recovery'
+              AND t.status IN ('tp','sl')
+            GROUP BY 1
+        """)
+        wr_stats = {r["grupo"]: r for r in cur.fetchall()}
+
+        # ── Distribuição por carteira ─────────────────────────────────────────
+        cur.execute("""
+            SELECT qt.carteira, COUNT(DISTINCT bs.mint) AS n_tokens
+            FROM bounce_signals bs
+            JOIN quarentena_trades qt
+                ON  qt.token_mint = bs.mint
+                AND qt.tipo = 'COMPRA'
+                AND qt.ts < bs.ts_signal
+                AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+            GROUP BY qt.carteira
+            ORDER BY n_tokens DESC
+        """)
+        por_carteira = cur.fetchall()
+
+        # Identifica carteiras "ruído" automaticamente:
+        # - Qualquer carteira presente em >30% dos bounces totais = ubíqua = ruído
+        noise_threshold = max(3, int(n_bounces * 0.30))
+        noise_wallets   = {r["carteira"] for r in por_carteira if r["n_tokens"] > noise_threshold}
+
+        # ── Recovery rate por carteira (excluindo ruído) ──────────────────────
+        cur.execute("""
+            SELECT
+                qt.carteira,
+                COUNT(DISTINCT bs.mint)                                         AS n_tokens,
+                ROUND(AVG(CASE WHEN m.recovery THEN 1.0 ELSE 0 END)::numeric*100,1)
+                                                                                AS recovery_pct,
+                ROUND(AVG(m.pct_gain)::numeric, 0)                             AS avg_gain,
+                COUNT(DISTINCT CASE WHEN t.status='tp' THEN t.id END)          AS n_tp,
+                COUNT(DISTINCT CASE WHEN t.status='sl' THEN t.id END)          AS n_sl
+            FROM bounce_signals bs
+            JOIN quarentena_trades qt
+                ON  qt.token_mint = bs.mint
+                AND qt.tipo = 'COMPRA'
+                AND qt.ts < bs.ts_signal
+                AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+            LEFT JOIN migrations m ON m.mint = bs.mint
+            LEFT JOIN trades t
+                ON  t.mint = bs.mint
+                AND t.exit_type = 'helius_sell_recovery'
+                AND t.status IN ('tp','sl')
+            WHERE m.recovery IS NOT NULL
+            GROUP BY qt.carteira
+            ORDER BY n_tokens DESC
+        """)
+        por_carteira_stats = cur.fetchall()
+
+        # ── Smart money: cruzamentos SEM carteiras ruído ──────────────────────
+        if noise_wallets:
+            noise_list = "','".join(noise_wallets)
+            cur.execute(f"""
+                WITH cruzados_smart AS (
+                    SELECT DISTINCT bs.mint
+                    FROM bounce_signals bs
+                    JOIN quarentena_trades qt
+                        ON  qt.token_mint = bs.mint
+                        AND qt.tipo = 'COMPRA'
+                        AND qt.ts < bs.ts_signal
+                        AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+                    WHERE qt.carteira NOT IN ('{noise_list}')
+                )
+                SELECT
+                    'com_smart'             AS grupo,
+                    COUNT(*)                AS n,
+                    ROUND(AVG(CASE WHEN m.recovery THEN 1.0 ELSE 0 END)::numeric*100,1) AS recovery_pct,
+                    ROUND(AVG(m.pct_gain)::numeric, 0) AS avg_gain
+                FROM bounce_signals bs
+                JOIN cruzados_smart c ON c.mint = bs.mint
+                LEFT JOIN migrations m ON m.mint = bs.mint
+                WHERE m.recovery IS NOT NULL
+
+                UNION ALL
+
+                SELECT
+                    'sem_smart'             AS grupo,
+                    COUNT(*)                AS n,
+                    ROUND(AVG(CASE WHEN m.recovery THEN 1.0 ELSE 0 END)::numeric*100,1) AS recovery_pct,
+                    ROUND(AVG(m.pct_gain)::numeric, 0) AS avg_gain
+                FROM bounce_signals bs
+                LEFT JOIN migrations m ON m.mint = bs.mint
+                WHERE m.recovery IS NOT NULL
+                  AND bs.mint NOT IN (SELECT mint FROM cruzados_smart)
+            """)
+            smart_stats = {r["grupo"]: r for r in cur.fetchall()}
+
+            # WR blockchain para smart money
+            cur.execute(f"""
+                WITH cruzados_smart AS (
+                    SELECT DISTINCT bs.mint
+                    FROM bounce_signals bs
+                    JOIN quarentena_trades qt
+                        ON  qt.token_mint = bs.mint
+                        AND qt.tipo = 'COMPRA'
+                        AND qt.ts < bs.ts_signal
+                        AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+                    WHERE qt.carteira NOT IN ('{noise_list}')
+                )
+                SELECT
+                    CASE WHEN c.mint IS NOT NULL THEN 'com_smart' ELSE 'sem_smart' END AS grupo,
+                    COUNT(*) AS n,
+                    ROUND(AVG(CASE WHEN t.status='tp' THEN 1.0 ELSE 0 END)::numeric*100,1) AS wr_pct,
+                    ROUND(AVG(t.pnl_pct_real*100)::numeric,1) AS avg_pnl
+                FROM trades t
+                LEFT JOIN cruzados_smart c ON c.mint = t.mint
+                WHERE t.exit_type = 'helius_sell_recovery'
+                  AND t.status IN ('tp','sl')
+                GROUP BY 1
+            """)
+            smart_wr = {r["grupo"]: r for r in cur.fetchall()}
+
+            # Tokens com 2+ wallets smart comprando (convergência)
+            cur.execute(f"""
+                SELECT
+                    bs.mint,
+                    bs.ts_signal,
+                    bs.bounce_pct,
+                    m.recovery,
+                    m.pct_gain,
+                    COUNT(DISTINCT qt.carteira)                AS n_wallets,
+                    STRING_AGG(DISTINCT qt.carteira, ', ' ORDER BY qt.carteira) AS wallets
+                FROM bounce_signals bs
+                JOIN quarentena_trades qt
+                    ON  qt.token_mint = bs.mint
+                    AND qt.tipo = 'COMPRA'
+                    AND qt.ts < bs.ts_signal
+                    AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+                LEFT JOIN migrations m ON m.mint = bs.mint
+                WHERE qt.carteira NOT IN ('{noise_list}')
+                GROUP BY bs.mint, bs.ts_signal, bs.bounce_pct, m.recovery, m.pct_gain
+                HAVING COUNT(DISTINCT qt.carteira) >= 2
+                ORDER BY COUNT(DISTINCT qt.carteira) DESC, bs.ts_signal DESC
+            """)
+            convergencia = cur.fetchall()
+        else:
+            smart_stats   = {}
+            smart_wr      = {}
+            convergencia  = []
+
+        conn.close()
+
+        # ── CSV export ───────────────────────────────────────────────────────
+        if fmt == "csv":
+            out = io.StringIO()
+            cols = ["mint","ts_signal","carteira","mins_antes","bounce_pct","drop_from_mig",
+                    "entry_ratio","sol_entrada","mc_migration","mc_min","mc_at_signal",
+                    "mc_t0","mc_t1","mc_t2","mc_t3",
+                    "recovery","pct_gain","time_to_bottom",
+                    "trade_status","trade_pnl","trade_exit_type"]
+            w = csv.DictWriter(out, fieldnames=cols, extrasaction="ignore")
+            w.writeheader()
+            for r in rows:
+                row = dict(r)
+                if row.get("bounce_pct") is not None:
+                    row["bounce_pct"] = round(float(row["bounce_pct"]) * 100, 1)
+                w.writerow(row)
+            return Response(
+                out.getvalue(),
+                mimetype="text/csv",
+                headers={"Content-Disposition": "attachment; filename=cruzamento_wallets.csv"}
+            )
+
+        # ── HTML ─────────────────────────────────────────────────────────────
+        n_tokens_unicos = len(set(r["mint"] for r in rows))
+        com  = stats.get("com_wallet", {})
+        sem  = stats.get("sem_wallet", {})
+        wr_c = wr_stats.get("com_wallet", {})
+        wr_s = wr_stats.get("sem_wallet", {})
+
+        delta_rec = (float(com.get("recovery_pct") or 0) - float(sem.get("recovery_pct") or 0))
+        delta_wr  = (float(wr_c.get("wr_pct") or 0)  - float(wr_s.get("wr_pct") or 0))
+
+        def delta_color(v): return "#4caf50" if v > 0 else ("#f44336" if v < 0 else "#888")
+
+        # Gate de suficiência
+        if n_tokens_unicos == 0:
+            gate_msg = "⚠️ Zero cruzamentos — universos sem sobreposição ainda. Continue acumulando dados."
+            gate_color = "#f44336"
+        elif n_tokens_unicos < 10:
+            gate_msg = f"⚠️ n={n_tokens_unicos} — amostra insuficiente. Gate mínimo: n≥15 tokens."
+            gate_color = "#ff9800"
+        elif n_tokens_unicos < 30:
+            gate_msg = f"🟡 n={n_tokens_unicos} — sinal preliminar. Gate para filtro em produção: n≥30 com delta WR ≥15pp."
+            gate_color = "#ff9800"
+        else:
+            gate_msg = f"✅ n={n_tokens_unicos} — amostra suficiente para análise. Avaliar delta para integração."
+            gate_color = "#4caf50"
+
+        # Tabela de detalhes
+        trs = ""
+        for r in rows:
+            rec_str  = "✅" if r["recovery"] else ("❌" if r["recovery"] is False else "—")
+            gain_str = f"{r['pct_gain']:+.0f}%" if r.get("pct_gain") is not None else "—"
+            gain_col = "#4caf50" if (r.get("pct_gain") or 0) > 0 else "#f44336"
+            mins     = f"{r['mins_antes']:.1f}min" if r.get("mins_antes") is not None else "—"
+            bounce   = f"{r['bounce_pct']*100:.0f}%" if r.get("bounce_pct") is not None else "—"
+            ratio    = f"{r['entry_ratio']:.2f}×" if r.get("entry_ratio") is not None else "—"
+            sol      = f"{r['sol_entrada']:.2f}" if r.get("sol_entrada") is not None else "—"
+            trade    = r.get("trade_status") or "não tradado"
+            if r.get("trade_pnl") is not None and r.get("trade_status") in ("tp","sl"):
+                trade += f" {float(r['trade_pnl']):+.1f}%"
+            bchain   = "✅" if r.get("trade_exit_type") == "helius_sell_recovery" else ""
+            trs += f"""<tr>
+                <td style='font-size:11px'>{r['mint'][:12]}</td>
+                <td>{r['carteira']}</td>
+                <td style='text-align:right'>{mins}</td>
+                <td style='text-align:right'>{bounce}</td>
+                <td style='text-align:right'>{ratio}</td>
+                <td style='text-align:right'>{sol}</td>
+                <td style='text-align:center'>{rec_str}</td>
+                <td style='color:{gain_col};text-align:right'>{gain_str}</td>
+                <td>{trade} {bchain}</td>
+            </tr>"""
+
+        cart_rows = "".join(
+            f"<tr><td>{r['carteira']}</td><td>{r['n_tokens']}</td></tr>"
+            for r in por_carteira
+        )
+
+        # Tabela recovery por carteira
+        def _wr_cell(n_tp, n_sl):
+            tot = (n_tp or 0) + (n_sl or 0)
+            if tot == 0: return "—"
+            return f"{round(100*(n_tp or 0)/tot)}%"
+
+        cart_stat_rows = ""
+        for r in por_carteira_stats:
+            bold = r["carteira"] not in noise_wallets
+            name = f"<b>{r['carteira']}</b>" if bold else f"<span style='color:#555'>{r['carteira']} (ruído)</span>"
+            cart_stat_rows += (
+                f"<tr><td>{name}</td>"
+                f"<td style='text-align:right'>{r['n_tokens']}</td>"
+                f"<td style='text-align:right'>{r['recovery_pct']}%</td>"
+                f"<td style='text-align:right'>{r['avg_gain']}%</td>"
+                f"<td style='text-align:right'>{r['n_tp']}</td>"
+                f"<td style='text-align:right'>{r['n_sl']}</td>"
+                f"<td style='text-align:right'>{_wr_cell(r['n_tp'], r['n_sl'])}</td>"
+                f"</tr>"
+            )
+
+        # Tabela convergência multi-wallet
+        conv_rows = ""
+        for r in convergencia:
+            rec_icon = "✅" if r["recovery"] else ("❌" if r["recovery"] is False else "—")
+            gain_str = f"{r['pct_gain']:+.0f}%" if r.get("pct_gain") is not None else "—"
+            gain_col = "#4caf50" if (r.get("pct_gain") or 0) > 0 else "#f44336"
+            bounce_s = f"{round(float(r['bounce_pct'])*100)}%" if r.get("bounce_pct") else "—"
+            conv_rows += (
+                f"<tr>"
+                f"<td style='font-size:11px'>{r['mint'][:16]}</td>"
+                f"<td style='text-align:right'>{bounce_s}</td>"
+                f"<td style='text-align:center'>{rec_icon}</td>"
+                f"<td style='text-align:right;color:{gain_col}'>{gain_str}</td>"
+                f"<td style='font-size:12px'>{r['wallets']}</td>"
+                f"<td style='text-align:center'>{r['n_wallets']}</td>"
+                f"</tr>"
+            )
+
+        # Smart money stats strings
+        noise_label     = ", ".join(sorted(noise_wallets)) or "nenhuma"
+        sc  = smart_stats.get("com_smart", {})
+        ss  = smart_stats.get("sem_smart", {})
+        src = float(sc.get("recovery_pct") or 0)
+        srs = float(ss.get("recovery_pct") or 0)
+        delta_smart_rec = src - srs
+        wc  = smart_wr.get("com_smart", {})
+        ws  = smart_wr.get("sem_smart", {})
+        wrc = float(wc.get("wr_pct") or 0)
+        wrs = float(ws.get("wr_pct") or 0)
+        delta_smart_wr  = wrc - wrs
+
+        html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+        <title>Cruzamento Wallets × NeideBOT</title>
+        <style>
+          body{{font-family:monospace;background:#111;color:#eee;padding:24px;}}
+          h1{{color:#fff;}} h2{{color:#aaa;margin-top:32px;}}
+          table{{border-collapse:collapse;width:100%;margin-top:8px;}}
+          th{{background:#222;color:#aaa;padding:6px 10px;text-align:left;font-size:12px;}}
+          td{{padding:5px 10px;border-bottom:1px solid #1e1e1e;font-size:13px;}}
+          .kpi{{display:inline-block;background:#1a1a1a;border:1px solid #333;
+               border-radius:8px;padding:16px 24px;margin:8px;min-width:160px;text-align:center;}}
+          .kpi .val{{font-size:28px;font-weight:bold;}}
+          .kpi .lbl{{font-size:11px;color:#666;margin-top:4px;}}
+          .note{{color:#666;font-size:12px;margin:4px 0 12px;}}
+          .gate{{padding:12px 20px;border-radius:6px;margin:16px 0;font-size:14px;}}
+        </style></head><body>
+        <h1>Cruzamento wallet-monitor × NeideBOT</h1>
+        <p class='note'>Wallets monitoradas que compraram o mesmo token DURANTE o dump (até 20min antes do bounce disparar)</p>
+
+        <div class='gate' style='background:{gate_color}22;border:1px solid {gate_color};color:{gate_color}'>
+          {gate_msg}
+        </div>
+
+        <p style='margin:8px 0'>
+          <a href='/analise/cruzamento-wallets?format=csv'
+             style='background:#333;color:#4caf50;padding:6px 14px;border-radius:4px;
+                    text-decoration:none;font-size:13px'>⬇ Exportar CSV completo</a>
+        </p>
+
+        <div>
+          <div class='kpi'><div class='val'>{n_bounces}</div><div class='lbl'>bounces NeideBOT</div></div>
+          <div class='kpi'><div class='val'>{n_compras}</div><div class='lbl'>compras no wallet-monitor</div></div>
+          <div class='kpi'><div class='val'>{len(rows)}</div><div class='lbl'>cruzamentos totais (linhas)</div></div>
+          <div class='kpi'><div class='val'>{n_tokens_unicos}</div><div class='lbl'>tokens únicos cruzados</div></div>
+        </div>
+
+        <h2>Recovery rate — com vs sem wallet antes do bounce</h2>
+        <table style='max-width:600px'>
+          <tr><th>Grupo</th><th>n</th><th>Recovery%</th><th>avg pct_gain</th></tr>
+          <tr><td>Com wallet monitorada</td>
+              <td>{com.get('n','—')}</td>
+              <td>{com.get('recovery_pct','—')}%</td>
+              <td>{com.get('avg_gain','—')}%</td></tr>
+          <tr><td>Sem wallet monitorada</td>
+              <td>{sem.get('n','—')}</td>
+              <td>{sem.get('recovery_pct','—')}%</td>
+              <td>{sem.get('avg_gain','—')}%</td></tr>
+          <tr style='font-weight:bold'>
+              <td>Delta</td><td>—</td>
+              <td style='color:{delta_color(delta_rec)}'>{delta_rec:+.1f}pp</td>
+              <td>—</td></tr>
+        </table>
+
+        <h2>Win rate real (blockchain) — com vs sem wallet</h2>
+        <table style='max-width:600px'>
+          <tr><th>Grupo</th><th>n trades</th><th>WR%</th><th>avg P&L</th></tr>
+          <tr><td>Com wallet monitorada</td>
+              <td>{wr_c.get('n','—')}</td>
+              <td>{wr_c.get('wr_pct','—')}%</td>
+              <td>{wr_c.get('avg_pnl','—')}%</td></tr>
+          <tr><td>Sem wallet monitorada</td>
+              <td>{wr_s.get('n','—')}</td>
+              <td>{wr_s.get('wr_pct','—')}%</td>
+              <td>{wr_s.get('avg_pnl','—')}%</td></tr>
+          <tr style='font-weight:bold'>
+              <td>Delta</td><td>—</td>
+              <td style='color:{delta_color(delta_wr)}'>{delta_wr:+.1f}pp</td>
+              <td>—</td></tr>
+        </table>
+
+        <h2>Cruzamentos por carteira (contagem bruta)</h2>
+        <table style='max-width:400px'>
+          <tr><th>Carteira</th><th>Tokens únicos</th></tr>
+          {cart_rows or "<tr><td colspan='2'>Nenhum</td></tr>"}
+        </table>
+        <p class='note'>Carteiras marcadas como ruído (presentes em >{noise_threshold} bounces = >30% do universo): <b style='color:#f44336'>{", ".join(sorted(noise_wallets)) or "nenhuma"}</b></p>
+
+        <h2>Recovery por carteira individual (excl. ruído)</h2>
+        <table style='max-width:700px'>
+          <tr><th>Carteira</th><th>n tokens</th><th>Recovery%</th><th>avg pct_gain</th><th>n TP</th><th>n SL</th><th>WR live</th></tr>
+          {cart_stat_rows or "<tr><td colspan='7' style='color:#666'>Sem dados</td></tr>"}
+        </table>
+
+        <h2>Smart money filtrado (sem ruído: {noise_label})</h2>
+        <p class='note'>Apenas wallets seletivas — exclui aquelas presentes em &gt;30% dos bounces</p>
+        <table style='max-width:600px'>
+          <tr><th>Grupo</th><th>n</th><th>Recovery%</th><th>avg gain</th></tr>
+          <tr><td>Com smart money</td><td>{sc.get('n','—')}</td><td>{sc.get('recovery_pct','—')}%</td><td>{sc.get('avg_gain','—')}%</td></tr>
+          <tr><td>Sem smart money</td><td>{ss.get('n','—')}</td><td>{ss.get('recovery_pct','—')}%</td><td>{ss.get('avg_gain','—')}%</td></tr>
+          <tr style='font-weight:bold'><td>Delta</td><td>—</td>
+              <td style='color:{delta_color(delta_smart_rec)}'>{delta_smart_rec:+.1f}pp</td><td>—</td></tr>
+        </table>
+        <table style='max-width:600px;margin-top:8px'>
+          <tr><th>Grupo</th><th>n trades blockchain</th><th>WR%</th><th>avg P&L</th></tr>
+          {f"<tr><td>Com smart money</td><td>{wc.get('n','—')}</td><td>{wc.get('wr_pct','—')}%</td><td>{wc.get('avg_pnl','—')}%</td></tr><tr><td>Sem smart money</td><td>{ws.get('n','—')}</td><td>{ws.get('wr_pct','—')}%</td><td>{ws.get('avg_pnl','—')}%</td></tr><tr style='font-weight:bold'><td>Delta WR</td><td>—</td><td style='color:{delta_color(delta_smart_wr)}'>{delta_smart_wr:+.1f}pp</td><td>—</td></tr>" if smart_wr else "<tr><td colspan='4' style='color:#666'>Sem trades blockchain com smart money ainda</td></tr>"}
+        </table>
+
+        <h2>Convergência multi-wallet ({len(convergencia)} tokens com ≥2 smart wallets)</h2>
+        <p class='note'>Sinal mais forte: múltiplas wallets seletivas comprando o mesmo token durante o dump</p>
+        <table>
+          <tr><th>Token</th><th>Bounce%</th><th style='text-align:center'>Recovery</th>
+              <th style='text-align:right'>pct_gain</th><th>Wallets</th><th>n wallets</th></tr>
+          {conv_rows or "<tr><td colspan='6' style='color:#666'>Nenhum caso de convergência ainda</td></tr>"}
+        </table>
+
+        <h2>Detalhe — todos os cruzamentos ({len(rows)} linhas, {n_tokens_unicos} tokens únicos)</h2>
+        <p class='note'>
+          mins_antes = quanto tempo antes do bounce a wallet comprou &nbsp;|&nbsp;
+          ratio = mc_t0/mc_migration (1.0 = comprou no preço da migração, &lt;1.0 = comprou mais barato) &nbsp;|&nbsp;
+          Uma linha por compra de wallet — mesmo token pode aparecer várias vezes se comprado por wallets diferentes
+        </p>
+        <div style='overflow-x:auto'>
+        <table>
+          <tr>
+            <th>Token (mint)</th><th>Carteira</th><th style='text-align:right'>Mins antes</th>
+            <th style='text-align:right'>Bounce%</th><th style='text-align:right'>Ratio</th>
+            <th style='text-align:right'>SOL</th>
+            <th style='text-align:center'>Recovery</th><th style='text-align:right'>pct_gain</th>
+            <th>Nosso trade</th>
+          </tr>
+          {trs or "<tr><td colspan='9' style='color:#666'>Nenhum cruzamento encontrado</td></tr>"}
+        </table>
+        </div>
+        </body></html>"""
+
+        return html
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
+@app.route("/analise/cruzamento-wallets-ticks")
+def analise_cruzamento_wallets_ticks():
+    """
+    Versão metodologicamente correta do cruzamento wallet-monitor × NeideBOT.
+
+    Métrica real: token_ticks nos 20min após ts_signal.
+      - entry   = mc_at_signal (preço real do sinal — inclui bounce inteiro)
+      - tp_hit  = max_mc_after >= entry × 1.75  (+75% trailing activation)
+      - sl_hit  = min_mc_after <= entry × 0.75  (-25% SL)
+      - Mínimo 3 ticks após sinal para considerar o outcome.
+
+    Pergunta: wallets monitoradas que compraram DURANTE o dump (antes do sinal)
+    correlacionam com token que teria batido nosso TP dentro de 20min?
+    """
+    import psycopg2, psycopg2.extras, traceback
+    from db import DATABASE_URL
+
+    TP_MULT   = 1.75   # +75%
+    SL_MULT   = 0.75   # -25%
+    MIN_TICKS = 3
+    DUMP_WINDOW_MIN = 20   # wallet comprou até 20min antes do sinal
+
+    # Wallets conhecidas como ruído/bot — excluídas do grupo "smart money"
+    NOISE_WALLETS = {"Gold", "carteira_S", "carteira_O"}
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # Verifica se quarentena_trades existe
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_name = 'quarentena_trades'
+            ) AS exists
+        """)
+        if not cur.fetchone()["exists"]:
+            conn.close()
+            return "<h2>Tabela quarentena_trades não encontrada neste banco.</h2>", 404
+
+        # ── Dataset principal: bounce_signals + token_ticks (metodologia sinal-puro) ─
+        # Para cada bounce com ≥ MIN_TICKS após ts_signal, calcula tp_hit / sl_hit.
+        # Depois LEFT JOIN com quarentena_trades para identificar quais carteiras
+        # compraram o token durante o dump (antes do sinal).
+        cur.execute("""
+            WITH tick_outcomes AS (
+                SELECT
+                    bs.mint,
+                    bs.ts_signal,
+                    bs.mc_at_signal                                   AS entry_mc,
+                    bs.bounce_pct,
+                    bs.elapsed_sec / 60.0                             AS elapsed_min,
+                    bs.mc_migration,
+                    MAX(COALESCE(tt.mc_high, tt.mc))                  AS max_mc,
+                    MIN(COALESCE(tt.mc_low,  tt.mc))                  AS min_mc,
+                    COUNT(tt.id)                                      AS tick_count
+                FROM bounce_signals bs
+                JOIN token_ticks tt
+                    ON  tt.mint    = bs.mint
+                    AND tt.tick_ts > bs.ts_signal
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '20 minutes'
+                WHERE bs.mc_at_signal IS NOT NULL
+                  AND bs.mc_at_signal > 0
+                  AND bs.bounce_pct   IS NOT NULL
+                GROUP BY bs.mint, bs.ts_signal, bs.mc_at_signal, bs.bounce_pct,
+                         bs.elapsed_sec, bs.mc_migration
+                HAVING COUNT(tt.id) >= %(min_ticks)s
+            ),
+            outcomes AS (
+                SELECT *,
+                    (max_mc >= entry_mc * %(tp)s) AS tp_hit,
+                    (min_mc <= entry_mc * %(sl)s) AS sl_hit
+                FROM tick_outcomes
+            ),
+            wallet_crossings AS (
+                SELECT DISTINCT
+                    bs.mint,
+                    qt.carteira
+                FROM bounce_signals bs
+                JOIN quarentena_trades qt
+                    ON  qt.token_mint = bs.mint
+                    AND qt.tipo       = 'COMPRA'
+                    AND qt.ts         < bs.ts_signal
+                    AND qt.ts         > bs.ts_signal - INTERVAL '%(window)s minutes'
+            )
+            SELECT
+                o.*,
+                wc.carteira
+            FROM outcomes o
+            LEFT JOIN wallet_crossings wc ON wc.mint = o.mint
+            ORDER BY o.ts_signal DESC
+        """, {"tp": TP_MULT, "sl": SL_MULT, "min_ticks": MIN_TICKS,
+               "window": DUMP_WINDOW_MIN})
+        rows = cur.fetchall()
+        conn.close()
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+    # ── Agrupamento em Python ─────────────────────────────────────────────────
+    # Um token pode ter múltiplas carteiras — cada linha é (token × carteira).
+    # Para métricas de grupo, o token conta UMA vez por grupo.
+
+    from collections import defaultdict
+
+    # Agrupa por mint para saber todas as carteiras por token
+    by_mint = defaultdict(lambda: {"tp": False, "sl": False, "carteiras": set(),
+                                   "entry_mc": None, "bounce_pct": None})
+    for r in rows:
+        m = r["mint"]
+        by_mint[m]["tp"]        = by_mint[m]["tp"] or r["tp_hit"]
+        by_mint[m]["sl"]        = by_mint[m]["sl"] or r["sl_hit"]
+        by_mint[m]["entry_mc"]  = r["entry_mc"]
+        by_mint[m]["bounce_pct"]= r["bounce_pct"]
+        if r["carteira"]:
+            by_mint[m]["carteiras"].add(r["carteira"])
+
+    all_mints = list(by_mint.items())
+    n_total   = len(all_mints)
+
+    def group_stats(mints_subset):
+        n  = len(mints_subset)
+        if n == 0:
+            return {"n": 0, "wr": None, "n_tp": 0, "n_sl": 0}
+        n_tp = sum(1 for _, v in mints_subset if v["tp"] and not v["sl"])
+        n_sl = sum(1 for _, v in mints_subset if v["sl"])
+        # tp_only = chegou no TP sem acionar o SL antes
+        return {
+            "n":    n,
+            "n_tp": n_tp,
+            "n_sl": n_sl,
+            "wr":   round(n_tp / n * 100, 1),
+        }
+
+    # Baseline: todos os tokens com ticks (sem filtro de carteira)
+    base = group_stats(all_mints)
+
+    # Tokens sem nenhuma carteira monitorada
+    sem_wallet = [(m, v) for m, v in all_mints if not v["carteiras"]]
+    g_sem      = group_stats(sem_wallet)
+
+    # Tokens com QUALQUER carteira monitorada
+    com_wallet = [(m, v) for m, v in all_mints if v["carteiras"]]
+    g_com      = group_stats(com_wallet)
+
+    # Tokens com carteiras smart (excluindo ruído)
+    smart_only = [(m, v) for m, v in all_mints
+                  if v["carteiras"] and not v["carteiras"].issubset(NOISE_WALLETS)]
+    g_smart    = group_stats(smart_only)
+
+    # Tokens APENAS com carteiras ruído (Gold/S/O)
+    noise_only = [(m, v) for m, v in all_mints
+                  if v["carteiras"] and v["carteiras"].issubset(NOISE_WALLETS)]
+    g_noise    = group_stats(noise_only)
+
+    # Por carteira individual
+    all_carteiras = sorted({r["carteira"] for r in rows if r["carteira"]})
+
+    per_wallet = {}
+    for cart in all_carteiras:
+        subset = [(m, v) for m, v in all_mints if cart in v["carteiras"]]
+        per_wallet[cart] = group_stats(subset)
+        per_wallet[cart]["is_noise"] = cart in NOISE_WALLETS
+
+    # Convergência: ≥2 smart money wallets no mesmo token
+    convergence = [(m, v) for m, v in all_mints
+                   if len(v["carteiras"] - NOISE_WALLETS) >= 2]
+    g_conv      = group_stats(convergence)
+
+    # ── HTML ─────────────────────────────────────────────────────────────────
+    def wr_color(wr, base_wr):
+        if wr is None: return "#8b949e"
+        if wr >= base_wr + 10: return "#3fb950"
+        if wr <= base_wr - 10: return "#f85149"
+        return "#e3b341"
+
+    def delta_str(wr, base_wr):
+        if wr is None: return "—"
+        d = wr - base_wr
+        color = "#3fb950" if d >= 5 else ("#f85149" if d <= -5 else "#e3b341")
+        return f"<span style='color:{color}'>{d:+.1f}pp</span>"
+
+    def pct(n_tp, n):
+        return f"{round(n_tp/n*100,1)}%" if n else "—"
+
+    BASE_WR = base["wr"] or 0
+
+    # Linhas da tabela de grupos
+    group_rows = ""
+    groups = [
+        ("Baseline (todos com ticks)", base,    False),
+        ("Sem nenhuma wallet",          g_sem,   False),
+        ("Com qualquer wallet",         g_com,   False),
+        ("Smart money (I/F/L/G/H/K)",  g_smart, True),
+        ("Ruído apenas (Gold/S/O)",     g_noise, False),
+        ("Convergência ≥2 smart",       g_conv,  True),
+    ]
+    for label, g, highlight in groups:
+        wr   = g["wr"]
+        wr_s = f"{wr:.1f}%" if wr is not None else "—"
+        bg   = "background:#1f3a1f;" if highlight and wr and wr > BASE_WR + 5 else ""
+        group_rows += (
+            f"<tr style='{bg}'>"
+            f"<td>{label}</td>"
+            f"<td style='text-align:right'>{g['n']}</td>"
+            f"<td style='text-align:right'>{g['n_tp']}</td>"
+            f"<td style='text-align:right'>{g['n_sl']}</td>"
+            f"<td style='text-align:right;color:{wr_color(wr, BASE_WR)}'>{wr_s}</td>"
+            f"<td style='text-align:right'>{delta_str(wr, BASE_WR)}</td>"
+            f"</tr>"
+        )
+
+    # Linhas por carteira
+    cart_rows = ""
+    for cart in sorted(per_wallet, key=lambda c: -(per_wallet[c]["n"])):
+        g    = per_wallet[cart]
+        wr   = g["wr"]
+        wr_s = f"{wr:.1f}%" if wr is not None else "—"
+        is_n = g["is_noise"]
+        dim  = "color:#6e7681;" if is_n else ""
+        tag  = " <span style='color:#f85149;font-size:10px'>[ruído]</span>" if is_n else ""
+        cart_rows += (
+            f"<tr style='{dim}'>"
+            f"<td>{cart}{tag}</td>"
+            f"<td style='text-align:right'>{g['n']}</td>"
+            f"<td style='text-align:right'>{g['n_tp']}</td>"
+            f"<td style='text-align:right'>{g['n_sl']}</td>"
+            f"<td style='text-align:right;color:{wr_color(wr, BASE_WR)}'>{wr_s}</td>"
+            f"<td style='text-align:right'>{delta_str(wr, BASE_WR)}</td>"
+            f"</tr>"
+        )
+
+    # Cobertura: quantos bounces têm ticks suficientes?
+    cur2 = None
+    try:
+        conn2 = psycopg2.connect(DATABASE_URL)
+        cur2  = conn2.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur2.execute("SELECT COUNT(*) AS n FROM bounce_signals")
+        n_bounces_total = cur2.fetchone()["n"]
+        conn2.close()
+    except Exception:
+        n_bounces_total = "?"
+
+    coverage_pct = round(n_total / n_bounces_total * 100, 1) if isinstance(n_bounces_total, int) and n_bounces_total else "?"
+
+    # Aviso metodológico
+    methodology_note = (
+        f"<b>Metodologia:</b> entry = <code>mc_at_signal</code> (preço real do sinal, "
+        f"inclui o bounce inteiro). TP = +75% em 20min. SL = -25%. "
+        f"Mínimo {MIN_TICKS} ticks após sinal. "
+        f"Cobertura: {n_total} / {n_bounces_total} bounces ({coverage_pct}%). "
+        f"Proxy <code>recovery</code> (mc_1h) DESCARTADO — não reflete se nosso trade teria hit TP."
+    )
+
+    html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+    <title>Cruzamento Wallets × Ticks</title>
+    <style>
+      body{{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}}
+      h1{{color:#58a6ff}}h2{{color:#79c0ff;margin-top:28px}}h3{{color:#8b949e;margin-top:20px}}
+      table{{border-collapse:collapse;width:100%;max-width:700px;margin-bottom:20px}}
+      th{{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:left}}
+      th:not(:first-child){{text-align:right}}
+      td{{padding:5px 10px;border:1px solid #21262d;white-space:nowrap}}
+      .warn{{background:#2d1f00;border:1px solid #9a6700;padding:10px 14px;
+              border-radius:4px;margin:12px 0;font-size:12px}}
+      .note{{color:#8b949e;font-size:12px;margin:4px 0 14px}}
+      a{{color:#58a6ff}}
+    </style></head><body>
+    <h1>Cruzamento wallet-monitor × NeideBOT — Métrica real (token_ticks)</h1>
+    <p class='note'>
+      Wallets que compraram o token DURANTE o dump (até {DUMP_WINDOW_MIN}min antes do sinal).
+      <br>O token bateria nosso TP (+75%) dentro de 20min a partir de <code>mc_at_signal</code>?
+    </p>
+
+    <div class='warn'>{methodology_note}</div>
+
+    <p><a href='/analise/cruzamento-wallets'>← Versão recovery (mc_1h)</a>
+       &nbsp;|&nbsp; <a href='/analise/sinal-puro'>Sinal Puro (baseline)</a></p>
+
+    <h2>WR real por grupo de wallet</h2>
+    <p class='note'>TP = único (tp_hit antes de sl_hit). Baseline = todos os tokens com ticks suficientes.</p>
+    <table>
+      <tr>
+        <th>Grupo</th><th>n tokens</th><th>n TP</th><th>n SL/outro</th>
+        <th>WR%</th><th>Delta vs baseline</th>
+      </tr>
+      {group_rows}
+    </table>
+
+    <h2>WR real por carteira individual</h2>
+    <p class='note'>Um token pode contar em múltiplas carteiras se mais de uma comprou durante o dump.</p>
+    <table>
+      <tr>
+        <th>Carteira</th><th>n tokens</th><th>n TP</th><th>n SL/outro</th>
+        <th>WR%</th><th>Delta vs baseline</th>
+      </tr>
+      {cart_rows or "<tr><td colspan='6' style='color:#666'>Nenhuma carteira cruzada com ticks disponíveis</td></tr>"}
+    </table>
+
+    <h2>Interpretação</h2>
+    <div class='warn' style='background:#161b22;border-color:#30363d'>
+      <b>Por que recovery (mc_1h) é métrica errada:</b><br>
+      recovery = mc_1h &gt; mc_bottom × 1.3. Problemas:<br>
+      (a) Não sabe se o SL (-25%) foi acionado antes da recuperação.<br>
+      (b) mc_1h é checkpoint arbitrário — token pode ter subido, caído, e "recuperado" sem jamais bater nosso TP.<br>
+      (c) mc_bottom é o fundo detectado, não nossa entrada. Nosso entry é mc_at_signal (já inclui o bounce de 30-50%).<br><br>
+      <b>O que este endpoint mede:</b> dado que entramos em mc_at_signal, o token chegou a +75%
+      (trailing activation) nos 20min seguintes <i>antes</i> de cair -25%?
+      Esta é a única pergunta que importa para o NeideBOT.
+    </div>
+
+    </body></html>"""
+
+    return html
+
+
+@app.route("/analise/wallet-entry-depth")
+def analise_wallet_entry_depth():
+    """
+    Segunda camada de análise: a variável real não é 'wallet comprou?' mas
+    'onde a wallet comprou?' (entry_ratio = mc_t0 / mc_migration).
+
+    Hipótese: wallet que comprou em ratio < 0.40 (capitulação profunda) correlaciona
+    com TP outcome muito mais do que wallet que comprou em ratio 0.70+ (momentum chaser).
+
+    Para cada cruzamento (token × carteira × TP outcome), agrega por:
+      1. Faixa de entry_ratio da wallet
+      2. Por carteira × faixa
+      3. Wallet entry_ratio vs token entry_ratio (mc_at_signal / mc_migration)
+         — ambas as wallets compraram profundo?
+    """
+    import psycopg2, psycopg2.extras, traceback
+    from db import DATABASE_URL
+
+    TP_MULT   = 1.75
+    SL_MULT   = 0.75
+    MIN_TICKS = 3
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_name = 'quarentena_trades'
+            ) AS exists
+        """)
+        if not cur.fetchone()["exists"]:
+            conn.close()
+            return "<h2>quarentena_trades não encontrada</h2>", 404
+
+        # Dataset completo: bounce outcome + wallet entry_ratio
+        cur.execute("""
+            WITH tick_outcomes AS (
+                SELECT
+                    bs.mint,
+                    bs.ts_signal,
+                    bs.mc_at_signal                                  AS entry_mc,
+                    bs.mc_migration,
+                    ROUND((bs.mc_at_signal / NULLIF(bs.mc_migration,0))::numeric, 3)
+                                                                     AS token_entry_ratio,
+                    bs.bounce_pct,
+                    bs.elapsed_sec / 60.0                            AS elapsed_min,
+                    MAX(COALESCE(tt.mc_high, tt.mc))                 AS max_mc,
+                    MIN(COALESCE(tt.mc_low,  tt.mc))                 AS min_mc,
+                    COUNT(tt.id)                                     AS tick_count
+                FROM bounce_signals bs
+                JOIN token_ticks tt
+                    ON  tt.mint    = bs.mint
+                    AND tt.tick_ts > bs.ts_signal
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '20 minutes'
+                WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+                  AND bs.mc_migration  IS NOT NULL AND bs.mc_migration  > 0
+                  AND bs.bounce_pct    IS NOT NULL
+                GROUP BY bs.mint, bs.ts_signal, bs.mc_at_signal, bs.mc_migration,
+                         bs.bounce_pct, bs.elapsed_sec
+                HAVING COUNT(tt.id) >= %(min_ticks)s
+            ),
+            outcomes AS (
+                SELECT *,
+                    (max_mc >= entry_mc * %(tp)s)   AS tp_hit,
+                    (min_mc <= entry_mc * %(sl)s)   AS sl_hit
+                FROM tick_outcomes
+            )
+            SELECT
+                o.mint,
+                o.tp_hit,
+                o.sl_hit,
+                o.token_entry_ratio,
+                o.bounce_pct,
+                o.elapsed_min,
+                qt.carteira,
+                ROUND((qt.mc_t0 / NULLIF(o.mc_migration, 0))::numeric, 3) AS wallet_ratio,
+                qt.sol_entrada
+            FROM outcomes o
+            JOIN quarentena_trades qt
+                ON  qt.token_mint = o.mint
+                AND qt.tipo       = 'COMPRA'
+                AND qt.ts         < o.ts_signal
+                AND qt.ts         > o.ts_signal - INTERVAL '20 minutes'
+                AND qt.mc_t0 IS NOT NULL
+                AND o.mc_migration > 0
+            ORDER BY o.ts_signal DESC
+        """, {"tp": TP_MULT, "sl": SL_MULT, "min_ticks": MIN_TICKS})
+        rows = cur.fetchall()
+
+        # Baseline: todos os bounces com ticks (sem filtro de wallet)
+        cur.execute("""
+            WITH tick_outcomes AS (
+                SELECT
+                    bs.mint,
+                    MAX(COALESCE(tt.mc_high, tt.mc)) AS max_mc,
+                    MIN(COALESCE(tt.mc_low,  tt.mc)) AS min_mc,
+                    bs.mc_at_signal                  AS entry_mc
+                FROM bounce_signals bs
+                JOIN token_ticks tt
+                    ON  tt.mint    = bs.mint
+                    AND tt.tick_ts > bs.ts_signal
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '20 minutes'
+                WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+                GROUP BY bs.mint, bs.mc_at_signal
+                HAVING COUNT(tt.id) >= %(min_ticks)s
+            )
+            SELECT
+                COUNT(*) AS n,
+                SUM(CASE WHEN max_mc >= entry_mc * %(tp)s
+                          AND min_mc > entry_mc * %(sl)s THEN 1 ELSE 0 END) AS n_tp
+            FROM tick_outcomes
+        """, {"tp": TP_MULT, "sl": SL_MULT, "min_ticks": MIN_TICKS})
+        base_row   = cur.fetchone()
+        conn.close()
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+    base_n  = base_row["n"]  or 0
+    base_tp = base_row["n_tp"] or 0
+    BASE_WR = round(base_tp / base_n * 100, 1) if base_n else 0
+
+    # ── Análise em Python ─────────────────────────────────────────────────────
+    from collections import defaultdict
+
+    # Por faixa de wallet_ratio
+    RATIO_BINS = [
+        ("<0.30", 0.0,  0.30),
+        ("0.30-0.50", 0.30, 0.50),
+        ("0.50-0.70", 0.50, 0.70),
+        ("0.70-1.00", 0.70, 1.00),
+        (">1.00",    1.00, 999),
+    ]
+
+    def bin_label(r, bins):
+        for label, lo, hi in bins:
+            if lo <= r < hi:
+                return label
+        return ">1.00"
+
+    ratio_buckets = defaultdict(lambda: {"n": 0, "n_tp": 0})
+    for r in rows:
+        wr = r["wallet_ratio"]
+        if wr is None:
+            continue
+        b = bin_label(float(wr), RATIO_BINS)
+        ratio_buckets[b]["n"]    += 1
+        if r["tp_hit"] and not r["sl_hit"]:
+            ratio_buckets[b]["n_tp"] += 1
+
+    # Por carteira × faixa de wallet_ratio
+    cart_ratio = defaultdict(lambda: defaultdict(lambda: {"n": 0, "n_tp": 0}))
+    for r in rows:
+        cart = r["carteira"]
+        wr   = r["wallet_ratio"]
+        if wr is None or cart is None:
+            continue
+        b = bin_label(float(wr), RATIO_BINS)
+        cart_ratio[cart][b]["n"]    += 1
+        if r["tp_hit"] and not r["sl_hit"]:
+            cart_ratio[cart][b]["n_tp"] += 1
+
+    # Por faixa de wallet_ratio com tp_hit — deduplicado por mint
+    # (um token pode aparecer 2x se 2 carteiras compraram; para outcome conta 1x)
+    by_mint_ratio = defaultdict(lambda: {"tp": False, "sl": False,
+                                         "wallet_ratio_min": 999.0})
+    for r in rows:
+        m  = r["mint"]
+        wr = r["wallet_ratio"]
+        if wr is None:
+            continue
+        by_mint_ratio[m]["tp"] = by_mint_ratio[m]["tp"] or (r["tp_hit"] and not r["sl_hit"])
+        by_mint_ratio[m]["sl"] = by_mint_ratio[m]["sl"] or r["sl_hit"]
+        by_mint_ratio[m]["wallet_ratio_min"] = min(
+            by_mint_ratio[m]["wallet_ratio_min"], float(wr))
+
+    dedup_buckets = defaultdict(lambda: {"n": 0, "n_tp": 0})
+    for m, v in by_mint_ratio.items():
+        b = bin_label(v["wallet_ratio_min"], RATIO_BINS)
+        dedup_buckets[b]["n"]    += 1
+        if v["tp"]:
+            dedup_buckets[b]["n_tp"] += 1
+
+    # ── HTML helpers ──────────────────────────────────────────────────────────
+    def wr_cell(n_tp, n):
+        if n == 0: return "—", "#8b949e"
+        wr = round(n_tp / n * 100, 1)
+        color = "#3fb950" if wr >= BASE_WR + 8 else ("#f85149" if wr <= BASE_WR - 8 else "#e3b341")
+        return f"{wr}%", color
+
+    def delta_cell(n_tp, n):
+        if n == 0: return "—"
+        d = round(n_tp / n * 100 - BASE_WR, 1)
+        color = "#3fb950" if d >= 5 else ("#f85149" if d <= -5 else "#8b949e")
+        return f"<span style='color:{color}'>{d:+.1f}pp</span>"
+
+    # Tabela 1: por faixa de wallet_ratio (deduplicado por token)
+    ratio_rows = ""
+    for label, lo, hi in RATIO_BINS:
+        d = dedup_buckets[label]
+        n, n_tp = d["n"], d["n_tp"]
+        ws, wc = wr_cell(n_tp, n)
+        ratio_rows += (
+            f"<tr><td>{label}</td>"
+            f"<td style='text-align:right'>{n}</td>"
+            f"<td style='text-align:right'>{n_tp}</td>"
+            f"<td style='text-align:right;color:{wc}'>{ws}</td>"
+            f"<td style='text-align:right'>{delta_cell(n_tp, n)}</td></tr>"
+        )
+
+    # Tabela 2: por carteira × faixa (linhas raw — um token pode contar ×2 se 2 wallets)
+    CARTS_ORDER = sorted(cart_ratio.keys())
+    cart_ratio_rows = ""
+    for cart in CARTS_ORDER:
+        first = True
+        for label, lo, hi in RATIO_BINS:
+            d = cart_ratio[cart][label]
+            if d["n"] == 0:
+                continue
+            n, n_tp = d["n"], d["n_tp"]
+            ws, wc  = wr_cell(n_tp, n)
+            cart_label = cart if first else ""
+            cart_ratio_rows += (
+                f"<tr>"
+                f"<td>{cart_label}</td>"
+                f"<td style='color:#8b949e'>{label}</td>"
+                f"<td style='text-align:right'>{n}</td>"
+                f"<td style='text-align:right'>{n_tp}</td>"
+                f"<td style='text-align:right;color:{wc}'>{ws}</td>"
+                f"<td style='text-align:right'>{delta_cell(n_tp, n)}</td></tr>"
+            )
+            first = False
+
+    html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+    <title>Wallet Entry Depth</title>
+    <style>
+      body{{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}}
+      h1{{color:#58a6ff}}h2{{color:#79c0ff;margin-top:28px}}
+      table{{border-collapse:collapse;width:100%;max-width:760px;margin-bottom:20px}}
+      th{{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:left}}
+      th:not(:first-child){{text-align:right}}
+      td{{padding:5px 10px;border:1px solid #21262d;white-space:nowrap}}
+      .warn{{background:#161b22;border:1px solid #30363d;padding:10px 14px;
+             border-radius:4px;margin:12px 0;font-size:12px}}
+      .note{{color:#8b949e;font-size:12px;margin:4px 0 14px}}
+      a{{color:#58a6ff}}
+    </style></head><body>
+    <h1>Wallet Entry Depth — onde a wallet comprou?</h1>
+    <p class='note'>
+      Hipótese: carteira que comprou a &lt;30% do mc_migration (capitulação profunda)
+      é sinal diferente de carteira que comprou a 80%+ (momentum chaser).
+      <br>Baseline WR = {BASE_WR}% (n={base_n}, todos os bounces com ≥{MIN_TICKS} ticks).
+    </p>
+
+    <p>
+      <a href='/analise/cruzamento-wallets-ticks'>← WR por grupo de wallet</a>
+      &nbsp;|&nbsp; <a href='/analise/sinal-puro'>Sinal Puro</a>
+    </p>
+
+    <h2>Tabela 1 — WR por faixa de wallet_ratio (token deduplicado)</h2>
+    <p class='note'>
+      wallet_ratio = mc_t0 (onde a wallet comprou) / mc_migration.<br>
+      &lt;0.30 = comprou abaixo de 30% da migração = comprador da capitulação profunda.<br>
+      Token conta 1× pelo menor ratio de wallet que comprou nele.
+    </p>
+    <table>
+      <tr><th>Faixa wallet_ratio</th><th>n tokens</th><th>n TP</th>
+          <th>WR%</th><th>Delta vs baseline</th></tr>
+      {ratio_rows}
+    </table>
+
+    <h2>Tabela 2 — Por carteira × faixa de wallet_ratio</h2>
+    <p class='note'>
+      Linhas raw — um token pode aparecer 2× se comprado por 2 carteiras em faixas diferentes.
+      Mostra o padrão de compra de cada carteira e o WR correspondente.
+    </p>
+    <table>
+      <tr><th>Carteira</th><th>Faixa ratio</th><th>n</th><th>n TP</th>
+          <th>WR%</th><th>Delta</th></tr>
+      {cart_ratio_rows or "<tr><td colspan='6' style='color:#666'>Sem dados</td></tr>"}
+    </table>
+
+    <div class='warn'>
+      <b>O que procurar:</b><br>
+      Se wallets em ratio &lt;0.30 têm WR significativamente maior → comprador profundo = sinal causal.<br>
+      Se o WR é flat por faixa → wallet presence é correlação espúria (ambos efeito de token de qualidade).<br>
+      Se uma carteira específica concentra entradas em &lt;0.30 com WR alto → ela é o sinal real.<br>
+      <br>
+      <b>carteira_L (n=22, WR 9.1% no endpoint anterior):</b> verificar em que faixa ela opera.
+      Se compra em 0.50-0.70 → momentum chaser, não sinal. Se compra em &lt;0.30 com WR baixo → sinal negativo real.
+    </div>
+
+    </body></html>"""
+
+    return html
+
+
+@app.route("/analise/wallet-token-outcome")
+def analise_wallet_token_outcome():
+    """
+    Pergunta correta: o token em si se comportou bem após a wallet comprar durante o dump?
+    Completamente desacoplado da nossa entrada (sem mc_at_signal, sem nosso SL/TP).
+
+    Métricas centradas no TOKEN:
+      - max_gain_from_bottom  = max(token_ticks.mc_high) / mc_min  nos 60min após o fundo
+      - recovered_30pct       = max_gain_from_bottom >= 1.30
+      - recovered_75pct       = max_gain_from_bottom >= 1.75
+      - recovered_200pct      = max_gain_from_bottom >= 3.00
+      - time_to_max_min       = minutos do fundo até o pico
+      - n_ticks_60min         = cobertura disponível
+
+    Grupos: por carteira, por faixa de wallet_ratio, baseline (todos os bounces).
+    """
+    import psycopg2, psycopg2.extras, traceback
+    from db import DATABASE_URL
+
+    MIN_TICKS = 3   # mínimo de ticks na janela pós-fundo para considerar
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_name = 'quarentena_trades'
+            ) AS exists
+        """)
+        if not cur.fetchone()["exists"]:
+            conn.close()
+            return "<h2>quarentena_trades não encontrada</h2>", 404
+
+        # ── Baseline: comportamento do token nos 60min após o fundo (sem filtro wallet) ──
+        # mc_min = fundo detectado pelo HotMonitor (bounce_signals.mc_min)
+        # max_mc_60min = pico atingido nos ticks da janela quente
+        cur.execute("""
+            SELECT
+                bs.mint,
+                bs.mc_min,
+                bs.ts_signal,
+                bs.bounce_pct,
+                bs.elapsed_sec / 60.0                                  AS elapsed_min,
+                MAX(COALESCE(tt.mc_high, tt.mc))                       AS max_mc_60min,
+                MIN(tt.tick_ts)                                        AS first_tick_ts,
+                MAX(tt.tick_ts)                                        AS last_tick_ts,
+                COUNT(tt.id)                                           AS n_ticks
+            FROM bounce_signals bs
+            JOIN token_ticks tt
+                ON  tt.mint    = bs.mint
+                AND tt.tick_ts > bs.ts_signal - INTERVAL '5 minutes'
+                AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
+            WHERE bs.mc_min IS NOT NULL AND bs.mc_min > 0
+            GROUP BY bs.mint, bs.mc_min, bs.ts_signal, bs.bounce_pct, bs.elapsed_sec
+            HAVING COUNT(tt.id) >= %(min_ticks)s
+        """, {"min_ticks": MIN_TICKS})
+        baseline_rows = cur.fetchall()
+
+        # ── Com wallet: cruzamento bounce_signals × quarentena_trades ──────────
+        cur.execute("""
+            SELECT
+                bs.mint,
+                bs.mc_min,
+                bs.mc_migration,
+                bs.ts_signal,
+                bs.bounce_pct,
+                bs.elapsed_sec / 60.0                                  AS elapsed_min,
+                MAX(COALESCE(tt.mc_high, tt.mc))                       AS max_mc_60min,
+                COUNT(tt.id)                                           AS n_ticks,
+                qt.carteira,
+                ROUND((qt.mc_t0 / NULLIF(bs.mc_migration, 0))::numeric, 3)
+                                                                       AS wallet_ratio,
+                qt.sol_entrada
+            FROM bounce_signals bs
+            JOIN token_ticks tt
+                ON  tt.mint    = bs.mint
+                AND tt.tick_ts > bs.ts_signal - INTERVAL '5 minutes'
+                AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
+            JOIN quarentena_trades qt
+                ON  qt.token_mint = bs.mint
+                AND qt.tipo       = 'COMPRA'
+                AND qt.ts         < bs.ts_signal
+                AND qt.ts         > bs.ts_signal - INTERVAL '20 minutes'
+                AND qt.mc_t0 IS NOT NULL
+                AND bs.mc_migration > 0
+            WHERE bs.mc_min IS NOT NULL AND bs.mc_min > 0
+            GROUP BY bs.mint, bs.mc_min, bs.mc_migration, bs.ts_signal,
+                     bs.bounce_pct, bs.elapsed_sec,
+                     qt.carteira, qt.mc_t0, qt.sol_entrada
+            HAVING COUNT(tt.id) >= %(min_ticks)s
+        """, {"min_ticks": MIN_TICKS})
+        wallet_rows = cur.fetchall()
+        conn.close()
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+    # ── Métricas centradas no token ───────────────────────────────────────────
+    def token_metrics(mc_min, max_mc_60min):
+        if not mc_min or not max_mc_60min or mc_min <= 0:
+            return None
+        gain = max_mc_60min / mc_min
+        return {
+            "gain":        round(gain, 2),
+            "rec30":       gain >= 1.30,
+            "rec75":       gain >= 1.75,
+            "rec200":      gain >= 3.00,
+        }
+
+    # Baseline: todos os tokens com ticks
+    base_stats = [token_metrics(r["mc_min"], r["max_mc_60min"]) for r in baseline_rows]
+    base_stats = [s for s in base_stats if s]
+    n_base     = len(base_stats)
+    base_rec30  = sum(1 for s in base_stats if s["rec30"])  / n_base * 100 if n_base else 0
+    base_rec75  = sum(1 for s in base_stats if s["rec75"])  / n_base * 100 if n_base else 0
+    base_rec200 = sum(1 for s in base_stats if s["rec200"]) / n_base * 100 if n_base else 0
+    base_avg    = sum(s["gain"] for s in base_stats) / n_base if n_base else 0
+
+    # Deduplicar wallet_rows por (mint × carteira) para a análise por carteira
+    # e por mint (menor ratio) para análise por faixa
+    from collections import defaultdict
+
+    # Por carteira: cada token conta 1× por carteira
+    by_cart_mint = defaultdict(dict)   # cart → {mint → metrics}
+    by_mint_global = {}                # mint → {metrics, carteiras, min_ratio}
+
+    for r in wallet_rows:
+        m    = r["mint"]
+        cart = r["carteira"]
+        wr   = float(r["wallet_ratio"]) if r["wallet_ratio"] else None
+        met  = token_metrics(r["mc_min"], r["max_mc_60min"])
+        if met is None or wr is None:
+            continue
+
+        # Por carteira — dedup por mint dentro de cada cart
+        if m not in by_cart_mint[cart]:
+            by_cart_mint[cart][m] = met
+
+        # Global: pega menor ratio de wallet por mint
+        if m not in by_mint_global:
+            by_mint_global[m] = {"met": met, "min_ratio": wr, "carteiras": set()}
+        else:
+            if wr < by_mint_global[m]["min_ratio"]:
+                by_mint_global[m]["min_ratio"] = wr
+        by_mint_global[m]["carteiras"].add(cart)
+
+    def agg(items):
+        n = len(items)
+        if n == 0:
+            return {"n": 0, "rec30": "—", "rec75": "—", "rec200": "—", "avg": "—"}
+        r30  = sum(1 for s in items if s["rec30"])
+        r75  = sum(1 for s in items if s["rec75"])
+        r200 = sum(1 for s in items if s["rec200"])
+        avg  = sum(s["gain"] for s in items) / n
+        return {
+            "n":     n,
+            "rec30": round(r30  / n * 100, 1),
+            "rec75": round(r75  / n * 100, 1),
+            "rec200":round(r200 / n * 100, 1),
+            "avg":   round(avg, 2),
+            "n_r30": r30, "n_r75": r75, "n_r200": r200,
+        }
+
+    # Por carteira
+    NOISE = {"Gold", "carteira_S", "carteira_O"}
+    cart_agg = {}
+    for cart, mint_dict in by_cart_mint.items():
+        cart_agg[cart] = agg(list(mint_dict.values()))
+
+    # Com qualquer wallet vs sem wallet
+    mints_com_wallet = set(by_mint_global.keys())
+    mints_sem_wallet = {r["mint"] for r in baseline_rows} - mints_com_wallet
+
+    stats_com = agg([by_mint_global[m]["met"] for m in mints_com_wallet
+                     if m in by_mint_global])
+    stats_sem = agg([token_metrics(r["mc_min"], r["max_mc_60min"])
+                     for r in baseline_rows if r["mint"] in mints_sem_wallet
+                     and token_metrics(r["mc_min"], r["max_mc_60min"])])
+
+    # Smart money only
+    smart_mints = {m for m, v in by_mint_global.items()
+                   if v["carteiras"] - NOISE}
+    stats_smart = agg([by_mint_global[m]["met"] for m in smart_mints])
+
+    # Por faixa de wallet_ratio (menor ratio por token)
+    RATIO_BINS = [
+        ("<0.30",    0.0,  0.30),
+        ("0.30-0.50",0.30, 0.50),
+        ("0.50-0.70",0.50, 0.70),
+        ("0.70-1.00",0.70, 1.00),
+        (">1.00",    1.00, 999),
+    ]
+    ratio_agg = {}
+    for label, lo, hi in RATIO_BINS:
+        items = [by_mint_global[m]["met"] for m, v in by_mint_global.items()
+                 if lo <= v["min_ratio"] < hi]
+        ratio_agg[label] = agg(items)
+
+    # ── HTML ─────────────────────────────────────────────────────────────────
+    def delta(val, base):
+        if val == "—" or base == 0: return "—"
+        d = val - base
+        c = "#3fb950" if d >= 5 else ("#f85149" if d <= -5 else "#8b949e")
+        return f"<span style='color:{c}'>{d:+.1f}pp</span>"
+
+    def col(v):
+        if v == "—": return "—"
+        return f"{v}%"
+
+    def avg_col(v):
+        if v == "—": return "—"
+        c = "#3fb950" if v >= base_avg + 0.3 else ("#f85149" if v <= base_avg - 0.3 else "#8b949e")
+        return f"<span style='color:{c}'>{v:.2f}×</span>"
+
+    def group_row(label, g, bold=False):
+        b = "font-weight:bold;" if bold else ""
+        return (
+            f"<tr style='{b}'>"
+            f"<td>{label}</td>"
+            f"<td style='text-align:right'>{g['n']}</td>"
+            f"<td style='text-align:right'>{col(g['rec30'])}</td>"
+            f"<td style='text-align:right'>{delta(g['rec30'], base_rec30)}</td>"
+            f"<td style='text-align:right'>{col(g['rec75'])}</td>"
+            f"<td style='text-align:right'>{delta(g['rec75'], base_rec75)}</td>"
+            f"<td style='text-align:right'>{col(g['rec200'])}</td>"
+            f"<td style='text-align:right'>{delta(g['rec200'], base_rec200)}</td>"
+            f"<td style='text-align:right'>{avg_col(g['avg'])}</td>"
+            f"</tr>"
+        )
+
+    base_g = {"n": n_base, "rec30": round(base_rec30,1), "rec75": round(base_rec75,1),
+              "rec200": round(base_rec200,1), "avg": round(base_avg,2)}
+
+    group_rows_html = ""
+    group_rows_html += group_row("Baseline (todos com ticks)", base_g, bold=True)
+    group_rows_html += group_row("Sem nenhuma wallet",         stats_sem)
+    group_rows_html += group_row("Com qualquer wallet",        stats_com)
+    group_rows_html += group_row("Smart money (excl. ruído)",  stats_smart)
+
+    cart_rows_html = ""
+    for cart in sorted(cart_agg, key=lambda c: -(cart_agg[c]["n"])):
+        g    = cart_agg[cart]
+        tag  = " <span style='color:#f85149;font-size:10px'>[ruído]</span>" if cart in NOISE else ""
+        dim  = "color:#6e7681;" if cart in NOISE else ""
+        cart_rows_html += (
+            f"<tr style='{dim}'>"
+            f"<td>{cart}{tag}</td>"
+            f"<td style='text-align:right'>{g['n']}</td>"
+            f"<td style='text-align:right'>{col(g['rec30'])}</td>"
+            f"<td style='text-align:right'>{delta(g['rec30'], base_rec30)}</td>"
+            f"<td style='text-align:right'>{col(g['rec75'])}</td>"
+            f"<td style='text-align:right'>{delta(g['rec75'], base_rec75)}</td>"
+            f"<td style='text-align:right'>{col(g['rec200'])}</td>"
+            f"<td style='text-align:right'>{delta(g['rec200'], base_rec200)}</td>"
+            f"<td style='text-align:right'>{avg_col(g['avg'])}</td>"
+            f"</tr>"
+        )
+
+    ratio_rows_html = ""
+    for label, lo, hi in RATIO_BINS:
+        g = ratio_agg[label]
+        ratio_rows_html += group_row(label, g)
+
+    base_rec30_s  = f"{base_rec30:.1f}%"
+    base_rec75_s  = f"{base_rec75:.1f}%"
+    base_rec200_s = f"{base_rec200:.1f}%"
+    base_avg_s    = f"{base_avg:.2f}×"
+
+    html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+    <title>Wallet Token Outcome</title>
+    <style>
+      body{{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}}
+      h1{{color:#58a6ff}}h2{{color:#79c0ff;margin-top:28px}}
+      table{{border-collapse:collapse;width:100%;max-width:900px;margin-bottom:20px}}
+      th{{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:left}}
+      th:not(:first-child){{text-align:right}}
+      td{{padding:5px 10px;border:1px solid #21262d;white-space:nowrap}}
+      .note{{color:#8b949e;font-size:12px;margin:4px 0 14px}}
+      .box{{background:#161b22;border:1px solid #30363d;padding:12px 16px;
+            border-radius:4px;margin:12px 0;font-size:12px}}
+      a{{color:#58a6ff}}
+    </style></head><body>
+    <h1>Wallet Token Outcome — o token em si</h1>
+    <p class='note'>
+      Pergunta: wallets que compraram durante o dump antecipam tokens que bounceiam de verdade?<br>
+      <b>Métricas centradas no TOKEN</b> (não na nossa entrada). Janela: 60min após ts_signal.<br>
+      Baseline: gain medido a partir de <code>mc_min</code> (fundo detectado), independente do nosso entry.
+    </p>
+
+    <p>
+      <a href='/analise/cruzamento-wallets-ticks'>← WR por grupo</a> &nbsp;|&nbsp;
+      <a href='/analise/wallet-entry-depth'>Wallet Entry Depth</a> &nbsp;|&nbsp;
+      <a href='/analise/sinal-puro'>Sinal Puro</a>
+    </p>
+
+    <div class='box'>
+      <b>Baseline (todos os bounces com ≥{MIN_TICKS} ticks, n={n_base}):</b><br>
+      +30% em 60min: {base_rec30_s} &nbsp;|&nbsp;
+      +75% em 60min: {base_rec75_s} &nbsp;|&nbsp;
+      +200% em 60min: {base_rec200_s} &nbsp;|&nbsp;
+      Avg gain: {base_avg_s}
+    </div>
+
+    <h2>Tabela 1 — Por grupo de wallet</h2>
+    <p class='note'>n = tokens únicos. rec30/75/200 = % que atingiu +30%/+75%/+200% a partir do fundo em 60min.</p>
+    <table>
+      <tr>
+        <th>Grupo</th><th>n</th>
+        <th>rec30%</th><th>Δ</th>
+        <th>rec75%</th><th>Δ</th>
+        <th>rec200%</th><th>Δ</th>
+        <th>avg gain</th>
+      </tr>
+      {group_rows_html}
+    </table>
+
+    <h2>Tabela 2 — Por carteira individual</h2>
+    <p class='note'>Token deduplicado por carteira — cada token conta 1× por carteira.</p>
+    <table>
+      <tr>
+        <th>Carteira</th><th>n</th>
+        <th>rec30%</th><th>Δ</th>
+        <th>rec75%</th><th>Δ</th>
+        <th>rec200%</th><th>Δ</th>
+        <th>avg gain</th>
+      </tr>
+      {cart_rows_html or "<tr><td colspan='9' style='color:#666'>Sem dados</td></tr>"}
+    </table>
+
+    <h2>Tabela 3 — Por faixa de wallet_ratio</h2>
+    <p class='note'>
+      wallet_ratio = onde a wallet comprou / mc_migration. Token deduplicado pelo menor ratio.<br>
+      Separa compradores da capitulação (&lt;0.30) de momentum chasers (&gt;1.00).
+    </p>
+    <table>
+      <tr>
+        <th>Faixa</th><th>n</th>
+        <th>rec30%</th><th>Δ</th>
+        <th>rec75%</th><th>Δ</th>
+        <th>rec200%</th><th>Δ</th>
+        <th>avg gain</th>
+      </tr>
+      {ratio_rows_html}
+    </table>
+
+    <div class='box'>
+      <b>Como interpretar:</b><br>
+      Se "Com qualquer wallet" tem avg gain e rec75 maiores que baseline →
+      wallets têm edge real em selecionar tokens que bounceiam.<br>
+      Se flat → wallet presence é correlação espúria com H10 (tokens que dumpam rápido
+      atraem compradores e também têm melhor recovery).<br><br>
+      A faixa &gt;1.00 no endpoint anterior tinha WR 23.7% — mas isso é reverse causality
+      (token já subindo atrai compradores). Aqui vemos o comportamento real do token a partir do fundo.
+    </div>
+
+    </body></html>"""
+
+    return html
+
+
+@app.route("/analise/h22-h25-ticks")
+def analise_h22_h25_ticks():
+    """
+    Versão correta de H22/H23/H24/H25: usa token_ticks como outcome, NÃO trades.
+
+    Motivação: H24/H25 têm 0 trades porque esses bounces são filtrados por A.2/A.3/smart
+    antes de virar trade. Nunca teremos trades para eles. Token_ticks mede o comportamento
+    real do TOKEN independente de filtros de execução, slippage ou decisões do bot.
+
+    Metodologia idêntica ao /analise/sinal-puro:
+      entry  = mc_at_signal (preço real do sinal)
+      tp_hit = max_mc_20min >= entry × 1.75  (+75%)
+      sl_hit = min_mc_20min <= entry × 0.75  (-25%)
+      Mínimo 3 ticks após sinal.
+    """
+    import psycopg2, psycopg2.extras, traceback
+    from db import DATABASE_URL
+
+    TP_MULT    = 1.75
+    SL_MULT    = 0.75
+    MIN_TICKS  = 3
+    WINDOW_MIN = 60   # 60min = janela completa do HotMonitor (não 20min que é nossa janela de trade)
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # Dataset: bounce_signals com H22/H23/H24/H25 + token_ticks nos 60min após sinal
+        cur.execute("""
+            WITH outcomes AS (
+                SELECT
+                    bs.mint,
+                    bs.mc_at_signal                                       AS entry_mc,
+                    bs.bounce_pct,
+                    bs.elapsed_sec / 60.0                                 AS elapsed_min,
+                    -- H22
+                    bs.absorption_buy_vol,
+                    bs.absorption_sell_vol,
+                    bs.absorption_events,
+                    -- H23
+                    bs.net_sol_flow,
+                    bs.h23_window,
+                    -- H24
+                    bs.dump_seller_hhi,
+                    bs.dump_seller_count,
+                    -- H25
+                    bs.pool_quote_at_signal,
+                    -- token outcome via ticks (janela 60min = HotMonitor completo)
+                    MAX(COALESCE(tt.mc_high, tt.mc))                      AS max_mc,
+                    MIN(COALESCE(tt.mc_low,  tt.mc))                      AS min_mc,
+                    COUNT(tt.id)                                          AS tick_count
+                FROM bounce_signals bs
+                JOIN token_ticks tt
+                    ON  tt.mint    = bs.mint
+                    AND tt.tick_ts > bs.ts_signal
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
+                WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+                  AND bs.bounce_pct   IS NOT NULL
+                GROUP BY bs.mint, bs.mc_at_signal, bs.bounce_pct, bs.elapsed_sec,
+                         bs.absorption_buy_vol, bs.absorption_sell_vol, bs.absorption_events,
+                         bs.net_sol_flow, bs.h23_window,
+                         bs.dump_seller_hhi, bs.dump_seller_count,
+                         bs.pool_quote_at_signal
+                HAVING COUNT(tt.id) >= %(min_ticks)s
+            )
+            SELECT *,
+                (max_mc >= entry_mc * %(tp)s)  AS tp_hit,
+                (min_mc <= entry_mc * %(sl)s)  AS sl_hit
+            FROM outcomes
+        """, {"tp": TP_MULT, "sl": SL_MULT, "min_ticks": MIN_TICKS})
+        rows = cur.fetchall()
+        conn.close()
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+    if not rows:
+        return "<p>Sem dados suficientes ainda (bounces com H22/H23/H24/H25 + ticks).</p>"
+
+    # ── Agregação em Python ───────────────────────────────────────────────────
+    n_total = len(rows)
+    base_tp = sum(1 for r in rows if r["tp_hit"] and not r["sl_hit"])
+    BASE_WR = round(base_tp / n_total * 100, 1) if n_total else 0
+
+    def agg(subset):
+        n = len(subset)
+        if n == 0:
+            return {"n": 0, "tp": 0, "sl": 0, "wr": None}
+        tp = sum(1 for r in subset if r["tp_hit"] and not r["sl_hit"])
+        sl = sum(1 for r in subset if r["sl_hit"])
+        return {"n": n, "tp": tp, "sl": sl,
+                "wr": round(tp / n * 100, 1) if n else None}
+
+    def ratio(r):
+        bv = r["absorption_buy_vol"] or 0
+        sv = r["absorption_sell_vol"] or 0
+        ev = r["absorption_events"]  or 0
+        if ev == 0 or bv == 0:
+            return None
+        if sv == 0:
+            return float("inf")
+        return bv / sv
+
+    # H22 ratio bins
+    H22_BINS = [
+        ("∞  (só compra — vacuum pump)", lambda x: x == float("inf")),
+        ("≥3×  (compra domina)",          lambda x: x is not None and x != float("inf") and x >= 3.0),
+        ("1.5–3×  (zona ideal)",          lambda x: x is not None and 1.5 <= x < 3.0),
+        ("1–1.5×  (equilibrado)",         lambda x: x is not None and 1.0 <= x < 1.5),
+        ("0.5–1×  (leve venda)",          lambda x: x is not None and 0.5 <= x < 1.0),
+        ("<0.5×  (venda domina)",         lambda x: x is not None and x != float("inf") and x < 0.5),
+        ("sem dados Helius",              lambda x: x is None),
+    ]
+
+    # H23 net_flow bins (only h23_window='bottom')
+    H23_BINS = [
+        (">5 SOL  (compra forte → sinal tardio)", lambda r: r["h23_window"] == "bottom" and r["net_sol_flow"] is not None and r["net_sol_flow"] >  5),
+        ("0–5 SOL  (compra leve)",                lambda r: r["h23_window"] == "bottom" and r["net_sol_flow"] is not None and 0 < r["net_sol_flow"] <= 5),
+        ("-5–0 SOL  (venda leve)",                lambda r: r["h23_window"] == "bottom" and r["net_sol_flow"] is not None and -5 < r["net_sol_flow"] <= 0),
+        ("<-5 SOL  (seller exhaustion)",          lambda r: r["h23_window"] == "bottom" and r["net_sol_flow"] is not None and r["net_sol_flow"] <= -5),
+        ("sem H23 bottom",                        lambda r: r["h23_window"] != "bottom" or r["net_sol_flow"] is None),
+    ]
+
+    # H24 HHI bins
+    H24_BINS = [
+        ("≥0.5  (1-2 sellers dominam)",   lambda r: r["dump_seller_hhi"] is not None and r["dump_seller_hhi"] >= 0.5),
+        ("0.2–0.5  (poucos sellers)",     lambda r: r["dump_seller_hhi"] is not None and 0.2 <= r["dump_seller_hhi"] < 0.5),
+        ("0.1–0.2  (distribuído)",        lambda r: r["dump_seller_hhi"] is not None and 0.1 <= r["dump_seller_hhi"] < 0.2),
+        ("<0.1  (muito distribuído)",     lambda r: r["dump_seller_hhi"] is not None and r["dump_seller_hhi"] < 0.1),
+        ("sem dados H24",                 lambda r: r["dump_seller_hhi"] is None),
+    ]
+
+    # H25 pool depth bins
+    H25_BINS = [
+        ("≥100 SOL  (pool fundo)",        lambda r: r["pool_quote_at_signal"] is not None and r["pool_quote_at_signal"] >= 100),
+        ("50–100 SOL",                    lambda r: r["pool_quote_at_signal"] is not None and 50 <= r["pool_quote_at_signal"] < 100),
+        ("20–50 SOL",                     lambda r: r["pool_quote_at_signal"] is not None and 20 <= r["pool_quote_at_signal"] < 50),
+        ("<20 SOL  (pool fino)",          lambda r: r["pool_quote_at_signal"] is not None and r["pool_quote_at_signal"] < 20),
+        ("sem dados H25",                 lambda r: r["pool_quote_at_signal"] is None),
+    ]
+
+    # ── HTML helpers ──────────────────────────────────────────────────────────
+    def wr_col(wr):
+        if wr is None: return "—", "#8b949e"
+        c = "#3fb950" if wr >= BASE_WR + 8 else ("#f85149" if wr <= BASE_WR - 8 else "#e3b341")
+        return f"{wr:.1f}%", c
+
+    def delta(wr):
+        if wr is None: return "—"
+        d = wr - BASE_WR
+        c = "#3fb950" if d >= 5 else ("#f85149" if d <= -5 else "#8b949e")
+        return f"<span style='color:{c}'>{d:+.1f}pp</span>"
+
+    def table_html(title, note, bins, key_fn):
+        hdrs = ["Faixa", "n (ticks)", "TP", "SL", "WR%", "Δ baseline"]
+        ths  = "".join(f"<th>{h}</th>" for h in hdrs)
+        body = ""
+        for label, fn in bins:
+            subset = [r for r in rows if fn(key_fn(r) if key_fn else r)]
+            g = agg(subset)
+            ws, wc = wr_col(g["wr"])
+            body += (
+                f"<tr><td>{label}</td>"
+                f"<td style='text-align:right'>{g['n']}</td>"
+                f"<td style='text-align:right'>{g['tp']}</td>"
+                f"<td style='text-align:right'>{g['sl']}</td>"
+                f"<td style='text-align:right;color:{wc}'>{ws}</td>"
+                f"<td style='text-align:right'>{delta(g['wr'])}</td></tr>"
+            )
+        note_html = f"<p class='note'>{note}</p>" if note else ""
+        return f"<h2>{title}</h2>{note_html}<table><tr>{ths}</tr>{body}</table>"
+
+    # H22 usa key_fn para extrair ratio
+    h22_body = ""
+    for label, fn in H22_BINS:
+        subset = [r for r in rows if fn(ratio(r))]
+        g = agg(subset)
+        ws, wc = wr_col(g["wr"])
+        h22_body += (
+            f"<tr><td>{label}</td>"
+            f"<td style='text-align:right'>{g['n']}</td>"
+            f"<td style='text-align:right'>{g['tp']}</td>"
+            f"<td style='text-align:right'>{g['sl']}</td>"
+            f"<td style='text-align:right;color:{wc}'>{ws}</td>"
+            f"<td style='text-align:right'>{delta(g['wr'])}</td></tr>"
+        )
+    hdrs_html = "".join(f"<th>{'Faixa' if i==0 else h}</th>" for i, h in enumerate(["Faixa","n (ticks)","TP","SL","WR%","Δ baseline"]))
+    h22_html  = (
+        f"<h2>H22 — Ratio Buy/Sell [ts_min-60s → ts_min] — outcome via token_ticks</h2>"
+        f"<p class='note'>Zona ideal: 1.5–3× (sellers presentes, compradores vencendo). "
+        f"Extremos ∞/≥3× = vacuum pump = token já subiu antes do sinal.</p>"
+        f"<table><tr>{hdrs_html}</tr>{h22_body}</table>"
+    )
+
+    h23_html = table_html(
+        "H23 — Net SOL Flow no Fundo (h23_window='bottom') — outcome via token_ticks",
+        "Hipótese reformulada: net_flow negativo = sellers ativos até o fundo = exhaustion. "
+        "Net_flow positivo = token já recovering antes da detecção = sinal tardio.",
+        H23_BINS, None)
+
+    h24_html = table_html(
+        "H24 — Concentração de Sellers no Dump (HHI) — outcome via token_ticks",
+        "HHI ≥0.5 = 1-2 wallets fizeram o dump. Sellers concentrados exaurem rápido → bounce mais sustentado?",
+        H24_BINS, None)
+
+    h25_html = table_html(
+        "H25 — Profundidade do Pool no Sinal — outcome via token_ticks",
+        "Pool fino (<20 SOL): compra de $300 move preço 25% → spike artificial → SL por ruído.",
+        H25_BINS, None)
+
+    # Cobertura info
+    n_h22 = sum(1 for r in rows if (r["absorption_events"] or 0) > 0)
+    n_h23 = sum(1 for r in rows if r["h23_window"] == "bottom" and r["net_sol_flow"] is not None)
+    n_h24 = sum(1 for r in rows if r["dump_seller_hhi"] is not None)
+    n_h25 = sum(1 for r in rows if r["pool_quote_at_signal"] is not None)
+
+    html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+    <title>H22-H25 Ticks</title>
+    <style>
+      body{{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}}
+      h1{{color:#58a6ff}}h2{{color:#79c0ff;margin-top:28px}}
+      table{{border-collapse:collapse;width:100%;max-width:720px;margin-bottom:20px}}
+      th{{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:left}}
+      th:not(:first-child){{text-align:right}}
+      td{{padding:5px 10px;border:1px solid #21262d;white-space:nowrap}}
+      .note{{color:#8b949e;font-size:12px;margin:4px 0 14px}}
+      .box{{background:#161b22;border:1px solid #30363d;padding:10px 14px;border-radius:4px;margin:10px 0;font-size:12px}}
+      a{{color:#58a6ff}}
+    </style></head><body>
+    <h1>H22 / H23 / H24 / H25 — Outcome via token_ticks</h1>
+    <p class='note'>
+      Métrica: token_ticks nos <b>60min</b> após ts_signal (janela completa do HotMonitor).
+      Entry = mc_at_signal. TP = +75% | SL = -25%. Independente de filtros de execução do bot.<br>
+      <span style='color:#e3b341'>Nota: 60min mede qualidade do TOKEN. Para janela de trade (20min) ver /analise/sinal-puro.</span>
+    </p>
+    <div class='box'>
+      Baseline: {n_total} bounces com ≥{MIN_TICKS} ticks | {base_tp} TP | {n_total-base_tp} não-TP | WR base = <b>{BASE_WR}%</b><br>
+      Cobertura: H22={n_h22} | H23 bottom={n_h23} | H24={n_h24} | H25={n_h25}
+    </div>
+    <p><a href='/analise/h24-h25'>← Versão trades</a> &nbsp;|&nbsp;
+       <a href='/analise/sinal-puro'>Sinal Puro</a> &nbsp;|&nbsp;
+       <a href='/analise/h22-correlation'>H22 Correlation</a></p>
+    {h22_html}
+    {h23_html}
+    {h24_html}
+    {h25_html}
+    </body></html>"""
+
+    return html
+
+
+@app.route("/analise/h23-investigation")
+def analise_h23_investigation():
+    """Investigação detalhada: tokens H23 >5 SOL — por que 45% WR em ticks mas 0% em trades."""
+    import psycopg2, psycopg2.extras, traceback
+    try:
+        return _analise_h23_investigation_inner()
+    except Exception:
+        return f"<pre>{traceback.format_exc()}</pre>", 500
+
+def _analise_h23_investigation_inner():
+    import psycopg2, psycopg2.extras
+    conn = psycopg2.connect(db.DATABASE_URL)
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    # entry_ratio = mc_at_signal / mc_migration (ambos em bounce_signals)
+    # smart_wallets vem de migrations (JOIN)
+    # ts_min não existe em bounce_signals; approx = ts_migration + time_to_bottom min (via migrations)
+
+    # --- Query 1: todos tokens H23 >5 SOL com contexto completo ---
+    cur.execute("""
+        SELECT
+            bs.mint,
+            m.token_nome,
+            bs.ts_signal,
+            ROUND((bs.mc_min / 1000)::numeric, 1)                            AS mc_min_k,
+            ROUND((bs.mc_at_signal / 1000)::numeric, 1)                      AS mc_signal_k,
+            ROUND((bs.mc_at_signal / NULLIF(bs.mc_min,0))::numeric, 3)       AS ratio_sig_bottom,
+            ROUND((bs.mc_at_signal / NULLIF(bs.mc_migration,0))::numeric, 3) AS entry_ratio,
+            ROUND(bs.net_sol_flow::numeric, 2)                               AS net_sol,
+            ROUND(bs.absorption_buy_vol::numeric, 2)                         AS buy_vol,
+            ROUND(bs.absorption_sell_vol::numeric, 2)                        AS sell_vol,
+            ROUND((bs.bounce_pct * 100)::numeric, 1)                         AS bounce_pct,
+            ROUND((bs.elapsed_sec / 60.0)::numeric, 1)                       AS elapsed_min,
+            m.smart_wallets,
+            ROUND(m.time_to_bottom::numeric, 1)                              AS ttb_min,
+            t.status   AS trade_status,
+            ROUND((t.pnl_pct_real * 100)::numeric, 1)                       AS pnl_pct,
+            t.exit_type
+        FROM bounce_signals bs
+        LEFT JOIN migrations m ON m.mint = bs.mint
+        LEFT JOIN LATERAL (
+            SELECT status, pnl_pct_real, exit_type
+            FROM trades
+            WHERE mint = bs.mint
+              AND exit_type IN ('helius_sell_recovery','helius','helius_recovery')
+              AND status IN ('tp','sl')
+            ORDER BY created_at ASC LIMIT 1
+        ) t ON true
+        WHERE bs.h23_window = 'bottom'
+          AND bs.net_sol_flow > 5
+        ORDER BY bs.net_sol_flow DESC
+    """)
+    tokens_h23 = cur.fetchall()
+
+    # --- Query 2: distribuição ratio signal/bottom por faixa net_sol_flow ---
+    cur.execute("""
+        SELECT
+            CASE
+                WHEN net_sol_flow > 10  THEN '>10 SOL'
+                WHEN net_sol_flow > 5   THEN '5-10 SOL'
+                WHEN net_sol_flow > 0   THEN '0-5 SOL'
+                WHEN net_sol_flow > -5  THEN '-5-0 SOL'
+                ELSE '<-5 SOL'
+            END AS faixa,
+            COUNT(*) AS n,
+            ROUND(AVG(mc_at_signal / NULLIF(mc_min,0))::numeric, 3) AS avg_ratio,
+            ROUND(MIN(mc_at_signal / NULLIF(mc_min,0))::numeric, 3) AS min_ratio,
+            ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (
+                ORDER BY mc_at_signal / NULLIF(mc_min,0)
+            )::numeric, 3) AS median_ratio,
+            ROUND(MAX(mc_at_signal / NULLIF(mc_min,0))::numeric, 3) AS max_ratio
+        FROM bounce_signals
+        WHERE h23_window = 'bottom'
+          AND mc_min > 0 AND mc_at_signal > 0
+        GROUP BY 1
+        ORDER BY MIN(net_sol_flow) DESC
+    """)
+    ratio_dist = cur.fetchall()
+
+    # --- Query 3: max gain pós-sinal para tokens H23 >5 (via token_ticks 60min) ---
+    cur.execute("""
+        SELECT
+            bs.mint,
+            m.token_nome,
+            ROUND(bs.net_sol_flow::numeric, 2)                               AS net_sol,
+            ROUND((bs.mc_min / 1000)::numeric, 1)                            AS mc_min_k,
+            ROUND((bs.mc_at_signal / 1000)::numeric, 1)                      AS mc_signal_k,
+            ROUND((bs.mc_at_signal / NULLIF(bs.mc_min,0))::numeric, 3)       AS ratio_sig_bot,
+            ROUND(m.time_to_bottom::numeric, 1)                              AS ttb_min,
+            COUNT(tt.tick_ts)                                                 AS n_ticks,
+            ROUND((MAX(tt.mc) / NULLIF(bs.mc_min,0))::numeric, 3)            AS max_gain_vs_bottom,
+            ROUND((MAX(tt.mc) / NULLIF(bs.mc_at_signal,0))::numeric, 3)      AS max_gain_vs_signal,
+            t.status AS trade_status,
+            ROUND((t.pnl_pct_real * 100)::numeric, 1) AS pnl_pct
+        FROM bounce_signals bs
+        LEFT JOIN migrations m ON m.mint = bs.mint
+        LEFT JOIN token_ticks tt
+            ON tt.mint = bs.mint
+           AND tt.tick_ts >= bs.ts_signal
+           AND tt.tick_ts <= bs.ts_signal + INTERVAL '60 minutes'
+        LEFT JOIN LATERAL (
+            SELECT status, pnl_pct_real
+            FROM trades
+            WHERE mint = bs.mint
+              AND exit_type IN ('helius_sell_recovery','helius','helius_recovery')
+              AND status IN ('tp','sl')
+            ORDER BY created_at ASC LIMIT 1
+        ) t ON true
+        WHERE bs.h23_window = 'bottom'
+          AND bs.net_sol_flow > 5
+        GROUP BY bs.mint, m.token_nome, bs.net_sol_flow, bs.mc_min,
+                 bs.mc_at_signal, bs.ts_signal, m.time_to_bottom,
+                 t.status, t.pnl_pct_real
+        ORDER BY bs.net_sol_flow DESC
+    """)
+    ticks_detail = cur.fetchall()
+
+    # --- Query 4: filtros — por que H23 >5 não viraram trade? ---
+    cur.execute("""
+        SELECT
+            bs.mint,
+            m.token_nome,
+            ROUND(bs.net_sol_flow::numeric, 2)                               AS net_sol,
+            ROUND((bs.bounce_pct * 100)::numeric, 1)                        AS bounce_pct,
+            ROUND((bs.mc_at_signal / NULLIF(bs.mc_migration,0))::numeric, 3) AS entry_ratio,
+            ROUND((bs.elapsed_sec / 60.0)::numeric, 1)                      AS elapsed_min,
+            m.smart_wallets,
+            CASE
+                WHEN bs.bounce_pct < 0.20 THEN 'A.7 bounce<20%'
+                WHEN bs.bounce_pct BETWEEN 0.20 AND 0.30 THEN 'A.2 dead_zone 20-30%'
+                WHEN (bs.mc_at_signal / NULLIF(bs.mc_migration,0)) BETWEEN 0.50 AND 0.65 THEN 'A.3 entry 50-65%'
+                WHEN bs.elapsed_sec > 1200 THEN 'A.5 elapsed>20min'
+                WHEN m.smart_wallets < 3 OR m.smart_wallets IS NULL THEN 'smart<3'
+                ELSE 'passou_filtros'
+            END AS filtro_provavel,
+            (SELECT COUNT(*) FROM trades WHERE mint = bs.mint) AS n_trades_total
+        FROM bounce_signals bs
+        LEFT JOIN migrations m ON m.mint = bs.mint
+        WHERE bs.h23_window = 'bottom'
+          AND bs.net_sol_flow > 5
+        ORDER BY bs.net_sol_flow DESC
+    """)
+    filter_analysis = cur.fetchall()
+
+    # --- Query 5: timing — time_to_bottom por faixa de net_sol_flow ---
+    cur.execute("""
+        SELECT
+            CASE
+                WHEN bs.net_sol_flow > 10 THEN '>10 SOL'
+                WHEN bs.net_sol_flow > 5  THEN '5-10 SOL'
+                WHEN bs.net_sol_flow > 0  THEN '0-5 SOL'
+                WHEN bs.net_sol_flow > -5 THEN '-5-0 SOL'
+                ELSE '<-5 SOL'
+            END AS faixa,
+            COUNT(*) AS n,
+            ROUND(AVG(m.time_to_bottom)::numeric, 1) AS avg_ttb,
+            ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (
+                ORDER BY m.time_to_bottom
+            )::numeric, 1) AS median_ttb,
+            ROUND(MIN(m.time_to_bottom)::numeric, 1) AS min_ttb,
+            ROUND(MAX(m.time_to_bottom)::numeric, 1) AS max_ttb
+        FROM bounce_signals bs
+        LEFT JOIN migrations m ON m.mint = bs.mint
+        WHERE bs.h23_window = 'bottom'
+          AND m.time_to_bottom IS NOT NULL
+        GROUP BY 1
+        ORDER BY MIN(bs.net_sol_flow) DESC
+    """)
+    timing_dist = cur.fetchall()
+
+    # --- Query 6: status real de TODOS os trades para tokens H23 >5 ---
+    cur.execute("""
+        SELECT
+            m.token_nome,
+            t.id,
+            t.status,
+            t.exit_type,
+            ROUND((t.pnl_pct_real * 100)::numeric, 1) AS pnl_pct,
+            t.created_at,
+            t.exit_ts,
+            ROUND(bs.net_sol_flow::numeric, 2) AS net_sol
+        FROM bounce_signals bs
+        LEFT JOIN migrations m ON m.mint = bs.mint
+        JOIN trades t ON t.mint = bs.mint
+        WHERE bs.h23_window = 'bottom'
+          AND bs.net_sol_flow > 5
+        ORDER BY bs.net_sol_flow DESC, t.created_at
+    """)
+    trades_raw = cur.fetchall()
+
+    cur.close(); conn.close()
+
+    def td(v, cls=""):
+        return f'<td class="{cls}">{v if v is not None else "—"}</td>'
+
+    def color_ratio(v):
+        if v is None: return "—"
+        r = float(v)
+        c = "green" if r < 1.35 else ("orange" if r < 1.55 else "red")
+        return f'<span style="color:{c};font-weight:bold">{r:.3f}×</span>'
+
+    def color_status(s):
+        if s == "tp": return '<span style="color:green">TP</span>'
+        if s == "sl": return '<span style="color:red">SL</span>'
+        return f'<span style="color:gray">{s or "sem_trade"}</span>'
+
+    # Table 1 — tokens H23 >5 SOL
+    rows1 = ""
+    for r in tokens_h23:
+        ratio_color = color_ratio(r['ratio_sig_bottom'])
+        entry_ratio_pct = f"{float(r['entry_ratio'])*100:.1f}%" if r['entry_ratio'] else '—'
+        rows1 += f"""<tr>
+            {td(r['token_nome'] or r['mint'][:8])}
+            {td(r['ts_signal'].strftime('%d/%m %H:%M') if r['ts_signal'] else '—')}
+            {td(f"${r['mc_min_k']}k" if r['mc_min_k'] else '—')}
+            {td(f"${r['mc_signal_k']}k" if r['mc_signal_k'] else '—')}
+            {td(ratio_color)}
+            {td(entry_ratio_pct)}
+            {td(f"{r['net_sol']} SOL")}
+            {td(f"{r['buy_vol']} / {r['sell_vol']}")}
+            {td(f"{r['bounce_pct']}%")}
+            {td(f"{r['elapsed_min']}min")}
+            {td(r['smart_wallets'])}
+            {td(f"{r['ttb_min']}min" if r['ttb_min'] else '—')}
+            {td(color_status(r['trade_status']))}
+            {td(f"{r['pnl_pct']}%" if r['pnl_pct'] is not None else '—')}
+        </tr>"""
+
+    table1 = f"""
+    <h2>1. Tokens H23 &gt;5 SOL — visão completa (n={len(tokens_h23)})</h2>
+    <p><b>ratio_sig/bottom</b> = mc_at_signal / mc_min = quanto o preço JÁ tinha subido quando disparou<br>
+    <b>entry%</b> = mc_at_signal / mc_migration = onde entramos relativo ao MC da migração<br>
+    <b>ttb</b> = time_to_bottom (min desde migração até o fundo)<br>
+    🟢 ratio &lt;1.35 = entrou perto do fundo | 🟠 1.35-1.55 = subiu antes | 🔴 &gt;1.55 = entrou tarde</p>
+    <table border=1 cellpadding=4 style="border-collapse:collapse;font-size:13px">
+    <tr><th>Token</th><th>Data</th><th>MC Fundo</th><th>MC Sinal</th><th>Ratio sig/bottom</th>
+        <th>Entry%</th><th>Net SOL</th><th>Buy/Sell SOL</th><th>Bounce%</th>
+        <th>Elapsed</th><th>Smart</th><th>TTB</th><th>Trade</th><th>P&amp;L</th></tr>
+    {rows1}
+    </table>"""
+
+    # Table 2 — distribuição ratio por faixa
+    rows2 = ""
+    for r in ratio_dist:
+        rows2 += f"""<tr>
+            {td(r['faixa'])}
+            {td(r['n'])}
+            {td(r['avg_ratio'])}
+            {td(r['min_ratio'])}
+            {td(r['median_ratio'])}
+            {td(r['max_ratio'])}
+        </tr>"""
+    table2 = f"""
+    <h2>2. Distribuição ratio mc_signal/mc_min por faixa de net_sol_flow</h2>
+    <p>Quanto mais alto o ratio, mais o token já tinha subido antes do sinal disparar.</p>
+    <table border=1 cellpadding=4 style="border-collapse:collapse;font-size:13px">
+    <tr><th>Faixa</th><th>n</th><th>avg ratio</th><th>min</th><th>median</th><th>max</th></tr>
+    {rows2}
+    </table>"""
+
+    # Table 3 — ticks detail
+    rows3 = ""
+    for r in ticks_detail:
+        gain_bot = float(r['max_gain_vs_bottom']) if r['max_gain_vs_bottom'] else None
+        gain_sig = float(r['max_gain_vs_signal']) if r['max_gain_vs_signal'] else None
+        c_bot = "green" if gain_bot and gain_bot >= 1.75 else ("orange" if gain_bot and gain_bot >= 1.30 else "red")
+        c_sig = "green" if gain_sig and gain_sig >= 1.75 else ("orange" if gain_sig and gain_sig >= 1.30 else "red")
+        rows3 += f"""<tr>
+            {td(r['token_nome'] or r['mint'][:8])}
+            {td(f"{r['net_sol']} SOL")}
+            {td(f"${r['mc_min_k']}k")}
+            {td(f"${r['mc_signal_k']}k")}
+            {td(f'<span style="color:{c_bot}">{gain_bot:.3f}×</span>' if gain_bot else '—')}
+            {td(f'<span style="color:{c_sig}">{gain_sig:.3f}×</span>' if gain_sig else '—')}
+            {td(f"{r['ratio_sig_bot']:.3f}×" if r['ratio_sig_bot'] else '—')}
+            {td(f"{r['ttb_min']}min" if r['ttb_min'] else '—')}
+            {td(r['n_ticks'])}
+            {td(color_status(r['trade_status']))}
+            {td(f"{r['pnl_pct']}%" if r['pnl_pct'] is not None else '—')}
+        </tr>"""
+    table3 = f"""
+    <h2>3. Max gain via token_ticks 60min (H23 &gt;5 SOL)</h2>
+    <p><b>max_gain_vs_bottom</b> = do fundo | <b>max_gain_vs_signal</b> = da nossa entrada (mc_at_signal)<br>
+    Verde = atingiu +75% TP | Laranja = atingiu +30% | Vermelho = não atingiu</p>
+    <table border=1 cellpadding=4 style="border-collapse:collapse;font-size:13px">
+    <tr><th>Token</th><th>Net SOL</th><th>MC Fundo</th><th>MC Sinal</th>
+        <th>Max gain vs bottom</th><th>Max gain vs signal</th><th>Ratio sig/bot</th>
+        <th>TTB</th><th>n_ticks</th><th>Trade</th><th>P&amp;L</th></tr>
+    {rows3}
+    </table>"""
+
+    # Table 4 — filtros
+    rows4 = ""
+    for r in filter_analysis:
+        c = "green" if r['filtro_provavel'] == 'passou_filtros' else "red"
+        rows4 += f"""<tr>
+            {td(r['token_nome'] or r['mint'][:8])}
+            {td(f"{r['net_sol']} SOL")}
+            {td(f"{r['bounce_pct']}%")}
+            {td(f"{float(r['entry_ratio'])*100:.1f}%" if r['entry_ratio'] else '—')}
+            {td(f"{r['elapsed_min']}min")}
+            {td(r['smart_wallets'])}
+            {td(f'<span style="color:{c}">{r["filtro_provavel"]}</span>')}
+            {td(r['n_trades_total'])}
+        </tr>"""
+    n_passou = sum(1 for r in filter_analysis if r['filtro_provavel'] == 'passou_filtros')
+    n_total = len(filter_analysis)
+    table4 = f"""
+    <h2>4. Análise de filtros — por que H23 &gt;5 não viraram trade? ({n_passou}/{n_total} passaram)</h2>
+    <table border=1 cellpadding=4 style="border-collapse:collapse;font-size:13px">
+    <tr><th>Token</th><th>Net SOL</th><th>Bounce%</th><th>Entry%</th><th>Elapsed</th>
+        <th>Smart</th><th>Filtro bloqueador</th><th>n_trades total</th></tr>
+    {rows4}
+    </table>"""
+
+    # Table 5 — timing via time_to_bottom
+    rows5 = ""
+    for r in timing_dist:
+        rows5 += f"""<tr>
+            {td(r['faixa'])}{td(r['n'])}{td(f"{r['avg_ttb']}min")}
+            {td(f"{r['median_ttb']}min")}{td(f"{r['min_ttb']}min")}{td(f"{r['max_ttb']}min")}
+        </tr>"""
+    table5 = f"""
+    <h2>5. Time-to-bottom por faixa de net_sol_flow</h2>
+    <p>Se H23 &gt;5 SOL tem TTB menor, o fundo foi rápido → sinal disparou mais cedo = entramos mais perto do fundo.</p>
+    <table border=1 cellpadding=4 style="border-collapse:collapse;font-size:13px">
+    <tr><th>Faixa</th><th>n</th><th>avg TTB</th><th>median TTB</th><th>min</th><th>max</th></tr>
+    {rows5}
+    </table>"""
+
+    # Table 6 — status real de todos os trades H23 >5
+    rows6 = ""
+    for r in trades_raw:
+        sc = {"tp": "green", "sl": "red", "open": "orange", "pending": "gray",
+              "error": "darkred", "trailing_active": "cyan", "expired": "gray"}.get(r['status'], "white")
+        rows6 += f"""<tr>
+            {td(r['token_nome'] or '—')}
+            {td(r['net_sol'])}
+            {td(r['id'])}
+            {td(f'<span style="color:{sc}">{r["status"]}</span>')}
+            {td(r['exit_type'] or '—')}
+            {td(f"{r['pnl_pct']}%" if r['pnl_pct'] is not None else '—')}
+            {td(r['created_at'].strftime('%d/%m %H:%M') if r['created_at'] else '—')}
+            {td(r['exit_ts'].strftime('%d/%m %H:%M') if r['exit_ts'] else '—')}
+        </tr>"""
+    table6 = f"""
+    <h2>6. Status real de TODOS os trades para tokens H23 &gt;5 SOL</h2>
+    <p>Inclui trades com qualquer status — mostra por que "passou_filtros + sem_trade" aconteceu.</p>
+    <table border=1 cellpadding=4 style="border-collapse:collapse;font-size:13px">
+    <tr><th>Token</th><th>Net SOL</th><th>Trade ID</th><th>Status</th><th>exit_type</th><th>P&amp;L</th><th>Criado</th><th>Exit</th></tr>
+    {rows6}
+    </table>"""
+
+    html = f"""<!DOCTYPE html><html><head>
+    <title>H23 Investigation</title>
+    <meta charset="utf-8">
+    <style>
+        body {{ font-family: monospace; padding: 20px; background: #0d1117; color: #c9d1d9; }}
+        h1 {{ color: #58a6ff; }}
+        h2 {{ color: #f0883e; margin-top: 30px; }}
+        table {{ border-color: #30363d; margin-bottom: 20px; }}
+        th {{ background: #161b22; color: #8b949e; }}
+        td {{ background: #0d1117; }}
+        p {{ color: #8b949e; font-size: 12px; }}
+    </style>
+    </head><body>
+    <h1>Investigação H23 >5 SOL — Por que 45% WR em ticks mas 0% em trades?</h1>
+    <p>Metodologia: tokens com h23_window='bottom' AND net_sol_flow > 5 SOL (compra forte nos 60s antes do fundo)</p>
+    {table1}
+    {table2}
+    {table3}
+    {table4}
+    {table5}
+    {table6}
+    </body></html>"""
+    return html
+
+
+@app.route("/debug/napoleon")
+def debug_napoleon():
+    """Mostra todos os dados brutos do Napoleon: ticks, bounce_signal, trades, kline timeline."""
+    import psycopg2, psycopg2.extras, traceback
+    try:
+        import psycopg2, psycopg2.extras
+        conn = psycopg2.connect(db.DATABASE_URL)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # Encontra o mint do Napoleon
+        cur.execute("SELECT mint, ts_migration, mc_migration, mc_migration_bc_ref FROM migrations WHERE token_nome ILIKE '%napoleon%' ORDER BY ts_migration DESC LIMIT 5")
+        naps = cur.fetchall()
+
+        if not naps:
+            return "<pre>Napoleon não encontrado em migrations</pre>"
+
+        mint = naps[0]['mint']
+
+        # bounce_signal
+        cur.execute("SELECT * FROM bounce_signals WHERE mint = %s", (mint,))
+        bs = cur.fetchone()
+
+        # TODOS os token_ticks em ordem cronológica
+        cur.execute("""
+            SELECT tick_ts, elapsed_sec, mc, mc_open, mc_high, mc_low, source
+            FROM token_ticks WHERE mint = %s ORDER BY tick_ts ASC
+        """, (mint,))
+        ticks = cur.fetchall()
+
+        # TODOS os trades
+        cur.execute("SELECT id, status, exit_type, pnl_pct_real, created_at, exit_ts FROM trades WHERE mint = %s ORDER BY created_at", (mint,))
+        trades = cur.fetchall()
+
+        cur.close(); conn.close()
+
+        def fmt(v, k=1000):
+            if v is None: return "—"
+            return f"${float(v)/k:.1f}k"
+
+        rows_t = ""
+        for t in ticks:
+            mc_low_v = float(t['mc_low']) if t['mc_low'] else None
+            mc_v = float(t['mc']) if t['mc'] else None
+            low_flag = ""
+            if mc_low_v and mc_v and mc_low_v < mc_v * 0.80:
+                low_flag = ' style="background:#3d0000"'  # kline low muito abaixo do close
+            rows_t += f"""<tr{low_flag}>
+                <td>{t['tick_ts'].strftime('%H:%M:%S') if t['tick_ts'] else '—'}</td>
+                <td>{t['elapsed_sec']}s</td>
+                <td>{fmt(t['mc'])}</td>
+                <td>{fmt(t.get('mc_open'))}</td>
+                <td>{fmt(t.get('mc_high'))}</td>
+                <td style="color:{'red' if mc_low_v and mc_low_v < 25000 else 'inherit'}">{fmt(t.get('mc_low'))}</td>
+                <td>{t['source']}</td>
+            </tr>"""
+
+        mig = naps[0]
+        bs_html = f"""
+        <h2>bounce_signals</h2><pre>
+mc_min        = {fmt(bs['mc_min']) if bs else '—'} (o valor suspeito)
+mc_at_signal  = {fmt(bs['mc_at_signal']) if bs else '—'}
+mc_migration  = {fmt(bs['mc_migration']) if bs else '—'}
+bounce_pct    = {round(float(bs['bounce_pct'])*100,1) if bs and bs['bounce_pct'] else '—'}%
+elapsed_sec   = {bs['elapsed_sec'] if bs else '—'}s
+ts_signal     = {bs['ts_signal'] if bs else '—'}
+h23_window    = {bs['h23_window'] if bs else '—'}
+net_sol_flow  = {bs['net_sol_flow'] if bs else '—'} SOL
+        </pre>""" if bs else "<p>Sem bounce_signal</p>"
+
+        trades_html = "<br>".join(
+            f"ID {t['id']} | {t['status']} | {t['exit_type']} | pnl={round(float(t['pnl_pct_real'])*100,1) if t['pnl_pct_real'] else '—'}% | {t['created_at']} → {t['exit_ts']}"
+            for t in trades
+        ) or "Sem trades"
+
+        html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+        <style>body{{font-family:monospace;padding:20px;background:#0d1117;color:#c9d1d9}}
+        h1,h2{{color:#58a6ff}} table{{border-collapse:collapse}} th,td{{border:1px solid #30363d;padding:4px}}
+        th{{background:#161b22}} pre{{color:#8b949e}}</style></head><body>
+        <h1>Debug: Napoleon</h1>
+        <p>mint: {mint}</p>
+        <p>ts_migration: {mig['ts_migration']} | mc_migration: {fmt(mig['mc_migration'])} | bc_ref: {fmt(mig['mc_migration_bc_ref'])}</p>
+        {bs_html}
+        <h2>Trades</h2><pre>{trades_html}</pre>
+        <h2>Token Ticks ({len(ticks)} total) — vermelho = kline low muito abaixo do close</h2>
+        <table><tr><th>time</th><th>elapsed</th><th>mc(close)</th><th>open</th><th>high</th><th>low</th><th>source</th></tr>
+        {rows_t}
+        </table></body></html>"""
+        return html
+    except Exception:
+        return f"<pre>{traceback.format_exc()}</pre>", 500
+
+
+@app.route("/analise/mc-migration-audit")
+def analise_mc_migration_audit():
+    """Audita a qualidade do mc_migration: bc_ref vs kline vs real price action."""
+    import psycopg2, psycopg2.extras, traceback
+    try:
+        return _mc_migration_audit_inner()
+    except Exception:
+        import traceback
+        return f"<pre>{traceback.format_exc()}</pre>", 500
+
+def _mc_migration_audit_inner():
+    import psycopg2, psycopg2.extras
+    conn = psycopg2.connect(db.DATABASE_URL)
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    # 1. Para cada token em bounce_signals, compara mc_migration (usado pelo bot)
+    #    vs mc_migration_bc_ref vs mc_migration_observed (da migrations table)
+    cur.execute("""
+        SELECT
+            m.token_nome,
+            m.mint,
+            m.mc_migration_source,
+            ROUND((m.mc_migration / 1000)::numeric, 1)          AS mc_mig_used_k,
+            ROUND((m.mc_migration_bc_ref / 1000)::numeric, 1)   AS mc_bc_ref_k,
+            ROUND((m.mc_migration_observed / 1000)::numeric, 1) AS mc_observed_k,
+            ROUND((bs.mc_min / 1000)::numeric, 1)               AS mc_min_k,
+            ROUND((bs.mc_at_signal / 1000)::numeric, 1)         AS mc_signal_k,
+            ROUND(bs.bounce_pct::numeric * 100, 1)              AS bounce_pct,
+            ROUND(bs.elapsed_sec::numeric / 60, 1)              AS elapsed_min,
+            ROUND(m.time_to_bottom::numeric, 1)                 AS ttb_min,
+            -- drop calculado com mc_migration USADO pelo bot
+            ROUND(((m.mc_migration - bs.mc_min) / NULLIF(m.mc_migration,0) * 100)::numeric, 1) AS drop_vs_used,
+            -- drop SE tivéssemos usado mc_bc_ref
+            ROUND(((m.mc_migration_bc_ref - bs.mc_min) / NULLIF(m.mc_migration_bc_ref,0) * 100)::numeric, 1) AS drop_vs_bcref,
+            -- sinal: bc_ref estava subestimado vs observed?
+            ROUND(((m.mc_migration_observed - m.mc_migration_bc_ref) / NULLIF(m.mc_migration_bc_ref,0) * 100)::numeric, 1) AS observed_vs_bcref_pct,
+            bs.h23_window,
+            t.status AS trade_status,
+            ROUND((t.pnl_pct_real * 100)::numeric, 1) AS pnl_pct
+        FROM bounce_signals bs
+        JOIN migrations m ON m.mint = bs.mint
+        LEFT JOIN LATERAL (
+            SELECT status, pnl_pct_real
+            FROM trades
+            WHERE mint = bs.mint
+              AND exit_type IN ('helius_sell_recovery','helius','helius_recovery')
+              AND status IN ('tp','sl')
+            ORDER BY created_at ASC LIMIT 1
+        ) t ON true
+        WHERE bs.h23_window = 'bottom'
+        ORDER BY bs.ts_signal DESC
+        LIMIT 100
+    """)
+    recent = cur.fetchall()
+
+    # 2. Distribuição: quantos tokens têm mc_migration_observed >> mc_migration_bc_ref?
+    cur.execute("""
+        SELECT
+            CASE
+                WHEN mc_migration_observed > mc_migration_bc_ref * 1.50 THEN 'observed > 1.5× bc_ref (subestimado grave)'
+                WHEN mc_migration_observed > mc_migration_bc_ref * 1.20 THEN 'observed 1.2-1.5× bc_ref (subestimado)'
+                WHEN mc_migration_observed > mc_migration_bc_ref * 0.80 THEN 'observed 0.8-1.2× bc_ref (ok)'
+                WHEN mc_migration_observed IS NULL THEN 'sem mc_observed'
+                ELSE 'observed < 0.8× bc_ref (superestimado)'
+            END AS faixa,
+            COUNT(*) AS n,
+            ROUND(AVG(mc_migration_observed / NULLIF(mc_migration_bc_ref,0))::numeric, 3) AS avg_ratio
+        FROM migrations
+        WHERE ts_migration > NOW() - INTERVAL '30 days'
+        GROUP BY 1
+        ORDER BY n DESC
+    """)
+    dist_migration = cur.fetchall()
+
+    # 3. Para bounce_signals recentes, qual % tem drop_from_mig calculado com bc_ref ERRADO?
+    #    (token que não dumpou de verdade: mc_min > mc_migration_observed)
+    cur.execute("""
+        SELECT
+            COUNT(*) FILTER (WHERE bs.mc_min < m.mc_migration_bc_ref * 0.70) AS real_dump_30pct,
+            COUNT(*) FILTER (WHERE bs.mc_min >= m.mc_migration_bc_ref * 0.70
+                               AND bs.mc_min < m.mc_migration_bc_ref) AS shallow_or_no_dump,
+            COUNT(*) FILTER (WHERE bs.mc_min >= m.mc_migration_bc_ref) AS mc_min_above_bcref,
+            COUNT(*) AS total
+        FROM bounce_signals bs
+        JOIN migrations m ON m.mint = bs.mint
+        WHERE bs.h23_window = 'bottom'
+          AND m.mc_migration_bc_ref IS NOT NULL
+    """)
+    dump_audit = cur.fetchone()
+
+    # 4. Comparar WR entre tokens com drop REAL (>30% vs bc_ref) e tokens sem drop real
+    cur.execute("""
+        SELECT
+            CASE
+                WHEN bs.mc_min < m.mc_migration_bc_ref * 0.70 THEN 'dump real >30% (vs bc_ref)'
+                WHEN bs.mc_min < m.mc_migration_bc_ref * 0.85 THEN 'dump leve 15-30% (vs bc_ref)'
+                ELSE 'sem dump ou mc_min acima de bc_ref'
+            END AS categoria,
+            COUNT(*) AS n_bounces,
+            COUNT(t.status) AS n_trades,
+            COUNT(*) FILTER (WHERE t.status = 'tp') AS n_tp,
+            ROUND(
+                (COUNT(*) FILTER (WHERE t.status = 'tp') * 100.0 / NULLIF(COUNT(t.status),0))::numeric, 1
+            ) AS wr_pct
+        FROM bounce_signals bs
+        JOIN migrations m ON m.mint = bs.mint
+        LEFT JOIN LATERAL (
+            SELECT status
+            FROM trades
+            WHERE mint = bs.mint
+              AND exit_type IN ('helius_sell_recovery','helius','helius_recovery')
+              AND status IN ('tp','sl')
+            ORDER BY created_at ASC LIMIT 1
+        ) t ON true
+        WHERE bs.h23_window = 'bottom'
+          AND m.mc_migration_bc_ref IS NOT NULL
+        GROUP BY 1
+        ORDER BY n_bounces DESC
+    """)
+    wr_by_dump = cur.fetchall()
+
+    cur.close(); conn.close()
+
+    def td(v):
+        return f'<td>{v if v is not None else "—"}</td>'
+
+    # Table 1 — tokens recentes com comparação de MC sources
+    rows1 = ""
+    for r in recent:
+        # Sinaliza quando mc_min está ACIMA do mc_migration_bc_ref (sem dump real)
+        no_real_dump = r['mc_min_k'] and r['mc_bc_ref_k'] and float(r['mc_min_k']) >= float(r['mc_bc_ref_k']) * 0.85
+        bg = ' style="background:#3d0000"' if no_real_dump else ''
+        status_col = f'<span style="color:{"green" if r["trade_status"]=="tp" else "red" if r["trade_status"]=="sl" else "gray"}">{r["trade_status"] or "—"}</span>'
+        rows1 += f"""<tr{bg}>
+            {td(r['token_nome'] or r['mint'][:8])}
+            {td(r['mc_migration_source'] or '—')}
+            {td(f"${r['mc_mig_used_k']}k")}
+            {td(f"${r['mc_bc_ref_k']}k")}
+            {td(f"${r['mc_observed_k']}k" if r['mc_observed_k'] else '—')}
+            {td(f"${r['mc_min_k']}k")}
+            {td(f"{r['drop_vs_used']}%")}
+            {td(f"{r['drop_vs_bcref']}%")}
+            {td(f"{r['bounce_pct']}%")}
+            {td(f"{r['elapsed_min']}min")}
+            {td(f"{r['ttb_min']}min" if r['ttb_min'] else '—')}
+            {td(status_col)}
+            {td(f"{r['pnl_pct']}%" if r['pnl_pct'] is not None else '—')}
+        </tr>"""
+
+    da = dump_audit
+    pct_no_dump = round(float(da['mc_min_above_bcref'] or 0) / max(float(da['total']),1) * 100, 1)
+    pct_shallow = round(float(da['shallow_or_no_dump'] or 0) / max(float(da['total']),1) * 100, 1)
+    pct_real = round(float(da['real_dump_30pct'] or 0) / max(float(da['total']),1) * 100, 1)
+
+    rows2 = "".join(f"<tr>{td(r['faixa'])}{td(r['n'])}{td(r['avg_ratio'])}</tr>" for r in dist_migration)
+    rows3 = ""
+    for r in wr_by_dump:
+        wr_str = str(r['wr_pct']) + "%" if r['wr_pct'] is not None else "—"
+        rows3 += f"<tr>{td(r['categoria'])}{td(r['n_bounces'])}{td(r['n_trades'])}{td(r['n_tp'])}{td(wr_str)}</tr>"
+
+    html = f"""<!DOCTYPE html><html><head>
+    <title>MC Migration Audit</title><meta charset="utf-8">
+    <style>
+        body {{ font-family: monospace; padding: 20px; background: #0d1117; color: #c9d1d9; }}
+        h1 {{ color: #58a6ff; }} h2 {{ color: #f0883e; margin-top: 30px; }}
+        table {{ border-color: #30363d; margin-bottom: 20px; border-collapse: collapse; }}
+        th {{ background: #161b22; color: #8b949e; padding: 4px; }}
+        td {{ background: #0d1117; padding: 4px; }}
+        p {{ color: #8b949e; font-size: 12px; }}
+        .warn {{ color: #ff6b6b; font-weight: bold; }}
+    </style></head><body>
+    <h1>Auditoria: mc_migration — qual % dos bounce signals tem dump REAL?</h1>
+    <p>Problema identificado: mc_migration usa bc_ref (teórico). Se token migrou com MC real > bc_ref, o "drop" calculado é falso.</p>
+
+    <h2>Resumo — bounce_signals com h23_window='bottom' (n={da['total']})</h2>
+    <ul>
+        <li class="warn">mc_min ACIMA de bc_ref (sem dump real): {da['mc_min_above_bcref']} ({pct_no_dump}%)</li>
+        <li style="color:orange">dump leve 15-30%: {da['shallow_or_no_dump']} ({pct_shallow}%)</li>
+        <li style="color:green">dump real >30% vs bc_ref: {da['real_dump_30pct']} ({pct_real}%)</li>
+    </ul>
+
+    <h2>WR por categoria de dump real</h2>
+    <table border=1>
+    <tr><th>Categoria</th><th>n_bounces</th><th>n_trades</th><th>n_tp</th><th>WR</th></tr>
+    {rows3}
+    </table>
+
+    <h2>Distribuição mc_migration_observed vs bc_ref (últimos 30 dias)</h2>
+    <table border=1>
+    <tr><th>Faixa</th><th>n</th><th>avg ratio</th></tr>
+    {rows2}
+    </table>
+
+    <h2>Tokens recentes — comparação de fontes de MC (vermelho = sem dump real)</h2>
+    <p>drop_vs_used = usando mc_migration atual | drop_vs_bcref = usando referência teórica<br>
+    Linha vermelha = mc_min >= 85% do bc_ref = token nunca dumpou de verdade pós-migração</p>
+    <table border=1>
+    <tr><th>Token</th><th>Fonte</th><th>MC usado</th><th>BC ref</th><th>MC observed</th>
+        <th>MC fundo</th><th>Drop (usado)</th><th>Drop (bcref)</th><th>Bounce%</th>
+        <th>Elapsed</th><th>TTB</th><th>Trade</th><th>P&L</th></tr>
+    {rows1}
+    </table>
+    </body></html>"""
+    return html
 
 
 if __name__ == "__main__":
