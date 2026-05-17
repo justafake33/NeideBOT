@@ -173,7 +173,10 @@ class HotMonitor:
             db.set_recovery_false(mint)
             return
 
-        if mc < state["mc_min"]:
+        # Pool em transição (primeiros 90s): trenches/Helius podem ter preços da bonding
+        # curve pré-migração. Não atualizar mc_min — _precise_bottom_tick cuida disso
+        # via A.9 (Helius-only para elapsed < BOUNCE_TIME_MIN_SEC).
+        if elapsed_sec >= 90 and mc < state["mc_min"]:
             state["mc_min"] = mc
             state["time_min"] = elapsed_min
             state["ts_min"]   = datetime.now(timezone.utc)
@@ -200,9 +203,8 @@ class HotMonitor:
     BOUNCE_MAX_PCT       = float(os.getenv("BOUNCE_MAX_PCT",         "9.99"))  # desativado por padrão — sem validação GMGN para threshold máximo (nota 87 CLAUDE.md)
     BOUNCE_DROP_MIN      = float(os.getenv("BOUNCE_DROP_MIN",        "0.30"))  # queda mínima da migração
     BOUNCE_TIME_MAX      = float(os.getenv("BOUNCE_TIME_MAX",        "20.0"))  # A.5: janela 30→20min (100% TPs em ≤20min)
-    BOUNCE_TIME_MIN_SEC  = int(os.getenv(  "BOUNCE_TIME_MIN_SEC",   "0"))     # A.9: janela mínima — ignora sinais muito cedo pós-migração
+    BOUNCE_TIME_MIN_SEC  = int(os.getenv(  "BOUNCE_TIME_MIN_SEC",   "90"))    # A.9: pool em transição nos primeiros 90s — mc_min não atualizado, sinais bloqueados
     BOTTOM_FRESHNESS_SEC = int(os.getenv(  "BOTTOM_FRESHNESS_SEC",  "300"))   # A.6: máx 5min desde o último mc_min
-    BOUNCE_TIME_MIN_SEC  = int(os.getenv(  "BOUNCE_TIME_MIN_SEC",   "90"))    # A.9: elapsed < 90s pool em transição, usar APENAS Helius
 
     def _check_bounce(self, mint: str, state: dict, mc: float, elapsed_sec: int):
         """Detecta bounce em tempo real. Fase A: filtros A.2, A.3, A.6.
