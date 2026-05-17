@@ -33923,27 +33923,30 @@ def analise_h23_investigation():
     conn = psycopg2.connect(db.DATABASE_URL)
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
+    # entry_ratio = mc_at_signal / mc_migration (ambos em bounce_signals)
+    # smart_wallets vem de migrations (JOIN)
+    # ts_min não existe em bounce_signals; approx = ts_migration + time_to_bottom min (via migrations)
+
     # --- Query 1: todos tokens H23 >5 SOL com contexto completo ---
     cur.execute("""
         SELECT
             bs.mint,
             m.token_nome,
             bs.ts_signal,
-            bs.ts_min,
-            ROUND((bs.mc_min / 1000)::numeric, 1)        AS mc_min_k,
-            ROUND((bs.mc_at_signal / 1000)::numeric, 1)  AS mc_signal_k,
-            ROUND((bs.mc_at_signal / NULLIF(bs.mc_min,0))::numeric, 3) AS ratio_sig_bottom,
-            ROUND(bs.net_sol_flow::numeric, 2)            AS net_sol,
-            ROUND(bs.absorption_buy_vol::numeric, 2)      AS buy_vol,
-            ROUND(bs.absorption_sell_vol::numeric, 2)     AS sell_vol,
-            ROUND(bs.bounce_pct * 100, 1)                 AS bounce_pct,
-            ROUND(bs.entry_ratio * 100, 1)                AS entry_ratio_pct,
-            ROUND(bs.elapsed_sec / 60.0, 1)               AS elapsed_min,
-            bs.smart_wallets,
+            ROUND((bs.mc_min / 1000)::numeric, 1)                            AS mc_min_k,
+            ROUND((bs.mc_at_signal / 1000)::numeric, 1)                      AS mc_signal_k,
+            ROUND((bs.mc_at_signal / NULLIF(bs.mc_min,0))::numeric, 3)       AS ratio_sig_bottom,
+            ROUND((bs.mc_at_signal / NULLIF(bs.mc_migration,0))::numeric, 3) AS entry_ratio,
+            ROUND(bs.net_sol_flow::numeric, 2)                               AS net_sol,
+            ROUND(bs.absorption_buy_vol::numeric, 2)                         AS buy_vol,
+            ROUND(bs.absorption_sell_vol::numeric, 2)                        AS sell_vol,
+            ROUND(bs.bounce_pct * 100, 1)                                    AS bounce_pct,
+            ROUND(bs.elapsed_sec / 60.0, 1)                                  AS elapsed_min,
+            m.smart_wallets,
+            ROUND(m.time_to_bottom::numeric, 1)                              AS ttb_min,
             t.status   AS trade_status,
-            ROUND((t.pnl_pct_real * 100)::numeric, 1)    AS pnl_pct,
-            t.exit_type,
-            EXTRACT(EPOCH FROM (bs.ts_signal - bs.ts_min))::int AS sec_min_to_signal
+            ROUND((t.pnl_pct_real * 100)::numeric, 1)                       AS pnl_pct,
+            t.exit_type
         FROM bounce_signals bs
         LEFT JOIN migrations m ON m.mint = bs.mint
         LEFT JOIN LATERAL (
@@ -33990,14 +33993,14 @@ def analise_h23_investigation():
         SELECT
             bs.mint,
             m.token_nome,
-            ROUND(bs.net_sol_flow::numeric, 2)             AS net_sol,
-            ROUND((bs.mc_min / 1000)::numeric, 1)          AS mc_min_k,
-            ROUND((bs.mc_at_signal / 1000)::numeric, 1)    AS mc_signal_k,
-            ROUND((bs.mc_at_signal / NULLIF(bs.mc_min,0))::numeric, 3) AS ratio_sig_bot,
-            EXTRACT(EPOCH FROM (bs.ts_signal - bs.ts_min))::int AS sec_min_to_sig,
-            COUNT(tt.tick_ts)                              AS n_ticks,
-            ROUND((MAX(tt.mc) / NULLIF(bs.mc_min,0))::numeric, 3)       AS max_gain_vs_bottom,
-            ROUND((MAX(tt.mc) / NULLIF(bs.mc_at_signal,0))::numeric, 3) AS max_gain_vs_signal,
+            ROUND(bs.net_sol_flow::numeric, 2)                               AS net_sol,
+            ROUND((bs.mc_min / 1000)::numeric, 1)                            AS mc_min_k,
+            ROUND((bs.mc_at_signal / 1000)::numeric, 1)                      AS mc_signal_k,
+            ROUND((bs.mc_at_signal / NULLIF(bs.mc_min,0))::numeric, 3)       AS ratio_sig_bot,
+            ROUND(m.time_to_bottom::numeric, 1)                              AS ttb_min,
+            COUNT(tt.tick_ts)                                                 AS n_ticks,
+            ROUND((MAX(tt.mc) / NULLIF(bs.mc_min,0))::numeric, 3)            AS max_gain_vs_bottom,
+            ROUND((MAX(tt.mc) / NULLIF(bs.mc_at_signal,0))::numeric, 3)      AS max_gain_vs_signal,
             t.status AS trade_status,
             ROUND((t.pnl_pct_real * 100)::numeric, 1) AS pnl_pct
         FROM bounce_signals bs
@@ -34017,7 +34020,7 @@ def analise_h23_investigation():
         WHERE bs.h23_window = 'bottom'
           AND bs.net_sol_flow > 5
         GROUP BY bs.mint, m.token_nome, bs.net_sol_flow, bs.mc_min,
-                 bs.mc_at_signal, bs.ts_min, bs.ts_signal,
+                 bs.mc_at_signal, bs.ts_signal, m.time_to_bottom,
                  t.status, t.pnl_pct_real
         ORDER BY bs.net_sol_flow DESC
     """)
@@ -34028,17 +34031,17 @@ def analise_h23_investigation():
         SELECT
             bs.mint,
             m.token_nome,
-            ROUND(bs.net_sol_flow::numeric, 2) AS net_sol,
-            ROUND(bs.bounce_pct * 100, 1)      AS bounce_pct,
-            ROUND(bs.entry_ratio * 100, 1)     AS entry_ratio_pct,
-            ROUND(bs.elapsed_sec / 60.0, 1)    AS elapsed_min,
-            bs.smart_wallets,
+            ROUND(bs.net_sol_flow::numeric, 2)                               AS net_sol,
+            ROUND(bs.bounce_pct * 100, 1)                                    AS bounce_pct,
+            ROUND((bs.mc_at_signal / NULLIF(bs.mc_migration,0))::numeric, 3) AS entry_ratio,
+            ROUND(bs.elapsed_sec / 60.0, 1)                                  AS elapsed_min,
+            m.smart_wallets,
             CASE
                 WHEN bs.bounce_pct < 0.20 THEN 'A.7 bounce<20%'
-                WHEN bs.bounce_pct BETWEEN 0.20 AND 0.30 THEN 'A.2 dead zone 20-30%'
-                WHEN bs.entry_ratio BETWEEN 0.50 AND 0.65 THEN 'A.3 entry 50-65%'
+                WHEN bs.bounce_pct BETWEEN 0.20 AND 0.30 THEN 'A.2 dead_zone 20-30%'
+                WHEN (bs.mc_at_signal / NULLIF(bs.mc_migration,0)) BETWEEN 0.50 AND 0.65 THEN 'A.3 entry 50-65%'
                 WHEN bs.elapsed_sec > 1200 THEN 'A.5 elapsed>20min'
-                WHEN bs.smart_wallets < 3 THEN 'smart<3'
+                WHEN m.smart_wallets < 3 OR m.smart_wallets IS NULL THEN 'smart<3'
                 ELSE 'passou_filtros'
             END AS filtro_provavel,
             (SELECT COUNT(*) FROM trades WHERE mint = bs.mint) AS n_trades_total
@@ -34050,28 +34053,29 @@ def analise_h23_investigation():
     """)
     filter_analysis = cur.fetchall()
 
-    # --- Query 5: timing detalhado — sec_min_to_signal por faixa ---
+    # --- Query 5: timing — time_to_bottom por faixa de net_sol_flow ---
     cur.execute("""
         SELECT
             CASE
-                WHEN net_sol_flow > 10 THEN '>10 SOL'
-                WHEN net_sol_flow > 5  THEN '5-10 SOL'
-                WHEN net_sol_flow > 0  THEN '0-5 SOL'
-                WHEN net_sol_flow > -5 THEN '-5-0 SOL'
+                WHEN bs.net_sol_flow > 10 THEN '>10 SOL'
+                WHEN bs.net_sol_flow > 5  THEN '5-10 SOL'
+                WHEN bs.net_sol_flow > 0  THEN '0-5 SOL'
+                WHEN bs.net_sol_flow > -5 THEN '-5-0 SOL'
                 ELSE '<-5 SOL'
             END AS faixa,
             COUNT(*) AS n,
-            ROUND(AVG(EXTRACT(EPOCH FROM (ts_signal - ts_min)))::numeric, 0) AS avg_sec_min_to_sig,
+            ROUND(AVG(m.time_to_bottom)::numeric, 1) AS avg_ttb,
             ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (
-                ORDER BY EXTRACT(EPOCH FROM (ts_signal - ts_min))
-            )::numeric, 0) AS median_sec_min_to_sig,
-            ROUND(MIN(EXTRACT(EPOCH FROM (ts_signal - ts_min)))::numeric, 0) AS min_sec,
-            ROUND(MAX(EXTRACT(EPOCH FROM (ts_signal - ts_min)))::numeric, 0) AS max_sec
-        FROM bounce_signals
-        WHERE h23_window = 'bottom'
-          AND ts_min IS NOT NULL AND ts_signal IS NOT NULL
+                ORDER BY m.time_to_bottom
+            )::numeric, 1) AS median_ttb,
+            ROUND(MIN(m.time_to_bottom)::numeric, 1) AS min_ttb,
+            ROUND(MAX(m.time_to_bottom)::numeric, 1) AS max_ttb
+        FROM bounce_signals bs
+        LEFT JOIN migrations m ON m.mint = bs.mint
+        WHERE bs.h23_window = 'bottom'
+          AND m.time_to_bottom IS NOT NULL
         GROUP BY 1
-        ORDER BY MIN(net_sol_flow) DESC
+        ORDER BY MIN(bs.net_sol_flow) DESC
     """)
     timing_dist = cur.fetchall()
 
@@ -34095,31 +34099,34 @@ def analise_h23_investigation():
     rows1 = ""
     for r in tokens_h23:
         ratio_color = color_ratio(r['ratio_sig_bottom'])
+        entry_ratio_pct = f"{float(r['entry_ratio'])*100:.1f}%" if r['entry_ratio'] else '—'
         rows1 += f"""<tr>
             {td(r['token_nome'] or r['mint'][:8])}
             {td(r['ts_signal'].strftime('%d/%m %H:%M') if r['ts_signal'] else '—')}
             {td(f"${r['mc_min_k']}k" if r['mc_min_k'] else '—')}
             {td(f"${r['mc_signal_k']}k" if r['mc_signal_k'] else '—')}
             {td(ratio_color)}
+            {td(entry_ratio_pct)}
             {td(f"{r['net_sol']} SOL")}
             {td(f"{r['buy_vol']} / {r['sell_vol']}")}
             {td(f"{r['bounce_pct']}%")}
-            {td(f"{r['entry_ratio_pct']}%")}
             {td(f"{r['elapsed_min']}min")}
             {td(r['smart_wallets'])}
-            {td(f"{r['sec_min_to_signal']}s")}
+            {td(f"{r['ttb_min']}min" if r['ttb_min'] else '—')}
             {td(color_status(r['trade_status']))}
             {td(f"{r['pnl_pct']}%" if r['pnl_pct'] is not None else '—')}
         </tr>"""
 
     table1 = f"""
     <h2>1. Tokens H23 &gt;5 SOL — visão completa (n={len(tokens_h23)})</h2>
-    <p><b>ratio_sig_bottom</b> = mc_at_signal / mc_min = quanto o preço JÁ tinha subido quando o sinal disparou<br>
-    🟢 &lt;1.35 = entrou perto do fundo | 🟠 1.35-1.55 = entrou já com alguma subida | 🔴 &gt;1.55 = entrou tarde</p>
+    <p><b>ratio_sig/bottom</b> = mc_at_signal / mc_min = quanto o preço JÁ tinha subido quando disparou<br>
+    <b>entry%</b> = mc_at_signal / mc_migration = onde entramos relativo ao MC da migração<br>
+    <b>ttb</b> = time_to_bottom (min desde migração até o fundo)<br>
+    🟢 ratio &lt;1.35 = entrou perto do fundo | 🟠 1.35-1.55 = subiu antes | 🔴 &gt;1.55 = entrou tarde</p>
     <table border=1 cellpadding=4 style="border-collapse:collapse;font-size:13px">
     <tr><th>Token</th><th>Data</th><th>MC Fundo</th><th>MC Sinal</th><th>Ratio sig/bottom</th>
-        <th>Net SOL</th><th>Buy/Sell SOL</th><th>Bounce%</th><th>Entry%</th>
-        <th>Elapsed</th><th>Smart</th><th>sec fundo→sinal</th><th>Trade</th><th>P&amp;L</th></tr>
+        <th>Entry%</th><th>Net SOL</th><th>Buy/Sell SOL</th><th>Bounce%</th>
+        <th>Elapsed</th><th>Smart</th><th>TTB</th><th>Trade</th><th>P&amp;L</th></tr>
     {rows1}
     </table>"""
 
@@ -34157,7 +34164,7 @@ def analise_h23_investigation():
             {td(f'<span style="color:{c_bot}">{gain_bot:.3f}×</span>' if gain_bot else '—')}
             {td(f'<span style="color:{c_sig}">{gain_sig:.3f}×</span>' if gain_sig else '—')}
             {td(f"{r['ratio_sig_bot']:.3f}×" if r['ratio_sig_bot'] else '—')}
-            {td(f"{r['sec_min_to_sig']}s")}
+            {td(f"{r['ttb_min']}min" if r['ttb_min'] else '—')}
             {td(r['n_ticks'])}
             {td(color_status(r['trade_status']))}
             {td(f"{r['pnl_pct']}%" if r['pnl_pct'] is not None else '—')}
@@ -34169,7 +34176,7 @@ def analise_h23_investigation():
     <table border=1 cellpadding=4 style="border-collapse:collapse;font-size:13px">
     <tr><th>Token</th><th>Net SOL</th><th>MC Fundo</th><th>MC Sinal</th>
         <th>Max gain vs bottom</th><th>Max gain vs signal</th><th>Ratio sig/bot</th>
-        <th>sec fundo→sinal</th><th>n_ticks</th><th>Trade</th><th>P&amp;L</th></tr>
+        <th>TTB</th><th>n_ticks</th><th>Trade</th><th>P&amp;L</th></tr>
     {rows3}
     </table>"""
 
@@ -34181,7 +34188,7 @@ def analise_h23_investigation():
             {td(r['token_nome'] or r['mint'][:8])}
             {td(f"{r['net_sol']} SOL")}
             {td(f"{r['bounce_pct']}%")}
-            {td(f"{r['entry_ratio_pct']}%")}
+            {td(f"{float(r['entry_ratio'])*100:.1f}%" if r['entry_ratio'] else '—')}
             {td(f"{r['elapsed_min']}min")}
             {td(r['smart_wallets'])}
             {td(f'<span style="color:{c}">{r["filtro_provavel"]}</span>')}
@@ -34197,18 +34204,18 @@ def analise_h23_investigation():
     {rows4}
     </table>"""
 
-    # Table 5 — timing
+    # Table 5 — timing via time_to_bottom
     rows5 = ""
     for r in timing_dist:
         rows5 += f"""<tr>
-            {td(r['faixa'])}{td(r['n'])}{td(f"{r['avg_sec_min_to_sig']}s")}
-            {td(f"{r['median_sec_min_to_sig']}s")}{td(f"{r['min_sec']}s")}{td(f"{r['max_sec']}s")}
+            {td(r['faixa'])}{td(r['n'])}{td(f"{r['avg_ttb']}min")}
+            {td(f"{r['median_ttb']}min")}{td(f"{r['min_ttb']}min")}{td(f"{r['max_ttb']}min")}
         </tr>"""
     table5 = f"""
-    <h2>5. Timing: segundos entre fundo e sinal por faixa</h2>
-    <p>Quanto mais rápido o sinal dispara após o fundo, mais cedo entramos.</p>
+    <h2>5. Time-to-bottom por faixa de net_sol_flow</h2>
+    <p>Se H23 &gt;5 SOL tem TTB menor, o fundo foi rápido → sinal disparou mais cedo = entramos mais perto do fundo.</p>
     <table border=1 cellpadding=4 style="border-collapse:collapse;font-size:13px">
-    <tr><th>Faixa</th><th>n</th><th>avg</th><th>median</th><th>min</th><th>max</th></tr>
+    <tr><th>Faixa</th><th>n</th><th>avg TTB</th><th>median TTB</th><th>min</th><th>max</th></tr>
     {rows5}
     </table>"""
 
