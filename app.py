@@ -30568,6 +30568,136 @@ def analise_tp_vs_sl():
         return f"<pre style='color:red'>{traceback.format_exc()}</pre>", 500
 
 
+@app.route("/analise/elapsed-granular")
+def analise_elapsed_granular():
+    """WR por minuto exato pós-migração — pente fino 0-20min."""
+    import psycopg2, traceback
+    from db import DATABASE_URL
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor()
+
+        # minuto a minuto 0-20 + bucket 20+
+        cur.execute("""
+            SELECT
+                CASE
+                    WHEN bs.elapsed_sec <  60  THEN '0-1min'
+                    WHEN bs.elapsed_sec < 120  THEN '1-2min'
+                    WHEN bs.elapsed_sec < 180  THEN '2-3min'
+                    WHEN bs.elapsed_sec < 240  THEN '3-4min'
+                    WHEN bs.elapsed_sec < 300  THEN '4-5min'
+                    WHEN bs.elapsed_sec < 360  THEN '5-6min'
+                    WHEN bs.elapsed_sec < 420  THEN '6-7min'
+                    WHEN bs.elapsed_sec < 480  THEN '7-8min'
+                    WHEN bs.elapsed_sec < 540  THEN '8-9min'
+                    WHEN bs.elapsed_sec < 600  THEN '9-10min'
+                    WHEN bs.elapsed_sec < 720  THEN '10-12min'
+                    WHEN bs.elapsed_sec < 900  THEN '12-15min'
+                    WHEN bs.elapsed_sec < 1200 THEN '15-20min'
+                    ELSE '>20min'
+                END as faixa,
+                MIN(bs.elapsed_sec)                                                        as _sort,
+                COUNT(*)                                                                   as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)                            as tp,
+                SUM(CASE WHEN t.status='sl' THEN 1 ELSE 0 END)                            as sl,
+                ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1) as wr,
+                ROUND((AVG(bs.bounce_pct)*100)::numeric,1)                                as avg_bounce,
+                ROUND((AVG(bs.drop_from_mig)*100)::numeric,1)                             as avg_dump,
+                ROUND((AVG(CASE WHEN t.status='tp' THEN t.pnl_pct_real END)*100)::numeric,1) as avg_pnl_tp,
+                ROUND((AVG(CASE WHEN t.status='sl' THEN t.pnl_pct_real END)*100)::numeric,1) as avg_pnl_sl
+            FROM trades t
+            JOIN bounce_signals bs ON bs.mint = t.mint
+                AND bs.ts_signal BETWEEN t.created_at - INTERVAL '5 min' AND t.created_at + INTERVAL '30 min'
+            JOIN migrations m ON m.mint = t.mint
+            WHERE t.exit_type IS NOT NULL AND t.status IN ('tp','sl')
+            GROUP BY 1
+            ORDER BY 2
+        """)
+        rows = cur.fetchall()
+
+        # totais
+        cur.execute("""
+            SELECT COUNT(*),
+                   SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END),
+                   ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1)
+            FROM trades t
+            JOIN bounce_signals bs ON bs.mint = t.mint
+                AND bs.ts_signal BETWEEN t.created_at - INTERVAL '5 min' AND t.created_at + INTERVAL '30 min'
+            WHERE t.exit_type IS NOT NULL AND t.status IN ('tp','sl')
+        """)
+        total, tps, wr_base = cur.fetchone()
+
+        conn.close()
+
+        # monta tabela com highlight por WR
+        trs = ""
+        for faixa, _sort, n, tp, sl, wr, avg_bounce, avg_dump, avg_pnl_tp, avg_pnl_sl in rows:
+            if wr is None:
+                wr_color = "#888"
+            elif wr >= 25:
+                wr_color = "#2a2"
+            elif wr >= 15:
+                wr_color = "#fa0"
+            else:
+                wr_color = "#a44"
+
+            bar_w = int((n / max(r[2] for r in rows)) * 120)
+            bar = f"<span style='display:inline-block;width:{bar_w}px;height:10px;background:#333;vertical-align:middle'></span>"
+
+            trs += f"""<tr>
+              <td><b>{faixa}</b></td>
+              <td>{bar} {n}</td>
+              <td style='color:#2a2'>{tp}</td>
+              <td style='color:#a44'>{sl}</td>
+              <td style='color:{wr_color}'><b>{wr}%</b></td>
+              <td>{avg_bounce if avg_bounce is not None else '—'}%</td>
+              <td>{avg_dump if avg_dump is not None else '—'}%</td>
+              <td style='color:#2a2'>{f"+{avg_pnl_tp:.0f}%" if avg_pnl_tp is not None else "—"}</td>
+              <td style='color:#a44'>{f"{avg_pnl_sl:.0f}%" if avg_pnl_sl is not None else "—"}</td>
+            </tr>"""
+
+        return f"""<!DOCTYPE html><html><head>
+        <meta charset='utf-8'><title>Elapsed Granular</title>
+        <meta http-equiv='refresh' content='60'>
+        <style>
+          body{{font-family:monospace;background:#111;color:#ccc;padding:20px}}
+          h2{{color:#fa0}} h3{{color:#fa0;margin-top:20px}}
+          table{{border-collapse:collapse;min-width:700px}}
+          th,td{{padding:6px 12px;border:1px solid #333;text-align:right}}
+          th{{background:#222;color:#fa0}} td:first-child{{text-align:left}}
+          .note{{color:#888;font-size:.9em;margin:4px 0 12px}}
+        </style></head><body>
+        <h2>Elapsed Granular — pente fino por minuto</h2>
+        <p class='note'>
+          Total blockchain-verificado: <b>{total}</b> trades &nbsp;|&nbsp;
+          TPs: <b>{tps}</b> &nbsp;|&nbsp;
+          WR base: <b>{wr_base}%</b><br>
+          Verde = WR ≥ 25% &nbsp; Amarelo = 15-25% &nbsp; Vermelho = &lt;15%
+        </p>
+        <table>
+          <tr>
+            <th>Minuto pós-migração</th>
+            <th>n trades</th>
+            <th>TP</th>
+            <th>SL</th>
+            <th>WR%</th>
+            <th>avg bounce%</th>
+            <th>avg dump%</th>
+            <th>avg P&amp;L (TP)</th>
+            <th>avg P&amp;L (SL)</th>
+          </tr>
+          {trs}
+        </table>
+        <p class='note' style='margin-top:16px'>
+          Auto-refresh 60s. Verde = faixas a manter. Vermelho = candidatas a bloquear com BOUNCE_TIME_MIN_SEC.<br>
+          avg bounce% = bounce médio dos trades nessa janela (TP e SL juntos).<br>
+          avg dump% = queda média da migração até o fundo nesses trades.
+        </p>
+        </body></html>"""
+    except Exception:
+        return f"<pre style='color:red'>{traceback.format_exc()}</pre>", 500
+
+
 @app.route("/analise/tp-vs-sl-recente")
 def analise_tp_vs_sl_recente():
     """Mesmo que tp-vs-sl mas filtrando apenas trades id >= 338 (filtros atuais ativos)."""
