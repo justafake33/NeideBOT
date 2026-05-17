@@ -30378,10 +30378,10 @@ def _analise_h24_h25_inner(conn, cur):
           AND bs.absorption_buy_vol IS NOT NULL
         GROUP BY 1
         ORDER BY
-            CASE
+            MIN(CASE
                 WHEN bs.absorption_sell_vol IS NULL OR bs.absorption_sell_vol = 0 THEN 0
-                ELSE MIN(bs.absorption_buy_vol / NULLIF(bs.absorption_sell_vol,0))
-            END DESC
+                ELSE bs.absorption_buy_vol / NULLIF(bs.absorption_sell_vol, 0)
+            END) DESC
     """)
 
     # ── Overhead Supply ───────────────────────────────────────────────────────
