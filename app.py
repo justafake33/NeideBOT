@@ -33683,15 +33683,16 @@ def analise_h22_h25_ticks():
     import psycopg2, psycopg2.extras, traceback
     from db import DATABASE_URL
 
-    TP_MULT   = 1.75
-    SL_MULT   = 0.75
-    MIN_TICKS = 3
+    TP_MULT    = 1.75
+    SL_MULT    = 0.75
+    MIN_TICKS  = 3
+    WINDOW_MIN = 60   # 60min = janela completa do HotMonitor (não 20min que é nossa janela de trade)
 
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-        # Dataset: bounce_signals com H22/H23/H24/H25 + token_ticks nos 20min após sinal
+        # Dataset: bounce_signals com H22/H23/H24/H25 + token_ticks nos 60min após sinal
         cur.execute("""
             WITH outcomes AS (
                 SELECT
@@ -33711,7 +33712,7 @@ def analise_h22_h25_ticks():
                     bs.dump_seller_count,
                     -- H25
                     bs.pool_quote_at_signal,
-                    -- token outcome via ticks
+                    -- token outcome via ticks (janela 60min = HotMonitor completo)
                     MAX(COALESCE(tt.mc_high, tt.mc))                      AS max_mc,
                     MIN(COALESCE(tt.mc_low,  tt.mc))                      AS min_mc,
                     COUNT(tt.id)                                          AS tick_count
@@ -33719,7 +33720,7 @@ def analise_h22_h25_ticks():
                 JOIN token_ticks tt
                     ON  tt.mint    = bs.mint
                     AND tt.tick_ts > bs.ts_signal
-                    AND tt.tick_ts < bs.ts_signal + INTERVAL '20 minutes'
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
                 WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
                   AND bs.bounce_pct   IS NOT NULL
                 GROUP BY bs.mint, bs.mc_at_signal, bs.bounce_pct, bs.elapsed_sec,
@@ -33895,8 +33896,9 @@ def analise_h22_h25_ticks():
     </style></head><body>
     <h1>H22 / H23 / H24 / H25 — Outcome via token_ticks</h1>
     <p class='note'>
-      Métrica: token_ticks nos 20min após ts_signal. Entry = mc_at_signal.
-      TP = +75% antes de -25% SL. Independente de filtros de execução do bot.
+      Métrica: token_ticks nos <b>60min</b> após ts_signal (janela completa do HotMonitor).
+      Entry = mc_at_signal. TP = +75% | SL = -25%. Independente de filtros de execução do bot.<br>
+      <span style='color:#e3b341'>Nota: 60min mede qualidade do TOKEN. Para janela de trade (20min) ver /analise/sinal-puro.</span>
     </p>
     <div class='box'>
       Baseline: {n_total} bounces com ≥{MIN_TICKS} ticks | {base_tp} TP | {n_total-base_tp} não-TP | WR base = <b>{BASE_WR}%</b><br>
