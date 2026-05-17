@@ -30764,14 +30764,16 @@ def analise_simulacao_300s():
             ts_mig_utc = ts_mig.replace(tzinfo=timezone.utc) if ts_mig.tzinfo is None else ts_mig
             t300 = ts_mig_utc.timestamp() + MIN_SEC  # unix epoch do t=5min
 
-            # 2. mc_min nos primeiros 300s (do banco; bounce_signals já tem o fundo real)
-            #    Complementa com token_ticks caso haja low mais baixo
+            # 2. mc_min nos primeiros 300s
+            from datetime import datetime
+            t300_dt = datetime.fromtimestamp(t300, tz=timezone.utc)
+
             cur.execute("""
                 SELECT MIN(COALESCE(mc_low, mc))
                 FROM token_ticks
                 WHERE mint = %s
-                  AND ts >= %s AND ts <= %s
-            """, (mint, ts_mig_utc, ts_mig_utc.replace(tzinfo=None).__class__.fromtimestamp(t300, tz=timezone.utc)))
+                  AND tick_ts >= %s AND tick_ts <= %s
+            """, (mint, ts_mig_utc, t300_dt))
             row = cur.fetchone()
             tick_mc_min = row[0] if row and row[0] else None
             mc_min_300s = min(bs_mc_min or 0, tick_mc_min or float('inf'))
@@ -30779,15 +30781,13 @@ def analise_simulacao_300s():
                 mc_min_300s = bs_mc_min
 
             # 3. mc em t=300s — tick mais próximo numa janela de ±TICK_WINDOW segundos
-            from datetime import datetime
-            t300_dt = datetime.fromtimestamp(t300, tz=timezone.utc)
             t300_lo = datetime.fromtimestamp(t300 - TICK_WINDOW, tz=timezone.utc)
             t300_hi = datetime.fromtimestamp(t300 + TICK_WINDOW, tz=timezone.utc)
 
             cur.execute("""
-                SELECT mc, ABS(EXTRACT(EPOCH FROM (ts - %s))) AS diff
+                SELECT mc, ABS(EXTRACT(EPOCH FROM (tick_ts - %s))) AS diff
                 FROM token_ticks
-                WHERE mint = %s AND ts BETWEEN %s AND %s
+                WHERE mint = %s AND tick_ts BETWEEN %s AND %s
                 ORDER BY diff
                 LIMIT 1
             """, (t300_dt, mint, t300_lo, t300_hi))
@@ -30830,10 +30830,10 @@ def analise_simulacao_300s():
             tp_ceil  = mc_300s * (1 + TP_PCT)
 
             cur.execute("""
-                SELECT mc_low, mc_high, mc, ts
+                SELECT mc_low, mc_high, mc, tick_ts
                 FROM token_ticks
-                WHERE mint = %s AND ts > %s
-                ORDER BY ts
+                WHERE mint = %s AND tick_ts > %s
+                ORDER BY tick_ts
             """, (mint, t300_dt))
             ticks = cur.fetchall()
 
