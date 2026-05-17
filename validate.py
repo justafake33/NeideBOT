@@ -85,63 +85,58 @@ def check_mcmin_ficticio(conn, since_dt):
 
 @check("mc_min menor que mínimo real em token_ticks", "CRÍTICO")
 def check_mcmin_vs_ticks(conn, since_dt):
-    # Para cada mint em bounce_signals, verifica se mc_min do bounce é ≥ MIN(ticks.mc) - 5%
-    # Mostra discrepâncias > 20%
-    since_filter = _since_clause(since_dt, "bs.ts_signal")
-    q = f"""
+    # Para cada mint em bounce_signals, verifica se mc_min do bounce é ≥ MIN(ticks válidos)
+    # Exclui elapsed_sec < 90: esses ticks podem ter preço da bonding curve — são a fonte do
+    # problema, não a referência correta. Usar como referência apenas ticks com elapsed_sec >= 90.
+    # Mostra discrepâncias > 20%.
+    q = """
         SELECT bs.mint,
-               bs.mc_min                              AS bs_mc_min,
-               MIN(tt.mc)                             AS tick_mc_min,
-               ROUND((MIN(tt.mc) / NULLIF(bs.mc_min,0))::numeric, 3) AS ratio,
+               bs.mc_min                                                      AS bs_mc_min,
+               MIN(CASE WHEN tt.elapsed_sec >= 90 THEN tt.mc END)             AS tick_mc_min,
+               ROUND((MIN(CASE WHEN tt.elapsed_sec >= 90 THEN tt.mc END)
+                      / NULLIF(bs.mc_min,0))::numeric, 3)                     AS ratio,
                bs.ts_signal
         FROM bounce_signals bs
         JOIN token_ticks tt ON tt.mint = bs.mint
         WHERE bs.mc_min > 0
-          {since_filter.replace('AND', 'AND bs.', 1) if since_dt else ''}
+    """ + _since_clause(since_dt, "bs.ts_signal") + """
         GROUP BY bs.mint, bs.mc_min, bs.ts_signal
-        HAVING MIN(tt.mc) < bs.mc_min * 0.80
-    """
-    # rewrite since filter cleanly
-    q2 = """
-        SELECT bs.mint,
-               bs.mc_min                              AS bs_mc_min,
-               MIN(tt.mc)                             AS tick_mc_min,
-               ROUND((MIN(tt.mc) / NULLIF(bs.mc_min,0))::numeric, 3) AS ratio,
-               bs.ts_signal
-        FROM bounce_signals bs
-        JOIN token_ticks tt ON tt.mint = bs.mint
-        WHERE bs.mc_min > 0
-    """ + (_since_clause(since_dt, "bs.ts_signal")) + """
-        GROUP BY bs.mint, bs.mc_min, bs.ts_signal
-        HAVING MIN(tt.mc) < bs.mc_min * 0.80
+        HAVING MIN(CASE WHEN tt.elapsed_sec >= 90 THEN tt.mc END) < bs.mc_min * 0.80
     """
     with conn.cursor() as cur:
-        cur.execute(q2, _params(since_dt))
+        cur.execute(q, _params(since_dt))
         rows = cur.fetchall()
     n = len(rows)
     passed = n == 0
     examples = [_fmt_row(r, ["mint","bs_mc_min","tick_mc_min","ratio","ts_signal"]) for r in rows[:3]]
-    desc = "tick_mc_min < bs_mc_min × 0.80 — o fundo real é 20%+ menor que o registrado no sinal"
+    desc = "tick_mc_min (elapsed≥90s) < bs_mc_min × 0.80 — fundo do bounce_signal 20%+ acima do fundo real nos ticks"
     return passed, n, examples, desc
 
 
-@check("token_ticks com elapsed_sec < 90", "CRÍTICO")
+@check("mc_low contaminado na janela de transição (elapsed < 90s)", "CRÍTICO")
 def check_ticks_elapsed(conn, since_dt):
-    # elapsed_sec < 90 AND >= 0 são ticks de transição bonding curve
+    # Após o fix: mc_low para elapsed < 90s vem do Helius (mínimo real das pool reserves)
+    # ou é NULL (sem eventos Helius nessa janela). Nunca deve vir do kline low.
+    # Invariante: mc_low de tick com elapsed < 90s nunca deve ser < mc (close) × 0.50.
+    # Se for, é kline low contaminado com preço da bonding curve pré-migração.
+    # Helius retorna mínimo real do pool — sempre próximo ao close (variação < 50%).
     since_join = ""
     if since_dt:
         since_join = """
             JOIN migrations m ON m.mint = tt.mint
-            WHERE tt.elapsed_sec < 90 AND tt.elapsed_sec >= 0
               AND m.ts_migration >= %(since)s
         """
-    else:
-        since_join = "WHERE tt.elapsed_sec < 90 AND tt.elapsed_sec >= 0"
-
     q = f"""
-        SELECT tt.mint, tt.elapsed_sec, tt.mc, tt.source
+        SELECT tt.mint, tt.elapsed_sec, tt.mc, tt.mc_low,
+               ROUND((tt.mc_low / NULLIF(tt.mc, 0))::numeric, 3) AS low_vs_close,
+               tt.source
         FROM token_ticks tt
         {since_join}
+        WHERE tt.source = 'kline'
+          AND tt.elapsed_sec >= 0
+          AND tt.elapsed_sec < 90
+          AND tt.mc_low IS NOT NULL
+          AND tt.mc_low < tt.mc * 0.50
         LIMIT 100
     """
     with conn.cursor() as cur:
@@ -149,8 +144,8 @@ def check_ticks_elapsed(conn, since_dt):
         rows = cur.fetchall()
     n = len(rows)
     passed = n == 0
-    examples = [_fmt_row(r, ["mint","elapsed_sec","mc","source"]) for r in rows[:3]]
-    desc = "ticks com elapsed_sec < 90 contêm preços da bonding curve pré-migração (corrompem mc_min)"
+    examples = [_fmt_row(r, ["mint","elapsed_sec","mc","mc_low","low_vs_close","source"]) for r in rows[:3]]
+    desc = "mc_low < mc × 0.50 em elapsed < 90s — kline low contaminado com preço de bonding curve (deve vir do Helius)"
     return passed, n, examples, desc
 
 

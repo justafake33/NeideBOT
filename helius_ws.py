@@ -580,6 +580,17 @@ class HeliusWS:
             "top_seller_frac": round(max(shares), 4),
         }
 
+    def get_min_mc_in_window(self, mint: str, from_ts: float, to_ts: float) -> float | None:
+        """Retorna o menor MC observado via Helius para um mint no intervalo [from_ts, to_ts].
+        Usado para substituir kline low na janela de transição (elapsed < 90s), onde o low
+        intra-candle do kline pode incluir preços da bonding curve pré-migração.
+        Retorna None se não há eventos Helius nessa janela.
+        """
+        with self._lock:
+            events = list(self._swap_events.get(mint, []))
+        window = [e["mc"] for e in events if from_ts <= e["ts"] <= to_ts and e["mc"] > 0]
+        return min(window) if window else None
+
     def _dexscreener_fallback(self, mint: str, supply: float):
         """
         Tier 2 — DexScreener fallback quando Anchor parse falha (token não é pAMM).

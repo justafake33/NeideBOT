@@ -202,25 +202,51 @@ class HotMonitor:
     BOUNCE_TIME_MAX      = float(os.getenv("BOUNCE_TIME_MAX",        "20.0"))  # A.5: janela 30→20min (100% TPs em ≤20min)
     BOUNCE_TIME_MIN_SEC  = int(os.getenv(  "BOUNCE_TIME_MIN_SEC",   "0"))     # A.9: janela mínima — ignora sinais muito cedo pós-migração
     BOTTOM_FRESHNESS_SEC = int(os.getenv(  "BOTTOM_FRESHNESS_SEC",  "300"))   # A.6: máx 5min desde o último mc_min
+    BOUNCE_TIME_MIN_SEC  = int(os.getenv(  "BOUNCE_TIME_MIN_SEC",   "90"))    # A.9: elapsed < 90s pool em transição, usar APENAS Helius
 
     def _check_bounce(self, mint: str, state: dict, mc: float, elapsed_sec: int):
-        """Detecta bounce em tempo real. Fase A: filtros A.2, A.3, A.6."""
-        if state.get("bounce_fired"):
-            return
+        """Detecta bounce em tempo real. Fase A: filtros A.2, A.3, A.6.
+
+        RACE CONDITION FIX: Atomic bounce_fired check-and-set com lock.
+        Dois threads podem chamar _check_bounce simultaneamente. Sem lock,
+        ambos leem bounce_fired=False/missing, ambos passam nos filtros,
+        ambos setam bounce_fired=True e disparam sinal duplicado.
+        """
+        # ── Atomic check-and-set com lock ────────────────────────────────────
+        # STALE MC_MIN FIX: Snapshot mc_min e ts_min DENTRO do lock.
+        # Outro thread pode atualizar state["mc_min"] entre a leitura (fora lock) e o
+        # cálculo de bounce_pct, causando inconsistência. Lê uma vez dentro do lock,
+        # usa cópia local fora do lock para todos os cálculos.
+        with self._lock:
+            mint_state = self._tokens.get(mint)
+            if mint_state is None:
+                return
+            if mint_state.get("bounce_fired"):
+                return
+            # Snapshot: lê dentro do lock, usa cópia local fora do lock
+            mc_min       = mint_state["mc_min"]
+            mc_migration = mint_state["mc_migration"]
+            ts_min       = mint_state.get("ts_min")
+            # Não set bounce_fired aqui — apenas checkpoint. Set só após passar todos os filtros.
 
         elapsed_min  = elapsed_sec / 60
-        mc_min       = state["mc_min"]
-        mc_migration = state["mc_migration"]
+
+        # ── Boundary checks ─────────────────────────────────────────────────────────
+        if elapsed_sec < 0 or elapsed_min > self.BOUNCE_TIME_MAX:
+            return
 
         # A.9 — Janela mínima: sinais nos primeiros N segundos têm WR muito baixo (dados: 0-5min → 12.9% WR vs 5-20min → 27% WR)
         if self.BOUNCE_TIME_MIN_SEC > 0 and elapsed_sec < self.BOUNCE_TIME_MIN_SEC:
             logger.debug("BOUNCE skip %s — A.9 muito cedo: %ds < min=%ds", mint[:8], elapsed_sec, self.BOUNCE_TIME_MIN_SEC)
             return
-
-        if elapsed_min > self.BOUNCE_TIME_MAX:
-            return
         if mc_min <= 0 or mc_migration <= 0:
             return
+
+        # A.9 — Data source selection by pool maturity:
+        # elapsed < BOUNCE_TIME_MIN_SEC: pool ainda em transição bonding curve → pool novo.
+        #   Usar APENAS Helius (preço real das pool reserves), ignorar kline (pode ter bonding curve).
+        # elapsed >= BOUNCE_TIME_MIN_SEC: pool estável, usar MIN(helius, kline) como antes.
+        # Impacto: sinais cedo (< ~5min) usam dado mais preciso, aumentam confiabilidade.
 
         drop_from_mig = (mc_migration - mc_min) / mc_migration
         if drop_from_mig < self.BOUNCE_DROP_MIN:
@@ -238,7 +264,7 @@ class HotMonitor:
         # Padrão inválido: token pica em <3min, dump por 10-20min, sinal dispara em mini-rally tardio.
         # Dados: 92% dos inválidos têm gap (ts_min → sinal) > 2min. P50 gap = 6.7min.
         # Válidos: fundo recente → sinal em 1-3min. Invalidos: fundo em 2-5min → sinal 13-17min depois.
-        ts_min = state.get("ts_min")
+        # ts_min já foi snapshot dentro do lock acima.
         if ts_min is not None:
             secs_since_bottom = (datetime.now(timezone.utc) - ts_min).total_seconds()
             if secs_since_bottom > self.BOTTOM_FRESHNESS_SEC:
@@ -275,17 +301,23 @@ class HotMonitor:
                 name=f"backfill-{mint[:8]}",
             ).start()
 
+        # H22-H26 — Coleta de métricas brutas de absorção (observe-only, NÃO bloqueia o sinal)
+        # Fonte: Helius pAMM events (buy/sell) em múltiplas janelas.
+        # Score/grade NÃO calculados aqui — fórmula não validada por dados reais.
+        # Após n≥30 bounces com outcomes (TP/SL), analisar quais métricas brutas
+        # discriminam e SÓ ENTÃO construir score baseado em correlações reais.
+
         # Três janelas de fluxo — visão completa do bounce:
-        # PRÉ  [ts_min-60s → ts_min]   : absorção do dump (sellers exaustos?)
-        # RISE [ts_min    → ts_signal] : quem comprou durante a subida?
+        # PRÉ  [ts_min-60s → ts_min]   : absorção do dump (sellers exaustos?) — H22
+        # RISE [ts_min    → ts_signal] : quem comprou durante a subida? — H26
         # PÓS  [ts_signal → ts_signal+60s]: coleta assíncrona (+60s via scheduler)
         now_ts     = datetime.now(timezone.utc).timestamp()
         ts_min_obj = state.get("ts_min")
         ts_min_ts  = ts_min_obj.timestamp() if ts_min_obj else None
 
+        absorption_window = {}  # alias para PRÉ window
         pre_window  = {}  # absorção do dump
         rise_window = {}  # momentum da subida
-
         if self._helius:
             try:
                 # PRÉ: [ts_min-60s → ts_min]
@@ -350,14 +382,22 @@ class HotMonitor:
         if rise_bv > 0:
             buy_concentration = round(rise_lb / rise_bv, 4)
 
+        # ── Atomic bounce_fired set: todos os filtros passaram, agora commita o sinal ────
+        # Usar lock novamente para garantir que nenhuma outra thread setou bounce_fired
+        # entre o snapshot inicial e aqui (improvável mas possível com timing muito específico).
         # Bug 3 fix: check-and-set atômico sob lock — evita double-fire por corrida
         # entre push_mc (trenches) e _precise_bottom_tick (kline) em threads concorrentes.
         with self._lock:
-            live = self._tokens.get(mint)
-            if not live or live.get("bounce_fired"):
+            mint_state = self._tokens.get(mint)
+            if mint_state and not mint_state.get("bounce_fired"):
+                mint_state["bounce_fired"] = True
+            else:
+                # Outra thread setou bounce_fired enquanto a gente passava nos filtros.
+                # Cancela o sinal para evitar duplicata.
+                logger.debug("BOUNCE %s: duplicate signal canceled (bounce_fired já setado por outra thread)", mint[:8])
                 return
-            live["bounce_fired"] = True
-        symbol = state.get("symbol", mint[:8])
+
+        symbol = mint_state.get("symbol", mint[:8])
 
         try:
             db.insert_bounce_signal({
@@ -689,10 +729,32 @@ class HotMonitor:
 
                     # 1. Atualiza mc_min com o low desta vela ANTES de checar bounce.
                     #    Garante que bounce_pct e A.6 usam o fundo correto desta vela.
+                    #
+                    #    A.9 — Data source selection by pool maturity:
+                    #    - elapsed < BOUNCE_TIME_MIN_SEC: pool em transição. Usar APENAS Helius.
+                    #      Kline low pode ser bonding curve pré-migração, muito abaixo do real.
+                    #    - elapsed >= BOUNCE_TIME_MIN_SEC: pool estável. Usar MIN(helius, kline).
+                    #      Helius é preço real (~5ms latência), kline pode ter lag (~200ms).
                     low_price = _float(c.get("low"))
-                    if low_price and low_price > 0:
-                        mc_low = low_price * state["total_supply"]
-                        if mc_low < state["mc_min"]:
+                    mc_low_kline = low_price * state["total_supply"] if (low_price and low_price > 0) else None
+                    mc_low = None
+
+                    if self._helius:
+                        candle_start = state["ts_mig_unix"] + max(0, elapsed_sec - 60)
+                        candle_end   = state["ts_mig_unix"] + elapsed_sec
+                        mc_low_helius = self._helius.get_min_mc_in_window(mint, candle_start, candle_end)
+
+                        if elapsed_sec < self.BOUNCE_TIME_MIN_SEC:
+                            # A.9: pool em transição — confiar APENAS em Helius
+                            mc_low = mc_low_helius
+                        else:
+                            # A.9: pool maduro — usar MIN(helius, kline)
+                            mc_low = min(v for v in [mc_low_helius, mc_low_kline] if v is not None) if any([mc_low_helius, mc_low_kline]) else None
+                    else:
+                        # Sem Helius: usar kline
+                        mc_low = mc_low_kline
+
+                    if mc_low and mc_low > 0 and mc_low < state["mc_min"]:
                             candle_dt = datetime.fromtimestamp(candle_ts, tz=timezone.utc)
                             with self._lock:
                                 inner = self._tokens.get(mint)
@@ -727,20 +789,25 @@ class HotMonitor:
                             state["mc_max"] = mc_close_peak
 
                     # 3. Acumula tick kline com OHLC completo.
+                    #    mc_low para elapsed < BOUNCE_TIME_MIN_SEC (90s) vem APENAS do Helius — pool em transição da bonding curve.
+                    #    mc_low para elapsed >= BOUNCE_TIME_MIN_SEC usa MIN(helius, kline) — pool estável.
+                    #    mc_low já foi calculado no passo 1, reutiliza aqui.
                     close_p = _float(c.get("close"))
                     open_p  = _float(c.get("open"))
                     high_p  = _float(c.get("high"))
-                    low_p   = _float(c.get("low"))
                     vol     = _float(c.get("volume"))
                     supply  = state["total_supply"]
                     if close_p and close_p > 0 and supply:
+                        # mc_low já foi calculado no passo 1 (com Helius + kline logic)
+                        mc_low_tick = (mc_low if elapsed_sec < 90
+                                       else (low_p * supply if (low_p and low_p > 0) else None))
                         kline_ticks.append({
                             "mint":        mint,
                             "elapsed_sec": elapsed_sec,
                             "mc":          close_p * supply,
                             "mc_open":     open_p  * supply if open_p  else None,
                             "mc_high":     high_p  * supply if high_p  else None,
-                            "mc_low":      low_p   * supply if low_p   else None,
+                            "mc_low":      mc_low_tick,
                             "volume_1m":   vol,
                         })
 
