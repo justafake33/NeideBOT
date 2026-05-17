@@ -32071,8 +32071,10 @@ def analise_cruzamento_wallets():
     Cruzamento NeideBOT × wallet-monitor no mesmo banco.
     Wallets monitoradas que compraram tokens DURANTE o dump (antes do bounce).
     """
-    import psycopg2, psycopg2.extras, traceback
+    import psycopg2, psycopg2.extras, traceback, csv, io
     from db import DATABASE_URL
+
+    fmt = request.args.get("format", "html")
 
     try:
         conn = psycopg2.connect(DATABASE_URL)
@@ -32214,6 +32216,27 @@ def analise_cruzamento_wallets():
 
         conn.close()
 
+        # ── CSV export ───────────────────────────────────────────────────────
+        if fmt == "csv":
+            out = io.StringIO()
+            cols = ["mint","ts_signal","carteira","mins_antes","bounce_pct","drop_from_mig",
+                    "entry_ratio","sol_entrada","mc_migration","mc_min","mc_at_signal",
+                    "mc_t0","mc_t1","mc_t2","mc_t3",
+                    "recovery","pct_gain","time_to_bottom",
+                    "trade_status","trade_pnl","trade_exit_type"]
+            w = csv.DictWriter(out, fieldnames=cols, extrasaction="ignore")
+            w.writeheader()
+            for r in rows:
+                row = dict(r)
+                if row.get("bounce_pct") is not None:
+                    row["bounce_pct"] = round(float(row["bounce_pct"]) * 100, 1)
+                w.writerow(row)
+            return Response(
+                out.getvalue(),
+                mimetype="text/csv",
+                headers={"Content-Disposition": "attachment; filename=cruzamento_wallets.csv"}
+            )
+
         # ── HTML ─────────────────────────────────────────────────────────────
         n_tokens_unicos = len(set(r["mint"] for r in rows))
         com  = stats.get("com_wallet", {})
@@ -32252,17 +32275,17 @@ def analise_cruzamento_wallets():
             sol      = f"{r['sol_entrada']:.2f}" if r.get("sol_entrada") is not None else "—"
             trade    = r.get("trade_status") or "não tradado"
             if r.get("trade_pnl") is not None and r.get("trade_status") in ("tp","sl"):
-                trade += f" {r['trade_pnl']:+.1f}%"
+                trade += f" {float(r['trade_pnl']):+.1f}%"
             bchain   = "✅" if r.get("trade_exit_type") == "helius_sell_recovery" else ""
             trs += f"""<tr>
-                <td>{r['mint'][:8]}</td>
+                <td style='font-size:11px'>{r['mint'][:12]}</td>
                 <td>{r['carteira']}</td>
-                <td>{mins}</td>
-                <td>{bounce}</td>
-                <td>{ratio}</td>
-                <td>{sol}</td>
-                <td>{rec_str}</td>
-                <td style='color:{gain_col}'>{gain_str}</td>
+                <td style='text-align:right'>{mins}</td>
+                <td style='text-align:right'>{bounce}</td>
+                <td style='text-align:right'>{ratio}</td>
+                <td style='text-align:right'>{sol}</td>
+                <td style='text-align:center'>{rec_str}</td>
+                <td style='color:{gain_col};text-align:right'>{gain_str}</td>
                 <td>{trade} {bchain}</td>
             </tr>"""
 
@@ -32293,10 +32316,16 @@ def analise_cruzamento_wallets():
           {gate_msg}
         </div>
 
+        <p style='margin:8px 0'>
+          <a href='/analise/cruzamento-wallets?format=csv'
+             style='background:#333;color:#4caf50;padding:6px 14px;border-radius:4px;
+                    text-decoration:none;font-size:13px'>⬇ Exportar CSV completo</a>
+        </p>
+
         <div>
           <div class='kpi'><div class='val'>{n_bounces}</div><div class='lbl'>bounces NeideBOT</div></div>
           <div class='kpi'><div class='val'>{n_compras}</div><div class='lbl'>compras no wallet-monitor</div></div>
-          <div class='kpi'><div class='val'>{len(rows)}</div><div class='lbl'>cruzamentos totais</div></div>
+          <div class='kpi'><div class='val'>{len(rows)}</div><div class='lbl'>cruzamentos totais (linhas)</div></div>
           <div class='kpi'><div class='val'>{n_tokens_unicos}</div><div class='lbl'>tokens únicos cruzados</div></div>
         </div>
 
@@ -32340,16 +32369,24 @@ def analise_cruzamento_wallets():
           {cart_rows or "<tr><td colspan='2'>Nenhum</td></tr>"}
         </table>
 
-        <h2>Detalhe — todos os cruzamentos ({len(rows)})</h2>
-        <p class='note'>mins_antes = quanto tempo antes do bounce a wallet comprou | ratio = mc_t0/mc_migration (1.0 = comprou no preço da migração)</p>
+        <h2>Detalhe — todos os cruzamentos ({len(rows)} linhas, {n_tokens_unicos} tokens únicos)</h2>
+        <p class='note'>
+          mins_antes = quanto tempo antes do bounce a wallet comprou &nbsp;|&nbsp;
+          ratio = mc_t0/mc_migration (1.0 = comprou no preço da migração, &lt;1.0 = comprou mais barato) &nbsp;|&nbsp;
+          Uma linha por compra de wallet — mesmo token pode aparecer várias vezes se comprado por wallets diferentes
+        </p>
+        <div style='overflow-x:auto'>
         <table>
           <tr>
-            <th>Token</th><th>Carteira</th><th>Mins antes</th><th>Bounce%</th>
-            <th>Ratio entrada</th><th>SOL gasto</th>
-            <th>Recovery</th><th>pct_gain</th><th>Nosso trade</th>
+            <th>Token (mint)</th><th>Carteira</th><th style='text-align:right'>Mins antes</th>
+            <th style='text-align:right'>Bounce%</th><th style='text-align:right'>Ratio</th>
+            <th style='text-align:right'>SOL</th>
+            <th style='text-align:center'>Recovery</th><th style='text-align:right'>pct_gain</th>
+            <th>Nosso trade</th>
           </tr>
           {trs or "<tr><td colspan='9' style='color:#666'>Nenhum cruzamento encontrado</td></tr>"}
         </table>
+        </div>
         </body></html>"""
 
         return html
