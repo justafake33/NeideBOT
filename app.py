@@ -30207,13 +30207,16 @@ def analise_h24_h25():
 
 def _analise_h24_h25_inner(conn, cur):
     # LEFT JOIN — bounces sem trade aparecem com t.status = NULL (não tradado)
-    # Filtra apenas trades blockchain-verificados (helius_sell_recovery) com status final tp/sl
+    # Inclui todos os exit_types blockchain-verificados:
+    #   helius_sell_recovery = auditoria retroativa (sessão 5, 139 trades)
+    #   helius               = fill detectado em tempo real pelo helius_rpc
+    #   helius_recovery      = fill detectado pós-timeout pelo _recover_fill()
     TRADE_JOIN = """
         LEFT JOIN LATERAL (
             SELECT status, pnl_pct_real
             FROM trades
             WHERE mint = bs.mint
-              AND exit_type = 'helius_sell_recovery'
+              AND exit_type IN ('helius_sell_recovery', 'helius', 'helius_recovery')
               AND status IN ('tp', 'sl')
             ORDER BY created_at ASC LIMIT 1
         ) t ON true
