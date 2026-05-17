@@ -32065,5 +32065,298 @@ def debug_microstructure():
         return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
+@app.route("/analise/cruzamento-wallets")
+def analise_cruzamento_wallets():
+    """
+    Cruzamento NeideBOT × wallet-monitor no mesmo banco.
+    Wallets monitoradas que compraram tokens DURANTE o dump (antes do bounce).
+    """
+    import psycopg2, psycopg2.extras, traceback
+    from db import DATABASE_URL
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # Verifica se quarentena_trades existe
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_name = 'quarentena_trades'
+            ) AS exists
+        """)
+        if not cur.fetchone()["exists"]:
+            return "<h2>Tabela quarentena_trades não encontrada neste banco.</h2>", 404
+
+        # ── Contagem total de bounces e compras disponíveis ──────────────────
+        cur.execute("SELECT COUNT(*) AS n FROM bounce_signals")
+        n_bounces = cur.fetchone()["n"]
+
+        cur.execute("SELECT COUNT(*) AS n FROM quarentena_trades WHERE tipo='COMPRA'")
+        n_compras = cur.fetchone()["n"]
+
+        # ── Cruzamento principal ─────────────────────────────────────────────
+        cur.execute("""
+            SELECT
+                bs.mint,
+                bs.ts_signal,
+                bs.bounce_pct,
+                bs.elapsed_sec,
+                bs.drop_from_mig,
+                bs.mc_migration,
+                bs.mc_min,
+                bs.mc_at_signal,
+                m.recovery,
+                m.pct_gain,
+                m.time_to_bottom,
+                qt.carteira,
+                qt.ts                                                      AS ts_compra,
+                ROUND(EXTRACT(EPOCH FROM (bs.ts_signal - qt.ts))::numeric/60, 1)
+                                                                           AS mins_antes,
+                qt.mc_t0,
+                qt.sol_entrada,
+                ROUND((qt.mc_t0 / NULLIF(bs.mc_migration, 0))::numeric, 2)
+                                                                           AS entry_ratio,
+                qt.mc_t1, qt.mc_t2, qt.mc_t3,
+                t.status    AS trade_status,
+                ROUND((t.pnl_pct_real * 100)::numeric, 1) AS trade_pnl,
+                t.exit_type AS trade_exit_type
+            FROM bounce_signals bs
+            JOIN quarentena_trades qt
+                ON  qt.token_mint = bs.mint
+                AND qt.tipo = 'COMPRA'
+                AND qt.ts < bs.ts_signal
+                AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+            LEFT JOIN migrations m ON m.mint = bs.mint
+            LEFT JOIN trades t
+                ON  t.mint = bs.mint
+                AND t.ts_signal BETWEEN bs.ts_signal - INTERVAL '60 seconds'
+                                    AND bs.ts_signal + INTERVAL '60 seconds'
+            ORDER BY bs.ts_signal DESC
+        """)
+        rows = cur.fetchall()
+
+        # ── Recovery rate: com vs sem cruzamento ─────────────────────────────
+        cur.execute("""
+            WITH cruzados AS (
+                SELECT DISTINCT bs.mint
+                FROM bounce_signals bs
+                JOIN quarentena_trades qt
+                    ON  qt.token_mint = bs.mint
+                    AND qt.tipo = 'COMPRA'
+                    AND qt.ts < bs.ts_signal
+                    AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+            )
+            SELECT
+                'com_wallet'            AS grupo,
+                COUNT(*)                AS n,
+                ROUND(AVG(CASE WHEN m.recovery THEN 1.0 ELSE 0 END)::numeric * 100, 1)
+                                        AS recovery_pct,
+                ROUND(AVG(m.pct_gain)::numeric, 0) AS avg_gain
+            FROM bounce_signals bs
+            JOIN cruzados c ON c.mint = bs.mint
+            LEFT JOIN migrations m ON m.mint = bs.mint
+            WHERE m.recovery IS NOT NULL
+
+            UNION ALL
+
+            SELECT
+                'sem_wallet'            AS grupo,
+                COUNT(*)                AS n,
+                ROUND(AVG(CASE WHEN m.recovery THEN 1.0 ELSE 0 END)::numeric * 100, 1)
+                                        AS recovery_pct,
+                ROUND(AVG(m.pct_gain)::numeric, 0) AS avg_gain
+            FROM bounce_signals bs
+            LEFT JOIN migrations m ON m.mint = bs.mint
+            WHERE m.recovery IS NOT NULL
+              AND bs.mint NOT IN (SELECT mint FROM cruzados)
+        """)
+        stats = {r["grupo"]: r for r in cur.fetchall()}
+
+        # ── WR blockchain verificado: com vs sem ─────────────────────────────
+        cur.execute("""
+            WITH cruzados AS (
+                SELECT DISTINCT bs.mint
+                FROM bounce_signals bs
+                JOIN quarentena_trades qt
+                    ON  qt.token_mint = bs.mint
+                    AND qt.tipo = 'COMPRA'
+                    AND qt.ts < bs.ts_signal
+                    AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+            )
+            SELECT
+                CASE WHEN c.mint IS NOT NULL THEN 'com_wallet' ELSE 'sem_wallet' END AS grupo,
+                COUNT(*)                                                    AS n,
+                ROUND(AVG(CASE WHEN t.status='tp' THEN 1.0 ELSE 0 END)::numeric*100,1)
+                                                                            AS wr_pct,
+                ROUND(AVG(t.pnl_pct_real*100)::numeric, 1)                 AS avg_pnl
+            FROM trades t
+            LEFT JOIN cruzados c ON c.mint = t.mint
+            WHERE t.exit_type = 'helius_sell_recovery'
+              AND t.status IN ('tp','sl')
+            GROUP BY 1
+        """)
+        wr_stats = {r["grupo"]: r for r in cur.fetchall()}
+
+        # ── Distribuição por carteira ─────────────────────────────────────────
+        cur.execute("""
+            SELECT qt.carteira, COUNT(DISTINCT bs.mint) AS n_tokens
+            FROM bounce_signals bs
+            JOIN quarentena_trades qt
+                ON  qt.token_mint = bs.mint
+                AND qt.tipo = 'COMPRA'
+                AND qt.ts < bs.ts_signal
+                AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+            GROUP BY qt.carteira
+            ORDER BY n_tokens DESC
+        """)
+        por_carteira = cur.fetchall()
+
+        conn.close()
+
+        # ── HTML ─────────────────────────────────────────────────────────────
+        n_tokens_unicos = len(set(r["mint"] for r in rows))
+        com  = stats.get("com_wallet", {})
+        sem  = stats.get("sem_wallet", {})
+        wr_c = wr_stats.get("com_wallet", {})
+        wr_s = wr_stats.get("sem_wallet", {})
+
+        delta_rec = (float(com.get("recovery_pct") or 0) - float(sem.get("recovery_pct") or 0))
+        delta_wr  = (float(wr_c.get("wr_pct") or 0)  - float(wr_s.get("wr_pct") or 0))
+
+        def delta_color(v): return "#4caf50" if v > 0 else ("#f44336" if v < 0 else "#888")
+
+        # Gate de suficiência
+        if n_tokens_unicos == 0:
+            gate_msg = "⚠️ Zero cruzamentos — universos sem sobreposição ainda. Continue acumulando dados."
+            gate_color = "#f44336"
+        elif n_tokens_unicos < 10:
+            gate_msg = f"⚠️ n={n_tokens_unicos} — amostra insuficiente. Gate mínimo: n≥15 tokens."
+            gate_color = "#ff9800"
+        elif n_tokens_unicos < 30:
+            gate_msg = f"🟡 n={n_tokens_unicos} — sinal preliminar. Gate para filtro em produção: n≥30 com delta WR ≥15pp."
+            gate_color = "#ff9800"
+        else:
+            gate_msg = f"✅ n={n_tokens_unicos} — amostra suficiente para análise. Avaliar delta para integração."
+            gate_color = "#4caf50"
+
+        # Tabela de detalhes
+        trs = ""
+        for r in rows:
+            rec_str  = "✅" if r["recovery"] else ("❌" if r["recovery"] is False else "—")
+            gain_str = f"{r['pct_gain']:+.0f}%" if r.get("pct_gain") is not None else "—"
+            gain_col = "#4caf50" if (r.get("pct_gain") or 0) > 0 else "#f44336"
+            mins     = f"{r['mins_antes']:.1f}min" if r.get("mins_antes") is not None else "—"
+            bounce   = f"{r['bounce_pct']*100:.0f}%" if r.get("bounce_pct") is not None else "—"
+            ratio    = f"{r['entry_ratio']:.2f}×" if r.get("entry_ratio") is not None else "—"
+            sol      = f"{r['sol_entrada']:.2f}" if r.get("sol_entrada") is not None else "—"
+            trade    = r.get("trade_status") or "não tradado"
+            if r.get("trade_pnl") is not None and r.get("trade_status") in ("tp","sl"):
+                trade += f" {r['trade_pnl']:+.1f}%"
+            bchain   = "✅" if r.get("trade_exit_type") == "helius_sell_recovery" else ""
+            trs += f"""<tr>
+                <td>{r['mint'][:8]}</td>
+                <td>{r['carteira']}</td>
+                <td>{mins}</td>
+                <td>{bounce}</td>
+                <td>{ratio}</td>
+                <td>{sol}</td>
+                <td>{rec_str}</td>
+                <td style='color:{gain_col}'>{gain_str}</td>
+                <td>{trade} {bchain}</td>
+            </tr>"""
+
+        cart_rows = "".join(
+            f"<tr><td>{r['carteira']}</td><td>{r['n_tokens']}</td></tr>"
+            for r in por_carteira
+        )
+
+        html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+        <title>Cruzamento Wallets × NeideBOT</title>
+        <style>
+          body{{font-family:monospace;background:#111;color:#eee;padding:24px;}}
+          h1{{color:#fff;}} h2{{color:#aaa;margin-top:32px;}}
+          table{{border-collapse:collapse;width:100%;margin-top:8px;}}
+          th{{background:#222;color:#aaa;padding:6px 10px;text-align:left;font-size:12px;}}
+          td{{padding:5px 10px;border-bottom:1px solid #1e1e1e;font-size:13px;}}
+          .kpi{{display:inline-block;background:#1a1a1a;border:1px solid #333;
+               border-radius:8px;padding:16px 24px;margin:8px;min-width:160px;text-align:center;}}
+          .kpi .val{{font-size:28px;font-weight:bold;}}
+          .kpi .lbl{{font-size:11px;color:#666;margin-top:4px;}}
+          .note{{color:#666;font-size:12px;margin:4px 0 12px;}}
+          .gate{{padding:12px 20px;border-radius:6px;margin:16px 0;font-size:14px;}}
+        </style></head><body>
+        <h1>Cruzamento wallet-monitor × NeideBOT</h1>
+        <p class='note'>Wallets monitoradas que compraram o mesmo token DURANTE o dump (até 20min antes do bounce disparar)</p>
+
+        <div class='gate' style='background:{gate_color}22;border:1px solid {gate_color};color:{gate_color}'>
+          {gate_msg}
+        </div>
+
+        <div>
+          <div class='kpi'><div class='val'>{n_bounces}</div><div class='lbl'>bounces NeideBOT</div></div>
+          <div class='kpi'><div class='val'>{n_compras}</div><div class='lbl'>compras no wallet-monitor</div></div>
+          <div class='kpi'><div class='val'>{len(rows)}</div><div class='lbl'>cruzamentos totais</div></div>
+          <div class='kpi'><div class='val'>{n_tokens_unicos}</div><div class='lbl'>tokens únicos cruzados</div></div>
+        </div>
+
+        <h2>Recovery rate — com vs sem wallet antes do bounce</h2>
+        <table style='max-width:600px'>
+          <tr><th>Grupo</th><th>n</th><th>Recovery%</th><th>avg pct_gain</th></tr>
+          <tr><td>Com wallet monitorada</td>
+              <td>{com.get('n','—')}</td>
+              <td>{com.get('recovery_pct','—')}%</td>
+              <td>{com.get('avg_gain','—')}%</td></tr>
+          <tr><td>Sem wallet monitorada</td>
+              <td>{sem.get('n','—')}</td>
+              <td>{sem.get('recovery_pct','—')}%</td>
+              <td>{sem.get('avg_gain','—')}%</td></tr>
+          <tr style='font-weight:bold'>
+              <td>Delta</td><td>—</td>
+              <td style='color:{delta_color(delta_rec)}'>{delta_rec:+.1f}pp</td>
+              <td>—</td></tr>
+        </table>
+
+        <h2>Win rate real (blockchain) — com vs sem wallet</h2>
+        <table style='max-width:600px'>
+          <tr><th>Grupo</th><th>n trades</th><th>WR%</th><th>avg P&L</th></tr>
+          <tr><td>Com wallet monitorada</td>
+              <td>{wr_c.get('n','—')}</td>
+              <td>{wr_c.get('wr_pct','—')}%</td>
+              <td>{wr_c.get('avg_pnl','—')}%</td></tr>
+          <tr><td>Sem wallet monitorada</td>
+              <td>{wr_s.get('n','—')}</td>
+              <td>{wr_s.get('wr_pct','—')}%</td>
+              <td>{wr_s.get('avg_pnl','—')}%</td></tr>
+          <tr style='font-weight:bold'>
+              <td>Delta</td><td>—</td>
+              <td style='color:{delta_color(delta_wr)}'>{delta_wr:+.1f}pp</td>
+              <td>—</td></tr>
+        </table>
+
+        <h2>Cruzamentos por carteira</h2>
+        <table style='max-width:400px'>
+          <tr><th>Carteira</th><th>Tokens únicos</th></tr>
+          {cart_rows or "<tr><td colspan='2'>Nenhum</td></tr>"}
+        </table>
+
+        <h2>Detalhe — todos os cruzamentos ({len(rows)})</h2>
+        <p class='note'>mins_antes = quanto tempo antes do bounce a wallet comprou | ratio = mc_t0/mc_migration (1.0 = comprou no preço da migração)</p>
+        <table>
+          <tr>
+            <th>Token</th><th>Carteira</th><th>Mins antes</th><th>Bounce%</th>
+            <th>Ratio entrada</th><th>SOL gasto</th>
+            <th>Recovery</th><th>pct_gain</th><th>Nosso trade</th>
+          </tr>
+          {trs or "<tr><td colspan='9' style='color:#666'>Nenhum cruzamento encontrado</td></tr>"}
+        </table>
+        </body></html>"""
+
+        return html
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
