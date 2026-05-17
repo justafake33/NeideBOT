@@ -30190,12 +30190,22 @@ def analise_h24_h25():
     Correlação H24 (seller concentration) + H25 (pool depth) + H23 (net flow bottom)
     vs outcomes blockchain-verificados.
     """
-    import psycopg2
+    import psycopg2, traceback
     from db import DATABASE_URL
 
-    conn = psycopg2.connect(DATABASE_URL)
-    cur  = conn.cursor()
+    try:
+     conn = psycopg2.connect(DATABASE_URL)
+     cur  = conn.cursor()
+    except Exception as e:
+        return f"<pre>DB connect error: {e}</pre>", 500
 
+    try:
+     return _analise_h24_h25_inner(conn, cur)
+    except Exception as e:
+        conn.close()
+        return f"<pre style='color:red'>{traceback.format_exc()}</pre>", 500
+
+def _analise_h24_h25_inner(conn, cur):
     TRADE_JOIN = """
         JOIN LATERAL (
             SELECT status, pnl_pct_real
