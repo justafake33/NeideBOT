@@ -31179,10 +31179,8 @@ def analise_simulacao_er():
 @app.route("/analise/smart-wallet")
 def analise_smart_wallet():
     """
-    Analisa uma carteira smart money cruzando com nossos mints.
-    Para cada mint que tradamos, verifica via getTokenAccountsByOwner
-    se a carteira tem/teve token account para esse mint.
-    1 RPC call por mint — eficiente independente do histórico da carteira.
+    Analisa carteira smart money cruzando com TODOS os nossos mints monitorados.
+    Métrica correta: performance DO TOKEN (pct_gain, recovery), não nosso trade.
     """
     import psycopg2, traceback, time
     from db import DATABASE_URL
@@ -31196,43 +31194,46 @@ def analise_smart_wallet():
         yield (f"<html><head><meta charset='utf-8'><title>Smart Wallet</title>"
                f"<style>body{{font-family:monospace;background:#111;color:#ccc;padding:20px}}"
                f"h2,h3{{color:#fa0}} .note{{color:#888;font-size:.9em}}"
-               f"table{{border-collapse:collapse;min-width:700px;margin-top:12px}}"
+               f"table{{border-collapse:collapse;min-width:800px;margin-top:12px}}"
                f"th,td{{padding:5px 10px;border:1px solid #333;text-align:right}}"
                f"th{{background:#222;color:#fa0}} td:first-child,td:nth-child(2){{text-align:left}}"
                f"</style></head><body>"
-               f"<h2>Smart Wallet Analysis</h2>"
-               f"<p class='note'>Carteira: <b>{WALLET}</b></p>{PAD}")
+               f"<h2>Smart Wallet — Performance do Token</h2>"
+               f"<p class='note'>Carteira: <b>{WALLET}</b><br>"
+               f"Métrica: pct_gain e recovery do token (não resultado do nosso trade)</p>{PAD}")
 
         rpc_url = helius_rpc.HELIUS_RPC_URL
         if not rpc_url:
             yield "<p style='color:#a44'>HELIUS_RPC_URL não configurado.</p></body></html>"
             return
 
-        # ── 1. Carregar todos os trades do banco ──
+        # ── 1. Carregar TODOS os mints da migrations (não só os que tradamos) ──
         try:
             conn = psycopg2.connect(DATABASE_URL)
             cur  = conn.cursor()
             cur.execute("""
-                SELECT t.id, t.mint, t.status, t.pnl_pct_real,
-                       m.token_nome, m.mc_migration, m.smart_wallets, m.renowned_wallets,
-                       bs.bounce_pct, bs.elapsed_sec
-                FROM trades t
-                JOIN migrations m ON m.mint = t.mint
-                JOIN bounce_signals bs ON bs.mint = t.mint
+                SELECT m.mint, m.token_nome, m.mc_migration, m.mc_peak, m.mc_bottom,
+                       m.pct_gain, m.pct_drop, m.recovery, m.time_to_peak, m.time_to_bottom,
+                       m.smart_wallets, m.renowned_wallets, m.ts_migration,
+                       t.id as trade_id, t.status as trade_status, t.pnl_pct_real
+                FROM migrations m
+                LEFT JOIN bounce_signals bs ON bs.mint = m.mint
+                LEFT JOIN trades t ON t.mint = m.mint
+                    AND t.exit_type IS NOT NULL AND t.status IN ('tp','sl') AND t.id >= 338
                     AND bs.ts_signal BETWEEN t.created_at - INTERVAL '5 min'
                                          AND t.created_at + INTERVAL '30 min'
-                WHERE t.exit_type IS NOT NULL AND t.status IN ('tp','sl')
-                  AND t.id >= 338
-                ORDER BY t.id
+                WHERE m.ts_migration >= '2026-05-06'
+                  AND m.mc_peak IS NOT NULL
+                ORDER BY m.ts_migration DESC
             """)
-            all_trades = cur.fetchall()
+            all_migs = cur.fetchall()
             conn.close()
         except Exception as e:
             yield f"<p style='color:#a44'>DB error: {e}</p></body></html>"
             return
 
-        unique_mints = list({r[1] for r in all_trades})
-        yield f"<p>Verificando <b>{len(unique_mints)}</b> mints únicos contra a carteira...</p>{PAD}"
+        unique_mints = list({r[0] for r in all_migs})
+        yield f"<p>Verificando <b>{len(unique_mints)}</b> mints monitorados contra a carteira...</p>{PAD}"
 
         # ── 2. Para cada mint, verificar se wallet tem token account ──
         wallet_mints = set()
@@ -31255,57 +31256,104 @@ def analise_smart_wallet():
                 pass
             time.sleep(0.05)
 
-        yield f"<p><b>{len(wallet_mints)}</b> mints onde a wallet esteve presente.</p>{PAD}"
+        yield f"<p><b>{len(wallet_mints)}</b> tokens onde a wallet esteve presente.</p>{PAD}"
 
-        # ── 3. Separar trades com/sem wallet e calcular WR ──
-        with_wallet    = [r for r in all_trades if r[1] in wallet_mints]
-        without_wallet = [r for r in all_trades if r[1] not in wallet_mints]
+        # ── 3. Separar com/sem wallet — métrica = token performance ──
+        # deduplica por mint (pode ter múltiplos trades no mesmo mint)
+        seen = set()
+        with_wallet    = []
+        without_wallet = []
 
-        n_with   = len(with_wallet)
-        n_wo     = len(without_wallet)
-        tp_with  = sum(1 for r in with_wallet    if r[2] == 'tp')
-        tp_wo    = sum(1 for r in without_wallet if r[2] == 'tp')
-        wr_with  = round(tp_with / n_with * 100, 1) if n_with else 0
-        wr_wo    = round(tp_wo   / n_wo   * 100, 1) if n_wo   else 0
-        delta    = round(wr_with - wr_wo, 1)
-        color    = '#2a2' if delta >= 10 else ('#fa0' if delta >= 0 else '#a44')
+        for row in all_migs:
+            mint = row[0]
+            if mint in seen:
+                continue
+            seen.add(mint)
+            if mint in wallet_mints:
+                with_wallet.append(row)
+            else:
+                without_wallet.append(row)
+
+        def token_stats(group):
+            n         = len(group)
+            n_rec     = sum(1 for r in group if r[7] is True)   # recovery
+            avg_gain  = sum((r[5] or 0) for r in group) / n if n else 0
+            avg_drop  = sum((r[6] or 0) for r in group) / n if n else 0
+            avg_peak_t = sum((r[8] or 0) for r in group) / n if n else 0
+            return n, n_rec, avg_gain, avg_drop, avg_peak_t
+
+        n_w,  nr_w,  ag_w,  ad_w,  ap_w  = token_stats(with_wallet)
+        n_wo, nr_wo, ag_wo, ad_wo, ap_wo = token_stats(without_wallet)
+
+        rec_w  = round(nr_w  / n_w  * 100, 1) if n_w  else 0
+        rec_wo = round(nr_wo / n_wo * 100, 1) if n_wo else 0
+        delta_rec  = round(rec_w - rec_wo, 1)
+        delta_gain = round((ag_w - ag_wo) * 100, 1)
+        color = '#2a2' if delta_rec >= 10 else ('#fa0' if delta_rec >= 0 else '#a44')
 
         yield f"""
-        <h3>Resultado</h3>
+        <h3>Performance do token: com vs sem a smart wallet</h3>
         <table>
-          <tr><th></th><th>n trades</th><th>TPs</th><th>WR%</th></tr>
+          <tr><th></th><th>n tokens</th><th>Recovery rate</th><th>avg pct_gain</th><th>avg dump%</th><th>avg time_to_peak</th></tr>
           <tr><td><b>Com smart wallet</b></td>
-              <td>{n_with}</td><td style='color:#2a2'>{tp_with}</td>
-              <td style='color:{color}'><b>{wr_with}%</b></td></tr>
+              <td>{n_w}</td>
+              <td style='color:{color}'><b>{rec_w}%</b></td>
+              <td style='color:#2a2'>+{ag_w*100:.0f}%</td>
+              <td>-{ad_w*100:.0f}%</td>
+              <td>{ap_w:.1f}min</td></tr>
           <tr><td><b>Sem smart wallet</b></td>
-              <td>{n_wo}</td><td style='color:#2a2'>{tp_wo}</td>
-              <td>{wr_wo}%</td></tr>
+              <td>{n_wo}</td>
+              <td>{rec_wo}%</td>
+              <td>+{ag_wo*100:.0f}%</td>
+              <td>-{ad_wo*100:.0f}%</td>
+              <td>{ap_wo:.1f}min</td></tr>
         </table>
-        <p class='note'>Delta: <span style='color:{color}'><b>{delta:+.1f}pp</b></span>
-        &nbsp;|&nbsp; Gate para filtro: n≥10 com +15pp consistente.</p>{PAD}
+        <p class='note'>
+          Delta recovery: <span style='color:{color}'><b>{delta_rec:+.1f}pp</b></span> &nbsp;|&nbsp;
+          Delta avg gain: <span style='color:#fa0'><b>{delta_gain:+.0f}pp</b></span><br>
+          Recovery = mc_1h &gt; mc_bottom × 1.3. Gate para filtro: n≥10 e +15pp recovery.
+        </p>{PAD}
         """
 
-        # ── 4. Tabela detalhada dos trades com wallet presente ──
+        # ── 4. Tabela detalhada dos tokens com wallet presente ──
         if with_wallet:
             trs = ""
-            for (tid, mint, status, pnl, nome, mc_mig, smart_cnt, renowned,
-                 bounce_pct, elapsed_sec) in sorted(with_wallet, key=lambda x: (x[2], -(x[3] or 0))):
-                rc      = '#2a2' if status == 'tp' else '#a44'
-                pnl_str = f"{pnl*100:+.0f}%" if pnl is not None else '—'
-                trs += (f"<tr><td>#{tid}</td><td>{nome or mint[:8]}</td>"
-                        f"<td style='color:{rc}'>{status.upper()} {pnl_str}</td>"
-                        f"<td>{round(bounce_pct*100) if bounce_pct else '—'}%</td>"
-                        f"<td>{elapsed_sec}s</td>"
-                        f"<td>{smart_cnt}</td><td>{renowned}</td></tr>")
+            for (mint, nome, mc_mig, mc_peak, mc_bot, pct_gain, pct_drop, recovery,
+                 ttp, ttb, smart_cnt, renowned, ts_mig,
+                 trade_id, trade_status, trade_pnl) in sorted(with_wallet, key=lambda x: -(x[5] or 0)):
+
+                rec_str   = '✅' if recovery is True else ('❌' if recovery is False else '—')
+                gain_str  = f"+{pct_gain*100:.0f}%" if pct_gain else '—'
+                drop_str  = f"-{pct_drop*100:.0f}%" if pct_drop else '—'
+                gain_col  = '#2a2' if pct_gain and pct_gain > 0.5 else '#fa0' if pct_gain else '#888'
+
+                if trade_id:
+                    tc = '#2a2' if trade_status == 'tp' else '#a44'
+                    t_str = f"<span style='color:{tc}'>#{trade_id} {trade_status.upper()} {trade_pnl*100:+.0f}%</span>" if trade_pnl else f"<span style='color:{tc}'>#{trade_id}</span>"
+                else:
+                    t_str = "<span style='color:#555'>não tradado</span>"
+
+                trs += (f"<tr><td>{nome or mint[:8]}</td>"
+                        f"<td style='color:{gain_col}'>{gain_str}</td>"
+                        f"<td>{drop_str}</td>"
+                        f"<td>{rec_str}</td>"
+                        f"<td>{ttp:.0f}min' if ttp else '—'}</td>"
+                        f"<td>{smart_cnt}</td><td>{renowned}</td>"
+                        f"<td>{t_str}</td></tr>")
+
             yield f"""
-            <h3>Trades com a smart wallet presente ({n_with})</h3>
+            <h3>Tokens onde a smart wallet esteve presente ({n_w})</h3>
+            <p class='note'>pct_gain = (mc_peak − mc_migration) / mc_migration. Nosso trade é separado — o token pode ter ido 500% mesmo que tenhamos SL.</p>
             <table>
-              <tr><th>#id</th><th>Token</th><th>Resultado</th>
-                  <th>bounce%</th><th>elapsed</th><th>smart_cnt</th><th>KOL</th></tr>
+              <tr><th>Token</th><th>pct_gain</th><th>dump%</th><th>Recovery</th>
+                  <th>time_to_peak</th><th>smart</th><th>KOL</th><th>Nosso trade</th></tr>
               {trs}
             </table>{PAD}
             """
 
+        yield "<p style='color:#888;margin-top:20px'>Análise concluída.</p></body></html>"
+
+    return Response(stream_with_context(generate()), content_type="text/html")
         yield "<p style='color:#888;margin-top:20px'>Análise concluída.</p></body></html>"
 
     return Response(stream_with_context(generate()), content_type="text/html")
