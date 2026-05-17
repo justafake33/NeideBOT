@@ -32599,5 +32599,321 @@ def analise_cruzamento_wallets():
         return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
+@app.route("/analise/cruzamento-wallets-ticks")
+def analise_cruzamento_wallets_ticks():
+    """
+    Versão metodologicamente correta do cruzamento wallet-monitor × NeideBOT.
+
+    Métrica real: token_ticks nos 20min após ts_signal.
+      - entry   = mc_at_signal (preço real do sinal — inclui bounce inteiro)
+      - tp_hit  = max_mc_after >= entry × 1.75  (+75% trailing activation)
+      - sl_hit  = min_mc_after <= entry × 0.75  (-25% SL)
+      - Mínimo 3 ticks após sinal para considerar o outcome.
+
+    Pergunta: wallets monitoradas que compraram DURANTE o dump (antes do sinal)
+    correlacionam com token que teria batido nosso TP dentro de 20min?
+    """
+    import psycopg2, psycopg2.extras, traceback
+    from db import DATABASE_URL
+
+    TP_MULT   = 1.75   # +75%
+    SL_MULT   = 0.75   # -25%
+    MIN_TICKS = 3
+    DUMP_WINDOW_MIN = 20   # wallet comprou até 20min antes do sinal
+
+    # Wallets conhecidas como ruído/bot — excluídas do grupo "smart money"
+    NOISE_WALLETS = {"Gold", "carteira_S", "carteira_O"}
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # Verifica se quarentena_trades existe
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_name = 'quarentena_trades'
+            ) AS exists
+        """)
+        if not cur.fetchone()["exists"]:
+            conn.close()
+            return "<h2>Tabela quarentena_trades não encontrada neste banco.</h2>", 404
+
+        # ── Dataset principal: bounce_signals + token_ticks (metodologia sinal-puro) ─
+        # Para cada bounce com ≥ MIN_TICKS após ts_signal, calcula tp_hit / sl_hit.
+        # Depois LEFT JOIN com quarentena_trades para identificar quais carteiras
+        # compraram o token durante o dump (antes do sinal).
+        cur.execute("""
+            WITH tick_outcomes AS (
+                SELECT
+                    bs.mint,
+                    bs.ts_signal,
+                    bs.mc_at_signal                                   AS entry_mc,
+                    bs.bounce_pct,
+                    bs.elapsed_sec / 60.0                             AS elapsed_min,
+                    bs.mc_migration,
+                    MAX(COALESCE(tt.mc_high, tt.mc))                  AS max_mc,
+                    MIN(COALESCE(tt.mc_low,  tt.mc))                  AS min_mc,
+                    COUNT(tt.id)                                      AS tick_count
+                FROM bounce_signals bs
+                JOIN token_ticks tt
+                    ON  tt.mint    = bs.mint
+                    AND tt.tick_ts > bs.ts_signal
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '20 minutes'
+                WHERE bs.mc_at_signal IS NOT NULL
+                  AND bs.mc_at_signal > 0
+                  AND bs.bounce_pct   IS NOT NULL
+                GROUP BY bs.mint, bs.ts_signal, bs.mc_at_signal, bs.bounce_pct,
+                         bs.elapsed_sec, bs.mc_migration
+                HAVING COUNT(tt.id) >= %(min_ticks)s
+            ),
+            outcomes AS (
+                SELECT *,
+                    (max_mc >= entry_mc * %(tp)s) AS tp_hit,
+                    (min_mc <= entry_mc * %(sl)s) AS sl_hit
+                FROM tick_outcomes
+            ),
+            wallet_crossings AS (
+                SELECT DISTINCT
+                    bs.mint,
+                    qt.carteira
+                FROM bounce_signals bs
+                JOIN quarentena_trades qt
+                    ON  qt.token_mint = bs.mint
+                    AND qt.tipo       = 'COMPRA'
+                    AND qt.ts         < bs.ts_signal
+                    AND qt.ts         > bs.ts_signal - INTERVAL '%(window)s minutes'
+            )
+            SELECT
+                o.*,
+                wc.carteira
+            FROM outcomes o
+            LEFT JOIN wallet_crossings wc ON wc.mint = o.mint
+            ORDER BY o.ts_signal DESC
+        """, {"tp": TP_MULT, "sl": SL_MULT, "min_ticks": MIN_TICKS,
+               "window": DUMP_WINDOW_MIN})
+        rows = cur.fetchall()
+        conn.close()
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+    # ── Agrupamento em Python ─────────────────────────────────────────────────
+    # Um token pode ter múltiplas carteiras — cada linha é (token × carteira).
+    # Para métricas de grupo, o token conta UMA vez por grupo.
+
+    from collections import defaultdict
+
+    # Agrupa por mint para saber todas as carteiras por token
+    by_mint = defaultdict(lambda: {"tp": False, "sl": False, "carteiras": set(),
+                                   "entry_mc": None, "bounce_pct": None})
+    for r in rows:
+        m = r["mint"]
+        by_mint[m]["tp"]        = by_mint[m]["tp"] or r["tp_hit"]
+        by_mint[m]["sl"]        = by_mint[m]["sl"] or r["sl_hit"]
+        by_mint[m]["entry_mc"]  = r["entry_mc"]
+        by_mint[m]["bounce_pct"]= r["bounce_pct"]
+        if r["carteira"]:
+            by_mint[m]["carteiras"].add(r["carteira"])
+
+    all_mints = list(by_mint.items())
+    n_total   = len(all_mints)
+
+    def group_stats(mints_subset):
+        n  = len(mints_subset)
+        if n == 0:
+            return {"n": 0, "wr": None, "n_tp": 0, "n_sl": 0}
+        n_tp = sum(1 for _, v in mints_subset if v["tp"] and not v["sl"])
+        n_sl = sum(1 for _, v in mints_subset if v["sl"])
+        # tp_only = chegou no TP sem acionar o SL antes
+        return {
+            "n":    n,
+            "n_tp": n_tp,
+            "n_sl": n_sl,
+            "wr":   round(n_tp / n * 100, 1),
+        }
+
+    # Baseline: todos os tokens com ticks (sem filtro de carteira)
+    base = group_stats(all_mints)
+
+    # Tokens sem nenhuma carteira monitorada
+    sem_wallet = [(m, v) for m, v in all_mints if not v["carteiras"]]
+    g_sem      = group_stats(sem_wallet)
+
+    # Tokens com QUALQUER carteira monitorada
+    com_wallet = [(m, v) for m, v in all_mints if v["carteiras"]]
+    g_com      = group_stats(com_wallet)
+
+    # Tokens com carteiras smart (excluindo ruído)
+    smart_only = [(m, v) for m, v in all_mints
+                  if v["carteiras"] and not v["carteiras"].issubset(NOISE_WALLETS)]
+    g_smart    = group_stats(smart_only)
+
+    # Tokens APENAS com carteiras ruído (Gold/S/O)
+    noise_only = [(m, v) for m, v in all_mints
+                  if v["carteiras"] and v["carteiras"].issubset(NOISE_WALLETS)]
+    g_noise    = group_stats(noise_only)
+
+    # Por carteira individual
+    all_carteiras = sorted({r["carteira"] for r in rows if r["carteira"]})
+
+    per_wallet = {}
+    for cart in all_carteiras:
+        subset = [(m, v) for m, v in all_mints if cart in v["carteiras"]]
+        per_wallet[cart] = group_stats(subset)
+        per_wallet[cart]["is_noise"] = cart in NOISE_WALLETS
+
+    # Convergência: ≥2 smart money wallets no mesmo token
+    convergence = [(m, v) for m, v in all_mints
+                   if len(v["carteiras"] - NOISE_WALLETS) >= 2]
+    g_conv      = group_stats(convergence)
+
+    # ── HTML ─────────────────────────────────────────────────────────────────
+    def wr_color(wr, base_wr):
+        if wr is None: return "#8b949e"
+        if wr >= base_wr + 10: return "#3fb950"
+        if wr <= base_wr - 10: return "#f85149"
+        return "#e3b341"
+
+    def delta_str(wr, base_wr):
+        if wr is None: return "—"
+        d = wr - base_wr
+        color = "#3fb950" if d >= 5 else ("#f85149" if d <= -5 else "#e3b341")
+        return f"<span style='color:{color}'>{d:+.1f}pp</span>"
+
+    def pct(n_tp, n):
+        return f"{round(n_tp/n*100,1)}%" if n else "—"
+
+    BASE_WR = base["wr"] or 0
+
+    # Linhas da tabela de grupos
+    group_rows = ""
+    groups = [
+        ("Baseline (todos com ticks)", base,    False),
+        ("Sem nenhuma wallet",          g_sem,   False),
+        ("Com qualquer wallet",         g_com,   False),
+        ("Smart money (I/F/L/G/H/K)",  g_smart, True),
+        ("Ruído apenas (Gold/S/O)",     g_noise, False),
+        ("Convergência ≥2 smart",       g_conv,  True),
+    ]
+    for label, g, highlight in groups:
+        wr   = g["wr"]
+        wr_s = f"{wr:.1f}%" if wr is not None else "—"
+        bg   = "background:#1f3a1f;" if highlight and wr and wr > BASE_WR + 5 else ""
+        group_rows += (
+            f"<tr style='{bg}'>"
+            f"<td>{label}</td>"
+            f"<td style='text-align:right'>{g['n']}</td>"
+            f"<td style='text-align:right'>{g['n_tp']}</td>"
+            f"<td style='text-align:right'>{g['n_sl']}</td>"
+            f"<td style='text-align:right;color:{wr_color(wr, BASE_WR)}'>{wr_s}</td>"
+            f"<td style='text-align:right'>{delta_str(wr, BASE_WR)}</td>"
+            f"</tr>"
+        )
+
+    # Linhas por carteira
+    cart_rows = ""
+    for cart in sorted(per_wallet, key=lambda c: -(per_wallet[c]["n"])):
+        g    = per_wallet[cart]
+        wr   = g["wr"]
+        wr_s = f"{wr:.1f}%" if wr is not None else "—"
+        is_n = g["is_noise"]
+        dim  = "color:#6e7681;" if is_n else ""
+        tag  = " <span style='color:#f85149;font-size:10px'>[ruído]</span>" if is_n else ""
+        cart_rows += (
+            f"<tr style='{dim}'>"
+            f"<td>{cart}{tag}</td>"
+            f"<td style='text-align:right'>{g['n']}</td>"
+            f"<td style='text-align:right'>{g['n_tp']}</td>"
+            f"<td style='text-align:right'>{g['n_sl']}</td>"
+            f"<td style='text-align:right;color:{wr_color(wr, BASE_WR)}'>{wr_s}</td>"
+            f"<td style='text-align:right'>{delta_str(wr, BASE_WR)}</td>"
+            f"</tr>"
+        )
+
+    # Cobertura: quantos bounces têm ticks suficientes?
+    cur2 = None
+    try:
+        conn2 = psycopg2.connect(DATABASE_URL)
+        cur2  = conn2.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur2.execute("SELECT COUNT(*) AS n FROM bounce_signals")
+        n_bounces_total = cur2.fetchone()["n"]
+        conn2.close()
+    except Exception:
+        n_bounces_total = "?"
+
+    coverage_pct = round(n_total / n_bounces_total * 100, 1) if isinstance(n_bounces_total, int) and n_bounces_total else "?"
+
+    # Aviso metodológico
+    methodology_note = (
+        f"<b>Metodologia:</b> entry = <code>mc_at_signal</code> (preço real do sinal, "
+        f"inclui o bounce inteiro). TP = +75% em 20min. SL = -25%. "
+        f"Mínimo {MIN_TICKS} ticks após sinal. "
+        f"Cobertura: {n_total} / {n_bounces_total} bounces ({coverage_pct}%). "
+        f"Proxy <code>recovery</code> (mc_1h) DESCARTADO — não reflete se nosso trade teria hit TP."
+    )
+
+    html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+    <title>Cruzamento Wallets × Ticks</title>
+    <style>
+      body{{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}}
+      h1{{color:#58a6ff}}h2{{color:#79c0ff;margin-top:28px}}h3{{color:#8b949e;margin-top:20px}}
+      table{{border-collapse:collapse;width:100%;max-width:700px;margin-bottom:20px}}
+      th{{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:left}}
+      th:not(:first-child){{text-align:right}}
+      td{{padding:5px 10px;border:1px solid #21262d;white-space:nowrap}}
+      .warn{{background:#2d1f00;border:1px solid #9a6700;padding:10px 14px;
+              border-radius:4px;margin:12px 0;font-size:12px}}
+      .note{{color:#8b949e;font-size:12px;margin:4px 0 14px}}
+      a{{color:#58a6ff}}
+    </style></head><body>
+    <h1>Cruzamento wallet-monitor × NeideBOT — Métrica real (token_ticks)</h1>
+    <p class='note'>
+      Wallets que compraram o token DURANTE o dump (até {DUMP_WINDOW_MIN}min antes do sinal).
+      <br>O token bateria nosso TP (+75%) dentro de 20min a partir de <code>mc_at_signal</code>?
+    </p>
+
+    <div class='warn'>{methodology_note}</div>
+
+    <p><a href='/analise/cruzamento-wallets'>← Versão recovery (mc_1h)</a>
+       &nbsp;|&nbsp; <a href='/analise/sinal-puro'>Sinal Puro (baseline)</a></p>
+
+    <h2>WR real por grupo de wallet</h2>
+    <p class='note'>TP = único (tp_hit antes de sl_hit). Baseline = todos os tokens com ticks suficientes.</p>
+    <table>
+      <tr>
+        <th>Grupo</th><th>n tokens</th><th>n TP</th><th>n SL/outro</th>
+        <th>WR%</th><th>Delta vs baseline</th>
+      </tr>
+      {group_rows}
+    </table>
+
+    <h2>WR real por carteira individual</h2>
+    <p class='note'>Um token pode contar em múltiplas carteiras se mais de uma comprou durante o dump.</p>
+    <table>
+      <tr>
+        <th>Carteira</th><th>n tokens</th><th>n TP</th><th>n SL/outro</th>
+        <th>WR%</th><th>Delta vs baseline</th>
+      </tr>
+      {cart_rows or "<tr><td colspan='6' style='color:#666'>Nenhuma carteira cruzada com ticks disponíveis</td></tr>"}
+    </table>
+
+    <h2>Interpretação</h2>
+    <div class='warn' style='background:#161b22;border-color:#30363d'>
+      <b>Por que recovery (mc_1h) é métrica errada:</b><br>
+      recovery = mc_1h &gt; mc_bottom × 1.3. Problemas:<br>
+      (a) Não sabe se o SL (-25%) foi acionado antes da recuperação.<br>
+      (b) mc_1h é checkpoint arbitrário — token pode ter subido, caído, e "recuperado" sem jamais bater nosso TP.<br>
+      (c) mc_bottom é o fundo detectado, não nossa entrada. Nosso entry é mc_at_signal (já inclui o bounce de 30-50%).<br><br>
+      <b>O que este endpoint mede:</b> dado que entramos em mc_at_signal, o token chegou a +75%
+      (trailing activation) nos 20min seguintes <i>antes</i> de cair -25%?
+      Esta é a única pergunta que importa para o NeideBOT.
+    </div>
+
+    </body></html>"""
+
+    return html
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
