@@ -350,7 +350,13 @@ class HotMonitor:
         if rise_bv > 0:
             buy_concentration = round(rise_lb / rise_bv, 4)
 
-        state["bounce_fired"] = True
+        # Bug 3 fix: check-and-set atômico sob lock — evita double-fire por corrida
+        # entre push_mc (trenches) e _precise_bottom_tick (kline) em threads concorrentes.
+        with self._lock:
+            live = self._tokens.get(mint)
+            if not live or live.get("bounce_fired"):
+                return
+            live["bounce_fired"] = True
         symbol = state.get("symbol", mint[:8])
 
         try:
@@ -488,6 +494,9 @@ class HotMonitor:
                 candle_ts   = int(c.get("time", 0)) / 1000
                 elapsed_sec = int(candle_ts - ts_mig_unix)
                 if elapsed_sec < 0 or elapsed_sec > 3660:
+                    continue
+                # Bug 6 fix: ignora o candle de transição bonding curve → pool.
+                if elapsed_sec < 90:
                     continue
                 close_p = _float(c.get("close"))
                 open_p  = _float(c.get("open"))
@@ -776,8 +785,13 @@ class HotMonitor:
         if candles_1h:
             for c in candles_1h:
                 candle_ts   = int(c.get("time", 0)) / 1000
-                elapsed_min = (candle_ts - ts_mig_unix) / 60
-                if elapsed_min < 0:
+                elapsed_sec = int(candle_ts - ts_mig_unix)
+                elapsed_min = elapsed_sec / 60
+                if elapsed_sec < 0 or elapsed_sec > 3660:
+                    continue
+                # Bug 5 fix: ignora o candle de transição bonding curve → pool.
+                # Mesmo filtro do _precise_bottom_tick — elimina mc_min fictício.
+                if elapsed_sec < 90:
                     continue
                 low = _float(c.get("low"))
                 if low and low > 0:
@@ -1155,6 +1169,9 @@ class Scanner:
         now               = datetime.now(timezone.utc)
         now_ts            = int(now.timestamp())
         capture_delay_sec = (now_ts - complete_ts) if complete_ts > 0 else None
+        # Bug 1 fix: usar o timestamp on-chain da migração, não o momento de detecção pelo bot.
+        # Usar 'now' como ts_migration faz elapsed_sec=60s para tokens migrados há 18min → falsos bounces imediatos.
+        ts_mig_real       = datetime.fromtimestamp(complete_ts, tz=timezone.utc) if complete_ts > 0 else now
 
         # Tenta obter o preço exato no momento da migração via kline de 1m.
         # A abertura do candle mais próximo de complete_timestamp é a melhor
@@ -1240,7 +1257,7 @@ class Scanner:
             "token_nome":               token.get("symbol"),
             "ts_detected":              watchlist_entry.get("ts_detected") if watchlist_entry else None,
             "bc_progress_at_detection": watchlist_entry.get("bc_progress_at_detection") if watchlist_entry else None,
-            "ts_migration":             now,
+            "ts_migration":             ts_mig_real,
             "mc_migration":             mc_migration,
             "mc_migration_observed":    mc_observed,
             "mc_migration_bc_ref":      mc_bc_ref,
@@ -1268,7 +1285,7 @@ class Scanner:
         logger.info("Migracao %s (%s) MC_oficial=$%.0f[%s] MC_obs=$%.0f[%s] liq=$%.0f exch=%s smart=%d%s",
                     symbol, mint[:8], mc_migration, src, mc_observed, src_observed, liq, exch, smart, delay_str)
 
-        self.hot.add(mint, mc_migration, now, symbol, total_supply, exchange=token.get("exchange"))
+        self.hot.add(mint, mc_migration, ts_mig_real, symbol, total_supply, exchange=token.get("exchange"))
 
 
 # ==============================================================================
