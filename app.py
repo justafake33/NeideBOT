@@ -33919,6 +33919,13 @@ def analise_h22_h25_ticks():
 @app.route("/analise/h23-investigation")
 def analise_h23_investigation():
     """Investigação detalhada: tokens H23 >5 SOL — por que 45% WR em ticks mas 0% em trades."""
+    import psycopg2, psycopg2.extras, traceback
+    try:
+        return _analise_h23_investigation_inner()
+    except Exception:
+        return f"<pre>{traceback.format_exc()}</pre>", 500
+
+def _analise_h23_investigation_inner():
     import psycopg2, psycopg2.extras
     conn = psycopg2.connect(db.DATABASE_URL)
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
