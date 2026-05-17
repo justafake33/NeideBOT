@@ -30184,6 +30184,180 @@ def analise_h23_deep():
         return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
+@app.route("/analise/h24-h25")
+def analise_h24_h25():
+    """
+    Correlação H24 (seller concentration) + H25 (pool depth) + H23 (net flow bottom)
+    vs outcomes blockchain-verificados.
+    """
+    import psycopg2
+    from db import DATABASE_URL
+
+    conn = psycopg2.connect(DATABASE_URL)
+    cur  = conn.cursor()
+
+    TRADE_JOIN = """
+        JOIN LATERAL (
+            SELECT status, pnl_pct_real
+            FROM trades
+            WHERE mint = bs.mint
+              AND created_at > bs.ts_signal - INTERVAL '5 minutes'
+              AND created_at < bs.ts_signal + INTERVAL '30 minutes'
+              AND exit_type IS NOT NULL
+            ORDER BY created_at ASC LIMIT 1
+        ) t ON true
+    """
+
+    # cobertura geral
+    cur.execute(f"""
+        SELECT
+            COUNT(*) FILTER (WHERE bs.dump_seller_hhi IS NOT NULL) as n_h24,
+            COUNT(*) FILTER (WHERE bs.pool_quote_at_signal IS NOT NULL) as n_h25,
+            COUNT(*) FILTER (WHERE bs.net_sol_flow IS NOT NULL AND bs.h23_window='bottom') as n_h23,
+            COUNT(*) as n_total
+        FROM bounce_signals bs {TRADE_JOIN}
+        WHERE bs.dump_seller_hhi IS NOT NULL OR bs.pool_quote_at_signal IS NOT NULL
+    """)
+    cov = cur.fetchone()
+
+    def table_html(title, rows, headers):
+        ths = "".join(f"<th>{h}</th>" for h in headers)
+        body = ""
+        for r in rows:
+            tds = "".join(f"<td>{v}</td>" for v in r)
+            body += f"<tr>{tds}</tr>"
+        return f"""
+        <h3>{title}</h3>
+        <table><tr>{ths}</tr>{body}</table>
+        """
+
+    def wr_color(wr_str):
+        try:
+            v = float(wr_str.strip('%'))
+            c = "#2a2" if v >= 20 else ("#fa0" if v >= 13 else "#a44")
+            return f"<span style='color:{c}'>{wr_str}</span>"
+        except:
+            return wr_str
+
+    # H24 — seller HHI
+    cur.execute(f"""
+        SELECT
+            CASE
+                WHEN bs.dump_seller_hhi >= 0.5 THEN '≥0.5  (1-2 sellers dominam)'
+                WHEN bs.dump_seller_hhi >= 0.2 THEN '0.2-0.5  (poucos sellers)'
+                WHEN bs.dump_seller_hhi >= 0.1 THEN '0.1-0.2  (distribuído)'
+                ELSE                                 '<0.1  (muito distribuído)'
+            END,
+            COUNT(*), SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN t.status IN ('sl','error') THEN 1 ELSE 0 END),
+            ROUND(AVG(t.pnl_pct_real)*100,1)
+        FROM bounce_signals bs {TRADE_JOIN}
+        WHERE bs.dump_seller_hhi IS NOT NULL
+        GROUP BY 1 ORDER BY MIN(bs.dump_seller_hhi) DESC
+    """)
+    h24_rows = []
+    for faixa, n, tp, sl, pnl in cur.fetchall():
+        wr = f"{tp/n*100:.0f}%" if n else "—"
+        h24_rows.append([faixa, n, tp, sl, wr_color(wr), f"{pnl}%" if pnl else "—"])
+
+    # H25 — pool depth
+    cur.execute(f"""
+        SELECT
+            CASE
+                WHEN bs.pool_quote_at_signal >= 100 THEN '≥100 SOL  (fundo)'
+                WHEN bs.pool_quote_at_signal >= 50  THEN '50-100 SOL'
+                WHEN bs.pool_quote_at_signal >= 20  THEN '20-50 SOL'
+                ELSE                                     '<20 SOL  (pool fino)'
+            END,
+            COUNT(*), SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN t.status IN ('sl','error') THEN 1 ELSE 0 END),
+            ROUND(AVG(t.pnl_pct_real)*100,1)
+        FROM bounce_signals bs {TRADE_JOIN}
+        WHERE bs.pool_quote_at_signal IS NOT NULL
+        GROUP BY 1 ORDER BY MIN(bs.pool_quote_at_signal) DESC
+    """)
+    h25_rows = []
+    for faixa, n, tp, sl, pnl in cur.fetchall():
+        wr = f"{tp/n*100:.0f}%" if n else "—"
+        h25_rows.append([faixa, n, tp, sl, wr_color(wr), f"{pnl}%" if pnl else "—"])
+
+    # H23 bottom window
+    cur.execute(f"""
+        SELECT
+            CASE
+                WHEN bs.net_sol_flow > 5   THEN '>5 SOL  (compra forte no fundo)'
+                WHEN bs.net_sol_flow > 0   THEN '0-5 SOL  (compra leve)'
+                WHEN bs.net_sol_flow > -5  THEN '-5-0 SOL  (venda leve)'
+                ELSE                            '<-5 SOL  (venda forte no fundo)'
+            END,
+            COUNT(*), SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN t.status IN ('sl','error') THEN 1 ELSE 0 END),
+            ROUND(AVG(t.pnl_pct_real)*100,1)
+        FROM bounce_signals bs {TRADE_JOIN}
+        WHERE bs.net_sol_flow IS NOT NULL AND bs.h23_window = 'bottom'
+        GROUP BY 1 ORDER BY MIN(bs.net_sol_flow) DESC
+    """)
+    h23_rows = []
+    for faixa, n, tp, sl, pnl in cur.fetchall():
+        wr = f"{tp/n*100:.0f}%" if n else "—"
+        h23_rows.append([faixa, n, tp, sl, wr_color(wr), f"{pnl}%" if pnl else "—"])
+
+    # overhead supply: mc_at_signal / mc_peak (da tabela migrations)
+    cur.execute(f"""
+        SELECT
+            CASE
+                WHEN bs.mc_at_signal / NULLIF(m.mc_peak,0) >= 0.7 THEN '≥70% do pico  (muitos vendedores acima)'
+                WHEN bs.mc_at_signal / NULLIF(m.mc_peak,0) >= 0.5 THEN '50-70% do pico'
+                WHEN bs.mc_at_signal / NULLIF(m.mc_peak,0) >= 0.3 THEN '30-50% do pico'
+                ELSE                                                     '<30% do pico  (maioria já saiu)'
+            END,
+            COUNT(*), SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN t.status IN ('sl','error') THEN 1 ELSE 0 END),
+            ROUND(AVG(t.pnl_pct_real)*100,1)
+        FROM bounce_signals bs
+        JOIN migrations m ON m.mint = bs.mint
+        {TRADE_JOIN}
+        WHERE m.mc_peak > 0 AND bs.mc_at_signal IS NOT NULL
+        GROUP BY 1 ORDER BY MIN(bs.mc_at_signal / NULLIF(m.mc_peak,0)) DESC
+    """)
+    os_rows = []
+    for faixa, n, tp, sl, pnl in cur.fetchall():
+        wr = f"{tp/n*100:.0f}%" if n else "—"
+        os_rows.append([faixa, n, tp, sl, wr_color(wr), f"{pnl}%" if pnl else "—"])
+
+    conn.close()
+
+    hdrs = ["Faixa", "n", "TP", "SL", "WR", "P&L médio"]
+
+    h24_tbl = table_html(f"H24 — Concentração de Sellers no Dump (n={cov[0]})", h24_rows, hdrs) if h24_rows else "<p style='color:#888'>Sem dados H24 ainda</p>"
+    h25_tbl = table_html(f"H25 — Profundidade do Pool no Sinal (n={cov[1]})", h25_rows, hdrs) if h25_rows else "<p style='color:#888'>Sem dados H25 ainda</p>"
+    h23_tbl = table_html(f"H23 — Net SOL Flow no Fundo / janela bottom (n={cov[2]})", h23_rows, hdrs) if h23_rows else "<p style='color:#888'>Sem dados H23 bottom ainda</p>"
+    os_tbl  = table_html(f"Overhead Supply — entrada como % do pico (todos os {cov[3]} trades)", os_rows, hdrs) if os_rows else ""
+
+    return f"""<!DOCTYPE html><html><head>
+    <meta charset='utf-8'><title>H24/H25/H23 vs Outcomes</title>
+    <style>
+      body {{ font-family: monospace; background:#111; color:#ccc; padding:20px; }}
+      h2 {{ color:#fa0; }} h3 {{ color:#fa0; margin-top:30px; }}
+      table {{ border-collapse:collapse; margin-bottom:10px; min-width:600px; }}
+      th,td {{ padding:6px 12px; border:1px solid #333; text-align:right; }}
+      th {{ background:#222; color:#fa0; }}
+      td:first-child {{ text-align:left; }}
+      .note {{ color:#888; font-size:.9em; margin-bottom:20px; }}
+    </style></head><body>
+    <h2>H23 / H24 / H25 — Correlação com Outcomes</h2>
+    <p class='note'>Apenas trades blockchain-verificados (exit_type IS NOT NULL). WR base total: 13.4%.</p>
+    {h24_tbl}
+    <p class='note'>HHI alto = 1-2 wallets fizeram o dump → sellers concentrados → exaurem rápido → bounce mais real?</p>
+    {h25_tbl}
+    <p class='note'>Pool fino (&lt;20 SOL) = qualquer compra move o preço muito → spikes falsos → SL imediato</p>
+    {h23_tbl}
+    <p class='note'>Janela: [ts_migration → ts_min]. Net flow positivo no fundo = compradores absorvendo enquanto o token caía</p>
+    {os_tbl}
+    <p class='note'>Overhead supply: se entramos a 70% do pico, há muita gente acima de nós querendo recuperar capital</p>
+    </body></html>"""
+
+
 @app.route("/analise/phantom-bounces")
 def analise_phantom_bounces():
     """
