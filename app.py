@@ -33665,5 +33665,256 @@ def analise_wallet_token_outcome():
     return html
 
 
+@app.route("/analise/h22-h25-ticks")
+def analise_h22_h25_ticks():
+    """
+    Versão correta de H22/H23/H24/H25: usa token_ticks como outcome, NÃO trades.
+
+    Motivação: H24/H25 têm 0 trades porque esses bounces são filtrados por A.2/A.3/smart
+    antes de virar trade. Nunca teremos trades para eles. Token_ticks mede o comportamento
+    real do TOKEN independente de filtros de execução, slippage ou decisões do bot.
+
+    Metodologia idêntica ao /analise/sinal-puro:
+      entry  = mc_at_signal (preço real do sinal)
+      tp_hit = max_mc_20min >= entry × 1.75  (+75%)
+      sl_hit = min_mc_20min <= entry × 0.75  (-25%)
+      Mínimo 3 ticks após sinal.
+    """
+    import psycopg2, psycopg2.extras, traceback
+    from db import DATABASE_URL
+
+    TP_MULT    = 1.75
+    SL_MULT    = 0.75
+    MIN_TICKS  = 3
+    WINDOW_MIN = 60   # 60min = janela completa do HotMonitor (não 20min que é nossa janela de trade)
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # Dataset: bounce_signals com H22/H23/H24/H25 + token_ticks nos 60min após sinal
+        cur.execute("""
+            WITH outcomes AS (
+                SELECT
+                    bs.mint,
+                    bs.mc_at_signal                                       AS entry_mc,
+                    bs.bounce_pct,
+                    bs.elapsed_sec / 60.0                                 AS elapsed_min,
+                    -- H22
+                    bs.absorption_buy_vol,
+                    bs.absorption_sell_vol,
+                    bs.absorption_events,
+                    -- H23
+                    bs.net_sol_flow,
+                    bs.h23_window,
+                    -- H24
+                    bs.dump_seller_hhi,
+                    bs.dump_seller_count,
+                    -- H25
+                    bs.pool_quote_at_signal,
+                    -- token outcome via ticks (janela 60min = HotMonitor completo)
+                    MAX(COALESCE(tt.mc_high, tt.mc))                      AS max_mc,
+                    MIN(COALESCE(tt.mc_low,  tt.mc))                      AS min_mc,
+                    COUNT(tt.id)                                          AS tick_count
+                FROM bounce_signals bs
+                JOIN token_ticks tt
+                    ON  tt.mint    = bs.mint
+                    AND tt.tick_ts > bs.ts_signal
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
+                WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+                  AND bs.bounce_pct   IS NOT NULL
+                GROUP BY bs.mint, bs.mc_at_signal, bs.bounce_pct, bs.elapsed_sec,
+                         bs.absorption_buy_vol, bs.absorption_sell_vol, bs.absorption_events,
+                         bs.net_sol_flow, bs.h23_window,
+                         bs.dump_seller_hhi, bs.dump_seller_count,
+                         bs.pool_quote_at_signal
+                HAVING COUNT(tt.id) >= %(min_ticks)s
+            )
+            SELECT *,
+                (max_mc >= entry_mc * %(tp)s)  AS tp_hit,
+                (min_mc <= entry_mc * %(sl)s)  AS sl_hit
+            FROM outcomes
+        """, {"tp": TP_MULT, "sl": SL_MULT, "min_ticks": MIN_TICKS})
+        rows = cur.fetchall()
+        conn.close()
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+    if not rows:
+        return "<p>Sem dados suficientes ainda (bounces com H22/H23/H24/H25 + ticks).</p>"
+
+    # ── Agregação em Python ───────────────────────────────────────────────────
+    n_total = len(rows)
+    base_tp = sum(1 for r in rows if r["tp_hit"] and not r["sl_hit"])
+    BASE_WR = round(base_tp / n_total * 100, 1) if n_total else 0
+
+    def agg(subset):
+        n = len(subset)
+        if n == 0:
+            return {"n": 0, "tp": 0, "sl": 0, "wr": None}
+        tp = sum(1 for r in subset if r["tp_hit"] and not r["sl_hit"])
+        sl = sum(1 for r in subset if r["sl_hit"])
+        return {"n": n, "tp": tp, "sl": sl,
+                "wr": round(tp / n * 100, 1) if n else None}
+
+    def ratio(r):
+        bv = r["absorption_buy_vol"] or 0
+        sv = r["absorption_sell_vol"] or 0
+        ev = r["absorption_events"]  or 0
+        if ev == 0 or bv == 0:
+            return None
+        if sv == 0:
+            return float("inf")
+        return bv / sv
+
+    # H22 ratio bins
+    H22_BINS = [
+        ("∞  (só compra — vacuum pump)", lambda x: x == float("inf")),
+        ("≥3×  (compra domina)",          lambda x: x is not None and x != float("inf") and x >= 3.0),
+        ("1.5–3×  (zona ideal)",          lambda x: x is not None and 1.5 <= x < 3.0),
+        ("1–1.5×  (equilibrado)",         lambda x: x is not None and 1.0 <= x < 1.5),
+        ("0.5–1×  (leve venda)",          lambda x: x is not None and 0.5 <= x < 1.0),
+        ("<0.5×  (venda domina)",         lambda x: x is not None and x != float("inf") and x < 0.5),
+        ("sem dados Helius",              lambda x: x is None),
+    ]
+
+    # H23 net_flow bins (only h23_window='bottom')
+    H23_BINS = [
+        (">5 SOL  (compra forte → sinal tardio)", lambda r: r["h23_window"] == "bottom" and r["net_sol_flow"] is not None and r["net_sol_flow"] >  5),
+        ("0–5 SOL  (compra leve)",                lambda r: r["h23_window"] == "bottom" and r["net_sol_flow"] is not None and 0 < r["net_sol_flow"] <= 5),
+        ("-5–0 SOL  (venda leve)",                lambda r: r["h23_window"] == "bottom" and r["net_sol_flow"] is not None and -5 < r["net_sol_flow"] <= 0),
+        ("<-5 SOL  (seller exhaustion)",          lambda r: r["h23_window"] == "bottom" and r["net_sol_flow"] is not None and r["net_sol_flow"] <= -5),
+        ("sem H23 bottom",                        lambda r: r["h23_window"] != "bottom" or r["net_sol_flow"] is None),
+    ]
+
+    # H24 HHI bins
+    H24_BINS = [
+        ("≥0.5  (1-2 sellers dominam)",   lambda r: r["dump_seller_hhi"] is not None and r["dump_seller_hhi"] >= 0.5),
+        ("0.2–0.5  (poucos sellers)",     lambda r: r["dump_seller_hhi"] is not None and 0.2 <= r["dump_seller_hhi"] < 0.5),
+        ("0.1–0.2  (distribuído)",        lambda r: r["dump_seller_hhi"] is not None and 0.1 <= r["dump_seller_hhi"] < 0.2),
+        ("<0.1  (muito distribuído)",     lambda r: r["dump_seller_hhi"] is not None and r["dump_seller_hhi"] < 0.1),
+        ("sem dados H24",                 lambda r: r["dump_seller_hhi"] is None),
+    ]
+
+    # H25 pool depth bins
+    H25_BINS = [
+        ("≥100 SOL  (pool fundo)",        lambda r: r["pool_quote_at_signal"] is not None and r["pool_quote_at_signal"] >= 100),
+        ("50–100 SOL",                    lambda r: r["pool_quote_at_signal"] is not None and 50 <= r["pool_quote_at_signal"] < 100),
+        ("20–50 SOL",                     lambda r: r["pool_quote_at_signal"] is not None and 20 <= r["pool_quote_at_signal"] < 50),
+        ("<20 SOL  (pool fino)",          lambda r: r["pool_quote_at_signal"] is not None and r["pool_quote_at_signal"] < 20),
+        ("sem dados H25",                 lambda r: r["pool_quote_at_signal"] is None),
+    ]
+
+    # ── HTML helpers ──────────────────────────────────────────────────────────
+    def wr_col(wr):
+        if wr is None: return "—", "#8b949e"
+        c = "#3fb950" if wr >= BASE_WR + 8 else ("#f85149" if wr <= BASE_WR - 8 else "#e3b341")
+        return f"{wr:.1f}%", c
+
+    def delta(wr):
+        if wr is None: return "—"
+        d = wr - BASE_WR
+        c = "#3fb950" if d >= 5 else ("#f85149" if d <= -5 else "#8b949e")
+        return f"<span style='color:{c}'>{d:+.1f}pp</span>"
+
+    def table_html(title, note, bins, key_fn):
+        hdrs = ["Faixa", "n (ticks)", "TP", "SL", "WR%", "Δ baseline"]
+        ths  = "".join(f"<th>{h}</th>" for h in hdrs)
+        body = ""
+        for label, fn in bins:
+            subset = [r for r in rows if fn(key_fn(r) if key_fn else r)]
+            g = agg(subset)
+            ws, wc = wr_col(g["wr"])
+            body += (
+                f"<tr><td>{label}</td>"
+                f"<td style='text-align:right'>{g['n']}</td>"
+                f"<td style='text-align:right'>{g['tp']}</td>"
+                f"<td style='text-align:right'>{g['sl']}</td>"
+                f"<td style='text-align:right;color:{wc}'>{ws}</td>"
+                f"<td style='text-align:right'>{delta(g['wr'])}</td></tr>"
+            )
+        note_html = f"<p class='note'>{note}</p>" if note else ""
+        return f"<h2>{title}</h2>{note_html}<table><tr>{ths}</tr>{body}</table>"
+
+    # H22 usa key_fn para extrair ratio
+    h22_body = ""
+    for label, fn in H22_BINS:
+        subset = [r for r in rows if fn(ratio(r))]
+        g = agg(subset)
+        ws, wc = wr_col(g["wr"])
+        h22_body += (
+            f"<tr><td>{label}</td>"
+            f"<td style='text-align:right'>{g['n']}</td>"
+            f"<td style='text-align:right'>{g['tp']}</td>"
+            f"<td style='text-align:right'>{g['sl']}</td>"
+            f"<td style='text-align:right;color:{wc}'>{ws}</td>"
+            f"<td style='text-align:right'>{delta(g['wr'])}</td></tr>"
+        )
+    hdrs_html = "".join(f"<th>{'Faixa' if i==0 else h}</th>" for i, h in enumerate(["Faixa","n (ticks)","TP","SL","WR%","Δ baseline"]))
+    h22_html  = (
+        f"<h2>H22 — Ratio Buy/Sell [ts_min-60s → ts_min] — outcome via token_ticks</h2>"
+        f"<p class='note'>Zona ideal: 1.5–3× (sellers presentes, compradores vencendo). "
+        f"Extremos ∞/≥3× = vacuum pump = token já subiu antes do sinal.</p>"
+        f"<table><tr>{hdrs_html}</tr>{h22_body}</table>"
+    )
+
+    h23_html = table_html(
+        "H23 — Net SOL Flow no Fundo (h23_window='bottom') — outcome via token_ticks",
+        "Hipótese reformulada: net_flow negativo = sellers ativos até o fundo = exhaustion. "
+        "Net_flow positivo = token já recovering antes da detecção = sinal tardio.",
+        H23_BINS, None)
+
+    h24_html = table_html(
+        "H24 — Concentração de Sellers no Dump (HHI) — outcome via token_ticks",
+        "HHI ≥0.5 = 1-2 wallets fizeram o dump. Sellers concentrados exaurem rápido → bounce mais sustentado?",
+        H24_BINS, None)
+
+    h25_html = table_html(
+        "H25 — Profundidade do Pool no Sinal — outcome via token_ticks",
+        "Pool fino (<20 SOL): compra de $300 move preço 25% → spike artificial → SL por ruído.",
+        H25_BINS, None)
+
+    # Cobertura info
+    n_h22 = sum(1 for r in rows if (r["absorption_events"] or 0) > 0)
+    n_h23 = sum(1 for r in rows if r["h23_window"] == "bottom" and r["net_sol_flow"] is not None)
+    n_h24 = sum(1 for r in rows if r["dump_seller_hhi"] is not None)
+    n_h25 = sum(1 for r in rows if r["pool_quote_at_signal"] is not None)
+
+    html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+    <title>H22-H25 Ticks</title>
+    <style>
+      body{{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}}
+      h1{{color:#58a6ff}}h2{{color:#79c0ff;margin-top:28px}}
+      table{{border-collapse:collapse;width:100%;max-width:720px;margin-bottom:20px}}
+      th{{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:left}}
+      th:not(:first-child){{text-align:right}}
+      td{{padding:5px 10px;border:1px solid #21262d;white-space:nowrap}}
+      .note{{color:#8b949e;font-size:12px;margin:4px 0 14px}}
+      .box{{background:#161b22;border:1px solid #30363d;padding:10px 14px;border-radius:4px;margin:10px 0;font-size:12px}}
+      a{{color:#58a6ff}}
+    </style></head><body>
+    <h1>H22 / H23 / H24 / H25 — Outcome via token_ticks</h1>
+    <p class='note'>
+      Métrica: token_ticks nos <b>60min</b> após ts_signal (janela completa do HotMonitor).
+      Entry = mc_at_signal. TP = +75% | SL = -25%. Independente de filtros de execução do bot.<br>
+      <span style='color:#e3b341'>Nota: 60min mede qualidade do TOKEN. Para janela de trade (20min) ver /analise/sinal-puro.</span>
+    </p>
+    <div class='box'>
+      Baseline: {n_total} bounces com ≥{MIN_TICKS} ticks | {base_tp} TP | {n_total-base_tp} não-TP | WR base = <b>{BASE_WR}%</b><br>
+      Cobertura: H22={n_h22} | H23 bottom={n_h23} | H24={n_h24} | H25={n_h25}
+    </div>
+    <p><a href='/analise/h24-h25'>← Versão trades</a> &nbsp;|&nbsp;
+       <a href='/analise/sinal-puro'>Sinal Puro</a> &nbsp;|&nbsp;
+       <a href='/analise/h22-correlation'>H22 Correlation</a></p>
+    {h22_html}
+    {h23_html}
+    {h24_html}
+    {h25_html}
+    </body></html>"""
+
+    return html
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
