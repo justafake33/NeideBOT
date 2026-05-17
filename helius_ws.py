@@ -460,11 +460,12 @@ class HeliusWS:
                                 self._pool_quote_last[mint] = pq
                         if buf is not None:
                             buf.append({
-                                "ts":     time.time(),
-                                "side":   event["side"],
-                                "sol":    event["sol"],
-                                "mc":     event["mc"],
-                                "wallet": event.get("wallet"),  # H24
+                                "ts":           time.time(),
+                                "side":         event["side"],
+                                "sol":          event["sol"],
+                                "mc":           event["mc"],
+                                "wallet":       event.get("wallet"),       # H24
+                                "pool_quote_sol": event.get("pool_quote_sol", 0),  # A.9
                             })
                     logger.info("HeliusWS price(anchor) %s: $%.0f MC [%s %.4f SOL]",
                                 mint[:8], event["mc"], event["side"], event["sol"])
@@ -580,15 +581,30 @@ class HeliusWS:
             "top_seller_frac": round(max(shares), 4),
         }
 
+    # Profundidade mínima da pool primária do pump.fun pAMM (SOL).
+    # Derivado da matemática da bonding curve: com k = 79 SOL × 200M tokens e todos
+    # os 1B tokens possíveis vendidos, o mínimo absoluto da pool primária é ~15.8 SOL.
+    # Com nosso filtro MC ≥ $5k, o mínimo real é ~21.5 SOL.
+    # Eventos Helius com pool_quote_sol < 10 SOL são de secondary pools (MEV, thin pools)
+    # não visíveis nos gráficos — a fake pool do evento espúrio tinha 0.83 SOL.
+    _MIN_POOL_SOL = float(os.getenv("MIN_POOL_SOL", "10"))
+
     def get_min_mc_in_window(self, mint: str, from_ts: float, to_ts: float) -> float | None:
         """Retorna o menor MC observado via Helius para um mint no intervalo [from_ts, to_ts].
         Usado para substituir kline low na janela de transição (elapsed < 90s), onde o low
         intra-candle do kline pode incluir preços da bonding curve pré-migração.
-        Retorna None se não há eventos Helius nessa janela.
+        Filtra eventos com pool_quote_sol < MIN_POOL_SOL para rejeitar secondary pools e
+        thin pools que produzem preços fictícios não visíveis nos gráficos (A.9).
+        Retorna None se não há eventos Helius válidos nessa janela.
         """
         with self._lock:
             events = list(self._swap_events.get(mint, []))
-        window = [e["mc"] for e in events if from_ts <= e["ts"] <= to_ts and e["mc"] > 0]
+        window = [
+            e["mc"] for e in events
+            if from_ts <= e["ts"] <= to_ts
+            and e["mc"] > 0
+            and e.get("pool_quote_sol", 0) >= self._MIN_POOL_SOL  # A.9: rejeita secondary pools
+        ]
         return min(window) if window else None
 
     def _dexscreener_fallback(self, mint: str, supply: float):
