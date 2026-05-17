@@ -753,7 +753,11 @@ class HotMonitor:
                         mc_low_kline = None
 
                     if self._helius:
-                        candle_start = state["ts_mig_unix"] + max(0, elapsed_sec - 60)
+                        # A.9: janela Helius nunca começa antes de ts_mig+90s (fim da transição
+                        # bonding curve → pool). Para o primeiro candle válido (elapsed=90),
+                        # max(0,...) daria ts_mig+30 — ainda na janela de inicialização do pool
+                        # onde os preços NÃO correspondem a trades reais visíveis nos gráficos.
+                        candle_start = state["ts_mig_unix"] + max(90, elapsed_sec - 60)
                         candle_end   = state["ts_mig_unix"] + elapsed_sec
                         mc_low_helius = self._helius.get_min_mc_in_window(mint, candle_start, candle_end)
 
