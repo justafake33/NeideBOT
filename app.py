@@ -33916,5 +33916,325 @@ def analise_h22_h25_ticks():
     return html
 
 
+@app.route("/analise/h23-investigation")
+def analise_h23_investigation():
+    """Investigação detalhada: tokens H23 >5 SOL — por que 45% WR em ticks mas 0% em trades."""
+    import psycopg2, psycopg2.extras
+    conn = psycopg2.connect(db.DATABASE_URL)
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    # --- Query 1: todos tokens H23 >5 SOL com contexto completo ---
+    cur.execute("""
+        SELECT
+            bs.mint,
+            m.token_nome,
+            bs.ts_signal,
+            bs.ts_min,
+            ROUND((bs.mc_min / 1000)::numeric, 1)        AS mc_min_k,
+            ROUND((bs.mc_at_signal / 1000)::numeric, 1)  AS mc_signal_k,
+            ROUND((bs.mc_at_signal / NULLIF(bs.mc_min,0))::numeric, 3) AS ratio_sig_bottom,
+            ROUND(bs.net_sol_flow::numeric, 2)            AS net_sol,
+            ROUND(bs.absorption_buy_vol::numeric, 2)      AS buy_vol,
+            ROUND(bs.absorption_sell_vol::numeric, 2)     AS sell_vol,
+            ROUND(bs.bounce_pct * 100, 1)                 AS bounce_pct,
+            ROUND(bs.entry_ratio * 100, 1)                AS entry_ratio_pct,
+            ROUND(bs.elapsed_sec / 60.0, 1)               AS elapsed_min,
+            bs.smart_wallets,
+            t.status   AS trade_status,
+            ROUND((t.pnl_pct_real * 100)::numeric, 1)    AS pnl_pct,
+            t.exit_type,
+            EXTRACT(EPOCH FROM (bs.ts_signal - bs.ts_min))::int AS sec_min_to_signal
+        FROM bounce_signals bs
+        LEFT JOIN migrations m ON m.mint = bs.mint
+        LEFT JOIN LATERAL (
+            SELECT status, pnl_pct_real, exit_type
+            FROM trades
+            WHERE mint = bs.mint
+              AND exit_type IN ('helius_sell_recovery','helius','helius_recovery')
+              AND status IN ('tp','sl')
+            ORDER BY created_at ASC LIMIT 1
+        ) t ON true
+        WHERE bs.h23_window = 'bottom'
+          AND bs.net_sol_flow > 5
+        ORDER BY bs.net_sol_flow DESC
+    """)
+    tokens_h23 = cur.fetchall()
+
+    # --- Query 2: distribuição ratio signal/bottom por faixa net_sol_flow ---
+    cur.execute("""
+        SELECT
+            CASE
+                WHEN net_sol_flow > 10  THEN '>10 SOL'
+                WHEN net_sol_flow > 5   THEN '5-10 SOL'
+                WHEN net_sol_flow > 0   THEN '0-5 SOL'
+                WHEN net_sol_flow > -5  THEN '-5-0 SOL'
+                ELSE '<-5 SOL'
+            END AS faixa,
+            COUNT(*) AS n,
+            ROUND(AVG(mc_at_signal / NULLIF(mc_min,0))::numeric, 3) AS avg_ratio,
+            ROUND(MIN(mc_at_signal / NULLIF(mc_min,0))::numeric, 3) AS min_ratio,
+            ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (
+                ORDER BY mc_at_signal / NULLIF(mc_min,0)
+            )::numeric, 3) AS median_ratio,
+            ROUND(MAX(mc_at_signal / NULLIF(mc_min,0))::numeric, 3) AS max_ratio
+        FROM bounce_signals
+        WHERE h23_window = 'bottom'
+          AND mc_min > 0 AND mc_at_signal > 0
+        GROUP BY 1
+        ORDER BY MIN(net_sol_flow) DESC
+    """)
+    ratio_dist = cur.fetchall()
+
+    # --- Query 3: max gain pós-sinal para tokens H23 >5 (via token_ticks 60min) ---
+    cur.execute("""
+        SELECT
+            bs.mint,
+            m.token_nome,
+            ROUND(bs.net_sol_flow::numeric, 2)             AS net_sol,
+            ROUND((bs.mc_min / 1000)::numeric, 1)          AS mc_min_k,
+            ROUND((bs.mc_at_signal / 1000)::numeric, 1)    AS mc_signal_k,
+            ROUND((bs.mc_at_signal / NULLIF(bs.mc_min,0))::numeric, 3) AS ratio_sig_bot,
+            EXTRACT(EPOCH FROM (bs.ts_signal - bs.ts_min))::int AS sec_min_to_sig,
+            COUNT(tt.tick_ts)                              AS n_ticks,
+            ROUND((MAX(tt.mc) / NULLIF(bs.mc_min,0))::numeric, 3)       AS max_gain_vs_bottom,
+            ROUND((MAX(tt.mc) / NULLIF(bs.mc_at_signal,0))::numeric, 3) AS max_gain_vs_signal,
+            t.status AS trade_status,
+            ROUND((t.pnl_pct_real * 100)::numeric, 1) AS pnl_pct
+        FROM bounce_signals bs
+        LEFT JOIN migrations m ON m.mint = bs.mint
+        LEFT JOIN token_ticks tt
+            ON tt.mint = bs.mint
+           AND tt.tick_ts >= bs.ts_signal
+           AND tt.tick_ts <= bs.ts_signal + INTERVAL '60 minutes'
+        LEFT JOIN LATERAL (
+            SELECT status, pnl_pct_real
+            FROM trades
+            WHERE mint = bs.mint
+              AND exit_type IN ('helius_sell_recovery','helius','helius_recovery')
+              AND status IN ('tp','sl')
+            ORDER BY created_at ASC LIMIT 1
+        ) t ON true
+        WHERE bs.h23_window = 'bottom'
+          AND bs.net_sol_flow > 5
+        GROUP BY bs.mint, m.token_nome, bs.net_sol_flow, bs.mc_min,
+                 bs.mc_at_signal, bs.ts_min, bs.ts_signal,
+                 t.status, t.pnl_pct_real
+        ORDER BY bs.net_sol_flow DESC
+    """)
+    ticks_detail = cur.fetchall()
+
+    # --- Query 4: filtros — por que H23 >5 não viraram trade? ---
+    cur.execute("""
+        SELECT
+            bs.mint,
+            m.token_nome,
+            ROUND(bs.net_sol_flow::numeric, 2) AS net_sol,
+            ROUND(bs.bounce_pct * 100, 1)      AS bounce_pct,
+            ROUND(bs.entry_ratio * 100, 1)     AS entry_ratio_pct,
+            ROUND(bs.elapsed_sec / 60.0, 1)    AS elapsed_min,
+            bs.smart_wallets,
+            CASE
+                WHEN bs.bounce_pct < 0.20 THEN 'A.7 bounce<20%'
+                WHEN bs.bounce_pct BETWEEN 0.20 AND 0.30 THEN 'A.2 dead zone 20-30%'
+                WHEN bs.entry_ratio BETWEEN 0.50 AND 0.65 THEN 'A.3 entry 50-65%'
+                WHEN bs.elapsed_sec > 1200 THEN 'A.5 elapsed>20min'
+                WHEN bs.smart_wallets < 3 THEN 'smart<3'
+                ELSE 'passou_filtros'
+            END AS filtro_provavel,
+            (SELECT COUNT(*) FROM trades WHERE mint = bs.mint) AS n_trades_total
+        FROM bounce_signals bs
+        LEFT JOIN migrations m ON m.mint = bs.mint
+        WHERE bs.h23_window = 'bottom'
+          AND bs.net_sol_flow > 5
+        ORDER BY bs.net_sol_flow DESC
+    """)
+    filter_analysis = cur.fetchall()
+
+    # --- Query 5: timing detalhado — sec_min_to_signal por faixa ---
+    cur.execute("""
+        SELECT
+            CASE
+                WHEN net_sol_flow > 10 THEN '>10 SOL'
+                WHEN net_sol_flow > 5  THEN '5-10 SOL'
+                WHEN net_sol_flow > 0  THEN '0-5 SOL'
+                WHEN net_sol_flow > -5 THEN '-5-0 SOL'
+                ELSE '<-5 SOL'
+            END AS faixa,
+            COUNT(*) AS n,
+            ROUND(AVG(EXTRACT(EPOCH FROM (ts_signal - ts_min)))::numeric, 0) AS avg_sec_min_to_sig,
+            ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (
+                ORDER BY EXTRACT(EPOCH FROM (ts_signal - ts_min))
+            )::numeric, 0) AS median_sec_min_to_sig,
+            ROUND(MIN(EXTRACT(EPOCH FROM (ts_signal - ts_min)))::numeric, 0) AS min_sec,
+            ROUND(MAX(EXTRACT(EPOCH FROM (ts_signal - ts_min)))::numeric, 0) AS max_sec
+        FROM bounce_signals
+        WHERE h23_window = 'bottom'
+          AND ts_min IS NOT NULL AND ts_signal IS NOT NULL
+        GROUP BY 1
+        ORDER BY MIN(net_sol_flow) DESC
+    """)
+    timing_dist = cur.fetchall()
+
+    cur.close(); conn.close()
+
+    def td(v, cls=""):
+        return f'<td class="{cls}">{v if v is not None else "—"}</td>'
+
+    def color_ratio(v):
+        if v is None: return "—"
+        r = float(v)
+        c = "green" if r < 1.35 else ("orange" if r < 1.55 else "red")
+        return f'<span style="color:{c};font-weight:bold">{r:.3f}×</span>'
+
+    def color_status(s):
+        if s == "tp": return '<span style="color:green">TP</span>'
+        if s == "sl": return '<span style="color:red">SL</span>'
+        return f'<span style="color:gray">{s or "sem_trade"}</span>'
+
+    # Table 1 — tokens H23 >5 SOL
+    rows1 = ""
+    for r in tokens_h23:
+        ratio_color = color_ratio(r['ratio_sig_bottom'])
+        rows1 += f"""<tr>
+            {td(r['token_nome'] or r['mint'][:8])}
+            {td(r['ts_signal'].strftime('%d/%m %H:%M') if r['ts_signal'] else '—')}
+            {td(f"${r['mc_min_k']}k" if r['mc_min_k'] else '—')}
+            {td(f"${r['mc_signal_k']}k" if r['mc_signal_k'] else '—')}
+            {td(ratio_color)}
+            {td(f"{r['net_sol']} SOL")}
+            {td(f"{r['buy_vol']} / {r['sell_vol']}")}
+            {td(f"{r['bounce_pct']}%")}
+            {td(f"{r['entry_ratio_pct']}%")}
+            {td(f"{r['elapsed_min']}min")}
+            {td(r['smart_wallets'])}
+            {td(f"{r['sec_min_to_signal']}s")}
+            {td(color_status(r['trade_status']))}
+            {td(f"{r['pnl_pct']}%" if r['pnl_pct'] is not None else '—')}
+        </tr>"""
+
+    table1 = f"""
+    <h2>1. Tokens H23 &gt;5 SOL — visão completa (n={len(tokens_h23)})</h2>
+    <p><b>ratio_sig_bottom</b> = mc_at_signal / mc_min = quanto o preço JÁ tinha subido quando o sinal disparou<br>
+    🟢 &lt;1.35 = entrou perto do fundo | 🟠 1.35-1.55 = entrou já com alguma subida | 🔴 &gt;1.55 = entrou tarde</p>
+    <table border=1 cellpadding=4 style="border-collapse:collapse;font-size:13px">
+    <tr><th>Token</th><th>Data</th><th>MC Fundo</th><th>MC Sinal</th><th>Ratio sig/bottom</th>
+        <th>Net SOL</th><th>Buy/Sell SOL</th><th>Bounce%</th><th>Entry%</th>
+        <th>Elapsed</th><th>Smart</th><th>sec fundo→sinal</th><th>Trade</th><th>P&amp;L</th></tr>
+    {rows1}
+    </table>"""
+
+    # Table 2 — distribuição ratio por faixa
+    rows2 = ""
+    for r in ratio_dist:
+        rows2 += f"""<tr>
+            {td(r['faixa'])}
+            {td(r['n'])}
+            {td(r['avg_ratio'])}
+            {td(r['min_ratio'])}
+            {td(r['median_ratio'])}
+            {td(r['max_ratio'])}
+        </tr>"""
+    table2 = f"""
+    <h2>2. Distribuição ratio mc_signal/mc_min por faixa de net_sol_flow</h2>
+    <p>Quanto mais alto o ratio, mais o token já tinha subido antes do sinal disparar.</p>
+    <table border=1 cellpadding=4 style="border-collapse:collapse;font-size:13px">
+    <tr><th>Faixa</th><th>n</th><th>avg ratio</th><th>min</th><th>median</th><th>max</th></tr>
+    {rows2}
+    </table>"""
+
+    # Table 3 — ticks detail
+    rows3 = ""
+    for r in ticks_detail:
+        gain_bot = float(r['max_gain_vs_bottom']) if r['max_gain_vs_bottom'] else None
+        gain_sig = float(r['max_gain_vs_signal']) if r['max_gain_vs_signal'] else None
+        c_bot = "green" if gain_bot and gain_bot >= 1.75 else ("orange" if gain_bot and gain_bot >= 1.30 else "red")
+        c_sig = "green" if gain_sig and gain_sig >= 1.75 else ("orange" if gain_sig and gain_sig >= 1.30 else "red")
+        rows3 += f"""<tr>
+            {td(r['token_nome'] or r['mint'][:8])}
+            {td(f"{r['net_sol']} SOL")}
+            {td(f"${r['mc_min_k']}k")}
+            {td(f"${r['mc_signal_k']}k")}
+            {td(f'<span style="color:{c_bot}">{gain_bot:.3f}×</span>' if gain_bot else '—')}
+            {td(f'<span style="color:{c_sig}">{gain_sig:.3f}×</span>' if gain_sig else '—')}
+            {td(f"{r['ratio_sig_bot']:.3f}×" if r['ratio_sig_bot'] else '—')}
+            {td(f"{r['sec_min_to_sig']}s")}
+            {td(r['n_ticks'])}
+            {td(color_status(r['trade_status']))}
+            {td(f"{r['pnl_pct']}%" if r['pnl_pct'] is not None else '—')}
+        </tr>"""
+    table3 = f"""
+    <h2>3. Max gain via token_ticks 60min (H23 &gt;5 SOL)</h2>
+    <p><b>max_gain_vs_bottom</b> = do fundo | <b>max_gain_vs_signal</b> = da nossa entrada (mc_at_signal)<br>
+    Verde = atingiu +75% TP | Laranja = atingiu +30% | Vermelho = não atingiu</p>
+    <table border=1 cellpadding=4 style="border-collapse:collapse;font-size:13px">
+    <tr><th>Token</th><th>Net SOL</th><th>MC Fundo</th><th>MC Sinal</th>
+        <th>Max gain vs bottom</th><th>Max gain vs signal</th><th>Ratio sig/bot</th>
+        <th>sec fundo→sinal</th><th>n_ticks</th><th>Trade</th><th>P&amp;L</th></tr>
+    {rows3}
+    </table>"""
+
+    # Table 4 — filtros
+    rows4 = ""
+    for r in filter_analysis:
+        c = "green" if r['filtro_provavel'] == 'passou_filtros' else "red"
+        rows4 += f"""<tr>
+            {td(r['token_nome'] or r['mint'][:8])}
+            {td(f"{r['net_sol']} SOL")}
+            {td(f"{r['bounce_pct']}%")}
+            {td(f"{r['entry_ratio_pct']}%")}
+            {td(f"{r['elapsed_min']}min")}
+            {td(r['smart_wallets'])}
+            {td(f'<span style="color:{c}">{r["filtro_provavel"]}</span>')}
+            {td(r['n_trades_total'])}
+        </tr>"""
+    n_passou = sum(1 for r in filter_analysis if r['filtro_provavel'] == 'passou_filtros')
+    n_total = len(filter_analysis)
+    table4 = f"""
+    <h2>4. Análise de filtros — por que H23 &gt;5 não viraram trade? ({n_passou}/{n_total} passaram)</h2>
+    <table border=1 cellpadding=4 style="border-collapse:collapse;font-size:13px">
+    <tr><th>Token</th><th>Net SOL</th><th>Bounce%</th><th>Entry%</th><th>Elapsed</th>
+        <th>Smart</th><th>Filtro bloqueador</th><th>n_trades total</th></tr>
+    {rows4}
+    </table>"""
+
+    # Table 5 — timing
+    rows5 = ""
+    for r in timing_dist:
+        rows5 += f"""<tr>
+            {td(r['faixa'])}{td(r['n'])}{td(f"{r['avg_sec_min_to_sig']}s")}
+            {td(f"{r['median_sec_min_to_sig']}s")}{td(f"{r['min_sec']}s")}{td(f"{r['max_sec']}s")}
+        </tr>"""
+    table5 = f"""
+    <h2>5. Timing: segundos entre fundo e sinal por faixa</h2>
+    <p>Quanto mais rápido o sinal dispara após o fundo, mais cedo entramos.</p>
+    <table border=1 cellpadding=4 style="border-collapse:collapse;font-size:13px">
+    <tr><th>Faixa</th><th>n</th><th>avg</th><th>median</th><th>min</th><th>max</th></tr>
+    {rows5}
+    </table>"""
+
+    html = f"""<!DOCTYPE html><html><head>
+    <title>H23 Investigation</title>
+    <meta charset="utf-8">
+    <style>
+        body {{ font-family: monospace; padding: 20px; background: #0d1117; color: #c9d1d9; }}
+        h1 {{ color: #58a6ff; }}
+        h2 {{ color: #f0883e; margin-top: 30px; }}
+        table {{ border-color: #30363d; margin-bottom: 20px; }}
+        th {{ background: #161b22; color: #8b949e; }}
+        td {{ background: #0d1117; }}
+        p {{ color: #8b949e; font-size: 12px; }}
+    </style>
+    </head><body>
+    <h1>Investigação H23 >5 SOL — Por que 45% WR em ticks mas 0% em trades?</h1>
+    <p>Metodologia: tokens com h23_window='bottom' AND net_sol_flow > 5 SOL (compra forte nos 60s antes do fundo)</p>
+    {table1}
+    {table2}
+    {table3}
+    {table4}
+    {table5}
+    </body></html>"""
+    return html
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
