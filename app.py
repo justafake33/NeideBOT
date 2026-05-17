@@ -30206,165 +30206,251 @@ def analise_h24_h25():
         return f"<pre style='color:red'>{traceback.format_exc()}</pre>", 500
 
 def _analise_h24_h25_inner(conn, cur):
+    # LEFT JOIN — bounces sem trade aparecem com t.status = NULL (não tradado)
+    # Filtra apenas trades blockchain-verificados (helius_sell_recovery) com status final tp/sl
     TRADE_JOIN = """
-        JOIN LATERAL (
+        LEFT JOIN LATERAL (
             SELECT status, pnl_pct_real
             FROM trades
             WHERE mint = bs.mint
-              AND created_at > bs.ts_signal - INTERVAL '5 minutes'
-              AND created_at < bs.ts_signal + INTERVAL '30 minutes'
-              AND exit_type IS NOT NULL
+              AND exit_type = 'helius_sell_recovery'
+              AND status IN ('tp', 'sl')
             ORDER BY created_at ASC LIMIT 1
         ) t ON true
     """
 
-    # cobertura geral
+    # cobertura geral: quantos bounces têm dados H24/H25/H23, e quantos foram tradados
     cur.execute(f"""
         SELECT
-            COUNT(*) FILTER (WHERE bs.dump_seller_hhi IS NOT NULL) as n_h24,
-            COUNT(*) FILTER (WHERE bs.pool_quote_at_signal IS NOT NULL) as n_h25,
-            COUNT(*) FILTER (WHERE bs.net_sol_flow IS NOT NULL AND bs.h23_window='bottom') as n_h23,
-            COUNT(*) as n_total
+            COUNT(*) FILTER (WHERE bs.dump_seller_hhi IS NOT NULL)                          AS n_h24,
+            COUNT(*) FILTER (WHERE bs.pool_quote_at_signal IS NOT NULL)                      AS n_h25,
+            COUNT(*) FILTER (WHERE bs.net_sol_flow IS NOT NULL AND bs.h23_window='bottom')   AS n_h23,
+            COUNT(*) FILTER (WHERE t.status IS NOT NULL)                                     AS n_traded,
+            COUNT(*) FILTER (WHERE t.status = 'tp')                                          AS n_tp,
+            COUNT(*) FILTER (WHERE t.status = 'sl')                                          AS n_sl
         FROM bounce_signals bs {TRADE_JOIN}
-        WHERE bs.dump_seller_hhi IS NOT NULL OR bs.pool_quote_at_signal IS NOT NULL
+        WHERE bs.dump_seller_hhi IS NOT NULL
+           OR bs.pool_quote_at_signal IS NOT NULL
+           OR (bs.net_sol_flow IS NOT NULL AND bs.h23_window = 'bottom')
     """)
     cov = cur.fetchone()
+    base_n  = cov[3] or 0
+    base_tp = cov[4] or 0
+    base_wr = round(base_tp / base_n * 100, 1) if base_n else 0
 
-    def table_html(title, rows, headers):
-        ths = "".join(f"<th>{h}</th>" for h in headers)
+    CSS = """<style>
+      body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+      h1{color:#58a6ff}h2{color:#79c0ff;margin-top:28px}h3{color:#8b949e;margin-top:20px}
+      table{border-collapse:collapse;width:100%;max-width:700px;margin-bottom:16px}
+      th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:left}
+      th:not(:first-child){text-align:right}
+      td{padding:5px 10px;border:1px solid #21262d;white-space:nowrap}
+      td:not(:first-child){text-align:right}
+      .note{color:#8b949e;font-size:12px;margin:4px 0 14px}
+      .box{background:#161b22;border:1px solid #30363d;padding:10px 14px;
+           border-radius:4px;margin:10px 0;font-size:12px}
+      a{color:#58a6ff}
+    </style>"""
+
+    def wr_color(wr, base):
+        if wr is None: return "#8b949e"
+        return "#3fb950" if wr >= base + 8 else ("#f85149" if wr <= base - 8 else "#e3b341")
+
+    def delta_html(wr, base):
+        if wr is None: return "—"
+        d = wr - base
+        c = "#3fb950" if d >= 5 else ("#f85149" if d <= -5 else "#8b949e")
+        return f"<span style='color:{c}'>{d:+.1f}pp</span>"
+
+    def table_html(title, note, rows):
+        hdrs = ["Faixa", "n total", "n tradados", "TP", "SL", "WR%", "Δ base", "P&L médio"]
+        ths  = "".join(f"<th>{h}</th>" for h in hdrs)
         body = ""
         for r in rows:
-            tds = "".join(f"<td>{v}</td>" for v in r)
-            body += f"<tr>{tds}</tr>"
-        return f"""
-        <h3>{title}</h3>
-        <table><tr>{ths}</tr>{body}</table>
-        """
+            faixa, n_all, n_trd, tp, sl, wr, pnl = r
+            wr_s  = f"{wr:.1f}%" if wr is not None else "—"
+            pnl_s = f"{pnl:+.1f}%" if pnl is not None else "—"
+            wrc   = wr_color(wr, base_wr)
+            body += (
+                f"<tr>"
+                f"<td>{faixa}</td>"
+                f"<td>{n_all}</td><td>{n_trd}</td><td>{tp}</td><td>{sl}</td>"
+                f"<td style='color:{wrc}'>{wr_s}</td>"
+                f"<td>{delta_html(wr, base_wr)}</td>"
+                f"<td>{pnl_s}</td>"
+                f"</tr>"
+            )
+        note_html = f"<p class='note'>{note}</p>" if note else ""
+        return f"<h2>{title}</h2>{note_html}<table><tr>{ths}</tr>{body}</table>"
 
-    def wr_color(wr_str):
-        try:
-            v = float(wr_str.strip('%'))
-            c = "#2a2" if v >= 20 else ("#fa0" if v >= 13 else "#a44")
-            return f"<span style='color:{c}'>{wr_str}</span>"
-        except:
-            return wr_str
+    def run_query(sql):
+        cur.execute(sql)
+        rows = []
+        for faixa, n_all, n_trd, tp, sl, pnl in cur.fetchall():
+            tp    = tp or 0
+            sl    = sl or 0
+            n_trd = n_trd or 0
+            wr    = round(tp / n_trd * 100, 1) if n_trd else None
+            pnl_v = round(float(pnl) * 100, 1) if pnl is not None else None
+            rows.append((faixa, n_all, n_trd, tp, sl, wr, pnl_v))
+        return rows
 
-    # H24 — seller HHI
-    cur.execute(f"""
+    # ── H24 — seller HHI ──────────────────────────────────────────────────────
+    h24_rows = run_query(f"""
         SELECT
             CASE
                 WHEN bs.dump_seller_hhi >= 0.5 THEN '≥0.5  (1-2 sellers dominam)'
                 WHEN bs.dump_seller_hhi >= 0.2 THEN '0.2-0.5  (poucos sellers)'
                 WHEN bs.dump_seller_hhi >= 0.1 THEN '0.1-0.2  (distribuído)'
                 ELSE                                 '<0.1  (muito distribuído)'
-            END,
-            COUNT(*), SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END),
-            SUM(CASE WHEN t.status IN ('sl','error') THEN 1 ELSE 0 END),
-            ROUND((AVG(t.pnl_pct_real)*100)::numeric,1)
+            END                                                        AS faixa,
+            COUNT(*)                                                    AS n_all,
+            COUNT(t.status)                                             AS n_trd,
+            SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)             AS tp,
+            SUM(CASE WHEN t.status='sl' THEN 1 ELSE 0 END)             AS sl,
+            AVG(t.pnl_pct_real)                                        AS pnl
         FROM bounce_signals bs {TRADE_JOIN}
         WHERE bs.dump_seller_hhi IS NOT NULL
         GROUP BY 1 ORDER BY MIN(bs.dump_seller_hhi) DESC
     """)
-    h24_rows = []
-    for faixa, n, tp, sl, pnl in cur.fetchall():
-        wr = f"{tp/n*100:.0f}%" if n else "—"
-        h24_rows.append([faixa, n, tp, sl, wr_color(wr), f"{pnl}%" if pnl else "—"])
 
-    # H25 — pool depth
-    cur.execute(f"""
+    # ── H25 — pool depth ─────────────────────────────────────────────────────
+    h25_rows = run_query(f"""
         SELECT
             CASE
-                WHEN bs.pool_quote_at_signal >= 100 THEN '≥100 SOL  (fundo)'
+                WHEN bs.pool_quote_at_signal >= 100 THEN '≥100 SOL  (pool fundo)'
                 WHEN bs.pool_quote_at_signal >= 50  THEN '50-100 SOL'
                 WHEN bs.pool_quote_at_signal >= 20  THEN '20-50 SOL'
                 ELSE                                     '<20 SOL  (pool fino)'
-            END,
-            COUNT(*), SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END),
-            SUM(CASE WHEN t.status IN ('sl','error') THEN 1 ELSE 0 END),
-            ROUND((AVG(t.pnl_pct_real)*100)::numeric,1)
+            END                                                        AS faixa,
+            COUNT(*)                                                    AS n_all,
+            COUNT(t.status)                                             AS n_trd,
+            SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)             AS tp,
+            SUM(CASE WHEN t.status='sl' THEN 1 ELSE 0 END)             AS sl,
+            AVG(t.pnl_pct_real)                                        AS pnl
         FROM bounce_signals bs {TRADE_JOIN}
         WHERE bs.pool_quote_at_signal IS NOT NULL
         GROUP BY 1 ORDER BY MIN(bs.pool_quote_at_signal) DESC
     """)
-    h25_rows = []
-    for faixa, n, tp, sl, pnl in cur.fetchall():
-        wr = f"{tp/n*100:.0f}%" if n else "—"
-        h25_rows.append([faixa, n, tp, sl, wr_color(wr), f"{pnl}%" if pnl else "—"])
 
-    # H23 bottom window
-    cur.execute(f"""
+    # ── H23 bottom window ─────────────────────────────────────────────────────
+    h23_rows = run_query(f"""
         SELECT
             CASE
-                WHEN bs.net_sol_flow > 5   THEN '>5 SOL  (compra forte no fundo)'
-                WHEN bs.net_sol_flow > 0   THEN '0-5 SOL  (compra leve)'
+                WHEN bs.net_sol_flow >  5  THEN '>5 SOL  (compra forte no fundo)'
+                WHEN bs.net_sol_flow >  0  THEN '0-5 SOL  (compra leve)'
                 WHEN bs.net_sol_flow > -5  THEN '-5-0 SOL  (venda leve)'
-                ELSE                            '<-5 SOL  (venda forte no fundo)'
-            END,
-            COUNT(*), SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END),
-            SUM(CASE WHEN t.status IN ('sl','error') THEN 1 ELSE 0 END),
-            ROUND((AVG(t.pnl_pct_real)*100)::numeric,1)
+                ELSE                            '<-5 SOL  (venda forte / seller exhaustion)'
+            END                                                        AS faixa,
+            COUNT(*)                                                    AS n_all,
+            COUNT(t.status)                                             AS n_trd,
+            SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)             AS tp,
+            SUM(CASE WHEN t.status='sl' THEN 1 ELSE 0 END)             AS sl,
+            AVG(t.pnl_pct_real)                                        AS pnl
         FROM bounce_signals bs {TRADE_JOIN}
         WHERE bs.net_sol_flow IS NOT NULL AND bs.h23_window = 'bottom'
         GROUP BY 1 ORDER BY MIN(bs.net_sol_flow) DESC
     """)
-    h23_rows = []
-    for faixa, n, tp, sl, pnl in cur.fetchall():
-        wr = f"{tp/n*100:.0f}%" if n else "—"
-        h23_rows.append([faixa, n, tp, sl, wr_color(wr), f"{pnl}%" if pnl else "—"])
 
-    # overhead supply: mc_at_signal / mc_peak (da tabela migrations)
-    cur.execute(f"""
+    # ── H22 ratio buy/sell (pre-window = [ts_min-60s → ts_min]) ──────────────
+    h22_rows = run_query(f"""
         SELECT
             CASE
-                WHEN bs.mc_at_signal / NULLIF(m.mc_peak,0) >= 0.7 THEN '≥70% do pico  (muitos vendedores acima)'
+                WHEN bs.absorption_sell_vol IS NULL OR bs.absorption_sell_vol = 0
+                    THEN '∞  (só compra — vacuum pump)'
+                WHEN bs.absorption_buy_vol / NULLIF(bs.absorption_sell_vol,0) >= 3
+                    THEN '≥3×  (compra domina)'
+                WHEN bs.absorption_buy_vol / NULLIF(bs.absorption_sell_vol,0) >= 1.5
+                    THEN '1.5-3×  (zona ideal)'
+                WHEN bs.absorption_buy_vol / NULLIF(bs.absorption_sell_vol,0) >= 1.0
+                    THEN '1-1.5×  (equilibrado)'
+                WHEN bs.absorption_buy_vol / NULLIF(bs.absorption_sell_vol,0) >= 0.5
+                    THEN '0.5-1×  (leve venda)'
+                ELSE '< 0.5×  (venda domina)'
+            END                                                        AS faixa,
+            COUNT(*)                                                    AS n_all,
+            COUNT(t.status)                                             AS n_trd,
+            SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)             AS tp,
+            SUM(CASE WHEN t.status='sl' THEN 1 ELSE 0 END)             AS sl,
+            AVG(t.pnl_pct_real)                                        AS pnl
+        FROM bounce_signals bs {TRADE_JOIN}
+        WHERE bs.absorption_events > 0
+          AND bs.absorption_buy_vol IS NOT NULL
+        GROUP BY 1
+        ORDER BY
+            CASE
+                WHEN bs.absorption_sell_vol IS NULL OR bs.absorption_sell_vol = 0 THEN 0
+                ELSE MIN(bs.absorption_buy_vol / NULLIF(bs.absorption_sell_vol,0))
+            END DESC
+    """)
+
+    # ── Overhead Supply ───────────────────────────────────────────────────────
+    os_rows = run_query(f"""
+        SELECT
+            CASE
+                WHEN bs.mc_at_signal / NULLIF(m.mc_peak,0) >= 0.7 THEN '≥70% do pico  (overhead alto)'
                 WHEN bs.mc_at_signal / NULLIF(m.mc_peak,0) >= 0.5 THEN '50-70% do pico'
                 WHEN bs.mc_at_signal / NULLIF(m.mc_peak,0) >= 0.3 THEN '30-50% do pico'
-                ELSE                                                     '<30% do pico  (maioria já saiu)'
-            END,
-            COUNT(*), SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END),
-            SUM(CASE WHEN t.status IN ('sl','error') THEN 1 ELSE 0 END),
-            ROUND((AVG(t.pnl_pct_real)*100)::numeric,1)
+                ELSE                                                     '<30% do pico  (overhead baixo)'
+            END                                                        AS faixa,
+            COUNT(*)                                                    AS n_all,
+            COUNT(t.status)                                             AS n_trd,
+            SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)             AS tp,
+            SUM(CASE WHEN t.status='sl' THEN 1 ELSE 0 END)             AS sl,
+            AVG(t.pnl_pct_real)                                        AS pnl
         FROM bounce_signals bs
         JOIN migrations m ON m.mint = bs.mint
         {TRADE_JOIN}
         WHERE m.mc_peak > 0 AND bs.mc_at_signal IS NOT NULL
         GROUP BY 1 ORDER BY MIN(bs.mc_at_signal / NULLIF(m.mc_peak,0)) DESC
     """)
-    os_rows = []
-    for faixa, n, tp, sl, pnl in cur.fetchall():
-        wr = f"{tp/n*100:.0f}%" if n else "—"
-        os_rows.append([faixa, n, tp, sl, wr_color(wr), f"{pnl}%" if pnl else "—"])
 
     conn.close()
 
-    hdrs = ["Faixa", "n", "TP", "SL", "WR", "P&L médio"]
+    n_h24, n_h25, n_h23 = cov[0], cov[1], cov[2]
 
-    h24_tbl = table_html(f"H24 — Concentração de Sellers no Dump (n={cov[0]})", h24_rows, hdrs) if h24_rows else "<p style='color:#888'>Sem dados H24 ainda</p>"
-    h25_tbl = table_html(f"H25 — Profundidade do Pool no Sinal (n={cov[1]})", h25_rows, hdrs) if h25_rows else "<p style='color:#888'>Sem dados H25 ainda</p>"
-    h23_tbl = table_html(f"H23 — Net SOL Flow no Fundo / janela bottom (n={cov[2]})", h23_rows, hdrs) if h23_rows else "<p style='color:#888'>Sem dados H23 bottom ainda</p>"
-    os_tbl  = table_html(f"Overhead Supply — entrada como % do pico (todos os {cov[3]} trades)", os_rows, hdrs) if os_rows else ""
+    h24_html = table_html(
+        f"H24 — Concentração de Sellers no Dump (n_bounces={n_h24}, n_tradados={base_n})",
+        "HHI alto (≥0.5) = 1-2 wallets dominaram o dump → sellers concentrados → exaurem rápido → bounce mais sustentado?",
+        h24_rows) if h24_rows else "<p class='note'>Sem dados H24 ainda</p>"
+
+    h25_html = table_html(
+        f"H25 — Profundidade do Pool no Sinal (n_bounces={n_h25})",
+        "Pool fino (<20 SOL): qualquer compra move o preço muito → spikes artificiais → SL disparado por ruído, não por direção real.",
+        h25_rows) if h25_rows else "<p class='note'>Sem dados H25 ainda</p>"
+
+    h23_html = table_html(
+        f"H23 — Net SOL Flow no Fundo / janela bottom (n_bounces={n_h23})",
+        "Janela [ts_min-60s → ts_min]. Hipótese reformulada: net_flow negativo = sellers ainda ativos até o fundo = seller exhaustion real. Net_flow positivo = token já recuperando antes da detecção = sinal dispara tarde.",
+        h23_rows) if h23_rows else "<p class='note'>Sem dados H23 bottom ainda</p>"
+
+    h22_html = table_html(
+        "H22 — Ratio Buy/Sell na janela pré-fundo [ts_min-60s → ts_min]",
+        "Zona ideal: 1.5–3× (compradores vencendo a batalha, mas sellers presentes = price discovery real). Extremos ∞/≥3× = vacuum pump sem sellers = SL imediato.",
+        h22_rows) if h22_rows else "<p class='note'>Sem dados H22 ainda</p>"
+
+    os_html = table_html(
+        "Overhead Supply — entrada como % do pico histórico",
+        "Entrada a 70%+ do pico = muitos holders acima de nós querendo recuperar capital = resistência de venda.",
+        os_rows) if os_rows else ""
 
     return f"""<!DOCTYPE html><html><head>
-    <meta charset='utf-8'><title>H24/H25/H23 vs Outcomes</title>
-    <style>
-      body {{ font-family: monospace; background:#111; color:#ccc; padding:20px; }}
-      h2 {{ color:#fa0; }} h3 {{ color:#fa0; margin-top:30px; }}
-      table {{ border-collapse:collapse; margin-bottom:10px; min-width:600px; }}
-      th,td {{ padding:6px 12px; border:1px solid #333; text-align:right; }}
-      th {{ background:#222; color:#fa0; }}
-      td:first-child {{ text-align:left; }}
-      .note {{ color:#888; font-size:.9em; margin-bottom:20px; }}
-    </style></head><body>
-    <h2>H23 / H24 / H25 — Correlação com Outcomes</h2>
-    <p class='note'>Apenas trades blockchain-verificados (exit_type IS NOT NULL). WR base total: 13.4%.</p>
-    {h24_tbl}
-    <p class='note'>HHI alto = 1-2 wallets fizeram o dump → sellers concentrados → exaurem rápido → bounce mais real?</p>
-    {h25_tbl}
-    <p class='note'>Pool fino (&lt;20 SOL) = qualquer compra move o preço muito → spikes falsos → SL imediato</p>
-    {h23_tbl}
-    <p class='note'>Janela: [ts_migration → ts_min]. Net flow positivo no fundo = compradores absorvendo enquanto o token caía</p>
-    {os_tbl}
-    <p class='note'>Overhead supply: se entramos a 70% do pico, há muita gente acima de nós querendo recuperar capital</p>
+    <meta charset='utf-8'><title>H22/H23/H24/H25 vs Outcomes</title>
+    {CSS}</head><body>
+    <h1>H22 / H23 / H24 / H25 — Correlação com Outcomes</h1>
+    <div class='box'>
+      Baseline: {base_n} trades blockchain-verificados (helius_sell_recovery) |
+      {base_tp} TP | {base_n - base_tp} SL | WR base = <b>{base_wr}%</b><br>
+      n_h24={n_h24} bounces | n_h25={n_h25} | n_h23={n_h23} (bottom-window)
+    </div>
+    <p><a href='/analise/h22-correlation'>H22 Correlation</a> &nbsp;|&nbsp;
+       <a href='/debug/h23-wr?window=bottom'>H23 WR Debug</a> &nbsp;|&nbsp;
+       <a href='/analise/sinal-puro'>Sinal Puro</a></p>
+    {h22_html}
+    {h23_html}
+    {h24_html}
+    {h25_html}
+    {os_html}
     </body></html>"""
 
 
