@@ -33947,8 +33947,8 @@ def _analise_h23_investigation_inner():
             ROUND(bs.net_sol_flow::numeric, 2)                               AS net_sol,
             ROUND(bs.absorption_buy_vol::numeric, 2)                         AS buy_vol,
             ROUND(bs.absorption_sell_vol::numeric, 2)                        AS sell_vol,
-            ROUND(bs.bounce_pct * 100, 1)                                    AS bounce_pct,
-            ROUND(bs.elapsed_sec / 60.0, 1)                                  AS elapsed_min,
+            ROUND((bs.bounce_pct * 100)::numeric, 1)                         AS bounce_pct,
+            ROUND((bs.elapsed_sec / 60.0)::numeric, 1)                       AS elapsed_min,
             m.smart_wallets,
             ROUND(m.time_to_bottom::numeric, 1)                              AS ttb_min,
             t.status   AS trade_status,
@@ -34039,9 +34039,9 @@ def _analise_h23_investigation_inner():
             bs.mint,
             m.token_nome,
             ROUND(bs.net_sol_flow::numeric, 2)                               AS net_sol,
-            ROUND(bs.bounce_pct * 100, 1)                                    AS bounce_pct,
+            ROUND((bs.bounce_pct * 100)::numeric, 1)                        AS bounce_pct,
             ROUND((bs.mc_at_signal / NULLIF(bs.mc_migration,0))::numeric, 3) AS entry_ratio,
-            ROUND(bs.elapsed_sec / 60.0, 1)                                  AS elapsed_min,
+            ROUND((bs.elapsed_sec / 60.0)::numeric, 1)                      AS elapsed_min,
             m.smart_wallets,
             CASE
                 WHEN bs.bounce_pct < 0.20 THEN 'A.7 bounce<20%'
