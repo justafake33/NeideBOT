@@ -203,15 +203,34 @@ class HotMonitor:
     BOTTOM_FRESHNESS_SEC = int(os.getenv(  "BOTTOM_FRESHNESS_SEC",  "300"))   # A.6: máx 5min desde o último mc_min
 
     def _check_bounce(self, mint: str, state: dict, mc: float, elapsed_sec: int):
-        """Detecta bounce em tempo real. Fase A: filtros A.2, A.3, A.6."""
-        if state.get("bounce_fired"):
-            return
+        """Detecta bounce em tempo real. Fase A: filtros A.2, A.3, A.6.
+
+        RACE CONDITION FIX: Atomic bounce_fired check-and-set com lock.
+        Dois threads podem chamar _check_bounce simultaneamente. Sem lock,
+        ambos leem bounce_fired=False/missing, ambos passam nos filtros,
+        ambos setam bounce_fired=True e disparam sinal duplicado.
+        """
+        # ── Atomic check-and-set com lock ────────────────────────────────────
+        # STALE MC_MIN FIX: Snapshot mc_min e ts_min DENTRO do lock.
+        # Outro thread pode atualizar state["mc_min"] entre a leitura (fora lock) e o
+        # cálculo de bounce_pct, causando inconsistência. Lê uma vez dentro do lock,
+        # usa cópia local fora do lock para todos os cálculos.
+        with self._lock:
+            mint_state = self._tokens.get(mint)
+            if mint_state is None:
+                return
+            if mint_state.get("bounce_fired"):
+                return
+            # Snapshot: lê dentro do lock, usa cópia local fora do lock
+            mc_min       = mint_state["mc_min"]
+            mc_migration = mint_state["mc_migration"]
+            ts_min       = mint_state.get("ts_min")
+            # Não set bounce_fired aqui — apenas checkpoint. Set só após passar todos os filtros.
 
         elapsed_min  = elapsed_sec / 60
-        mc_min       = state["mc_min"]
-        mc_migration = state["mc_migration"]
 
-        if elapsed_min > self.BOUNCE_TIME_MAX:
+        # ── Boundary checks ─────────────────────────────────────────────────────────
+        if elapsed_sec < 0 or elapsed_min > self.BOUNCE_TIME_MAX:
             return
         if mc_min <= 0 or mc_migration <= 0:
             return
@@ -232,7 +251,7 @@ class HotMonitor:
         # Padrão inválido: token pica em <3min, dump por 10-20min, sinal dispara em mini-rally tardio.
         # Dados: 92% dos inválidos têm gap (ts_min → sinal) > 2min. P50 gap = 6.7min.
         # Válidos: fundo recente → sinal em 1-3min. Invalidos: fundo em 2-5min → sinal 13-17min depois.
-        ts_min = state.get("ts_min")
+        # ts_min já foi snapshot dentro do lock acima.
         if ts_min is not None:
             secs_since_bottom = (datetime.now(timezone.utc) - ts_min).total_seconds()
             if secs_since_bottom > self.BOTTOM_FRESHNESS_SEC:
@@ -297,8 +316,20 @@ class HotMonitor:
             except Exception as e:
                 logger.debug("H22 absorption %s: %s", mint[:8], e)
 
-        state["bounce_fired"] = True
-        symbol = state.get("symbol", mint[:8])
+        # ── Atomic bounce_fired set: todos os filtros passaram, agora commita o sinal ────
+        # Usar lock novamente para garantir que nenhuma outra thread setou bounce_fired
+        # entre o snapshot inicial e aqui (improvável mas possível com timing muito específico).
+        with self._lock:
+            mint_state = self._tokens.get(mint)
+            if mint_state and not mint_state.get("bounce_fired"):
+                mint_state["bounce_fired"] = True
+            else:
+                # Outra thread setou bounce_fired enquanto a gente passava nos filtros.
+                # Cancela o sinal para evitar duplicata.
+                logger.debug("BOUNCE %s: duplicate signal canceled (bounce_fired já setado por outra thread)", mint[:8])
+                return
+
+        symbol = mint_state.get("symbol", mint[:8])
 
         try:
             db.insert_bounce_signal({
@@ -610,15 +641,22 @@ class HotMonitor:
                     #    que ficam muito abaixo do preço real do pool novo.
                     #    Fonte correta: mínimo real dos eventos Helius WebSocket nessa janela,
                     #    que captura pool reserves em tempo real (~5ms de latência).
+                    #    MAS: Helius pode estar atrasado (~200ms de lag no deque).
+                    #    FIX: usar MIN(helius, kline) para ser conservador:
+                    #    - Se Helius está atrasado e retorna valor alto, kline low verdadeiro é menor
+                    #    - Usar o mínimo garante que não usamos fundo fictício
                     low_price = _float(c.get("low"))
+                    mc_low_kline = low_price * state["total_supply"] if (low_price and low_price > 0) else None
+
                     if elapsed_sec < 90 and self._helius:
                         candle_start = state["ts_mig_unix"] + max(0, elapsed_sec - 60)
                         candle_end   = state["ts_mig_unix"] + elapsed_sec
-                        mc_low = self._helius.get_min_mc_in_window(mint, candle_start, candle_end)
-                    elif low_price and low_price > 0:
-                        mc_low = low_price * state["total_supply"]
+                        mc_low_helius = self._helius.get_min_mc_in_window(mint, candle_start, candle_end)
+                        # Usar o MENOR entre Helius e kline para evitar stale Helius
+                        mc_low = min(v for v in [mc_low_helius, mc_low_kline] if v is not None) if any([mc_low_helius, mc_low_kline]) else None
                     else:
-                        mc_low = None
+                        mc_low = mc_low_kline
+
                     if mc_low and mc_low > 0 and mc_low < state["mc_min"]:
                             candle_dt = datetime.fromtimestamp(candle_ts, tz=timezone.utc)
                             with self._lock:
@@ -654,17 +692,18 @@ class HotMonitor:
                             state["mc_max"] = mc_close_peak
 
                     # 3. Acumula tick kline com OHLC completo.
-                    #    mc_low para elapsed < 90s vem do Helius (já calculado no passo 1).
-                    #    Para elapsed >= 90s, usa o low do kline normalmente.
+                    #    mc_low para elapsed < 90s vem de MIN(helius, kline) para evitar stale data.
+                    #    mc_low já foi calculado no passo 1, reutiliza aqui.
+                    #    Para elapsed >= 90s, usa o low do kline normalmente (pool estabilizado).
                     close_p = _float(c.get("close"))
                     open_p  = _float(c.get("open"))
                     high_p  = _float(c.get("high"))
-                    low_p   = _float(c.get("low"))
                     vol     = _float(c.get("volume"))
                     supply  = state["total_supply"]
                     if close_p and close_p > 0 and supply:
+                        # mc_low já foi calculado no passo 1 (com Helius + kline logic)
                         mc_low_tick = (mc_low if elapsed_sec < 90
-                                       else (low_p * supply if low_p else None))
+                                       else (low_p * supply if (low_p and low_p > 0) else None))
                         kline_ticks.append({
                             "mint":        mint,
                             "elapsed_sec": elapsed_sec,
