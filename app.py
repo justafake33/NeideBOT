@@ -32915,5 +32915,304 @@ def analise_cruzamento_wallets_ticks():
     return html
 
 
+@app.route("/analise/wallet-entry-depth")
+def analise_wallet_entry_depth():
+    """
+    Segunda camada de análise: a variável real não é 'wallet comprou?' mas
+    'onde a wallet comprou?' (entry_ratio = mc_t0 / mc_migration).
+
+    Hipótese: wallet que comprou em ratio < 0.40 (capitulação profunda) correlaciona
+    com TP outcome muito mais do que wallet que comprou em ratio 0.70+ (momentum chaser).
+
+    Para cada cruzamento (token × carteira × TP outcome), agrega por:
+      1. Faixa de entry_ratio da wallet
+      2. Por carteira × faixa
+      3. Wallet entry_ratio vs token entry_ratio (mc_at_signal / mc_migration)
+         — ambas as wallets compraram profundo?
+    """
+    import psycopg2, psycopg2.extras, traceback
+    from db import DATABASE_URL
+
+    TP_MULT   = 1.75
+    SL_MULT   = 0.75
+    MIN_TICKS = 3
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_name = 'quarentena_trades'
+            ) AS exists
+        """)
+        if not cur.fetchone()["exists"]:
+            conn.close()
+            return "<h2>quarentena_trades não encontrada</h2>", 404
+
+        # Dataset completo: bounce outcome + wallet entry_ratio
+        cur.execute("""
+            WITH tick_outcomes AS (
+                SELECT
+                    bs.mint,
+                    bs.ts_signal,
+                    bs.mc_at_signal                                  AS entry_mc,
+                    bs.mc_migration,
+                    ROUND((bs.mc_at_signal / NULLIF(bs.mc_migration,0))::numeric, 3)
+                                                                     AS token_entry_ratio,
+                    bs.bounce_pct,
+                    bs.elapsed_sec / 60.0                            AS elapsed_min,
+                    MAX(COALESCE(tt.mc_high, tt.mc))                 AS max_mc,
+                    MIN(COALESCE(tt.mc_low,  tt.mc))                 AS min_mc,
+                    COUNT(tt.id)                                     AS tick_count
+                FROM bounce_signals bs
+                JOIN token_ticks tt
+                    ON  tt.mint    = bs.mint
+                    AND tt.tick_ts > bs.ts_signal
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '20 minutes'
+                WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+                  AND bs.mc_migration  IS NOT NULL AND bs.mc_migration  > 0
+                  AND bs.bounce_pct    IS NOT NULL
+                GROUP BY bs.mint, bs.ts_signal, bs.mc_at_signal, bs.mc_migration,
+                         bs.bounce_pct, bs.elapsed_sec
+                HAVING COUNT(tt.id) >= %(min_ticks)s
+            ),
+            outcomes AS (
+                SELECT *,
+                    (max_mc >= entry_mc * %(tp)s)   AS tp_hit,
+                    (min_mc <= entry_mc * %(sl)s)   AS sl_hit
+                FROM tick_outcomes
+            )
+            SELECT
+                o.mint,
+                o.tp_hit,
+                o.sl_hit,
+                o.token_entry_ratio,
+                o.bounce_pct,
+                o.elapsed_min,
+                qt.carteira,
+                ROUND((qt.mc_t0 / NULLIF(o.mc_migration, 0))::numeric, 3) AS wallet_ratio,
+                qt.sol_entrada
+            FROM outcomes o
+            JOIN quarentena_trades qt
+                ON  qt.token_mint = o.mint
+                AND qt.tipo       = 'COMPRA'
+                AND qt.ts         < o.ts_signal
+                AND qt.ts         > o.ts_signal - INTERVAL '20 minutes'
+                AND qt.mc_t0 IS NOT NULL
+                AND o.mc_migration > 0
+            ORDER BY o.ts_signal DESC
+        """, {"tp": TP_MULT, "sl": SL_MULT, "min_ticks": MIN_TICKS})
+        rows = cur.fetchall()
+
+        # Baseline: todos os bounces com ticks (sem filtro de wallet)
+        cur.execute("""
+            WITH tick_outcomes AS (
+                SELECT
+                    bs.mint,
+                    MAX(COALESCE(tt.mc_high, tt.mc)) AS max_mc,
+                    MIN(COALESCE(tt.mc_low,  tt.mc)) AS min_mc,
+                    bs.mc_at_signal                  AS entry_mc
+                FROM bounce_signals bs
+                JOIN token_ticks tt
+                    ON  tt.mint    = bs.mint
+                    AND tt.tick_ts > bs.ts_signal
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '20 minutes'
+                WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+                GROUP BY bs.mint, bs.mc_at_signal
+                HAVING COUNT(tt.id) >= %(min_ticks)s
+            )
+            SELECT
+                COUNT(*) AS n,
+                SUM(CASE WHEN max_mc >= entry_mc * %(tp)s
+                          AND min_mc > entry_mc * %(sl)s THEN 1 ELSE 0 END) AS n_tp
+            FROM tick_outcomes
+        """, {"tp": TP_MULT, "sl": SL_MULT, "min_ticks": MIN_TICKS})
+        base_row   = cur.fetchone()
+        conn.close()
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+    base_n  = base_row["n"]  or 0
+    base_tp = base_row["n_tp"] or 0
+    BASE_WR = round(base_tp / base_n * 100, 1) if base_n else 0
+
+    # ── Análise em Python ─────────────────────────────────────────────────────
+    from collections import defaultdict
+
+    # Por faixa de wallet_ratio
+    RATIO_BINS = [
+        ("<0.30", 0.0,  0.30),
+        ("0.30-0.50", 0.30, 0.50),
+        ("0.50-0.70", 0.50, 0.70),
+        ("0.70-1.00", 0.70, 1.00),
+        (">1.00",    1.00, 999),
+    ]
+
+    def bin_label(r, bins):
+        for label, lo, hi in bins:
+            if lo <= r < hi:
+                return label
+        return ">1.00"
+
+    ratio_buckets = defaultdict(lambda: {"n": 0, "n_tp": 0})
+    for r in rows:
+        wr = r["wallet_ratio"]
+        if wr is None:
+            continue
+        b = bin_label(float(wr), RATIO_BINS)
+        ratio_buckets[b]["n"]    += 1
+        if r["tp_hit"] and not r["sl_hit"]:
+            ratio_buckets[b]["n_tp"] += 1
+
+    # Por carteira × faixa de wallet_ratio
+    cart_ratio = defaultdict(lambda: defaultdict(lambda: {"n": 0, "n_tp": 0}))
+    for r in rows:
+        cart = r["carteira"]
+        wr   = r["wallet_ratio"]
+        if wr is None or cart is None:
+            continue
+        b = bin_label(float(wr), RATIO_BINS)
+        cart_ratio[cart][b]["n"]    += 1
+        if r["tp_hit"] and not r["sl_hit"]:
+            cart_ratio[cart][b]["n_tp"] += 1
+
+    # Por faixa de wallet_ratio com tp_hit — deduplicado por mint
+    # (um token pode aparecer 2x se 2 carteiras compraram; para outcome conta 1x)
+    by_mint_ratio = defaultdict(lambda: {"tp": False, "sl": False,
+                                         "wallet_ratio_min": 999.0})
+    for r in rows:
+        m  = r["mint"]
+        wr = r["wallet_ratio"]
+        if wr is None:
+            continue
+        by_mint_ratio[m]["tp"] = by_mint_ratio[m]["tp"] or (r["tp_hit"] and not r["sl_hit"])
+        by_mint_ratio[m]["sl"] = by_mint_ratio[m]["sl"] or r["sl_hit"]
+        by_mint_ratio[m]["wallet_ratio_min"] = min(
+            by_mint_ratio[m]["wallet_ratio_min"], float(wr))
+
+    dedup_buckets = defaultdict(lambda: {"n": 0, "n_tp": 0})
+    for m, v in by_mint_ratio.items():
+        b = bin_label(v["wallet_ratio_min"], RATIO_BINS)
+        dedup_buckets[b]["n"]    += 1
+        if v["tp"]:
+            dedup_buckets[b]["n_tp"] += 1
+
+    # ── HTML helpers ──────────────────────────────────────────────────────────
+    def wr_cell(n_tp, n):
+        if n == 0: return "—", "#8b949e"
+        wr = round(n_tp / n * 100, 1)
+        color = "#3fb950" if wr >= BASE_WR + 8 else ("#f85149" if wr <= BASE_WR - 8 else "#e3b341")
+        return f"{wr}%", color
+
+    def delta_cell(n_tp, n):
+        if n == 0: return "—"
+        d = round(n_tp / n * 100 - BASE_WR, 1)
+        color = "#3fb950" if d >= 5 else ("#f85149" if d <= -5 else "#8b949e")
+        return f"<span style='color:{color}'>{d:+.1f}pp</span>"
+
+    # Tabela 1: por faixa de wallet_ratio (deduplicado por token)
+    ratio_rows = ""
+    for label, lo, hi in RATIO_BINS:
+        d = dedup_buckets[label]
+        n, n_tp = d["n"], d["n_tp"]
+        ws, wc = wr_cell(n_tp, n)
+        ratio_rows += (
+            f"<tr><td>{label}</td>"
+            f"<td style='text-align:right'>{n}</td>"
+            f"<td style='text-align:right'>{n_tp}</td>"
+            f"<td style='text-align:right;color:{wc}'>{ws}</td>"
+            f"<td style='text-align:right'>{delta_cell(n_tp, n)}</td></tr>"
+        )
+
+    # Tabela 2: por carteira × faixa (linhas raw — um token pode contar ×2 se 2 wallets)
+    CARTS_ORDER = sorted(cart_ratio.keys())
+    cart_ratio_rows = ""
+    for cart in CARTS_ORDER:
+        first = True
+        for label, lo, hi in RATIO_BINS:
+            d = cart_ratio[cart][label]
+            if d["n"] == 0:
+                continue
+            n, n_tp = d["n"], d["n_tp"]
+            ws, wc  = wr_cell(n_tp, n)
+            cart_label = cart if first else ""
+            cart_ratio_rows += (
+                f"<tr>"
+                f"<td>{cart_label}</td>"
+                f"<td style='color:#8b949e'>{label}</td>"
+                f"<td style='text-align:right'>{n}</td>"
+                f"<td style='text-align:right'>{n_tp}</td>"
+                f"<td style='text-align:right;color:{wc}'>{ws}</td>"
+                f"<td style='text-align:right'>{delta_cell(n_tp, n)}</td></tr>"
+            )
+            first = False
+
+    html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+    <title>Wallet Entry Depth</title>
+    <style>
+      body{{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}}
+      h1{{color:#58a6ff}}h2{{color:#79c0ff;margin-top:28px}}
+      table{{border-collapse:collapse;width:100%;max-width:760px;margin-bottom:20px}}
+      th{{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:left}}
+      th:not(:first-child){{text-align:right}}
+      td{{padding:5px 10px;border:1px solid #21262d;white-space:nowrap}}
+      .warn{{background:#161b22;border:1px solid #30363d;padding:10px 14px;
+             border-radius:4px;margin:12px 0;font-size:12px}}
+      .note{{color:#8b949e;font-size:12px;margin:4px 0 14px}}
+      a{{color:#58a6ff}}
+    </style></head><body>
+    <h1>Wallet Entry Depth — onde a wallet comprou?</h1>
+    <p class='note'>
+      Hipótese: carteira que comprou a &lt;30% do mc_migration (capitulação profunda)
+      é sinal diferente de carteira que comprou a 80%+ (momentum chaser).
+      <br>Baseline WR = {BASE_WR}% (n={base_n}, todos os bounces com ≥{MIN_TICKS} ticks).
+    </p>
+
+    <p>
+      <a href='/analise/cruzamento-wallets-ticks'>← WR por grupo de wallet</a>
+      &nbsp;|&nbsp; <a href='/analise/sinal-puro'>Sinal Puro</a>
+    </p>
+
+    <h2>Tabela 1 — WR por faixa de wallet_ratio (token deduplicado)</h2>
+    <p class='note'>
+      wallet_ratio = mc_t0 (onde a wallet comprou) / mc_migration.<br>
+      &lt;0.30 = comprou abaixo de 30% da migração = comprador da capitulação profunda.<br>
+      Token conta 1× pelo menor ratio de wallet que comprou nele.
+    </p>
+    <table>
+      <tr><th>Faixa wallet_ratio</th><th>n tokens</th><th>n TP</th>
+          <th>WR%</th><th>Delta vs baseline</th></tr>
+      {ratio_rows}
+    </table>
+
+    <h2>Tabela 2 — Por carteira × faixa de wallet_ratio</h2>
+    <p class='note'>
+      Linhas raw — um token pode aparecer 2× se comprado por 2 carteiras em faixas diferentes.
+      Mostra o padrão de compra de cada carteira e o WR correspondente.
+    </p>
+    <table>
+      <tr><th>Carteira</th><th>Faixa ratio</th><th>n</th><th>n TP</th>
+          <th>WR%</th><th>Delta</th></tr>
+      {cart_ratio_rows or "<tr><td colspan='6' style='color:#666'>Sem dados</td></tr>"}
+    </table>
+
+    <div class='warn'>
+      <b>O que procurar:</b><br>
+      Se wallets em ratio &lt;0.30 têm WR significativamente maior → comprador profundo = sinal causal.<br>
+      Se o WR é flat por faixa → wallet presence é correlação espúria (ambos efeito de token de qualidade).<br>
+      Se uma carteira específica concentra entradas em &lt;0.30 com WR alto → ela é o sinal real.<br>
+      <br>
+      <b>carteira_L (n=22, WR 9.1% no endpoint anterior):</b> verificar em que faixa ela opera.
+      Se compra em 0.50-0.70 → momentum chaser, não sinal. Se compra em &lt;0.30 com WR baixo → sinal negativo real.
+    </div>
+
+    </body></html>"""
+
+    return html
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
