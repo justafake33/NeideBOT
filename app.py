@@ -30961,6 +30961,221 @@ def analise_simulacao_300s():
         return f"<pre style='color:red'>{traceback.format_exc()}</pre>", 500
 
 
+@app.route("/analise/simulacao-er")
+def analise_simulacao_er():
+    """
+    Variante da simulação 300s sem o filtro A.8 (entry_ratio < 1.0).
+    Mostra WR simulado por faixa de entry_ratio para encontrar o teto ideal.
+    """
+    import psycopg2, traceback
+    from db import DATABASE_URL
+    from datetime import datetime, timezone
+
+    SL_PCT     = 0.25
+    TP_PCT     = 0.75
+    BOUNCE_MIN = 0.55
+    MIN_SEC    = 300
+    TICK_WIN   = 90
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor()
+
+        cur.execute("""
+            SELECT t.id, t.mint, t.status, t.pnl_pct_real,
+                   bs.elapsed_sec, bs.mc_min,
+                   m.mc_migration, m.ts_migration, m.token_nome
+            FROM trades t
+            JOIN bounce_signals bs ON bs.mint = t.mint
+                AND bs.ts_signal BETWEEN t.created_at - INTERVAL '5 min'
+                                     AND t.created_at + INTERVAL '30 min'
+            JOIN migrations m ON m.mint = t.mint
+            WHERE t.exit_type IS NOT NULL AND t.status IN ('tp','sl')
+              AND t.id >= 338 AND bs.elapsed_sec < 300
+            ORDER BY t.id
+        """)
+        trades = cur.fetchall()
+
+        rows = []  # (id, nome, elapsed, real_status, real_pnl, er_bucket, sim_status, sim_pnl)
+
+        for (tid, mint, real_status, real_pnl, elapsed_sec,
+             bs_mc_min, mc_migration, ts_mig, token_nome) in trades:
+
+            if not ts_mig or not mc_migration or mc_migration <= 0:
+                continue
+
+            ts_mig_utc = ts_mig.replace(tzinfo=timezone.utc) if ts_mig.tzinfo is None else ts_mig
+            t300       = ts_mig_utc.timestamp() + MIN_SEC
+            t300_dt    = datetime.fromtimestamp(t300, tz=timezone.utc)
+
+            # mc_min nos primeiros 300s
+            cur.execute("""
+                SELECT MIN(COALESCE(mc_low, mc)) FROM token_ticks
+                WHERE mint=%s AND tick_ts BETWEEN %s AND %s
+            """, (mint, ts_mig_utc, t300_dt))
+            r = cur.fetchone()
+            mc_min_300s = min(bs_mc_min or 0, r[0] or float('inf'))
+            if mc_min_300s <= 0 or mc_min_300s == float('inf'):
+                mc_min_300s = bs_mc_min or 0
+
+            # mc em t=300s
+            cur.execute("""
+                SELECT mc FROM token_ticks
+                WHERE mint=%s AND tick_ts BETWEEN %s AND %s
+                ORDER BY ABS(EXTRACT(EPOCH FROM (tick_ts-%s)))
+                LIMIT 1
+            """, (mint,
+                  datetime.fromtimestamp(t300 - TICK_WIN, tz=timezone.utc),
+                  datetime.fromtimestamp(t300 + TICK_WIN, tz=timezone.utc),
+                  t300_dt))
+            r = cur.fetchone()
+            if not r or not r[0]:
+                continue
+
+            mc_300s = float(r[0])
+            if mc_min_300s <= 0:
+                continue
+
+            bounce_300s = (mc_300s - mc_min_300s) / mc_min_300s
+            entry_ratio = mc_300s / mc_migration
+
+            # filtros mantidos: bounce mínimo + A.3 dead zone (abaixo da migração)
+            # A.8 (entry_ratio < 1.0) REMOVIDO — aqui está o estudo
+            if bounce_300s < BOUNCE_MIN:
+                continue
+            if 0.50 <= entry_ratio <= 0.65:
+                continue
+
+            # bucket de entry_ratio
+            if   entry_ratio < 1.00: er_bucket = '<100%'
+            elif entry_ratio < 1.10: er_bucket = '100-110%'
+            elif entry_ratio < 1.20: er_bucket = '110-120%'
+            elif entry_ratio < 1.50: er_bucket = '120-150%'
+            elif entry_ratio < 2.00: er_bucket = '150-200%'
+            else:                    er_bucket = '>200%'
+
+            # simular TP/SL com ticks após t=300s
+            sl_floor = mc_300s * (1 - SL_PCT)
+            tp_ceil  = mc_300s * (1 + TP_PCT)
+
+            cur.execute("""
+                SELECT mc_low, mc_high, mc FROM token_ticks
+                WHERE mint=%s AND tick_ts > %s ORDER BY tick_ts
+            """, (mint, t300_dt))
+            ticks = cur.fetchall()
+
+            sim_status = 'sem_saida'
+            sim_pnl    = None
+            for (mc_low, mc_high, mc_close) in ticks:
+                lo = float(mc_low   or mc_close or 0)
+                hi = float(mc_high  or mc_close or 0)
+                cl = float(mc_close or 0)
+                if lo > 0 and lo <= sl_floor:
+                    sim_status = 'sl'; sim_pnl = round(-SL_PCT*100, 1); break
+                if cl > 0 and cl <= sl_floor:
+                    sim_status = 'sl'; sim_pnl = round((cl/mc_300s-1)*100, 1); break
+                if hi > 0 and hi >= tp_ceil:
+                    sim_status = 'tp'; sim_pnl = round(TP_PCT*100, 1); break
+                if cl > 0 and cl >= tp_ceil:
+                    sim_status = 'tp'; sim_pnl = round((cl/mc_300s-1)*100, 1); break
+
+            rows.append((tid, token_nome or mint[:8], elapsed_sec,
+                         real_status, real_pnl, er_bucket,
+                         round(entry_ratio*100), round(bounce_300s*100),
+                         round(mc_300s), sim_status, sim_pnl))
+
+        conn.close()
+
+        # ── Resumo por bucket ──
+        from collections import defaultdict
+        ER_ORDER = ['<100%','100-110%','110-120%','120-150%','150-200%','>200%']
+        buckets  = defaultdict(list)
+        for r in rows:
+            buckets[r[5]].append(r)
+
+        summary_rows = ""
+        for bkt in ER_ORDER:
+            group = buckets.get(bkt, [])
+            if not group: continue
+            n      = len(group)
+            tp_sim = sum(1 for r in group if r[9]=='tp')
+            sl_sim = sum(1 for r in group if r[9]=='sl')
+            no_ex  = sum(1 for r in group if r[9]=='sem_saida')
+            wr_sim = round(tp_sim/n*100,1) if n else 0
+            tp_rl  = sum(1 for r in group if r[3]=='tp')
+            wr_rl  = round(tp_rl/n*100,1) if n else 0
+            avg_er = round(sum(r[6] for r in group)/n)
+            avg_b  = round(sum(r[7] for r in group)/n)
+            color  = '#2a2' if wr_sim >= 25 else ('#fa0' if wr_sim >= 15 else '#a44')
+            summary_rows += f"""<tr>
+              <td><b>{bkt}</b></td>
+              <td>{n}</td>
+              <td style='color:{color}'><b>{wr_sim}%</b></td>
+              <td>{tp_sim}</td><td>{sl_sim}</td><td>{no_ex}</td>
+              <td style='color:#888'>{wr_rl}%</td>
+              <td>{avg_er}%</td><td>{avg_b}%</td>
+            </tr>"""
+
+        total_fired = len(rows)
+        total_tp    = sum(1 for r in rows if r[9]=='tp')
+        wr_total    = round(total_tp/total_fired*100,1) if total_fired else 0
+
+        # ── Tabela detalhada ──
+        detail_rows = ""
+        for r in sorted(rows, key=lambda x: (x[5], x[0])):
+            tid, nome, elapsed, real_st, real_pnl, er_bkt, er_pct, b_pct, mc300, sim_st, sim_pnl = r
+            rc = '#2a2' if real_st=='tp' else '#a44'
+            if sim_st=='tp':   sc,sl = '#2a2', f'✅ TP +{sim_pnl:.0f}%'
+            elif sim_st=='sl': sc,sl = '#a44', f'❌ SL {sim_pnl:.0f}%'
+            else:              sc,sl = '#fa0', '⏳ sem saída'
+            rpnl = f"{real_pnl*100:+.0f}%" if real_pnl is not None else '—'
+            detail_rows += (f"<tr><td>#{tid}</td><td>{nome}</td>"
+                f"<td>{elapsed}s</td>"
+                f"<td style='color:{rc}'>{real_st.upper()} {rpnl}</td>"
+                f"<td>{er_pct}%</td><td>{b_pct}%</td><td>${mc300:,}</td>"
+                f"<td style='color:{sc}'><b>{sl}</b></td></tr>")
+
+        return f"""<!DOCTYPE html><html><head>
+        <meta charset='utf-8'><title>Simulação ER Study</title>
+        <style>
+          body{{font-family:monospace;background:#111;color:#ccc;padding:20px}}
+          h2,h3{{color:#fa0}} table{{border-collapse:collapse;min-width:700px;margin-bottom:24px}}
+          th,td{{padding:5px 10px;border:1px solid #333;text-align:right}}
+          th{{background:#222;color:#fa0}} td:first-child,td:nth-child(2){{text-align:left}}
+          .note{{color:#888;font-size:.9em;margin:4px 0 12px}}
+        </style></head><body>
+        <h2>Estudo de entry_ratio — standby 5min sem A.8</h2>
+        <p class='note'>
+          Trades id≥338, elapsed&lt;5min. A.8 removido — tokens acima da migração permitidos.<br>
+          Mantidos: bounce≥55%, A.3 dead zone. <b>{total_fired} disparariam</b> | WR simulado total: <b>{wr_total}%</b>
+        </p>
+
+        <h3>Resumo por faixa de entry_ratio em t=5min</h3>
+        <table>
+          <tr><th>entry_ratio</th><th>n</th><th>WR sim</th>
+              <th>TP sim</th><th>SL sim</th><th>sem saída</th>
+              <th>WR real</th><th>avg ER</th><th>avg bounce</th></tr>
+          {summary_rows}
+        </table>
+        <p class='note'>
+          WR sim = resultado simulado comprando em mc_5min.<br>
+          WR real = resultado real desses mesmos trades (comprados na hora certa, 0-5min).<br>
+          Se WR sim &lt; WR real → comprar mais cedo era melhor.<br>
+          Se WR sim &gt; WR real → esperar 5min melhora o resultado.
+        </p>
+
+        <h3>Detalhe por trade (ordenado por bucket)</h3>
+        <table>
+          <tr><th>#id</th><th>Token</th><th>Elapsed</th><th>Real</th>
+              <th>Entry ratio</th><th>Bounce t=5min</th><th>MC t=5min</th><th>Simulação</th></tr>
+          {detail_rows}
+        </table>
+        </body></html>"""
+
+    except Exception:
+        return f"<pre style='color:red'>{traceback.format_exc()}</pre>", 500
+
+
 @app.route("/analise/tp-vs-sl-recente")
 def analise_tp_vs_sl_recente():
     """Mesmo que tp-vs-sl mas filtrando apenas trades id >= 338 (filtros atuais ativos)."""
