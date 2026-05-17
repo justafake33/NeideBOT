@@ -201,6 +201,7 @@ class HotMonitor:
     BOUNCE_DROP_MIN      = float(os.getenv("BOUNCE_DROP_MIN",        "0.30"))  # queda mínima da migração
     BOUNCE_TIME_MAX      = float(os.getenv("BOUNCE_TIME_MAX",        "20.0"))  # A.5: janela 30→20min (100% TPs em ≤20min)
     BOTTOM_FRESHNESS_SEC = int(os.getenv(  "BOTTOM_FRESHNESS_SEC",  "300"))   # A.6: máx 5min desde o último mc_min
+    BOUNCE_TIME_MIN_SEC  = int(os.getenv(  "BOUNCE_TIME_MIN_SEC",   "90"))    # A.9: elapsed < 90s pool em transição, usar APENAS Helius
 
     def _check_bounce(self, mint: str, state: dict, mc: float, elapsed_sec: int):
         """Detecta bounce em tempo real. Fase A: filtros A.2, A.3, A.6.
@@ -702,9 +703,9 @@ class HotMonitor:
                             state["mc_max"] = mc_close_peak
 
                     # 3. Acumula tick kline com OHLC completo.
-                    #    mc_low para elapsed < 90s vem de MIN(helius, kline) para evitar stale data.
+                    #    mc_low para elapsed < BOUNCE_TIME_MIN_SEC (90s) vem APENAS do Helius — pool em transição da bonding curve.
+                    #    mc_low para elapsed >= BOUNCE_TIME_MIN_SEC usa MIN(helius, kline) — pool estável.
                     #    mc_low já foi calculado no passo 1, reutiliza aqui.
-                    #    Para elapsed >= 90s, usa o low do kline normalmente (pool estabilizado).
                     close_p = _float(c.get("close"))
                     open_p  = _float(c.get("open"))
                     high_p  = _float(c.get("high"))
