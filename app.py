@@ -32214,6 +32214,129 @@ def analise_cruzamento_wallets():
         """)
         por_carteira = cur.fetchall()
 
+        # Identifica carteiras "ruído" automaticamente:
+        # - Qualquer carteira presente em >30% dos bounces totais = ubíqua = ruído
+        noise_threshold = max(3, int(n_bounces * 0.30))
+        noise_wallets   = {r["carteira"] for r in por_carteira if r["n_tokens"] > noise_threshold}
+
+        # ── Recovery rate por carteira (excluindo ruído) ──────────────────────
+        cur.execute("""
+            SELECT
+                qt.carteira,
+                COUNT(DISTINCT bs.mint)                                         AS n_tokens,
+                ROUND(AVG(CASE WHEN m.recovery THEN 1.0 ELSE 0 END)::numeric*100,1)
+                                                                                AS recovery_pct,
+                ROUND(AVG(m.pct_gain)::numeric, 0)                             AS avg_gain,
+                COUNT(DISTINCT CASE WHEN t.status='tp' THEN t.id END)          AS n_tp,
+                COUNT(DISTINCT CASE WHEN t.status='sl' THEN t.id END)          AS n_sl
+            FROM bounce_signals bs
+            JOIN quarentena_trades qt
+                ON  qt.token_mint = bs.mint
+                AND qt.tipo = 'COMPRA'
+                AND qt.ts < bs.ts_signal
+                AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+            LEFT JOIN migrations m ON m.mint = bs.mint
+            LEFT JOIN trades t
+                ON  t.mint = bs.mint
+                AND t.exit_type = 'helius_sell_recovery'
+                AND t.status IN ('tp','sl')
+            WHERE m.recovery IS NOT NULL
+            GROUP BY qt.carteira
+            ORDER BY n_tokens DESC
+        """)
+        por_carteira_stats = cur.fetchall()
+
+        # ── Smart money: cruzamentos SEM carteiras ruído ──────────────────────
+        if noise_wallets:
+            noise_list = "','".join(noise_wallets)
+            cur.execute(f"""
+                WITH cruzados_smart AS (
+                    SELECT DISTINCT bs.mint
+                    FROM bounce_signals bs
+                    JOIN quarentena_trades qt
+                        ON  qt.token_mint = bs.mint
+                        AND qt.tipo = 'COMPRA'
+                        AND qt.ts < bs.ts_signal
+                        AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+                    WHERE qt.carteira NOT IN ('{noise_list}')
+                )
+                SELECT
+                    'com_smart'             AS grupo,
+                    COUNT(*)                AS n,
+                    ROUND(AVG(CASE WHEN m.recovery THEN 1.0 ELSE 0 END)::numeric*100,1) AS recovery_pct,
+                    ROUND(AVG(m.pct_gain)::numeric, 0) AS avg_gain
+                FROM bounce_signals bs
+                JOIN cruzados_smart c ON c.mint = bs.mint
+                LEFT JOIN migrations m ON m.mint = bs.mint
+                WHERE m.recovery IS NOT NULL
+
+                UNION ALL
+
+                SELECT
+                    'sem_smart'             AS grupo,
+                    COUNT(*)                AS n,
+                    ROUND(AVG(CASE WHEN m.recovery THEN 1.0 ELSE 0 END)::numeric*100,1) AS recovery_pct,
+                    ROUND(AVG(m.pct_gain)::numeric, 0) AS avg_gain
+                FROM bounce_signals bs
+                LEFT JOIN migrations m ON m.mint = bs.mint
+                WHERE m.recovery IS NOT NULL
+                  AND bs.mint NOT IN (SELECT mint FROM cruzados_smart)
+            """)
+            smart_stats = {r["grupo"]: r for r in cur.fetchall()}
+
+            # WR blockchain para smart money
+            cur.execute(f"""
+                WITH cruzados_smart AS (
+                    SELECT DISTINCT bs.mint
+                    FROM bounce_signals bs
+                    JOIN quarentena_trades qt
+                        ON  qt.token_mint = bs.mint
+                        AND qt.tipo = 'COMPRA'
+                        AND qt.ts < bs.ts_signal
+                        AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+                    WHERE qt.carteira NOT IN ('{noise_list}')
+                )
+                SELECT
+                    CASE WHEN c.mint IS NOT NULL THEN 'com_smart' ELSE 'sem_smart' END AS grupo,
+                    COUNT(*) AS n,
+                    ROUND(AVG(CASE WHEN t.status='tp' THEN 1.0 ELSE 0 END)::numeric*100,1) AS wr_pct,
+                    ROUND(AVG(t.pnl_pct_real*100)::numeric,1) AS avg_pnl
+                FROM trades t
+                LEFT JOIN cruzados_smart c ON c.mint = t.mint
+                WHERE t.exit_type = 'helius_sell_recovery'
+                  AND t.status IN ('tp','sl')
+                GROUP BY 1
+            """)
+            smart_wr = {r["grupo"]: r for r in cur.fetchall()}
+
+            # Tokens com 2+ wallets smart comprando (convergência)
+            cur.execute(f"""
+                SELECT
+                    bs.mint,
+                    bs.ts_signal,
+                    bs.bounce_pct,
+                    m.recovery,
+                    m.pct_gain,
+                    COUNT(DISTINCT qt.carteira)                AS n_wallets,
+                    STRING_AGG(DISTINCT qt.carteira, ', ' ORDER BY qt.carteira) AS wallets
+                FROM bounce_signals bs
+                JOIN quarentena_trades qt
+                    ON  qt.token_mint = bs.mint
+                    AND qt.tipo = 'COMPRA'
+                    AND qt.ts < bs.ts_signal
+                    AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+                LEFT JOIN migrations m ON m.mint = bs.mint
+                WHERE qt.carteira NOT IN ('{noise_list}')
+                GROUP BY bs.mint, bs.ts_signal, bs.bounce_pct, m.recovery, m.pct_gain
+                HAVING COUNT(DISTINCT qt.carteira) >= 2
+                ORDER BY COUNT(DISTINCT qt.carteira) DESC, bs.ts_signal DESC
+            """)
+            convergencia = cur.fetchall()
+        else:
+            smart_stats   = {}
+            smart_wr      = {}
+            convergencia  = []
+
         conn.close()
 
         # ── CSV export ───────────────────────────────────────────────────────
@@ -32294,6 +32417,58 @@ def analise_cruzamento_wallets():
             for r in por_carteira
         )
 
+        # Tabela recovery por carteira
+        def _wr_cell(n_tp, n_sl):
+            tot = (n_tp or 0) + (n_sl or 0)
+            if tot == 0: return "—"
+            return f"{round(100*(n_tp or 0)/tot)}%"
+
+        cart_stat_rows = ""
+        for r in por_carteira_stats:
+            bold = r["carteira"] not in noise_wallets
+            name = f"<b>{r['carteira']}</b>" if bold else f"<span style='color:#555'>{r['carteira']} (ruído)</span>"
+            cart_stat_rows += (
+                f"<tr><td>{name}</td>"
+                f"<td style='text-align:right'>{r['n_tokens']}</td>"
+                f"<td style='text-align:right'>{r['recovery_pct']}%</td>"
+                f"<td style='text-align:right'>{r['avg_gain']}%</td>"
+                f"<td style='text-align:right'>{r['n_tp']}</td>"
+                f"<td style='text-align:right'>{r['n_sl']}</td>"
+                f"<td style='text-align:right'>{_wr_cell(r['n_tp'], r['n_sl'])}</td>"
+                f"</tr>"
+            )
+
+        # Tabela convergência multi-wallet
+        conv_rows = ""
+        for r in convergencia:
+            rec_icon = "✅" if r["recovery"] else ("❌" if r["recovery"] is False else "—")
+            gain_str = f"{r['pct_gain']:+.0f}%" if r.get("pct_gain") is not None else "—"
+            gain_col = "#4caf50" if (r.get("pct_gain") or 0) > 0 else "#f44336"
+            bounce_s = f"{round(float(r['bounce_pct'])*100)}%" if r.get("bounce_pct") else "—"
+            conv_rows += (
+                f"<tr>"
+                f"<td style='font-size:11px'>{r['mint'][:16]}</td>"
+                f"<td style='text-align:right'>{bounce_s}</td>"
+                f"<td style='text-align:center'>{rec_icon}</td>"
+                f"<td style='text-align:right;color:{gain_col}'>{gain_str}</td>"
+                f"<td style='font-size:12px'>{r['wallets']}</td>"
+                f"<td style='text-align:center'>{r['n_wallets']}</td>"
+                f"</tr>"
+            )
+
+        # Smart money stats strings
+        noise_label     = ", ".join(sorted(noise_wallets)) or "nenhuma"
+        sc  = smart_stats.get("com_smart", {})
+        ss  = smart_stats.get("sem_smart", {})
+        src = float(sc.get("recovery_pct") or 0)
+        srs = float(ss.get("recovery_pct") or 0)
+        delta_smart_rec = src - srs
+        wc  = smart_wr.get("com_smart", {})
+        ws  = smart_wr.get("sem_smart", {})
+        wrc = float(wc.get("wr_pct") or 0)
+        wrs = float(ws.get("wr_pct") or 0)
+        delta_smart_wr  = wrc - wrs
+
         html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
         <title>Cruzamento Wallets × NeideBOT</title>
         <style>
@@ -32363,10 +32538,39 @@ def analise_cruzamento_wallets():
               <td>—</td></tr>
         </table>
 
-        <h2>Cruzamentos por carteira</h2>
+        <h2>Cruzamentos por carteira (contagem bruta)</h2>
         <table style='max-width:400px'>
           <tr><th>Carteira</th><th>Tokens únicos</th></tr>
           {cart_rows or "<tr><td colspan='2'>Nenhum</td></tr>"}
+        </table>
+        <p class='note'>Carteiras marcadas como ruído (presentes em >{noise_threshold} bounces = >30% do universo): <b style='color:#f44336'>{", ".join(sorted(noise_wallets)) or "nenhuma"}</b></p>
+
+        <h2>Recovery por carteira individual (excl. ruído)</h2>
+        <table style='max-width:700px'>
+          <tr><th>Carteira</th><th>n tokens</th><th>Recovery%</th><th>avg pct_gain</th><th>n TP</th><th>n SL</th><th>WR live</th></tr>
+          {cart_stat_rows or "<tr><td colspan='7' style='color:#666'>Sem dados</td></tr>"}
+        </table>
+
+        <h2>Smart money filtrado (sem ruído: {noise_label})</h2>
+        <p class='note'>Apenas wallets seletivas — exclui aquelas presentes em &gt;30% dos bounces</p>
+        <table style='max-width:600px'>
+          <tr><th>Grupo</th><th>n</th><th>Recovery%</th><th>avg gain</th></tr>
+          <tr><td>Com smart money</td><td>{sc.get('n','—')}</td><td>{sc.get('recovery_pct','—')}%</td><td>{sc.get('avg_gain','—')}%</td></tr>
+          <tr><td>Sem smart money</td><td>{ss.get('n','—')}</td><td>{ss.get('recovery_pct','—')}%</td><td>{ss.get('avg_gain','—')}%</td></tr>
+          <tr style='font-weight:bold'><td>Delta</td><td>—</td>
+              <td style='color:{delta_color(delta_smart_rec)}'>{delta_smart_rec:+.1f}pp</td><td>—</td></tr>
+        </table>
+        <table style='max-width:600px;margin-top:8px'>
+          <tr><th>Grupo</th><th>n trades blockchain</th><th>WR%</th><th>avg P&L</th></tr>
+          {f"<tr><td>Com smart money</td><td>{wc.get('n','—')}</td><td>{wc.get('wr_pct','—')}%</td><td>{wc.get('avg_pnl','—')}%</td></tr><tr><td>Sem smart money</td><td>{ws.get('n','—')}</td><td>{ws.get('wr_pct','—')}%</td><td>{ws.get('avg_pnl','—')}%</td></tr><tr style='font-weight:bold'><td>Delta WR</td><td>—</td><td style='color:{delta_color(delta_smart_wr)}'>{delta_smart_wr:+.1f}pp</td><td>—</td></tr>" if smart_wr else "<tr><td colspan='4' style='color:#666'>Sem trades blockchain com smart money ainda</td></tr>"}
+        </table>
+
+        <h2>Convergência multi-wallet ({len(convergencia)} tokens com ≥2 smart wallets)</h2>
+        <p class='note'>Sinal mais forte: múltiplas wallets seletivas comprando o mesmo token durante o dump</p>
+        <table>
+          <tr><th>Token</th><th>Bounce%</th><th style='text-align:center'>Recovery</th>
+              <th style='text-align:right'>pct_gain</th><th>Wallets</th><th>n wallets</th></tr>
+          {conv_rows or "<tr><td colspan='6' style='color:#666'>Nenhum caso de convergência ainda</td></tr>"}
         </table>
 
         <h2>Detalhe — todos os cruzamentos ({len(rows)} linhas, {n_tokens_unicos} tokens únicos)</h2>
