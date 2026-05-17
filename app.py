@@ -31179,11 +31179,140 @@ def analise_simulacao_er():
 @app.route("/analise/smart-wallet")
 def analise_smart_wallet():
     """
-    Analisa uma carteira smart money:
-    1. Busca todas as transações dela via Helius (desde MAY_6)
-    2. Extrai os mints que ela comprou
-    3. Cruza com bounce_signals + trades para ver correlação com TP/SL
+    Analisa uma carteira smart money cruzando com nossos mints.
+    Para cada mint que tradamos, verifica via getTokenAccountsByOwner
+    se a carteira tem/teve token account para esse mint.
+    1 RPC call por mint — eficiente independente do histórico da carteira.
     """
+    import psycopg2, traceback, time
+    from db import DATABASE_URL
+    from flask import request, Response, stream_with_context
+    import helius_rpc, requests as req_lib
+
+    WALLET = request.args.get("wallet", "VJSDW6S74YXR4rRR9P4xwhMvLZJQMhrUb8XMFirUsy1")
+    PAD    = " " * 2048
+
+    def generate():
+        yield (f"<html><head><meta charset='utf-8'><title>Smart Wallet</title>"
+               f"<style>body{{font-family:monospace;background:#111;color:#ccc;padding:20px}}"
+               f"h2,h3{{color:#fa0}} .note{{color:#888;font-size:.9em}}"
+               f"table{{border-collapse:collapse;min-width:700px;margin-top:12px}}"
+               f"th,td{{padding:5px 10px;border:1px solid #333;text-align:right}}"
+               f"th{{background:#222;color:#fa0}} td:first-child,td:nth-child(2){{text-align:left}}"
+               f"</style></head><body>"
+               f"<h2>Smart Wallet Analysis</h2>"
+               f"<p class='note'>Carteira: <b>{WALLET}</b></p>{PAD}")
+
+        rpc_url = helius_rpc.HELIUS_RPC_URL
+        if not rpc_url:
+            yield "<p style='color:#a44'>HELIUS_RPC_URL não configurado.</p></body></html>"
+            return
+
+        # ── 1. Carregar todos os trades do banco ──
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            cur  = conn.cursor()
+            cur.execute("""
+                SELECT t.id, t.mint, t.status, t.pnl_pct_real,
+                       m.token_nome, m.mc_migration, m.smart_wallets, m.renowned_wallets,
+                       bs.bounce_pct, bs.elapsed_sec
+                FROM trades t
+                JOIN migrations m ON m.mint = t.mint
+                JOIN bounce_signals bs ON bs.mint = t.mint
+                    AND bs.ts_signal BETWEEN t.created_at - INTERVAL '5 min'
+                                         AND t.created_at + INTERVAL '30 min'
+                WHERE t.exit_type IS NOT NULL AND t.status IN ('tp','sl')
+                  AND t.id >= 338
+                ORDER BY t.id
+            """)
+            all_trades = cur.fetchall()
+            conn.close()
+        except Exception as e:
+            yield f"<p style='color:#a44'>DB error: {e}</p></body></html>"
+            return
+
+        unique_mints = list({r[1] for r in all_trades})
+        yield f"<p>Verificando <b>{len(unique_mints)}</b> mints únicos contra a carteira...</p>{PAD}"
+
+        # ── 2. Para cada mint, verificar se wallet tem token account ──
+        wallet_mints = set()
+        processed    = 0
+
+        for mint in unique_mints:
+            processed += 1
+            if processed % 20 == 0:
+                yield f"<p class='note'>{processed}/{len(unique_mints)} verificados... ({len(wallet_mints)} encontrados)</p>{PAD}"
+
+            body = {"jsonrpc": "2.0", "id": 1,
+                    "method": "getTokenAccountsByOwner",
+                    "params": [WALLET, {"mint": mint}, {"encoding": "jsonParsed"}]}
+            try:
+                resp  = req_lib.post(rpc_url, json=body, timeout=10)
+                value = resp.json().get("result", {}).get("value", [])
+                if value:
+                    wallet_mints.add(mint)
+            except Exception:
+                pass
+            time.sleep(0.05)
+
+        yield f"<p><b>{len(wallet_mints)}</b> mints onde a wallet esteve presente.</p>{PAD}"
+
+        # ── 3. Separar trades com/sem wallet e calcular WR ──
+        with_wallet    = [r for r in all_trades if r[1] in wallet_mints]
+        without_wallet = [r for r in all_trades if r[1] not in wallet_mints]
+
+        n_with   = len(with_wallet)
+        n_wo     = len(without_wallet)
+        tp_with  = sum(1 for r in with_wallet    if r[2] == 'tp')
+        tp_wo    = sum(1 for r in without_wallet if r[2] == 'tp')
+        wr_with  = round(tp_with / n_with * 100, 1) if n_with else 0
+        wr_wo    = round(tp_wo   / n_wo   * 100, 1) if n_wo   else 0
+        delta    = round(wr_with - wr_wo, 1)
+        color    = '#2a2' if delta >= 10 else ('#fa0' if delta >= 0 else '#a44')
+
+        yield f"""
+        <h3>Resultado</h3>
+        <table>
+          <tr><th></th><th>n trades</th><th>TPs</th><th>WR%</th></tr>
+          <tr><td><b>Com smart wallet</b></td>
+              <td>{n_with}</td><td style='color:#2a2'>{tp_with}</td>
+              <td style='color:{color}'><b>{wr_with}%</b></td></tr>
+          <tr><td><b>Sem smart wallet</b></td>
+              <td>{n_wo}</td><td style='color:#2a2'>{tp_wo}</td>
+              <td>{wr_wo}%</td></tr>
+        </table>
+        <p class='note'>Delta: <span style='color:{color}'><b>{delta:+.1f}pp</b></span>
+        &nbsp;|&nbsp; Gate para filtro: n≥10 com +15pp consistente.</p>{PAD}
+        """
+
+        # ── 4. Tabela detalhada dos trades com wallet presente ──
+        if with_wallet:
+            trs = ""
+            for (tid, mint, status, pnl, nome, mc_mig, smart_cnt, renowned,
+                 bounce_pct, elapsed_sec) in sorted(with_wallet, key=lambda x: (x[2], -(x[3] or 0))):
+                rc      = '#2a2' if status == 'tp' else '#a44'
+                pnl_str = f"{pnl*100:+.0f}%" if pnl is not None else '—'
+                trs += (f"<tr><td>#{tid}</td><td>{nome or mint[:8]}</td>"
+                        f"<td style='color:{rc}'>{status.upper()} {pnl_str}</td>"
+                        f"<td>{round(bounce_pct*100) if bounce_pct else '—'}%</td>"
+                        f"<td>{elapsed_sec}s</td>"
+                        f"<td>{smart_cnt}</td><td>{renowned}</td></tr>")
+            yield f"""
+            <h3>Trades com a smart wallet presente ({n_with})</h3>
+            <table>
+              <tr><th>#id</th><th>Token</th><th>Resultado</th>
+                  <th>bounce%</th><th>elapsed</th><th>smart_cnt</th><th>KOL</th></tr>
+              {trs}
+            </table>{PAD}
+            """
+
+        yield "<p style='color:#888;margin-top:20px'>Análise concluída.</p></body></html>"
+
+    return Response(stream_with_context(generate()), content_type="text/html")
+
+
+@app.route("/analise/tp-vs-sl-recente")
+def analise_tp_vs_sl_recente():
     import psycopg2, traceback, time
     from db import DATABASE_URL
     from flask import request, Response, stream_with_context
