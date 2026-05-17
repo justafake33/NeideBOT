@@ -604,10 +604,22 @@ class HotMonitor:
 
                     # 1. Atualiza mc_min com o low desta vela ANTES de checar bounce.
                     #    Garante que bounce_pct e A.6 usam o fundo correto desta vela.
+                    #
+                    #    Para elapsed_sec < 90 (janela de transição bonding curve → pool):
+                    #    o kline low pode incluir preços da bonding curve pré-migração,
+                    #    que ficam muito abaixo do preço real do pool novo.
+                    #    Fonte correta: mínimo real dos eventos Helius WebSocket nessa janela,
+                    #    que captura pool reserves em tempo real (~5ms de latência).
                     low_price = _float(c.get("low"))
-                    if low_price and low_price > 0:
+                    if elapsed_sec < 90 and self._helius:
+                        candle_start = state["ts_mig_unix"] + max(0, elapsed_sec - 60)
+                        candle_end   = state["ts_mig_unix"] + elapsed_sec
+                        mc_low = self._helius.get_min_mc_in_window(mint, candle_start, candle_end)
+                    elif low_price and low_price > 0:
                         mc_low = low_price * state["total_supply"]
-                        if mc_low < state["mc_min"]:
+                    else:
+                        mc_low = None
+                    if mc_low and mc_low > 0 and mc_low < state["mc_min"]:
                             candle_dt = datetime.fromtimestamp(candle_ts, tz=timezone.utc)
                             with self._lock:
                                 inner = self._tokens.get(mint)
@@ -642,6 +654,8 @@ class HotMonitor:
                             state["mc_max"] = mc_close_peak
 
                     # 3. Acumula tick kline com OHLC completo.
+                    #    mc_low para elapsed < 90s vem do Helius (já calculado no passo 1).
+                    #    Para elapsed >= 90s, usa o low do kline normalmente.
                     close_p = _float(c.get("close"))
                     open_p  = _float(c.get("open"))
                     high_p  = _float(c.get("high"))
@@ -649,13 +663,15 @@ class HotMonitor:
                     vol     = _float(c.get("volume"))
                     supply  = state["total_supply"]
                     if close_p and close_p > 0 and supply:
+                        mc_low_tick = (mc_low if elapsed_sec < 90
+                                       else (low_p * supply if low_p else None))
                         kline_ticks.append({
                             "mint":        mint,
                             "elapsed_sec": elapsed_sec,
                             "mc":          close_p * supply,
                             "mc_open":     open_p  * supply if open_p  else None,
                             "mc_high":     high_p  * supply if high_p  else None,
-                            "mc_low":      low_p   * supply if low_p   else None,
+                            "mc_low":      mc_low_tick,
                             "volume_1m":   vol,
                         })
 

@@ -113,13 +113,13 @@ def check_mcmin_vs_ticks(conn, since_dt):
     return passed, n, examples, desc
 
 
-@check("kline mc_low gravado em janela de transição (elapsed < 90s)", "CRÍTICO")
+@check("mc_low contaminado na janela de transição (elapsed < 90s)", "CRÍTICO")
 def check_ticks_elapsed(conn, since_dt):
-    # Ticks com elapsed_sec < 90 precisam existir — o close deles é dado real do pool novo.
-    # O problema é gravar mc_low do kline nessa janela: o low intra-candle pode incluir preços
-    # da bonding curve pré-migração, que ficam muito abaixo do preço real do pool.
-    # Invariante: token_ticks com source='kline' AND elapsed_sec < 90 devem ter mc_low = NULL.
-    # O mc_low correto nessa janela vem do Helius WebSocket (pool reserves em tempo real).
+    # Após o fix: mc_low para elapsed < 90s vem do Helius (mínimo real das pool reserves)
+    # ou é NULL (sem eventos Helius nessa janela). Nunca deve vir do kline low.
+    # Invariante: mc_low de tick com elapsed < 90s nunca deve ser < mc (close) × 0.50.
+    # Se for, é kline low contaminado com preço da bonding curve pré-migração.
+    # Helius retorna mínimo real do pool — sempre próximo ao close (variação < 50%).
     since_join = ""
     if since_dt:
         since_join = """
@@ -127,13 +127,16 @@ def check_ticks_elapsed(conn, since_dt):
               AND m.ts_migration >= %(since)s
         """
     q = f"""
-        SELECT tt.mint, tt.elapsed_sec, tt.mc, tt.mc_low, tt.source
+        SELECT tt.mint, tt.elapsed_sec, tt.mc, tt.mc_low,
+               ROUND((tt.mc_low / NULLIF(tt.mc, 0))::numeric, 3) AS low_vs_close,
+               tt.source
         FROM token_ticks tt
         {since_join}
         WHERE tt.source = 'kline'
-          AND tt.elapsed_sec < 90
           AND tt.elapsed_sec >= 0
+          AND tt.elapsed_sec < 90
           AND tt.mc_low IS NOT NULL
+          AND tt.mc_low < tt.mc * 0.50
         LIMIT 100
     """
     with conn.cursor() as cur:
@@ -141,8 +144,8 @@ def check_ticks_elapsed(conn, since_dt):
         rows = cur.fetchall()
     n = len(rows)
     passed = n == 0
-    examples = [_fmt_row(r, ["mint","elapsed_sec","mc","mc_low","source"]) for r in rows[:3]]
-    desc = "kline mc_low gravado em elapsed < 90s — low intra-candle pode ser preço da bonding curve pré-migração"
+    examples = [_fmt_row(r, ["mint","elapsed_sec","mc","mc_low","low_vs_close","source"]) for r in rows[:3]]
+    desc = "mc_low < mc × 0.50 em elapsed < 90s — kline low contaminado com preço de bonding curve (deve vir do Helius)"
     return passed, n, examples, desc
 
 
