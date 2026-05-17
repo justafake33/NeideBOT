@@ -30260,7 +30260,7 @@ def _analise_h24_h25_inner(conn, cur):
             END,
             COUNT(*), SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END),
             SUM(CASE WHEN t.status IN ('sl','error') THEN 1 ELSE 0 END),
-            ROUND(AVG(t.pnl_pct_real)*100,1)
+            ROUND((AVG(t.pnl_pct_real)*100)::numeric,1)
         FROM bounce_signals bs {TRADE_JOIN}
         WHERE bs.dump_seller_hhi IS NOT NULL
         GROUP BY 1 ORDER BY MIN(bs.dump_seller_hhi) DESC
@@ -30281,7 +30281,7 @@ def _analise_h24_h25_inner(conn, cur):
             END,
             COUNT(*), SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END),
             SUM(CASE WHEN t.status IN ('sl','error') THEN 1 ELSE 0 END),
-            ROUND(AVG(t.pnl_pct_real)*100,1)
+            ROUND((AVG(t.pnl_pct_real)*100)::numeric,1)
         FROM bounce_signals bs {TRADE_JOIN}
         WHERE bs.pool_quote_at_signal IS NOT NULL
         GROUP BY 1 ORDER BY MIN(bs.pool_quote_at_signal) DESC
@@ -30302,7 +30302,7 @@ def _analise_h24_h25_inner(conn, cur):
             END,
             COUNT(*), SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END),
             SUM(CASE WHEN t.status IN ('sl','error') THEN 1 ELSE 0 END),
-            ROUND(AVG(t.pnl_pct_real)*100,1)
+            ROUND((AVG(t.pnl_pct_real)*100)::numeric,1)
         FROM bounce_signals bs {TRADE_JOIN}
         WHERE bs.net_sol_flow IS NOT NULL AND bs.h23_window = 'bottom'
         GROUP BY 1 ORDER BY MIN(bs.net_sol_flow) DESC
@@ -30323,7 +30323,7 @@ def _analise_h24_h25_inner(conn, cur):
             END,
             COUNT(*), SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END),
             SUM(CASE WHEN t.status IN ('sl','error') THEN 1 ELSE 0 END),
-            ROUND(AVG(t.pnl_pct_real)*100,1)
+            ROUND((AVG(t.pnl_pct_real)*100)::numeric,1)
         FROM bounce_signals bs
         JOIN migrations m ON m.mint = bs.mint
         {TRADE_JOIN}
