@@ -200,6 +200,7 @@ class HotMonitor:
     BOUNCE_MAX_PCT       = float(os.getenv("BOUNCE_MAX_PCT",         "9.99"))  # desativado por padrão — sem validação GMGN para threshold máximo (nota 87 CLAUDE.md)
     BOUNCE_DROP_MIN      = float(os.getenv("BOUNCE_DROP_MIN",        "0.30"))  # queda mínima da migração
     BOUNCE_TIME_MAX      = float(os.getenv("BOUNCE_TIME_MAX",        "20.0"))  # A.5: janela 30→20min (100% TPs em ≤20min)
+    BOUNCE_TIME_MIN_SEC  = int(os.getenv(  "BOUNCE_TIME_MIN_SEC",   "0"))     # A.9: janela mínima — ignora sinais muito cedo pós-migração
     BOTTOM_FRESHNESS_SEC = int(os.getenv(  "BOTTOM_FRESHNESS_SEC",  "300"))   # A.6: máx 5min desde o último mc_min
 
     def _check_bounce(self, mint: str, state: dict, mc: float, elapsed_sec: int):
@@ -210,6 +211,11 @@ class HotMonitor:
         elapsed_min  = elapsed_sec / 60
         mc_min       = state["mc_min"]
         mc_migration = state["mc_migration"]
+
+        # A.9 — Janela mínima: sinais nos primeiros N segundos têm WR muito baixo (dados: 0-5min → 12.9% WR vs 5-20min → 27% WR)
+        if self.BOUNCE_TIME_MIN_SEC > 0 and elapsed_sec < self.BOUNCE_TIME_MIN_SEC:
+            logger.debug("BOUNCE skip %s — A.9 muito cedo: %ds < min=%ds", mint[:8], elapsed_sec, self.BOUNCE_TIME_MIN_SEC)
+            return
 
         if elapsed_min > self.BOUNCE_TIME_MAX:
             return
