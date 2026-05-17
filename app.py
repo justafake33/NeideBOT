@@ -31337,7 +31337,7 @@ def analise_smart_wallet():
                         f"<td style='color:{gain_col}'>{gain_str}</td>"
                         f"<td>{drop_str}</td>"
                         f"<td>{rec_str}</td>"
-                        f"<td>{ttp:.0f}min' if ttp else '—'}</td>"
+                        f"<td>{f'{ttp:.0f}min' if ttp else '—'}</td>"
                         f"<td>{smart_cnt}</td><td>{renowned}</td>"
                         f"<td>{t_str}</td></tr>")
 
@@ -31351,9 +31351,6 @@ def analise_smart_wallet():
             </table>{PAD}
             """
 
-        yield "<p style='color:#888;margin-top:20px'>Análise concluída.</p></body></html>"
-
-    return Response(stream_with_context(generate()), content_type="text/html")
         yield "<p style='color:#888;margin-top:20px'>Análise concluída.</p></body></html>"
 
     return Response(stream_with_context(generate()), content_type="text/html")
