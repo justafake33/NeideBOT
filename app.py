@@ -33214,5 +33214,367 @@ def analise_wallet_entry_depth():
     return html
 
 
+@app.route("/analise/wallet-token-outcome")
+def analise_wallet_token_outcome():
+    """
+    Pergunta correta: o token em si se comportou bem após a wallet comprar durante o dump?
+    Completamente desacoplado da nossa entrada (sem mc_at_signal, sem nosso SL/TP).
+
+    Métricas centradas no TOKEN:
+      - max_gain_from_bottom  = max(token_ticks.mc_high) / mc_min  nos 60min após o fundo
+      - recovered_30pct       = max_gain_from_bottom >= 1.30
+      - recovered_75pct       = max_gain_from_bottom >= 1.75
+      - recovered_200pct      = max_gain_from_bottom >= 3.00
+      - time_to_max_min       = minutos do fundo até o pico
+      - n_ticks_60min         = cobertura disponível
+
+    Grupos: por carteira, por faixa de wallet_ratio, baseline (todos os bounces).
+    """
+    import psycopg2, psycopg2.extras, traceback
+    from db import DATABASE_URL
+
+    MIN_TICKS = 3   # mínimo de ticks na janela pós-fundo para considerar
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_name = 'quarentena_trades'
+            ) AS exists
+        """)
+        if not cur.fetchone()["exists"]:
+            conn.close()
+            return "<h2>quarentena_trades não encontrada</h2>", 404
+
+        # ── Baseline: comportamento do token nos 60min após o fundo (sem filtro wallet) ──
+        # mc_min = fundo detectado pelo HotMonitor (bounce_signals.mc_min)
+        # max_mc_60min = pico atingido nos ticks da janela quente
+        cur.execute("""
+            SELECT
+                bs.mint,
+                bs.mc_min,
+                bs.ts_signal,
+                bs.bounce_pct,
+                bs.elapsed_sec / 60.0                                  AS elapsed_min,
+                MAX(COALESCE(tt.mc_high, tt.mc))                       AS max_mc_60min,
+                MIN(tt.tick_ts)                                        AS first_tick_ts,
+                MAX(tt.tick_ts)                                        AS last_tick_ts,
+                COUNT(tt.id)                                           AS n_ticks
+            FROM bounce_signals bs
+            JOIN token_ticks tt
+                ON  tt.mint    = bs.mint
+                AND tt.tick_ts > bs.ts_signal - INTERVAL '5 minutes'
+                AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
+            WHERE bs.mc_min IS NOT NULL AND bs.mc_min > 0
+            GROUP BY bs.mint, bs.mc_min, bs.ts_signal, bs.bounce_pct, bs.elapsed_sec
+            HAVING COUNT(tt.id) >= %(min_ticks)s
+        """, {"min_ticks": MIN_TICKS})
+        baseline_rows = cur.fetchall()
+
+        # ── Com wallet: cruzamento bounce_signals × quarentena_trades ──────────
+        cur.execute("""
+            SELECT
+                bs.mint,
+                bs.mc_min,
+                bs.mc_migration,
+                bs.ts_signal,
+                bs.bounce_pct,
+                bs.elapsed_sec / 60.0                                  AS elapsed_min,
+                MAX(COALESCE(tt.mc_high, tt.mc))                       AS max_mc_60min,
+                COUNT(tt.id)                                           AS n_ticks,
+                qt.carteira,
+                ROUND((qt.mc_t0 / NULLIF(bs.mc_migration, 0))::numeric, 3)
+                                                                       AS wallet_ratio,
+                qt.sol_entrada
+            FROM bounce_signals bs
+            JOIN token_ticks tt
+                ON  tt.mint    = bs.mint
+                AND tt.tick_ts > bs.ts_signal - INTERVAL '5 minutes'
+                AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
+            JOIN quarentena_trades qt
+                ON  qt.token_mint = bs.mint
+                AND qt.tipo       = 'COMPRA'
+                AND qt.ts         < bs.ts_signal
+                AND qt.ts         > bs.ts_signal - INTERVAL '20 minutes'
+                AND qt.mc_t0 IS NOT NULL
+                AND bs.mc_migration > 0
+            WHERE bs.mc_min IS NOT NULL AND bs.mc_min > 0
+            GROUP BY bs.mint, bs.mc_min, bs.mc_migration, bs.ts_signal,
+                     bs.bounce_pct, bs.elapsed_sec,
+                     qt.carteira, qt.mc_t0, qt.sol_entrada
+            HAVING COUNT(tt.id) >= %(min_ticks)s
+        """, {"min_ticks": MIN_TICKS})
+        wallet_rows = cur.fetchall()
+        conn.close()
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+    # ── Métricas centradas no token ───────────────────────────────────────────
+    def token_metrics(mc_min, max_mc_60min):
+        if not mc_min or not max_mc_60min or mc_min <= 0:
+            return None
+        gain = max_mc_60min / mc_min
+        return {
+            "gain":        round(gain, 2),
+            "rec30":       gain >= 1.30,
+            "rec75":       gain >= 1.75,
+            "rec200":      gain >= 3.00,
+        }
+
+    # Baseline: todos os tokens com ticks
+    base_stats = [token_metrics(r["mc_min"], r["max_mc_60min"]) for r in baseline_rows]
+    base_stats = [s for s in base_stats if s]
+    n_base     = len(base_stats)
+    base_rec30  = sum(1 for s in base_stats if s["rec30"])  / n_base * 100 if n_base else 0
+    base_rec75  = sum(1 for s in base_stats if s["rec75"])  / n_base * 100 if n_base else 0
+    base_rec200 = sum(1 for s in base_stats if s["rec200"]) / n_base * 100 if n_base else 0
+    base_avg    = sum(s["gain"] for s in base_stats) / n_base if n_base else 0
+
+    # Deduplicar wallet_rows por (mint × carteira) para a análise por carteira
+    # e por mint (menor ratio) para análise por faixa
+    from collections import defaultdict
+
+    # Por carteira: cada token conta 1× por carteira
+    by_cart_mint = defaultdict(dict)   # cart → {mint → metrics}
+    by_mint_global = {}                # mint → {metrics, carteiras, min_ratio}
+
+    for r in wallet_rows:
+        m    = r["mint"]
+        cart = r["carteira"]
+        wr   = float(r["wallet_ratio"]) if r["wallet_ratio"] else None
+        met  = token_metrics(r["mc_min"], r["max_mc_60min"])
+        if met is None or wr is None:
+            continue
+
+        # Por carteira — dedup por mint dentro de cada cart
+        if m not in by_cart_mint[cart]:
+            by_cart_mint[cart][m] = met
+
+        # Global: pega menor ratio de wallet por mint
+        if m not in by_mint_global:
+            by_mint_global[m] = {"met": met, "min_ratio": wr, "carteiras": set()}
+        else:
+            if wr < by_mint_global[m]["min_ratio"]:
+                by_mint_global[m]["min_ratio"] = wr
+        by_mint_global[m]["carteiras"].add(cart)
+
+    def agg(items):
+        n = len(items)
+        if n == 0:
+            return {"n": 0, "rec30": "—", "rec75": "—", "rec200": "—", "avg": "—"}
+        r30  = sum(1 for s in items if s["rec30"])
+        r75  = sum(1 for s in items if s["rec75"])
+        r200 = sum(1 for s in items if s["rec200"])
+        avg  = sum(s["gain"] for s in items) / n
+        return {
+            "n":     n,
+            "rec30": round(r30  / n * 100, 1),
+            "rec75": round(r75  / n * 100, 1),
+            "rec200":round(r200 / n * 100, 1),
+            "avg":   round(avg, 2),
+            "n_r30": r30, "n_r75": r75, "n_r200": r200,
+        }
+
+    # Por carteira
+    NOISE = {"Gold", "carteira_S", "carteira_O"}
+    cart_agg = {}
+    for cart, mint_dict in by_cart_mint.items():
+        cart_agg[cart] = agg(list(mint_dict.values()))
+
+    # Com qualquer wallet vs sem wallet
+    mints_com_wallet = set(by_mint_global.keys())
+    mints_sem_wallet = {r["mint"] for r in baseline_rows} - mints_com_wallet
+
+    stats_com = agg([by_mint_global[m]["met"] for m in mints_com_wallet
+                     if m in by_mint_global])
+    stats_sem = agg([token_metrics(r["mc_min"], r["max_mc_60min"])
+                     for r in baseline_rows if r["mint"] in mints_sem_wallet
+                     and token_metrics(r["mc_min"], r["max_mc_60min"])])
+
+    # Smart money only
+    smart_mints = {m for m, v in by_mint_global.items()
+                   if v["carteiras"] - NOISE}
+    stats_smart = agg([by_mint_global[m]["met"] for m in smart_mints])
+
+    # Por faixa de wallet_ratio (menor ratio por token)
+    RATIO_BINS = [
+        ("<0.30",    0.0,  0.30),
+        ("0.30-0.50",0.30, 0.50),
+        ("0.50-0.70",0.50, 0.70),
+        ("0.70-1.00",0.70, 1.00),
+        (">1.00",    1.00, 999),
+    ]
+    ratio_agg = {}
+    for label, lo, hi in RATIO_BINS:
+        items = [by_mint_global[m]["met"] for m, v in by_mint_global.items()
+                 if lo <= v["min_ratio"] < hi]
+        ratio_agg[label] = agg(items)
+
+    # ── HTML ─────────────────────────────────────────────────────────────────
+    def delta(val, base):
+        if val == "—" or base == 0: return "—"
+        d = val - base
+        c = "#3fb950" if d >= 5 else ("#f85149" if d <= -5 else "#8b949e")
+        return f"<span style='color:{c}'>{d:+.1f}pp</span>"
+
+    def col(v):
+        if v == "—": return "—"
+        return f"{v}%"
+
+    def avg_col(v):
+        if v == "—": return "—"
+        c = "#3fb950" if v >= base_avg + 0.3 else ("#f85149" if v <= base_avg - 0.3 else "#8b949e")
+        return f"<span style='color:{c}'>{v:.2f}×</span>"
+
+    def group_row(label, g, bold=False):
+        b = "font-weight:bold;" if bold else ""
+        return (
+            f"<tr style='{b}'>"
+            f"<td>{label}</td>"
+            f"<td style='text-align:right'>{g['n']}</td>"
+            f"<td style='text-align:right'>{col(g['rec30'])}</td>"
+            f"<td style='text-align:right'>{delta(g['rec30'], base_rec30)}</td>"
+            f"<td style='text-align:right'>{col(g['rec75'])}</td>"
+            f"<td style='text-align:right'>{delta(g['rec75'], base_rec75)}</td>"
+            f"<td style='text-align:right'>{col(g['rec200'])}</td>"
+            f"<td style='text-align:right'>{delta(g['rec200'], base_rec200)}</td>"
+            f"<td style='text-align:right'>{avg_col(g['avg'])}</td>"
+            f"</tr>"
+        )
+
+    base_g = {"n": n_base, "rec30": round(base_rec30,1), "rec75": round(base_rec75,1),
+              "rec200": round(base_rec200,1), "avg": round(base_avg,2)}
+
+    group_rows_html = ""
+    group_rows_html += group_row("Baseline (todos com ticks)", base_g, bold=True)
+    group_rows_html += group_row("Sem nenhuma wallet",         stats_sem)
+    group_rows_html += group_row("Com qualquer wallet",        stats_com)
+    group_rows_html += group_row("Smart money (excl. ruído)",  stats_smart)
+
+    cart_rows_html = ""
+    for cart in sorted(cart_agg, key=lambda c: -(cart_agg[c]["n"])):
+        g    = cart_agg[cart]
+        tag  = " <span style='color:#f85149;font-size:10px'>[ruído]</span>" if cart in NOISE else ""
+        dim  = "color:#6e7681;" if cart in NOISE else ""
+        cart_rows_html += (
+            f"<tr style='{dim}'>"
+            f"<td>{cart}{tag}</td>"
+            f"<td style='text-align:right'>{g['n']}</td>"
+            f"<td style='text-align:right'>{col(g['rec30'])}</td>"
+            f"<td style='text-align:right'>{delta(g['rec30'], base_rec30)}</td>"
+            f"<td style='text-align:right'>{col(g['rec75'])}</td>"
+            f"<td style='text-align:right'>{delta(g['rec75'], base_rec75)}</td>"
+            f"<td style='text-align:right'>{col(g['rec200'])}</td>"
+            f"<td style='text-align:right'>{delta(g['rec200'], base_rec200)}</td>"
+            f"<td style='text-align:right'>{avg_col(g['avg'])}</td>"
+            f"</tr>"
+        )
+
+    ratio_rows_html = ""
+    for label, lo, hi in RATIO_BINS:
+        g = ratio_agg[label]
+        ratio_rows_html += group_row(label, g)
+
+    base_rec30_s  = f"{base_rec30:.1f}%"
+    base_rec75_s  = f"{base_rec75:.1f}%"
+    base_rec200_s = f"{base_rec200:.1f}%"
+    base_avg_s    = f"{base_avg:.2f}×"
+
+    html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+    <title>Wallet Token Outcome</title>
+    <style>
+      body{{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}}
+      h1{{color:#58a6ff}}h2{{color:#79c0ff;margin-top:28px}}
+      table{{border-collapse:collapse;width:100%;max-width:900px;margin-bottom:20px}}
+      th{{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:left}}
+      th:not(:first-child){{text-align:right}}
+      td{{padding:5px 10px;border:1px solid #21262d;white-space:nowrap}}
+      .note{{color:#8b949e;font-size:12px;margin:4px 0 14px}}
+      .box{{background:#161b22;border:1px solid #30363d;padding:12px 16px;
+            border-radius:4px;margin:12px 0;font-size:12px}}
+      a{{color:#58a6ff}}
+    </style></head><body>
+    <h1>Wallet Token Outcome — o token em si</h1>
+    <p class='note'>
+      Pergunta: wallets que compraram durante o dump antecipam tokens que bounceiam de verdade?<br>
+      <b>Métricas centradas no TOKEN</b> (não na nossa entrada). Janela: 60min após ts_signal.<br>
+      Baseline: gain medido a partir de <code>mc_min</code> (fundo detectado), independente do nosso entry.
+    </p>
+
+    <p>
+      <a href='/analise/cruzamento-wallets-ticks'>← WR por grupo</a> &nbsp;|&nbsp;
+      <a href='/analise/wallet-entry-depth'>Wallet Entry Depth</a> &nbsp;|&nbsp;
+      <a href='/analise/sinal-puro'>Sinal Puro</a>
+    </p>
+
+    <div class='box'>
+      <b>Baseline (todos os bounces com ≥{MIN_TICKS} ticks, n={n_base}):</b><br>
+      +30% em 60min: {base_rec30_s} &nbsp;|&nbsp;
+      +75% em 60min: {base_rec75_s} &nbsp;|&nbsp;
+      +200% em 60min: {base_rec200_s} &nbsp;|&nbsp;
+      Avg gain: {base_avg_s}
+    </div>
+
+    <h2>Tabela 1 — Por grupo de wallet</h2>
+    <p class='note'>n = tokens únicos. rec30/75/200 = % que atingiu +30%/+75%/+200% a partir do fundo em 60min.</p>
+    <table>
+      <tr>
+        <th>Grupo</th><th>n</th>
+        <th>rec30%</th><th>Δ</th>
+        <th>rec75%</th><th>Δ</th>
+        <th>rec200%</th><th>Δ</th>
+        <th>avg gain</th>
+      </tr>
+      {group_rows_html}
+    </table>
+
+    <h2>Tabela 2 — Por carteira individual</h2>
+    <p class='note'>Token deduplicado por carteira — cada token conta 1× por carteira.</p>
+    <table>
+      <tr>
+        <th>Carteira</th><th>n</th>
+        <th>rec30%</th><th>Δ</th>
+        <th>rec75%</th><th>Δ</th>
+        <th>rec200%</th><th>Δ</th>
+        <th>avg gain</th>
+      </tr>
+      {cart_rows_html or "<tr><td colspan='9' style='color:#666'>Sem dados</td></tr>"}
+    </table>
+
+    <h2>Tabela 3 — Por faixa de wallet_ratio</h2>
+    <p class='note'>
+      wallet_ratio = onde a wallet comprou / mc_migration. Token deduplicado pelo menor ratio.<br>
+      Separa compradores da capitulação (&lt;0.30) de momentum chasers (&gt;1.00).
+    </p>
+    <table>
+      <tr>
+        <th>Faixa</th><th>n</th>
+        <th>rec30%</th><th>Δ</th>
+        <th>rec75%</th><th>Δ</th>
+        <th>rec200%</th><th>Δ</th>
+        <th>avg gain</th>
+      </tr>
+      {ratio_rows_html}
+    </table>
+
+    <div class='box'>
+      <b>Como interpretar:</b><br>
+      Se "Com qualquer wallet" tem avg gain e rec75 maiores que baseline →
+      wallets têm edge real em selecionar tokens que bounceiam.<br>
+      Se flat → wallet presence é correlação espúria com H10 (tokens que dumpam rápido
+      atraem compradores e também têm melhor recovery).<br><br>
+      A faixa &gt;1.00 no endpoint anterior tinha WR 23.7% — mas isso é reverse causality
+      (token já subindo atrai compradores). Aqui vemos o comportamento real do token a partir do fundo.
+    </div>
+
+    </body></html>"""
+
+    return html
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
