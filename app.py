@@ -34086,6 +34086,26 @@ def _analise_h23_investigation_inner():
     """)
     timing_dist = cur.fetchall()
 
+    # --- Query 6: status real de TODOS os trades para tokens H23 >5 ---
+    cur.execute("""
+        SELECT
+            m.token_nome,
+            t.id,
+            t.status,
+            t.exit_type,
+            ROUND((t.pnl_pct_real * 100)::numeric, 1) AS pnl_pct,
+            t.created_at,
+            t.exit_ts,
+            ROUND(bs.net_sol_flow::numeric, 2) AS net_sol
+        FROM bounce_signals bs
+        LEFT JOIN migrations m ON m.mint = bs.mint
+        JOIN trades t ON t.mint = bs.mint
+        WHERE bs.h23_window = 'bottom'
+          AND bs.net_sol_flow > 5
+        ORDER BY bs.net_sol_flow DESC, t.created_at
+    """)
+    trades_raw = cur.fetchall()
+
     cur.close(); conn.close()
 
     def td(v, cls=""):
@@ -34226,6 +34246,29 @@ def _analise_h23_investigation_inner():
     {rows5}
     </table>"""
 
+    # Table 6 — status real de todos os trades H23 >5
+    rows6 = ""
+    for r in trades_raw:
+        sc = {"tp": "green", "sl": "red", "open": "orange", "pending": "gray",
+              "error": "darkred", "trailing_active": "cyan", "expired": "gray"}.get(r['status'], "white")
+        rows6 += f"""<tr>
+            {td(r['token_nome'] or '—')}
+            {td(r['net_sol'])}
+            {td(r['id'])}
+            {td(f'<span style="color:{sc}">{r["status"]}</span>')}
+            {td(r['exit_type'] or '—')}
+            {td(f"{r['pnl_pct']}%" if r['pnl_pct'] is not None else '—')}
+            {td(r['created_at'].strftime('%d/%m %H:%M') if r['created_at'] else '—')}
+            {td(r['exit_ts'].strftime('%d/%m %H:%M') if r['exit_ts'] else '—')}
+        </tr>"""
+    table6 = f"""
+    <h2>6. Status real de TODOS os trades para tokens H23 &gt;5 SOL</h2>
+    <p>Inclui trades com qualquer status — mostra por que "passou_filtros + sem_trade" aconteceu.</p>
+    <table border=1 cellpadding=4 style="border-collapse:collapse;font-size:13px">
+    <tr><th>Token</th><th>Net SOL</th><th>Trade ID</th><th>Status</th><th>exit_type</th><th>P&amp;L</th><th>Criado</th><th>Exit</th></tr>
+    {rows6}
+    </table>"""
+
     html = f"""<!DOCTYPE html><html><head>
     <title>H23 Investigation</title>
     <meta charset="utf-8">
@@ -34246,6 +34289,7 @@ def _analise_h23_investigation_inner():
     {table3}
     {table4}
     {table5}
+    {table6}
     </body></html>"""
     return html
 
