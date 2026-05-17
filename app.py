@@ -34294,6 +34294,98 @@ def _analise_h23_investigation_inner():
     return html
 
 
+@app.route("/debug/napoleon")
+def debug_napoleon():
+    """Mostra todos os dados brutos do Napoleon: ticks, bounce_signal, trades, kline timeline."""
+    import psycopg2, psycopg2.extras, traceback
+    try:
+        import psycopg2, psycopg2.extras
+        conn = psycopg2.connect(db.DATABASE_URL)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # Encontra o mint do Napoleon
+        cur.execute("SELECT mint, ts_migration, mc_migration, mc_migration_bc_ref FROM migrations WHERE token_nome ILIKE '%napoleon%' ORDER BY ts_migration DESC LIMIT 5")
+        naps = cur.fetchall()
+
+        if not naps:
+            return "<pre>Napoleon não encontrado em migrations</pre>"
+
+        mint = naps[0]['mint']
+
+        # bounce_signal
+        cur.execute("SELECT * FROM bounce_signals WHERE mint = %s", (mint,))
+        bs = cur.fetchone()
+
+        # TODOS os token_ticks em ordem cronológica
+        cur.execute("""
+            SELECT tick_ts, elapsed_sec, mc, mc_open, mc_high, mc_low, source
+            FROM token_ticks WHERE mint = %s ORDER BY tick_ts ASC
+        """, (mint,))
+        ticks = cur.fetchall()
+
+        # TODOS os trades
+        cur.execute("SELECT id, status, exit_type, pnl_pct_real, created_at, exit_ts FROM trades WHERE mint = %s ORDER BY created_at", (mint,))
+        trades = cur.fetchall()
+
+        cur.close(); conn.close()
+
+        def fmt(v, k=1000):
+            if v is None: return "—"
+            return f"${float(v)/k:.1f}k"
+
+        rows_t = ""
+        for t in ticks:
+            mc_low_v = float(t['mc_low']) if t['mc_low'] else None
+            mc_v = float(t['mc']) if t['mc'] else None
+            low_flag = ""
+            if mc_low_v and mc_v and mc_low_v < mc_v * 0.80:
+                low_flag = ' style="background:#3d0000"'  # kline low muito abaixo do close
+            rows_t += f"""<tr{low_flag}>
+                <td>{t['tick_ts'].strftime('%H:%M:%S') if t['tick_ts'] else '—'}</td>
+                <td>{t['elapsed_sec']}s</td>
+                <td>{fmt(t['mc'])}</td>
+                <td>{fmt(t.get('mc_open'))}</td>
+                <td>{fmt(t.get('mc_high'))}</td>
+                <td style="color:{'red' if mc_low_v and mc_low_v < 25000 else 'inherit'}">{fmt(t.get('mc_low'))}</td>
+                <td>{t['source']}</td>
+            </tr>"""
+
+        mig = naps[0]
+        bs_html = f"""
+        <h2>bounce_signals</h2><pre>
+mc_min        = {fmt(bs['mc_min']) if bs else '—'} (o valor suspeito)
+mc_at_signal  = {fmt(bs['mc_at_signal']) if bs else '—'}
+mc_migration  = {fmt(bs['mc_migration']) if bs else '—'}
+bounce_pct    = {round(float(bs['bounce_pct'])*100,1) if bs and bs['bounce_pct'] else '—'}%
+elapsed_sec   = {bs['elapsed_sec'] if bs else '—'}s
+ts_signal     = {bs['ts_signal'] if bs else '—'}
+h23_window    = {bs['h23_window'] if bs else '—'}
+net_sol_flow  = {bs['net_sol_flow'] if bs else '—'} SOL
+        </pre>""" if bs else "<p>Sem bounce_signal</p>"
+
+        trades_html = "<br>".join(
+            f"ID {t['id']} | {t['status']} | {t['exit_type']} | pnl={round(float(t['pnl_pct_real'])*100,1) if t['pnl_pct_real'] else '—'}% | {t['created_at']} → {t['exit_ts']}"
+            for t in trades
+        ) or "Sem trades"
+
+        html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+        <style>body{{font-family:monospace;padding:20px;background:#0d1117;color:#c9d1d9}}
+        h1,h2{{color:#58a6ff}} table{{border-collapse:collapse}} th,td{{border:1px solid #30363d;padding:4px}}
+        th{{background:#161b22}} pre{{color:#8b949e}}</style></head><body>
+        <h1>Debug: Napoleon</h1>
+        <p>mint: {mint}</p>
+        <p>ts_migration: {mig['ts_migration']} | mc_migration: {fmt(mig['mc_migration'])} | bc_ref: {fmt(mig['mc_migration_bc_ref'])}</p>
+        {bs_html}
+        <h2>Trades</h2><pre>{trades_html}</pre>
+        <h2>Token Ticks ({len(ticks)} total) — vermelho = kline low muito abaixo do close</h2>
+        <table><tr><th>time</th><th>elapsed</th><th>mc(close)</th><th>open</th><th>high</th><th>low</th><th>source</th></tr>
+        {rows_t}
+        </table></body></html>"""
+        return html
+    except Exception:
+        return f"<pre>{traceback.format_exc()}</pre>", 500
+
+
 @app.route("/analise/mc-migration-audit")
 def analise_mc_migration_audit():
     """Audita a qualidade do mc_migration: bc_ref vs kline vs real price action."""
