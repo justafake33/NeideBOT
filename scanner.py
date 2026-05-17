@@ -235,6 +235,12 @@ class HotMonitor:
         if mc_min <= 0 or mc_migration <= 0:
             return
 
+        # A.9 — Data source selection by pool maturity:
+        # elapsed < BOUNCE_TIME_MIN_SEC: pool ainda em transição bonding curve → pool novo.
+        #   Usar APENAS Helius (preço real das pool reserves), ignorar kline (pode ter bonding curve).
+        # elapsed >= BOUNCE_TIME_MIN_SEC: pool estável, usar MIN(helius, kline) como antes.
+        # Impacto: sinais cedo (< ~5min) usam dado mais preciso, aumentam confiabilidade.
+
         drop_from_mig = (mc_migration - mc_min) / mc_migration
         if drop_from_mig < self.BOUNCE_DROP_MIN:
             return
@@ -294,6 +300,7 @@ class HotMonitor:
         # Após n≥30 bounces com outcomes (TP/SL), analisar quais métricas brutas
         # discriminam e SÓ ENTÃO construir score baseado em correlações reais.
         absorption_window = {}
+        rise_window = {}  # TODO: H26 — rise_window (janela pós-bounce) será coletado em próxima versão
         if self._helius:
             try:
                 absorption_window = self._helius.get_absorption_window(mint, window_sec=60)
@@ -636,25 +643,28 @@ class HotMonitor:
                     # 1. Atualiza mc_min com o low desta vela ANTES de checar bounce.
                     #    Garante que bounce_pct e A.6 usam o fundo correto desta vela.
                     #
-                    #    Para elapsed_sec < 90 (janela de transição bonding curve → pool):
-                    #    o kline low pode incluir preços da bonding curve pré-migração,
-                    #    que ficam muito abaixo do preço real do pool novo.
-                    #    Fonte correta: mínimo real dos eventos Helius WebSocket nessa janela,
-                    #    que captura pool reserves em tempo real (~5ms de latência).
-                    #    MAS: Helius pode estar atrasado (~200ms de lag no deque).
-                    #    FIX: usar MIN(helius, kline) para ser conservador:
-                    #    - Se Helius está atrasado e retorna valor alto, kline low verdadeiro é menor
-                    #    - Usar o mínimo garante que não usamos fundo fictício
+                    #    A.9 — Data source selection by pool maturity:
+                    #    - elapsed < BOUNCE_TIME_MIN_SEC: pool em transição. Usar APENAS Helius.
+                    #      Kline low pode ser bonding curve pré-migração, muito abaixo do real.
+                    #    - elapsed >= BOUNCE_TIME_MIN_SEC: pool estável. Usar MIN(helius, kline).
+                    #      Helius é preço real (~5ms latência), kline pode ter lag (~200ms).
                     low_price = _float(c.get("low"))
                     mc_low_kline = low_price * state["total_supply"] if (low_price and low_price > 0) else None
+                    mc_low = None
 
-                    if elapsed_sec < 90 and self._helius:
+                    if self._helius:
                         candle_start = state["ts_mig_unix"] + max(0, elapsed_sec - 60)
                         candle_end   = state["ts_mig_unix"] + elapsed_sec
                         mc_low_helius = self._helius.get_min_mc_in_window(mint, candle_start, candle_end)
-                        # Usar o MENOR entre Helius e kline para evitar stale Helius
-                        mc_low = min(v for v in [mc_low_helius, mc_low_kline] if v is not None) if any([mc_low_helius, mc_low_kline]) else None
+
+                        if elapsed_sec < self.BOUNCE_TIME_MIN_SEC:
+                            # A.9: pool em transição — confiar APENAS em Helius
+                            mc_low = mc_low_helius
+                        else:
+                            # A.9: pool maduro — usar MIN(helius, kline)
+                            mc_low = min(v for v in [mc_low_helius, mc_low_kline] if v is not None) if any([mc_low_helius, mc_low_kline]) else None
                     else:
+                        # Sem Helius: usar kline
                         mc_low = mc_low_kline
 
                     if mc_low and mc_low > 0 and mc_low < state["mc_min"]:
