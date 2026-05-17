@@ -673,6 +673,10 @@ class HotMonitor:
                     elapsed_min = elapsed_sec / 60
                     if elapsed_sec < 0 or elapsed_sec > 3660:
                         continue
+                    # Ignora o primeiro candle (cobre transição bonding curve → pool).
+                    # O kline low desse candle inclui preços pré-migração e corrompe mc_min.
+                    if elapsed_sec < 90:
+                        continue
 
                     # 1. Atualiza mc_min com o low desta vela ANTES de checar bounce.
                     #    Garante que bounce_pct e A.6 usam o fundo correto desta vela.
