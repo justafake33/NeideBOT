@@ -30368,6 +30368,206 @@ def _analise_h24_h25_inner(conn, cur):
     </body></html>"""
 
 
+@app.route("/analise/tp-vs-sl")
+def analise_tp_vs_sl():
+    """40 TPs vs 258 SLs — o que os diferencia nos dados reais."""
+    import psycopg2, traceback
+    from db import DATABASE_URL
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor()
+
+        JOIN = """
+            FROM trades t
+            JOIN bounce_signals bs ON bs.mint = t.mint
+                AND bs.ts_signal BETWEEN t.created_at - INTERVAL '5 min' AND t.created_at + INTERVAL '30 min'
+            JOIN migrations m ON m.mint = t.mint
+            WHERE t.exit_type IS NOT NULL AND t.status IN ('tp','sl')
+        """
+
+        sections = []
+
+        def section(title, headers, rows, note=""):
+            ths = "".join(f"<th>{h}</th>" for h in headers)
+            trs = ""
+            for r in rows:
+                tds = "".join(f"<td>{v if v is not None else '—'}</td>" for v in r)
+                trs += f"<tr>{tds}</tr>"
+            n = f"<p class='note'>{note}</p>" if note else ""
+            return f"<h3>{title}</h3><table><tr>{ths}</tr>{trs}</table>{n}"
+
+        # 1. bounce_pct por faixa
+        cur.execute(f"""
+            SELECT
+                CASE
+                    WHEN bs.bounce_pct < 0.70  THEN '55-70%'
+                    WHEN bs.bounce_pct < 1.00  THEN '70-100%'
+                    WHEN bs.bounce_pct < 1.50  THEN '100-150%'
+                    WHEN bs.bounce_pct < 2.50  THEN '150-250%'
+                    ELSE '250%+'
+                END as faixa,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1) as wr
+            {JOIN}
+            GROUP BY 1 ORDER BY MIN(bs.bounce_pct)
+        """)
+        sections.append(section("1. WR por faixa de bounce_pct",
+            ["bounce_pct", "n", "TP", "WR%"], cur.fetchall(),
+            "Maior discriminador conhecido: bounce >70% tinha WR 74% (n=23 histórico)"))
+
+        # 2. elapsed (tempo migração→sinal)
+        cur.execute(f"""
+            SELECT
+                CASE
+                    WHEN bs.elapsed_sec < 300  THEN '0-5min'
+                    WHEN bs.elapsed_sec < 600  THEN '5-10min'
+                    WHEN bs.elapsed_sec < 900  THEN '10-15min'
+                    WHEN bs.elapsed_sec < 1200 THEN '15-20min'
+                    ELSE '>20min'
+                END as faixa,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1) as wr
+            {JOIN}
+            GROUP BY 1 ORDER BY MIN(bs.elapsed_sec)
+        """)
+        sections.append(section("2. WR por tempo migração→sinal (elapsed)",
+            ["elapsed", "n", "TP", "WR%"], cur.fetchall(),
+            "H10: fundo em <25min tem recovery rate maior"))
+
+        # 3. smart wallets
+        cur.execute(f"""
+            SELECT
+                CASE
+                    WHEN m.smart_wallets >= 10 THEN '>=10'
+                    WHEN m.smart_wallets >= 5  THEN '5-9'
+                    WHEN m.smart_wallets >= 3  THEN '3-4'
+                    ELSE '1-2'
+                END as smart,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1) as wr
+            {JOIN}
+            GROUP BY 1 ORDER BY MIN(m.smart_wallets) DESC
+        """)
+        sections.append(section("3. WR por smart_wallets",
+            ["smart_wallets", "n", "TP", "WR%"], cur.fetchall(),
+            "Filtro atual: smart>=3. Live data: smart=3→57% WR (n pequeno)"))
+
+        # 4. drop_from_mig (profundidade do dump)
+        cur.execute(f"""
+            SELECT
+                CASE
+                    WHEN bs.drop_from_mig >= 0.80 THEN '>=80% dump'
+                    WHEN bs.drop_from_mig >= 0.70 THEN '70-80%'
+                    WHEN bs.drop_from_mig >= 0.60 THEN '60-70%'
+                    WHEN bs.drop_from_mig >= 0.50 THEN '50-60%'
+                    ELSE '<50%'
+                END as faixa,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1) as wr
+            {JOIN}
+            GROUP BY 1 ORDER BY MIN(bs.drop_from_mig) DESC
+        """)
+        sections.append(section("4. WR por profundidade do dump (drop_from_mig)",
+            ["dump depth", "n", "TP", "WR%"], cur.fetchall(),
+            "Mediana histórica de dump: 72%. Tokens mais dumpados têm recovery mais real?"))
+
+        # 5. mc_migration (tamanho do token)
+        cur.execute(f"""
+            SELECT
+                CASE
+                    WHEN m.mc_migration >= 150000 THEN '>$150k'
+                    WHEN m.mc_migration >= 100000 THEN '$100-150k'
+                    WHEN m.mc_migration >= 60000  THEN '$60-100k'
+                    WHEN m.mc_migration >= 30000  THEN '$30-60k'
+                    ELSE '<$30k'
+                END as faixa,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1) as wr
+            {JOIN}
+            GROUP BY 1 ORDER BY MIN(m.mc_migration) DESC
+        """)
+        sections.append(section("5. WR por MC de migração",
+            ["mc_migration", "n", "TP", "WR%"], cur.fetchall(),
+            "Tokens maiores têm mais liquidez e holders — bounce mais sustentável?"))
+
+        # 6. renowned_wallets (KOLs)
+        cur.execute(f"""
+            SELECT
+                CASE
+                    WHEN m.renowned_wallets >= 3 THEN '>=3 KOLs'
+                    WHEN m.renowned_wallets >= 1 THEN '1-2 KOLs'
+                    ELSE '0 KOLs'
+                END as kols,
+                COUNT(*) as n,
+                SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END) as tp,
+                ROUND((100.0*SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)/COUNT(*))::numeric,1) as wr
+            {JOIN}
+            GROUP BY 1 ORDER BY MIN(m.renowned_wallets) DESC
+        """)
+        sections.append(section("6. WR por KOL wallets (renowned)",
+            ["KOLs", "n", "TP", "WR%"], cur.fetchall(),
+            "KOLs = influencers com histórico. Presença deles indica interesse real?"))
+
+        # 7. pnl dos TPs
+        cur.execute("""
+            SELECT
+                ROUND((MIN(pnl_pct_real)*100)::numeric,0),
+                ROUND((PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY pnl_pct_real)*100)::numeric,0),
+                ROUND((PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY pnl_pct_real)*100)::numeric,0),
+                ROUND((AVG(pnl_pct_real)*100)::numeric,0),
+                ROUND((MAX(pnl_pct_real)*100)::numeric,0),
+                COUNT(*)
+            FROM trades WHERE exit_type IS NOT NULL AND status='tp'
+        """)
+        sections.append(section("7. Distribuição de P&L nos 40 TPs",
+            ["min%", "p25%", "median%", "avg%", "max%", "n"], cur.fetchall()))
+
+        # 8. os 40 TPs individuais
+        cur.execute(f"""
+            SELECT
+                t.created_at::date,
+                m.token_nome,
+                ROUND((bs.bounce_pct*100)::numeric,0) as bounce,
+                ROUND((bs.drop_from_mig*100)::numeric,0) as dump,
+                bs.elapsed_sec/60 as elapsed_min,
+                m.smart_wallets,
+                m.renowned_wallets,
+                ROUND(m.mc_migration::numeric/1000,1) as mc_mig_k,
+                ROUND((t.pnl_pct_real*100)::numeric,0) as pnl
+            {JOIN}
+            AND t.status='tp'
+            ORDER BY t.pnl_pct_real DESC
+        """)
+        sections.append(section("8. Os 40 TPs — lista completa (maior P&L primeiro)",
+            ["data","token","bounce%","dump%","elapsed min","smart","KOL","mc_mig $k","pnl%"],
+            cur.fetchall()))
+
+        conn.close()
+
+        body = "".join(sections)
+        return f"""<!DOCTYPE html><html><head>
+        <meta charset='utf-8'><title>TP vs SL Analysis</title>
+        <style>
+          body{{font-family:monospace;background:#111;color:#ccc;padding:20px}}
+          h2{{color:#fa0}} h3{{color:#fa0;margin-top:28px}}
+          table{{border-collapse:collapse;margin-bottom:6px;min-width:500px}}
+          th,td{{padding:5px 10px;border:1px solid #333;text-align:right}}
+          th{{background:#222;color:#fa0}} td:first-child{{text-align:left}}
+          .note{{color:#888;font-size:.9em;margin:4px 0 16px}}
+        </style></head><body>
+        <h2>40 TPs vs 258 SLs — o que os diferencia</h2>
+        <p class='note'>Base: trades blockchain-verificados (exit_type IS NOT NULL). WR base: 13.4%</p>
+        {body}
+        </body></html>"""
+    except Exception:
+        return f"<pre style='color:red'>{traceback.format_exc()}</pre>", 500
+
+
 @app.route("/analise/wallet-signal")
 def analise_wallet_signal():
     """
