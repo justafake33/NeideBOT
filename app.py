@@ -34294,5 +34294,211 @@ def _analise_h23_investigation_inner():
     return html
 
 
+@app.route("/analise/mc-migration-audit")
+def analise_mc_migration_audit():
+    """Audita a qualidade do mc_migration: bc_ref vs kline vs real price action."""
+    import psycopg2, psycopg2.extras, traceback
+    try:
+        return _mc_migration_audit_inner()
+    except Exception:
+        import traceback
+        return f"<pre>{traceback.format_exc()}</pre>", 500
+
+def _mc_migration_audit_inner():
+    import psycopg2, psycopg2.extras
+    conn = psycopg2.connect(db.DATABASE_URL)
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    # 1. Para cada token em bounce_signals, compara mc_migration (usado pelo bot)
+    #    vs mc_migration_bc_ref vs mc_migration_observed (da migrations table)
+    cur.execute("""
+        SELECT
+            m.token_nome,
+            m.mint,
+            m.mc_migration_source,
+            ROUND((m.mc_migration / 1000)::numeric, 1)          AS mc_mig_used_k,
+            ROUND((m.mc_migration_bc_ref / 1000)::numeric, 1)   AS mc_bc_ref_k,
+            ROUND((m.mc_migration_observed / 1000)::numeric, 1) AS mc_observed_k,
+            ROUND((bs.mc_min / 1000)::numeric, 1)               AS mc_min_k,
+            ROUND((bs.mc_at_signal / 1000)::numeric, 1)         AS mc_signal_k,
+            ROUND(bs.bounce_pct::numeric * 100, 1)              AS bounce_pct,
+            ROUND(bs.elapsed_sec::numeric / 60, 1)              AS elapsed_min,
+            ROUND(m.time_to_bottom::numeric, 1)                 AS ttb_min,
+            -- drop calculado com mc_migration USADO pelo bot
+            ROUND(((m.mc_migration - bs.mc_min) / NULLIF(m.mc_migration,0) * 100)::numeric, 1) AS drop_vs_used,
+            -- drop SE tivéssemos usado mc_bc_ref
+            ROUND(((m.mc_migration_bc_ref - bs.mc_min) / NULLIF(m.mc_migration_bc_ref,0) * 100)::numeric, 1) AS drop_vs_bcref,
+            -- sinal: bc_ref estava subestimado vs observed?
+            ROUND(((m.mc_migration_observed - m.mc_migration_bc_ref) / NULLIF(m.mc_migration_bc_ref,0) * 100)::numeric, 1) AS observed_vs_bcref_pct,
+            bs.h23_window,
+            t.status AS trade_status,
+            ROUND((t.pnl_pct_real * 100)::numeric, 1) AS pnl_pct
+        FROM bounce_signals bs
+        JOIN migrations m ON m.mint = bs.mint
+        LEFT JOIN LATERAL (
+            SELECT status, pnl_pct_real
+            FROM trades
+            WHERE mint = bs.mint
+              AND exit_type IN ('helius_sell_recovery','helius','helius_recovery')
+              AND status IN ('tp','sl')
+            ORDER BY created_at ASC LIMIT 1
+        ) t ON true
+        WHERE bs.h23_window = 'bottom'
+        ORDER BY bs.ts_signal DESC
+        LIMIT 100
+    """)
+    recent = cur.fetchall()
+
+    # 2. Distribuição: quantos tokens têm mc_migration_observed >> mc_migration_bc_ref?
+    cur.execute("""
+        SELECT
+            CASE
+                WHEN mc_migration_observed > mc_migration_bc_ref * 1.50 THEN 'observed > 1.5× bc_ref (subestimado grave)'
+                WHEN mc_migration_observed > mc_migration_bc_ref * 1.20 THEN 'observed 1.2-1.5× bc_ref (subestimado)'
+                WHEN mc_migration_observed > mc_migration_bc_ref * 0.80 THEN 'observed 0.8-1.2× bc_ref (ok)'
+                WHEN mc_migration_observed IS NULL THEN 'sem mc_observed'
+                ELSE 'observed < 0.8× bc_ref (superestimado)'
+            END AS faixa,
+            COUNT(*) AS n,
+            ROUND(AVG(mc_migration_observed / NULLIF(mc_migration_bc_ref,0))::numeric, 3) AS avg_ratio
+        FROM migrations
+        WHERE ts_migration > NOW() - INTERVAL '30 days'
+        GROUP BY 1
+        ORDER BY n DESC
+    """)
+    dist_migration = cur.fetchall()
+
+    # 3. Para bounce_signals recentes, qual % tem drop_from_mig calculado com bc_ref ERRADO?
+    #    (token que não dumpou de verdade: mc_min > mc_migration_observed)
+    cur.execute("""
+        SELECT
+            COUNT(*) FILTER (WHERE bs.mc_min < m.mc_migration_bc_ref * 0.70) AS real_dump_30pct,
+            COUNT(*) FILTER (WHERE bs.mc_min >= m.mc_migration_bc_ref * 0.70
+                               AND bs.mc_min < m.mc_migration_bc_ref) AS shallow_or_no_dump,
+            COUNT(*) FILTER (WHERE bs.mc_min >= m.mc_migration_bc_ref) AS mc_min_above_bcref,
+            COUNT(*) AS total
+        FROM bounce_signals bs
+        JOIN migrations m ON m.mint = bs.mint
+        WHERE bs.h23_window = 'bottom'
+          AND m.mc_migration_bc_ref IS NOT NULL
+    """)
+    dump_audit = cur.fetchone()
+
+    # 4. Comparar WR entre tokens com drop REAL (>30% vs bc_ref) e tokens sem drop real
+    cur.execute("""
+        SELECT
+            CASE
+                WHEN bs.mc_min < m.mc_migration_bc_ref * 0.70 THEN 'dump real >30% (vs bc_ref)'
+                WHEN bs.mc_min < m.mc_migration_bc_ref * 0.85 THEN 'dump leve 15-30% (vs bc_ref)'
+                ELSE 'sem dump ou mc_min acima de bc_ref'
+            END AS categoria,
+            COUNT(*) AS n_bounces,
+            COUNT(t.status) AS n_trades,
+            COUNT(*) FILTER (WHERE t.status = 'tp') AS n_tp,
+            ROUND(
+                (COUNT(*) FILTER (WHERE t.status = 'tp') * 100.0 / NULLIF(COUNT(t.status),0))::numeric, 1
+            ) AS wr_pct
+        FROM bounce_signals bs
+        JOIN migrations m ON m.mint = bs.mint
+        LEFT JOIN LATERAL (
+            SELECT status
+            FROM trades
+            WHERE mint = bs.mint
+              AND exit_type IN ('helius_sell_recovery','helius','helius_recovery')
+              AND status IN ('tp','sl')
+            ORDER BY created_at ASC LIMIT 1
+        ) t ON true
+        WHERE bs.h23_window = 'bottom'
+          AND m.mc_migration_bc_ref IS NOT NULL
+        GROUP BY 1
+        ORDER BY n_bounces DESC
+    """)
+    wr_by_dump = cur.fetchall()
+
+    cur.close(); conn.close()
+
+    def td(v):
+        return f'<td>{v if v is not None else "—"}</td>'
+
+    # Table 1 — tokens recentes com comparação de MC sources
+    rows1 = ""
+    for r in recent:
+        # Sinaliza quando mc_min está ACIMA do mc_migration_bc_ref (sem dump real)
+        no_real_dump = r['mc_min_k'] and r['mc_bc_ref_k'] and float(r['mc_min_k']) >= float(r['mc_bc_ref_k']) * 0.85
+        bg = ' style="background:#3d0000"' if no_real_dump else ''
+        status_col = f'<span style="color:{"green" if r["trade_status"]=="tp" else "red" if r["trade_status"]=="sl" else "gray"}">{r["trade_status"] or "—"}</span>'
+        rows1 += f"""<tr{bg}>
+            {td(r['token_nome'] or r['mint'][:8])}
+            {td(r['mc_migration_source'] or '—')}
+            {td(f"${r['mc_mig_used_k']}k")}
+            {td(f"${r['mc_bc_ref_k']}k")}
+            {td(f"${r['mc_observed_k']}k" if r['mc_observed_k'] else '—')}
+            {td(f"${r['mc_min_k']}k")}
+            {td(f"{r['drop_vs_used']}%")}
+            {td(f"{r['drop_vs_bcref']}%")}
+            {td(f"{r['bounce_pct']}%")}
+            {td(f"{r['elapsed_min']}min")}
+            {td(f"{r['ttb_min']}min" if r['ttb_min'] else '—')}
+            {td(status_col)}
+            {td(f"{r['pnl_pct']}%" if r['pnl_pct'] is not None else '—')}
+        </tr>"""
+
+    da = dump_audit
+    pct_no_dump = round(float(da['mc_min_above_bcref'] or 0) / max(float(da['total']),1) * 100, 1)
+    pct_shallow = round(float(da['shallow_or_no_dump'] or 0) / max(float(da['total']),1) * 100, 1)
+    pct_real = round(float(da['real_dump_30pct'] or 0) / max(float(da['total']),1) * 100, 1)
+
+    rows2 = "".join(f"<tr>{td(r['faixa'])}{td(r['n'])}{td(r['avg_ratio'])}</tr>" for r in dist_migration)
+    rows3 = ""
+    for r in wr_by_dump:
+        wr_str = str(r['wr_pct']) + "%" if r['wr_pct'] is not None else "—"
+        rows3 += f"<tr>{td(r['categoria'])}{td(r['n_bounces'])}{td(r['n_trades'])}{td(r['n_tp'])}{td(wr_str)}</tr>"
+
+    html = f"""<!DOCTYPE html><html><head>
+    <title>MC Migration Audit</title><meta charset="utf-8">
+    <style>
+        body {{ font-family: monospace; padding: 20px; background: #0d1117; color: #c9d1d9; }}
+        h1 {{ color: #58a6ff; }} h2 {{ color: #f0883e; margin-top: 30px; }}
+        table {{ border-color: #30363d; margin-bottom: 20px; border-collapse: collapse; }}
+        th {{ background: #161b22; color: #8b949e; padding: 4px; }}
+        td {{ background: #0d1117; padding: 4px; }}
+        p {{ color: #8b949e; font-size: 12px; }}
+        .warn {{ color: #ff6b6b; font-weight: bold; }}
+    </style></head><body>
+    <h1>Auditoria: mc_migration — qual % dos bounce signals tem dump REAL?</h1>
+    <p>Problema identificado: mc_migration usa bc_ref (teórico). Se token migrou com MC real > bc_ref, o "drop" calculado é falso.</p>
+
+    <h2>Resumo — bounce_signals com h23_window='bottom' (n={da['total']})</h2>
+    <ul>
+        <li class="warn">mc_min ACIMA de bc_ref (sem dump real): {da['mc_min_above_bcref']} ({pct_no_dump}%)</li>
+        <li style="color:orange">dump leve 15-30%: {da['shallow_or_no_dump']} ({pct_shallow}%)</li>
+        <li style="color:green">dump real >30% vs bc_ref: {da['real_dump_30pct']} ({pct_real}%)</li>
+    </ul>
+
+    <h2>WR por categoria de dump real</h2>
+    <table border=1>
+    <tr><th>Categoria</th><th>n_bounces</th><th>n_trades</th><th>n_tp</th><th>WR</th></tr>
+    {rows3}
+    </table>
+
+    <h2>Distribuição mc_migration_observed vs bc_ref (últimos 30 dias)</h2>
+    <table border=1>
+    <tr><th>Faixa</th><th>n</th><th>avg ratio</th></tr>
+    {rows2}
+    </table>
+
+    <h2>Tokens recentes — comparação de fontes de MC (vermelho = sem dump real)</h2>
+    <p>drop_vs_used = usando mc_migration atual | drop_vs_bcref = usando referência teórica<br>
+    Linha vermelha = mc_min >= 85% do bc_ref = token nunca dumpou de verdade pós-migração</p>
+    <table border=1>
+    <tr><th>Token</th><th>Fonte</th><th>MC usado</th><th>BC ref</th><th>MC observed</th>
+        <th>MC fundo</th><th>Drop (usado)</th><th>Drop (bcref)</th><th>Bounce%</th>
+        <th>Elapsed</th><th>TTB</th><th>Trade</th><th>P&L</th></tr>
+    {rows1}
+    </table>
+    </body></html>"""
+    return html
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
