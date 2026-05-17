@@ -30610,6 +30610,7 @@ def analise_elapsed_granular():
                 AND bs.ts_signal BETWEEN t.created_at - INTERVAL '5 min' AND t.created_at + INTERVAL '30 min'
             JOIN migrations m ON m.mint = t.mint
             WHERE t.exit_type IS NOT NULL AND t.status IN ('tp','sl')
+              AND t.id >= 338
             GROUP BY 1
             ORDER BY 2
         """)
@@ -30624,6 +30625,7 @@ def analise_elapsed_granular():
             JOIN bounce_signals bs ON bs.mint = t.mint
                 AND bs.ts_signal BETWEEN t.created_at - INTERVAL '5 min' AND t.created_at + INTERVAL '30 min'
             WHERE t.exit_type IS NOT NULL AND t.status IN ('tp','sl')
+              AND t.id >= 338
         """)
         total, tps, wr_base = cur.fetchone()
 
@@ -30667,7 +30669,7 @@ def analise_elapsed_granular():
           th{{background:#222;color:#fa0}} td:first-child{{text-align:left}}
           .note{{color:#888;font-size:.9em;margin:4px 0 12px}}
         </style></head><body>
-        <h2>Elapsed Granular — pente fino por minuto</h2>
+        <h2>Elapsed Granular — pente fino por minuto (id ≥ 338)</h2>
         <p class='note'>
           Total blockchain-verificado: <b>{total}</b> trades &nbsp;|&nbsp;
           TPs: <b>{tps}</b> &nbsp;|&nbsp;
