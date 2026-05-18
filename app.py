@@ -34616,9 +34616,10 @@ def debug_pool_depth():
         cur.execute("""
             SELECT
                 t.id, t.mint, t.ts_signal, t.status, t.pnl_pct_real,
-                t.entry_expected, t.entry_mc_real,
-                m.mc_migration, m.liq_migration, m.mc_bottom,
-                bs.mc_at_signal, bs.mc_min
+                t.entry_expected, t.mc_at_signal,
+                t.mc_bottom, t.mc_migration AS t_mc_migration,
+                m.mc_migration, m.liq_migration,
+                bs.mc_min
             FROM trades t
             LEFT JOIN migrations m ON t.mint = m.mint
             LEFT JOIN bounce_signals bs ON t.mint = bs.mint
@@ -34629,19 +34630,17 @@ def debug_pool_depth():
 
     trades = []
     for r in rows:
-        mc_entry = r['entry_mc_real'] or r['entry_expected'] or 0
-        mc_sig   = r['mc_at_signal'] or mc_entry
-        pool_sol = pool_sol_from_mc(mc_sig or mc_entry)
+        mc_sig  = r['mc_at_signal'] or r['entry_expected'] or 0
+        pool_sol = pool_sol_from_mc(mc_sig)
         liq_mig  = r['liq_migration'] or 0
         liq_sol  = liq_mig / SOL_USD if liq_mig else None
         trades.append({
             "id":       r['id'],
             "status":   r['status'] or '',
             "pnl":      r['pnl_pct_real'],
-            "mc_entry": mc_entry,
             "mc_sig":   mc_sig,
             "mc_min":   r['mc_min'] or 0,
-            "mc_mig":   r['mc_migration'] or 0,
+            "mc_mig":   r['mc_migration'] or r['t_mc_migration'] or 0,
             "liq_mig":  liq_mig,
             "liq_sol":  liq_sol,
             "pool_sol": pool_sol,
@@ -34662,21 +34661,27 @@ def debug_pool_depth():
     rows_html = ""
     for t in trades:
         ps = t["pool_sol"]
-        ps_str = f"{ps:.1f} SOL" if ps is not None else "n/a"
-        ls_str = f"{t['liq_sol']:.1f} SOL" if t['liq_sol'] else "—"
+        ps_str  = f"{ps:.1f} SOL" if ps is not None else "n/a"
+        ps_color = "#f85149" if (ps is not None and ps < 10) else "#e6edf3"
+        ls_str  = f"{t['liq_sol']:.1f} SOL" if t['liq_sol'] else "—"
         pnl_str = f"{t['pnl']*100:+.0f}%" if t['pnl'] is not None else "—"
         status_color = "#3fb950" if "tp" in t["status"] else ("#f85149" if "sl" in t["status"] else "#8b949e")
-        warn = " ⚠️" if ps and ps < 10 else ""
-        rows_html += f"""<tr>
-            <td style='color:#8b949e'>#{t['id']}</td>
-            <td style='color:{status_color}'>{t['status']}</td>
-            <td style='color:{status_color}'>{pnl_str}</td>
-            <td>${t['mc_sig']:>9,.0f}</td>
-            <td>${t['mc_mig']:>9,.0f}</td>
-            <td>${t['liq_mig']:>9,.0f}</td>
-            <td style='color:{"#f85149" if ps and ps < 10 else "#e6edf3"}'>{ps_str}{warn}</td>
-            <td style='color:#8b949e'>{ls_str}</td>
-        </tr>"""
+        warn = " ⚠️" if ps is not None and ps < 10 else ""
+        mc_sig_str = f"${t['mc_sig']:>9,.0f}" if t['mc_sig'] else "—"
+        mc_mig_str = f"${t['mc_mig']:>9,.0f}" if t['mc_mig'] else "—"
+        liq_mig_str = f"${t['liq_mig']:>9,.0f}" if t['liq_mig'] else "—"
+        rows_html += (
+            f"<tr>"
+            f"<td style='color:#8b949e'>#{t['id']}</td>"
+            f"<td style='color:{status_color}'>{t['status']}</td>"
+            f"<td style='color:{status_color}'>{pnl_str}</td>"
+            f"<td>{mc_sig_str}</td>"
+            f"<td>{mc_mig_str}</td>"
+            f"<td>{liq_mig_str}</td>"
+            f"<td style='color:{ps_color}'>{ps_str}{warn}</td>"
+            f"<td style='color:#8b949e'>{ls_str}</td>"
+            f"</tr>"
+        )
 
     buckets_html = "".join(
         f"<td style='text-align:center;padding:6px 12px;background:#161b22;border:1px solid #30363d'>"
