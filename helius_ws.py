@@ -467,8 +467,15 @@ class HeliusWS:
                                 "wallet":       event.get("wallet"),       # H24
                                 "pool_quote_sol": event.get("pool_quote_sol", 0),  # A.9
                             })
-                    logger.info("HeliusWS price(anchor) %s: $%.0f MC [%s %.4f SOL]",
-                                mint[:8], event["mc"], event["side"], event["sol"])
+                    pq_check = event.get("pool_quote_sol", 0)
+                    if pq_check > 0 and pq_check < self._MIN_POOL_SOL:
+                        # A.9: rejeita evento de secondary pool (thin pool) — não atualiza mc_min
+                        logger.debug("HeliusWS A.9 skip %s: pool_quote=%.1f SOL < %.1f",
+                                     mint[:8], pq_check, self._MIN_POOL_SOL)
+                        return
+                    logger.info("HeliusWS price(anchor) %s: $%.0f MC [%s %.4f SOL pool=%.1f]",
+                                mint[:8], event["mc"], event["side"], event["sol"],
+                                event.get("pool_quote_sol", 0))
                     self._on_price(mint, event["mc"])
                     return
             except Exception as e:
