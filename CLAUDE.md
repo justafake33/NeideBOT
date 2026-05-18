@@ -748,6 +748,9 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 144. **Bug 3 (CRÍTICO): race condition em `bounce_fired` — double-fire de trades (sessão 9)**. `push_mc` (poll trenches, thread hot-monitor) e `_precise_bottom_tick` (kline, thread hot-precise) chamam `_check_bounce()` concorrentemente. O guard em `state.get("bounce_fired")` na linha 208 não é atômico — duas threads podem passar simultaneamente e disparar dois trades no mesmo token. Fix: check-and-set atômico sob `_lock` antes do ponto-de-não-retorno: `with self._lock: if live.get("bounce_fired"): return; live["bounce_fired"] = True`. O guard na linha 208 permanece como fast-path de otimização.
 145. **Bug 5 (ALTO): `_graduate` processava candle de transição bonding curve → pool (sessão 9)**. O loop kline em `_graduate` verificava apenas `elapsed_min < 0` para skip. Candles com `elapsed_sec` entre 0-89s (transição) tinham preços pré-migração no `low` → `db.update_bottom()` gravava mc_bottom fictício (muito baixo) no banco para todos os tokens que passavam pela graduação de 60min. Dados históricos de mc_bottom foram corrompidos sistematicamente. Fix: `if elapsed_sec < 90: continue` — idêntico ao filtro do `_precise_bottom_tick`.
 146. **Bug 6 (ALTO): `_backfill_slope_ticks` idem (sessão 9)**. O loop kline em `_backfill_slope_ticks` (chamado em thread de backfill no primeiro bounce elegível) também não tinha o filtro `elapsed_sec < 90`. Ticks históricos inseridos por esse caminho tinham mc_low do candle de transição — corrompendo tanto os gráficos de análise quanto o backtester tick-level. Fix: mesmo `if elapsed_sec < 90: continue`. Após as 4 correções, TODOS os três pontos de leitura de kline histórico (precise, graduate, backfill) são consistentes.
+147. **`logsSubscribe(mentions=[mint])` captura secondary pools invisíveis nos gráficos (sessão 10, 2026-05-18)**. A subscrição Helius captura QUALQUER transação que menciona o mint — não apenas swaps na pool primária. Secondary pools (MEV sandwiches, pools criadas por terceiros com liquidez arbitrária) também emitem BuyEvent/SellEvent com o mesmo discriminador Anchor do pAMM primário. Um evento espúrio identificado nos logs: pool com 0.83 SOL produzia preço $8,178 — fisicamente possível via AMM (constante produto baixíssima), mas a pool primária tinha 80.8 SOL. O DexScreener nunca mostra transações em secondary pools → price action não aparece nos gráficos → mc_min fictício disparava bounces em tokens sem dump real.
+148. **A.9 — `MIN_POOL_SOL=10` filtra secondary pools (sessão 10, 2026-05-18)**. Derivado da matemática da bonding curve: pool pAMM inicializa com ~79 SOL × 200M tokens (k = 1.58×10²⁵). Pior caso absoluto (100% dos 1B tokens vendidos de volta): pool retém 15.8 SOL. Com nosso filtro MC ≥ $5k: pool primária mínima = 21.5 SOL. Todos os 356 trades históricos tinham pool estimada ≥ 38.6 SOL. Fake secondary pool = 0.83 SOL — gap de 46×. Implementação: `pool_quote_sol` adicionado ao deque de eventos em `helius_ws.py` (antes só ia para `_pool_quote_last`). `get_min_mc_in_window()` filtra `e.get("pool_quote_sol", 0) >= _MIN_POOL_SOL`. Env var `MIN_POOL_SOL` (default 10). Fórmula de conversão MC → pool SOL: `pool_sol = √(k × price_ratio) / 1e9` onde `price_ratio = (mc / (1e9 × sol_usd)) × 1e3`.
+149. **Fix Helius window bug — `max(0, elapsed-60)` → `max(90, elapsed-60)` (sessão 10)**. Em `_precise_bottom_tick()`, a janela Helius era `[ts_mig + max(0, elapsed-60), ts_mig + elapsed]`. Para o primeiro candle válido (elapsed=90s), isso dava `ts_mig + 30s` como início — ainda dentro da janela de transição bonding curve→pool. Fix: `max(90, elapsed-60)` garante que a janela Helius nunca começa antes de `ts_mig + 90s`. Complementa o filtro `elapsed_sec < 90` do kline — agora ambas as fontes de mc_min têm o mesmo cutoff temporal.
 
 ---
 
@@ -783,12 +786,17 @@ Dados históricos anteriores ao fix do elapsed_sec < 90 são suspeitos — mc_mi
 **Maior discriminador live encontrado: bounce_pct >70% → WR 74% (n=23, +45pp)**
 Próxima mudança de env var após deploy: `BOUNCE_MIN_PCT=0.50` (teste) → `0.70` se confirmado.
 
+**Correções sessão 10 (2026-05-18 — branch `claude/implement-h23-net-sol-flow-ZR5jn`):**
+- ✅ **A.9 — pool depth filter**: `get_min_mc_in_window()` agora filtra eventos Helius com `pool_quote_sol < MIN_POOL_SOL`. `pool_quote_sol` adicionado ao deque de eventos (antes só ia para `_pool_quote_last`).
+- ✅ **Fix Helius window bug**: `candle_start = ts_mig + max(90, elapsed-60)` — janela nunca começa antes de ts_mig+90s.
+
 **Checklist para religar o bot:**
-1. Fazer merge do branch `claude/audit-neidenbot-purchases-8k0Tn` → `main` no Railway
+1. Fazer merge do branch `claude/implement-h23-net-sol-flow-ZR5jn` → `main` no Railway
 2. Aguardar redeploy completo
 3. Verificar logs: ts_migration nos logs deve mostrar o timestamp on-chain (não o momento atual)
-4. Mudar `BOUNCE_MIN_PCT=0.50` no Railway (env var)
-5. Mudar `TRADING_ENABLED=true`
+4. Setar `MIN_POOL_SOL=10` no Railway (ou deixar default — código já usa 10)
+5. Mudar `BOUNCE_MIN_PCT=0.50` no Railway (env var)
+6. Mudar `TRADING_ENABLED=true`
 
 **Regra de ouro para novos filtros:** só implementar com n≥30 trades validados no GMGN. **Nunca usar DB WR como fonte.**
 
