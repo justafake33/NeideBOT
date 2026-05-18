@@ -34592,5 +34592,127 @@ def _mc_migration_audit_inner():
     return html
 
 
+@app.route("/debug/pool-depth")
+def debug_pool_depth():
+    """
+    Mostra pool_quote_sol estimado no momento de cada trade.
+    Derivado via AMM constant product: k = 79 SOL × 200M tokens.
+    Valida o threshold MIN_POOL_SOL=10 contra os dados reais.
+    """
+    import math
+
+    SOL_USD = float(request.args.get("sol_usd", "90"))
+    K_AMM = 79e9 * 200e6 * 1e6  # lamports * raw_tokens (constante do pool)
+
+    def pool_sol_from_mc(mc_usd):
+        if not mc_usd or mc_usd <= 0:
+            return None
+        price_sol   = mc_usd / (1e9 * SOL_USD)
+        price_ratio = price_sol * 1e3
+        pq_sq = K_AMM * price_ratio
+        return math.sqrt(pq_sq) / 1e9 if pq_sq > 0 else None
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                t.id, t.mint, t.ts_signal, t.status, t.pnl_pct_real,
+                t.entry_expected, t.entry_mc_real,
+                m.mc_migration, m.liq_migration, m.mc_bottom,
+                bs.mc_at_signal, bs.mc_min
+            FROM trades t
+            LEFT JOIN migrations m ON t.mint = m.mint
+            LEFT JOIN bounce_signals bs ON t.mint = bs.mint
+            WHERE t.status NOT IN ('pending','error','open')
+            ORDER BY t.ts_signal
+        """)
+        rows = cur.fetchall()
+
+    trades = []
+    for r in rows:
+        mc_entry = r['entry_mc_real'] or r['entry_expected'] or 0
+        mc_sig   = r['mc_at_signal'] or mc_entry
+        pool_sol = pool_sol_from_mc(mc_sig or mc_entry)
+        liq_mig  = r['liq_migration'] or 0
+        liq_sol  = liq_mig / SOL_USD if liq_mig else None
+        trades.append({
+            "id":       r['id'],
+            "status":   r['status'] or '',
+            "pnl":      r['pnl_pct_real'],
+            "mc_entry": mc_entry,
+            "mc_sig":   mc_sig,
+            "mc_min":   r['mc_min'] or 0,
+            "mc_mig":   r['mc_migration'] or 0,
+            "liq_mig":  liq_mig,
+            "liq_sol":  liq_sol,
+            "pool_sol": pool_sol,
+        })
+
+    # Histograma de pool_sol estimado
+    buckets = {"<5": 0, "5-10": 0, "10-20": 0, "20-40": 0, "40-80": 0, "80+": 0}
+    for t in trades:
+        ps = t["pool_sol"]
+        if ps is None: continue
+        if ps < 5:    buckets["<5"] += 1
+        elif ps < 10: buckets["5-10"] += 1
+        elif ps < 20: buckets["10-20"] += 1
+        elif ps < 40: buckets["20-40"] += 1
+        elif ps < 80: buckets["40-80"] += 1
+        else:         buckets["80+"] += 1
+
+    rows_html = ""
+    for t in trades:
+        ps = t["pool_sol"]
+        ps_str = f"{ps:.1f} SOL" if ps is not None else "n/a"
+        ls_str = f"{t['liq_sol']:.1f} SOL" if t['liq_sol'] else "—"
+        pnl_str = f"{t['pnl']*100:+.0f}%" if t['pnl'] is not None else "—"
+        status_color = "#3fb950" if "tp" in t["status"] else ("#f85149" if "sl" in t["status"] else "#8b949e")
+        warn = " ⚠️" if ps and ps < 10 else ""
+        rows_html += f"""<tr>
+            <td style='color:#8b949e'>#{t['id']}</td>
+            <td style='color:{status_color}'>{t['status']}</td>
+            <td style='color:{status_color}'>{pnl_str}</td>
+            <td>${t['mc_sig']:>9,.0f}</td>
+            <td>${t['mc_mig']:>9,.0f}</td>
+            <td>${t['liq_mig']:>9,.0f}</td>
+            <td style='color:{"#f85149" if ps and ps < 10 else "#e6edf3"}'>{ps_str}{warn}</td>
+            <td style='color:#8b949e'>{ls_str}</td>
+        </tr>"""
+
+    buckets_html = "".join(
+        f"<td style='text-align:center;padding:6px 12px;background:#161b22;border:1px solid #30363d'>"
+        f"<b style='color:#58a6ff'>{v}</b><br><small>{k} SOL</small></td>"
+        for k, v in buckets.items()
+    )
+
+    html = f"""<!DOCTYPE html><html><head><title>Pool Depth por Trade</title>
+<style>body{{background:#0d1117;color:#e6edf3;font-family:monospace;padding:20px}}
+table{{border-collapse:collapse;width:100%}}
+th,td{{border:1px solid #30363d;padding:5px 10px;text-align:right;white-space:nowrap}}
+th{{background:#161b22;color:#58a6ff;text-align:center}}</style></head><body>
+<h2 style='color:#58a6ff'>Pool Depth Estimado por Trade</h2>
+<p style='color:#8b949e'>SOL/USD usado: <b style='color:#e6edf3'>${SOL_USD:.0f}</b>
+&nbsp;|&nbsp; k = 79 SOL × 200M tokens &nbsp;|&nbsp; MIN_POOL_SOL threshold = <b style='color:#f0883e'>10 SOL</b>
+&nbsp;|&nbsp; <a href='?sol_usd=90' style='color:#58a6ff'>SOL=$90</a>
+&nbsp; <a href='?sol_usd=150' style='color:#58a6ff'>SOL=$150</a>
+&nbsp; <a href='?sol_usd=170' style='color:#58a6ff'>SOL=$170</a></p>
+
+<h3 style='color:#e6edf3'>Distribuição de pool_sol estimado no sinal (todos os {len(trades)} trades)</h3>
+<table style='width:auto;margin-bottom:20px'><tr>{buckets_html}</tr></table>
+<p style='color:#8b949e;font-size:12px'>⚠️ = abaixo do threshold MIN_POOL_SOL=10 (secondary pool rejeitado pelo A.9)</p>
+
+<h3 style='color:#e6edf3'>Detalhe por trade</h3>
+<table>
+<tr><th>#</th><th>Status</th><th>PnL</th><th>MC@sinal</th><th>MC@migração</th>
+    <th>Liq@migração</th><th>Pool SOL est.</th><th>Liq SOL@mig</th></tr>
+{rows_html}
+</table>
+<p style='color:#8b949e;font-size:11px;margin-top:16px'>
+Pool SOL estimado = √(k × price_ratio) / 1e9, onde price_ratio = (MC / (1B × SOL_USD)) × 1000.<br>
+Liq@migração = liq_migration do GMGN trenches no momento da migração (não no sinal).
+</p>
+</body></html>"""
+    return html
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
