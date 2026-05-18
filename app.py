@@ -6416,8 +6416,8 @@ def debug_open_trades():
                 diag.append('<span class="warn">⚠ fill não registrado (entry_price_usd=NULL)</span>')
             if not entry_mc_real and entry_expected:
                 diag.append('<span class="warn">⚠ usando entry_expected como ref SL (fill ausente)</span>')
-            if entry_mc_real and entry_expected and entry_mc_real > entry_expected * 1.3:
-                diag.append(f'<span class="warn">⚠ entrada real {entry_mc_real/entry_expected:.1f}× acima do esperado (slippage alto)</span>')
+            if entry_mc_real and entry_expected and entry_mc_real > entry_expected * 1.10:
+                diag.append(f'<span class="warn">⚠ slippage alto: entrada real {entry_mc_real/entry_expected:.1f}× acima do sinal ({(entry_mc_real/entry_expected-1)*100:.0f}%)</span>')
             if sl_mc and min_low and sl_hit_in_ticks:
                 diag.append('<span class="green">✓ SL atingido em ticks — TradeMonitor deveria ter detectado</span>')
             elif sl_mc and min_low and not sl_hit_in_ticks:
