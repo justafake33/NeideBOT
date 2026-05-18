@@ -112,11 +112,7 @@ class TradeExecutor:
             return
 
         amount_sol   = CALIBRATION_AMOUNT / sol_usd
-        # entry_expected = MC real no sinal (onde o bot vai comprar).
-        # NÃO é mc_bottom × 1.15 — isso estava sempre abaixo da entrada real
-        # porque o bounce mínimo configurado é 30%+ (BOUNCE_MIN_PCT).
-        # mc_at_signal é o preço quando todos os filtros passaram e o swap é enviado.
-        entry_target = mc_at_signal if mc_at_signal > 0 else mc_bottom * (1 + bounce_pct)
+        entry_target = mc_bottom * 1.15  # referência para persistência
 
         try:
             trade_id = db.insert_trade({
@@ -364,7 +360,7 @@ class TradeMonitor:
     """
     Roda em background e detecta quando TP ou SL foi atingido para trades 'open'.
     Usa token_ticks (mc_high/mc_low em USD) coletados pelo HotMonitor/scanner.
-    Compara contra entry_mc_real (fill on-chain via Helius) ou mc_at_signal com os thresholds tp_pct/sl_pct.
+    Compara contra entry_expected (mc_bottom * 1.15) com os thresholds tp_pct/sl_pct.
     """
 
     def __init__(self):
@@ -677,11 +673,15 @@ class TradeMonitor:
                 db.update_trade(trade_id, {"status": "expired", "exit_type": "expired", "exit_ts": now})
                 return
 
-        # Referência para SL/TP: entry_mc_real (fill on-chain) > mc_at_signal (sinal) > entry_expected.
-        # entry_expected agora = mc_at_signal (corrigido) — não mais mc_bottom × 1.15.
-        mc_at_signal     = trade.get("mc_at_signal") or entry_mc
-        sl_ref           = entry_mc_real or mc_at_signal
-        sl_mc            = sl_ref * (1 - sl_pct)
+        # SL usa entry_mc real se disponível; fallback para entry_expected.
+        # tp_mc: usa entry_mc_real se disponível.
+        # Fallback: mc_at_signal (MC no momento do sinal = aproximação da entrada real).
+        # entry_expected (mc_bottom × 1.15) está SEMPRE abaixo da entrada real —
+        # para bounce 88%, entry_expected×1.75 = ×2.01 mas o bot comprou em ×1.88.
+        # tp_mc ficaria abaixo do preço de entrada → marca trailing_active imediato no 1º tick.
+        sl_ref  = entry_mc_real or entry_mc
+        sl_mc   = sl_ref * (1 - sl_pct)
+        mc_at_signal     = trade.get("mc_at_signal") or entry_mc  # melhor proxy que entry_expected
         tp_mc            = entry_mc_real * (1 + tp_pct) if entry_mc_real else mc_at_signal * (1 + tp_pct)
         tp_from_expected = entry_mc_real is None  # flag: tp_mc baseado em proxy (não fill real)
 
