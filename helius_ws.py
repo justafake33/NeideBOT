@@ -450,25 +450,31 @@ class HeliusWS:
             try:
                 event = _parse_swap_event_from_logs(logs, supply, _sol_usd_cached)
                 if event and event["mc"] > 0:
-                    # H22/H24/H25: acumula na rolling window (só pump AMM tem side/sol/wallet)
+                    # A.9: filtro de thin pool ANTES de qualquer append — impede contaminação
+                    # de _swap_events (H22/H23) e _pool_quote_last (H25) com eventos de
+                    # secondary pools. pq_check == 0 também é rejeitado (parse incompleto).
+                    pq_check = event.get("pool_quote_sol", 0)
+                    if pq_check < self._MIN_POOL_SOL:
+                        logger.debug("HeliusWS A.9 skip %s: pool_quote=%.1f SOL < %.1f",
+                                     mint[:8], pq_check, self._MIN_POOL_SOL)
+                        return
+
+                    # H22/H24/H25: acumula na rolling window — garantido pool primária (≥ _MIN_POOL_SOL)
                     if event["side"] != "unknown":
                         with self._lock:
                             buf = self._swap_events.get(mint)
-                            # H25: pool_quote mais recente
-                            pq = event.get("pool_quote_sol", 0)
-                            if pq > 0:
-                                self._pool_quote_last[mint] = pq
+                            self._pool_quote_last[mint] = pq_check  # H25: sempre da pool primária
                         if buf is not None:
                             buf.append({
-                                "ts":           time.time(),
-                                "side":         event["side"],
-                                "sol":          event["sol"],
-                                "mc":           event["mc"],
-                                "wallet":       event.get("wallet"),       # H24
-                                "pool_quote_sol": event.get("pool_quote_sol", 0),  # A.9
+                                "ts":             time.time(),
+                                "side":           event["side"],
+                                "sol":            event["sol"],
+                                "mc":             event["mc"],
+                                "wallet":         event.get("wallet"),
+                                "pool_quote_sol": pq_check,
                             })
-                    logger.info("HeliusWS price(anchor) %s: $%.0f MC [%s %.4f SOL]",
-                                mint[:8], event["mc"], event["side"], event["sol"])
+                    logger.info("HeliusWS price(anchor) %s: $%.0f MC [%s %.4f SOL pool=%.1f]",
+                                mint[:8], event["mc"], event["side"], event["sol"], pq_check)
                     self._on_price(mint, event["mc"])
                     return
             except Exception as e:
