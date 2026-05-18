@@ -737,12 +737,27 @@ class HotMonitor:
                     #      Kline low pode ser bonding curve pré-migração, muito abaixo do real.
                     #    - elapsed >= BOUNCE_TIME_MIN_SEC: pool estável. Usar MIN(helius, kline).
                     #      Helius é preço real (~5ms latência), kline pode ter lag (~200ms).
-                    low_price = _float(c.get("low"))
-                    mc_low_kline = low_price * state["total_supply"] if (low_price and low_price > 0) else None
+                    low_price   = _float(c.get("low"))
+                    close_price = _float(c.get("close"))
+                    mc_low_kline   = low_price   * state["total_supply"] if (low_price   and low_price   > 0) else None
+                    mc_close_candle = close_price * state["total_supply"] if (close_price and close_price > 0) else None
                     mc_low = None
 
+                    # Wick guard: em pools finos, um único whale sell empurra o AMM price
+                    # momentaneamente para 1/200x do normal e o kline registra isso como 'low'.
+                    # Mesmo problema que levou a usar close em vez de high para mc_max.
+                    # Se low < close × 0.50 → wick intra-candle, descarta o low.
+                    if mc_low_kline and mc_close_candle and mc_low_kline < mc_close_candle * 0.50:
+                        logger.debug("Wick ignorado %s: kline_low=$%.0f < close×0.50=$%.0f",
+                                     state.get("symbol", mint[:8]), mc_low_kline, mc_close_candle * 0.50)
+                        mc_low_kline = None
+
                     if self._helius:
-                        candle_start = state["ts_mig_unix"] + max(0, elapsed_sec - 60)
+                        # A.9: janela Helius nunca começa antes de ts_mig+90s (fim da transição
+                        # bonding curve → pool). Para o primeiro candle válido (elapsed=90),
+                        # max(0,...) daria ts_mig+30 — ainda na janela de inicialização do pool
+                        # onde os preços NÃO correspondem a trades reais visíveis nos gráficos.
+                        candle_start = state["ts_mig_unix"] + max(90, elapsed_sec - 60)
                         candle_end   = state["ts_mig_unix"] + elapsed_sec
                         mc_low_helius = self._helius.get_min_mc_in_window(mint, candle_start, candle_end)
 
