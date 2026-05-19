@@ -747,7 +747,7 @@ class HotMonitor:
                     mc_low = None
 
                     if self._helius:
-                        candle_start = state["ts_mig_unix"] + max(0, elapsed_sec - 60)
+                        candle_start = state["ts_mig_unix"] + max(90, elapsed_sec - 60)
                         candle_end   = state["ts_mig_unix"] + elapsed_sec
                         mc_low_helius = self._helius.get_min_mc_in_window(mint, candle_start, candle_end)
 
