@@ -512,6 +512,14 @@ class TradeMonitor:
             except Exception as e:
                 logger.debug("TradeMonitor absorption #%s: %s", trade.get("id"), e)
         for trade in db.get_trailing_active_trades():
+            # Tenta recuperar fill se ainda NULL (trailing_active pode chegar aqui sem fill)
+            if not trade.get("entry_price_usd") and trade.get("order_id"):
+                try:
+                    recovered = self._recover_fill(trade, sol_usd)
+                    if recovered:
+                        trade = db.get_trade_by_id(trade["id"]) or trade
+                except Exception as e:
+                    logger.debug("TradeMonitor recover_fill trailing #%s: %s", trade.get("id"), e)
             try:
                 self._check_trailing_exit(trade, sol_usd, now)
             except Exception as e:
