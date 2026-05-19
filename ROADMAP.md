@@ -1,7 +1,7 @@
 # NeideBOT — Roadmap
 
-**Atualizado:** 2026-05-18 (sessão 10)
-**Estado:** Bot PAUSADO · correções de dados de entrada deployadas · A.9 (pool depth filter) implementado · investigando fonte de mc_min fictícios via Helius secondary pools · branch ativo: `claude/implement-h23-net-sol-flow-ZR5jn`
+**Atualizado:** 2026-05-19 (sessão 11)
+**Estado:** Bot PAUSADO · correções k-gate + BOUNCE_MAX_PCT prontas para merge · branch ativo: `claude/audit-neidenbot-purchases-8k0Tn`
 
 ---
 
@@ -66,6 +66,11 @@
 | **A.9 — Filtro de pool depth Helius (MIN_POOL_SOL=10)** | 2026-05-18 | `logsSubscribe(mentions=[mint])` captura QUALQUER tx que mencione o mint — incluindo secondary pools invisíveis nos gráficos. Evento espúrio identificado: pool com 0.83 SOL produzia preço $8,178 que nunca apareceu no DexScreener. Causa: pool do pAMM secundário (MEV, thin pool) com AMM math válido mas completamente separado da pool primária. Fix: armazenar `pool_quote_sol` por evento no deque + filtrar `get_min_mc_in_window()` por `pool_quote_sol >= MIN_POOL_SOL`. Threshold derivado da bonding curve: k = 79 SOL × 200M tokens → pior caso absoluto (100% tokens vendidos) = 15.8 SOL. Com nosso filtro MC ≥ $5k: mínimo da pool primária = 21.5 SOL. Todos os 356 trades históricos tinham pool estimada ≥ 38.6 SOL. MIN_POOL_SOL=10 rejeita secondary pools (0.83 SOL, gap 46×) com margem segura abaixo do mínimo real. |
 | **Fix Helius window bug (A.9 segunda parte)** | 2026-05-18 | `_precise_bottom_tick()` buscava janela Helius com `candle_start = ts_mig + max(0, elapsed-60)`. Para o primeiro candle válido (elapsed=90s), isso dava `ts_mig+30` — ainda dentro da janela de transição bonding curve→pool onde preços não correspondem a trades reais. Fix: `max(90, elapsed-60)` garante que a janela Helius nunca começa antes de ts_mig+90s. |
 | **`/debug/pool-depth`** | 2026-05-18 | Endpoint que mostra pool_quote_sol estimado via AMM math para cada trade histórico. Valida o threshold MIN_POOL_SOL. Histograma: 0 trades <10 SOL, 9 trades em 20-40 SOL, 346 em 40-80 SOL, 1 em 80+ SOL — confirma que o threshold de 10 SOL é extremamente conservador e seguro. |
+| **k-gate INIT SKIP → rejeita + DROP REJECT → limpa e rejeita** | 2026-05-19 | Duas correções no k-gate em `helius_ws.py`. Antes: INIT SKIP passava o evento (sem k_established), DROP REJECT fazia reset para k_raw e passava. Resultado: eventos de secondary pool chegavam como dados válidos. Fix: INIT SKIP → `return`; DROP REJECT → `pop(mint)` + `return`. Commit `9c25f6b`. |
+| **`_K_INIT_TOLERANCE = 0.80` — causa raiz do mc_bottom tardio** | 2026-05-19 | Tolerância anterior (0.60) definia `k_init_min = 2.51e25`. Pools com ~100 trades de fee acumulados têm k ≈ 1.767e25 — abaixo do mínimo. TODOS os eventos Helius desses mints eram INIT SKIP'd → bot cego → mc_min vinha de kline/trenches com lag de 2-4min. Para tokens com fundo em t=2min, sinal disparava em t=4:40 com bounce já +208%. Fix: tolerância 0.80 → `k_init_min = 1.253e25` — cobre até ~130 trades de fee. Secondary pools (0.83 SOL, k≈1.19e25) continuam bloqueadas. Commit `28ba86b`. **Hardcoded — zero env var necessária.** |
+| **`BOUNCE_MAX_PCT` guard bug corrigido** | 2026-05-19 | Guard `< 1.0` desativava o filtro para qualquer threshold ≥ 100% (ex: `1.50 < 1.0 = False`). Setar `BOUNCE_MAX_PCT=1.50` no Railway **não tinha efeito**. Fix: `< 9.99`. Agora `BOUNCE_MAX_PCT=1.50` bloqueia bounces tardios >150%. Commit `9bbdaf2`. **Env var necessária: `BOUNCE_MAX_PCT=1.50`.** |
+| **trailing_active fill recovery** | 2026-05-19 | `_recover_fill` só era chamado para trades `open`. Trades que transicionavam para `trailing_active` sem `entry_price_usd` nunca tinham fill recuperado. Fix: loop `get_trailing_active_trades()` agora tenta `_recover_fill` antes de `_check_trailing_exit`. Commit `aced744`. |
+| **Diagnóstico ZUCC — case study de entrada tardia** | 2026-05-19 | Real bottom: $13K em t=2min após migração. Sinal disparou em t=4:40 com entrada a $40K (bounce 208%). Causa: k=1.767e25 < k_init_min=2.51e25 → INIT SKIP → Helius cego → kline 1-2min candle fechou, GMGN indexou, bot processou → $13K capturado correto mas com 2-3min de lag. Preço já estava a $40K. BOUNCE_MAX_PCT desativado (guard bug) → sinal disparou. Com fixes deployados: Helius teria visto fundo em tempo real, sinal teria disparado a ~$17K (30% bounce de $13K). |
 
 > ⚠️ **WR REAL CORRIGIDO (2026-05-14 sessão 5):** banco tinha dados fictícios — TradeMonitor inferia saídas de MC snapshots, não da blockchain. Auditoria via Helius revelou WR real de **10.1%** (14 TP / 125 SL / 139 trades). WR anterior de 32% era inflado por falsos TPs. `/debug/sell-recovery` executado: 139 correções persistidas.
 > ⚠️ **DADOS HISTÓRICOS SUSPEITOS (sessão 9):** mc_min de todos os tokens antes do fix (elapsed_sec < 90) pode estar corrompido pelo candle de transição. Análises de WR baseadas em `mc_min` histórico (bounce_pct, entry_ratio, drop_from_mig) devem ser tratadas com cautela. Novos trades pós-deploy serão os primeiros com dados de entrada confiáveis.
@@ -74,18 +79,28 @@
 
 ## 🔜 Curto Prazo
 
-### 0. DEPLOY DAS CORREÇÕES ← FAZER AGORA (sessão 9)
+### 0. DEPLOY DAS CORREÇÕES ← FAZER AGORA (sessão 11)
 
 **Branch com as correções:** `claude/audit-neidenbot-purchases-8k0Tn`
-Fazer merge para `main` no Railway para que o bot use os fixes.
+Fazer merge para `main` no Railway.
 
-**Verificação pós-deploy:** nos logs do Railway, `ts_migration` deve mostrar o timestamp on-chain da migração (ex: "2026-05-17 14:32:05 UTC"), não o momento de detecção. Se `capture_delay_sec` aparece nos logs, o fix está ativo.
+**Env vars a setar no Railway após deploy:**
+```
+BOUNCE_MAX_PCT=1.50     ← OBRIGATÓRIO (guard bug corrigido, filtro agora funciona)
+TRADING_ENABLED=true    ← RELIGAR o bot
+```
+
+**Env vars que NÃO precisam ser setadas** (já são defaults seguros):
+- `K_INIT_TOLERANCE`: hardcoded em 0.80 no código — zero ação
+- `MIN_POOL_SOL`: default 10 no código — zero ação
+
+**Verificação pós-deploy:** nos logs, confirmar que Helius eventos chegam para tokens que antes eram INIT SKIP'd. Se `bounce_pct` nos sinais está na faixa 30-150% (e não 150-300%+), o filtro BOUNCE_MAX_PCT está funcionando.
 
 ---
 
-### 0b. BOUNCE_MIN_PCT → 0.50 ← SEGUNDA AÇÃO (env var, zero código)
+### 0b. BOUNCE_MIN_PCT → 0.50 ← OPCIONAL após n≥10 trades limpos
 
-**Por quê:** bounce_pct >70% tem WR 74% (n=23, +45pp). Gradiente claro nos dados live — mesmo que esses dados sejam parcialmente corrompidos por mc_min errado, o gradiente é forte o suficiente para valer.
+**Por quê:** bounce_pct >70% tem WR 74% (n=23, +45pp). Mas esses dados são com mc_min corrompido. Aguardar n≥10 trades pós-fix para confirmar o gradiente persiste com dados limpos.
 
 ---
 

@@ -751,10 +751,13 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 147. **`logsSubscribe(mentions=[mint])` captura secondary pools invisíveis nos gráficos (sessão 10, 2026-05-18)**. A subscrição Helius captura QUALQUER transação que menciona o mint — não apenas swaps na pool primária. Secondary pools (MEV sandwiches, pools criadas por terceiros com liquidez arbitrária) também emitem BuyEvent/SellEvent com o mesmo discriminador Anchor do pAMM primário. Um evento espúrio identificado nos logs: pool com 0.83 SOL produzia preço $8,178 — fisicamente possível via AMM (constante produto baixíssima), mas a pool primária tinha 80.8 SOL. O DexScreener nunca mostra transações em secondary pools → price action não aparece nos gráficos → mc_min fictício disparava bounces em tokens sem dump real.
 148. **A.9 — `MIN_POOL_SOL=10` filtra secondary pools (sessão 10, 2026-05-18)**. Derivado da matemática da bonding curve: pool pAMM inicializa com ~79 SOL × 200M tokens (k = 1.58×10²⁵). Pior caso absoluto (100% dos 1B tokens vendidos de volta): pool retém 15.8 SOL. Com nosso filtro MC ≥ $5k: pool primária mínima = 21.5 SOL. Todos os 356 trades históricos tinham pool estimada ≥ 38.6 SOL. Fake secondary pool = 0.83 SOL — gap de 46×. Implementação: `pool_quote_sol` adicionado ao deque de eventos em `helius_ws.py` (antes só ia para `_pool_quote_last`). `get_min_mc_in_window()` filtra `e.get("pool_quote_sol", 0) >= _MIN_POOL_SOL`. Env var `MIN_POOL_SOL` (default 10). Fórmula de conversão MC → pool SOL: `pool_sol = √(k × price_ratio) / 1e9` onde `price_ratio = (mc / (1e9 × sol_usd)) × 1e3`.
 149. **Fix Helius window bug — `max(0, elapsed-60)` → `max(90, elapsed-60)` (sessão 10)**. Em `_precise_bottom_tick()`, a janela Helius era `[ts_mig + max(0, elapsed-60), ts_mig + elapsed]`. Para o primeiro candle válido (elapsed=90s), isso dava `ts_mig + 30s` como início — ainda dentro da janela de transição bonding curve→pool. Fix: `max(90, elapsed-60)` garante que a janela Helius nunca começa antes de `ts_mig + 90s`. Complementa o filtro `elapsed_sec < 90` do kline — agora ambas as fontes de mc_min têm o mesmo cutoff temporal.
+150. **`_K_INIT_TOLERANCE = 0.80` — causa raiz do mc_bottom tardio (sessão 11, 2026-05-19)**. Tolerância anterior de 0.60 definia `k_init_min = 6.265e25 × 0.40 = 2.51e25`. Após ~100 trades de fee (1.25%/trade cada), k da pool decai para `6.265e25 × (0.9875)^100 ≈ 1.767e25` — abaixo do mínimo. Todos os eventos Helius do mint eram INIT SKIP'd → bot cego em tempo real → mc_min vinha do kline (1-2 min lag) ou trenches (2-4 min lag). Para tokens que fazem fundo em t=2min e bounce imediato (ZUCC, TIMMY, MK4), o sinal disparava 4-5 minutos depois — com o token já +200-600% acima do fundo. O bot capturava o fundo correto via kline (ex: ZUCC $13K), mas apenas quando a janela de 1min fechava e GMGN indexava. Fix: `_K_INIT_TOLERANCE = 0.80` → `k_init_min = 1.253e25` → cobre dumps de até ~130 trades de fee acumulados. **Hardcoded no commit `28ba86b`, sem env var.** Secondary pools (0.83 SOL, k≈1.19e25) continuam bloqueadas abaixo do novo mínimo com margem segura.
+151. **`BOUNCE_MAX_PCT` guard bug — `< 1.0` deveria ser `< 9.99` (sessão 11, 2026-05-19)**. O guard `if self.BOUNCE_MAX_PCT < 1.0 and bounce_pct > self.BOUNCE_MAX_PCT` desativava o filtro para qualquer threshold ≥ 100% porque `1.50 < 1.0 = False`. Setar `BOUNCE_MAX_PCT=1.50` no Railway **não tinha efeito nenhum** com o código antigo. Fix: guard mudado para `< 9.99` (o default é 9.99 = desativado). Agora `BOUNCE_MAX_PCT=1.50` bloqueia sinais onde bounce > 150% — compras tardias como ZUCC (208%) são rejeitadas. Commited em `9bbdaf2`.
+152. **Causa raiz estrutural do problema de entrada: Helius cego + BOUNCE_MAX_PCT desativado (sessão 11)**. O bot consistentemente capturava tokens corredores (tokens que sobem 300-600%) mas entrava na posição errada porque: (1) sem Helius real-time, mc_min vinha do kline/trenches com lag de 2-4 minutos; (2) sinal disparava quando o bounce já estava 150-300% completo; (3) BOUNCE_MAX_PCT estava quebrado e não bloqueava. Efeito: comprar o topo de tokens que depois caem ao SL. Com os dois fixes (28ba86b + 9bbdaf2) e `BOUNCE_MAX_PCT=1.50` no Railway: (a) Helius acompanha em tempo real desde t=0; (b) sinal dispara no real início do bounce (30% do fundo); (c) bounces tardios >150% são rejeitados como safety net. **Env var necessária no Railway: apenas `BOUNCE_MAX_PCT=1.50`. K_INIT_TOLERANCE=0.80 já está hardcoded no código.**
 
 ---
 
-## 🔄 Estado Atual: BOT PAUSADO — aguardando deploy das correções (sessão 9, 2026-05-17)
+## 🔄 Estado Atual: BOT PAUSADO — aguardando deploy das correções (sessão 11, 2026-05-19)
 
 ### Pipeline (após deploy das correções — branch `claude/audit-neidenbot-purchases-8k0Tn`)
 `TRADING_ENABLED=false` ← BOT PAUSADO para deploy seguro.
@@ -764,39 +767,40 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 
 **Portfolio:** ~$50 restantes de 1 SOL original (~$170). 70% perdido em trades com dados de entrada corrompidos (mc_min fictício do candle de transição).
 
-**Correções deployadas (sessão 9 — commit `aab93e9`):**
-- ✅ **Bug 1 (CRÍTICO)**: `ts_migration` agora usa `complete_timestamp` on-chain — elapsed_sec correto para todos os tokens
-- ✅ **Bug 3 (CRÍTICO)**: `bounce_fired` check-and-set atômico sob `_lock` — zero double-fire de trades
-- ✅ **Bug 5 (ALTO)**: `_graduate` agora ignora candle de transição (elapsed_sec < 90)
-- ✅ **Bug 6 (ALTO)**: `_backfill_slope_ticks` idem
-- ✅ **Fix anterior (sessão 9)**: `_precise_bottom_tick` ignora elapsed_sec < 90 — causa raiz do mc_min fictício
+**Correções pendentes de merge (branch `claude/audit-neidenbot-purchases-8k0Tn`):**
+- ✅ **Bug 1 (CRÍTICO)**: `ts_migration` agora usa `complete_timestamp` on-chain (sessão 9)
+- ✅ **Bug 3 (CRÍTICO)**: `bounce_fired` check-and-set atômico sob `_lock` (sessão 9)
+- ✅ **Bug 5 (ALTO)**: `_graduate` ignora candle de transição (sessão 9)
+- ✅ **Bug 6 (ALTO)**: `_backfill_slope_ticks` idem (sessão 9)
+- ✅ **A.9 pool depth filter**: `pool_quote_sol >= MIN_POOL_SOL` (sessão 10)
+- ✅ **Fix Helius window bug**: janela nunca começa antes de ts_mig+90s (sessão 10)
+- ✅ **k-gate INIT SKIP → rejeita**: eventos fora do range não passam mais (sessão 11, `9c25f6b`)
+- ✅ **k-gate DROP REJECT → limpa e rejeita**: `pop(mint)` + `return` (sessão 11, `9c25f6b`)
+- ✅ **`_K_INIT_TOLERANCE = 0.80`**: cobre pools com k degradado por ~130 trades de fee (sessão 11, `28ba86b`)
+- ✅ **`BOUNCE_MAX_PCT` guard fix**: `< 1.0` → `< 9.99` — filtro agora funciona para thresholds > 100% (sessão 11, `9bbdaf2`)
+- ✅ **trailing_active fill recovery**: `_recover_fill` agora chamado para trades `trailing_active` sem `entry_price_usd` (sessão 11, `aced744`)
 
 **Filtros ativos (ordem de aplicação no _check_bounce):**
 - A.2: bloqueia bounce_pct 20-30% (redundante com A.7 mas mantido como safety net)
 - A.3: bloqueia entry 50-65% do mc_migration
 - A.5: bloqueia elapsed > 20min
-- A.6: bloqueia fundo estagnado > 5min (agora com ts_min correto graças ao Bug 1 fix)
+- A.6: bloqueia fundo estagnado > 5min
 - A.7: bloqueia bounce_pct < 30% (BOUNCE_MIN_PCT=0.30)
 - FILTER_PUMP_ONLY: garante cobertura H22
-- smart≥3: FILTER_SMART_MIN=3 — discriminação questionável em dados live (smart=1→31%, smart=3→30%, flat)
 
 **WR real blockchain (sessão 5, 2026-05-14): 10.1%** (14 TP / 125 SL / 139 trades — todos com dados corrompidos de mc_min).
-Dados históricos anteriores ao fix do elapsed_sec < 90 são suspeitos — mc_min estava errado em muitos tokens.
+Dados históricos anteriores ao fix do elapsed_sec < 90 são suspeitos. Primeiros dados limpos serão os trades pós-deploy deste branch.
 
 **Maior discriminador live encontrado: bounce_pct >70% → WR 74% (n=23, +45pp)**
-Próxima mudança de env var após deploy: `BOUNCE_MIN_PCT=0.50` (teste) → `0.70` se confirmado.
 
-**Correções sessão 10 (2026-05-18 — branch `claude/implement-h23-net-sol-flow-ZR5jn`):**
-- ✅ **A.9 — pool depth filter**: `get_min_mc_in_window()` agora filtra eventos Helius com `pool_quote_sol < MIN_POOL_SOL`. `pool_quote_sol` adicionado ao deque de eventos (antes só ia para `_pool_quote_last`).
-- ✅ **Fix Helius window bug**: `candle_start = ts_mig + max(90, elapsed-60)` — janela nunca começa antes de ts_mig+90s.
-
-**Checklist para religar o bot:**
-1. Fazer merge do branch `claude/implement-h23-net-sol-flow-ZR5jn` → `main` no Railway
+**Checklist para religar o bot (sessão 11):**
+1. Fazer merge do branch `claude/audit-neidenbot-purchases-8k0Tn` → `main` no Railway
 2. Aguardar redeploy completo
-3. Verificar logs: ts_migration nos logs deve mostrar o timestamp on-chain (não o momento atual)
-4. Setar `MIN_POOL_SOL=10` no Railway (ou deixar default — código já usa 10)
-5. Mudar `BOUNCE_MIN_PCT=0.50` no Railway (env var)
+3. Setar `BOUNCE_MAX_PCT=1.50` no Railway (bloqueia bounces tardios >150%)
+4. `K_INIT_TOLERANCE=0.80` já está hardcoded — zero ação necessária
+5. `MIN_POOL_SOL=10` já é o default — zero ação necessária
 6. Mudar `TRADING_ENABLED=true`
+7. Opcional: `BOUNCE_MIN_PCT=0.50` para focar em bounces de qualidade
 
 **Regra de ouro para novos filtros:** só implementar com n≥30 trades validados no GMGN. **Nunca usar DB WR como fonte.**
 
