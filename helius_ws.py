@@ -69,10 +69,44 @@ _MC_MAX         = 10_000_000  # $10M — acima é suspeito para micro-caps
 # Um evento de programa errado com bytes aleatórios produz k completamente diferente.
 _K_ABSOLUTE_MIN = 5e23   # abaixo disso é impossível para uma pool pump.fun real
 _K_ABSOLUTE_MAX = 5e26   # acima disso é fisicamente impossível
-# Ratio máximo entre k_established e k_event — cobre: degradação por fees em muitos trades,
-# dump severo (base sobe muito), e variação natural pós-migração.
-# Fake events têm k diferente por 10x–10000x. 5.0 detecta isso com margem larga.
-_K_RATIO_MAX    = 5.0
+#
+# INVARIANTE DIRECIONAL (mais importante que ratio):
+#
+#   k pode APENAS diminuir ao longo do tempo (fees extraem valor do pool a cada trade).
+#   k = pool_base × pool_quote é aritmética de inteiros — sem erro de floating point.
+#   Um evento com k > k_established é FISICAMENTE IMPOSSÍVEL na mesma pool.
+#   Logo: k_raw > k_established × (1 + tolerância) → deve ser de pool diferente → rejeitar.
+#
+#   Tolerância de +2%: cobre o primeiro evento (k_established pode ser levemente baixo
+#   se o primeiro evento já tinha alguma fee) e variação de arredondamento de inteiros u64.
+#
+_K_INCREASE_TOLERANCE = 0.02   # 2% — k não pode aumentar mais que isso (fees são monotônicos)
+#
+# Para o lado de baixo: k pode diminuir muito com muitos trades.
+# Fee total por trade: 1% protocolo + 0.25% LP = 1.25%.
+# Após 200 trades (heavy activity em 60min): k × (1-0.0125)^200 ≈ 0.08 × k_initial (12x menor).
+# K_RATIO_MAX=5.0 estava muito apertado — rejeitaria eventos legítimos após ~128 trades.
+# Solução: verificar apenas o lado de AUMENTO (duro, físico) + absoluto_min como piso.
+# O K_RATIO_MAX abaixo é mantido apenas como "sanity check" para quedas extremas (>100x),
+# que indicam que k_established foi capturado incorretamente (ex: na pool de transição).
+_K_RATIO_MAX    = 100.0   # safety net only — >100x queda sugere k_established corrompido
+#
+# PROTEÇÃO NA INICIALIZAÇÃO:
+#
+#   pump.fun pAMM sempre migra com ~79 SOL × ~793M tokens → k_initial ≈ 6.265e25.
+#   Um secondary pool com 15 SOL × 800M tokens teria k = 1.2e25 (5x abaixo).
+#   Se o primeiro evento recebido é desse secondary pool, k_established = 1.2e25.
+#   Subsequentes eventos da pool primária (k ≈ 6e25) são rejeitados pelo directional check!
+#
+#   Solução: restringir inicialização a k próximo do valor teórico de migração.
+#   Tolerância ±50% cobre variação real de tokens pós-fees/burns (793M vs 1B) e deflação
+#   rápida no dump inicial.
+#
+#   Qualquer primeiro evento com k fora desse range → provavelmente de pool diferente.
+#   k_established só é setado quando k do primeiro evento está na faixa esperada.
+#
+_K_INIT_EXPECTED  = 6.265e25   # k teórico de migração: 79 SOL × 793M tokens (unidades brutas)
+_K_INIT_TOLERANCE = 0.60       # ±60% — cobre supply variable (793M–1000M) e dump inicial
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -510,11 +544,22 @@ class HeliusWS:
                         return
 
                     # ── k-consistency gate ────────────────────────────────────────────
-                    # Verifica que pool_base × pool_quote é consistente com a pool real.
-                    # Fake events (programa errado, secondary pool) têm k diferente por 10x–10000x.
-                    # Pool real: k decresce monotonicamente por fees (≤1.25%/trade), nunca salta.
+                    # INVARIANTE FÍSICA: k = pool_base × pool_quote é constante produto.
+                    # Fees reduzem k monotonicamente a cada trade (≤1.25%/trade).
+                    # k NUNCA pode aumentar na mesma pool — qualquer aumento indica pool diferente.
+                    #
+                    # Dois checks em ordem crescente de custo:
+                    #   1. Absolute range: k fora de [5e23, 5e26] → bytes inválidos ou pool impossível
+                    #   2. Direcional: k_raw > k_established × 1.02 → FISICAMENTE impossível na mesma pool
+                    #   3. Safety net: k_raw < k_established / 100 → k_established foi corrompido
+                    #
+                    # O check direcional (2) é a inovação central:
+                    #   - Rejeita secondary pools quando k salta para cima (diferente de k_established)
+                    #   - Permite queda legítima por fees sem limite fixo (>128 trades não é rejeitado)
+                    #   - Zero falsos positivos: k nunca aumenta na mesma pool (aritmética de inteiros u64)
                     k_raw = event.get("k_raw", 0)
                     if k_raw > 0:
+                        # Check 1: absolute range
                         if not (_K_ABSOLUTE_MIN <= k_raw <= _K_ABSOLUTE_MAX):
                             logger.warning("HeliusWS k-gate ABSOLUTE skip %s: k=%.2e fora de [%.0e, %.0e]",
                                            mint[:8], k_raw, _K_ABSOLUTE_MIN, _K_ABSOLUTE_MAX)
@@ -522,24 +567,59 @@ class HeliusWS:
                         with self._lock:
                             k_est = self._k_established.get(mint)
                         if k_est is None:
-                            # Primeiro evento válido para este mint: establece k de referência
-                            with self._lock:
-                                self._k_established[mint] = k_raw
-                            logger.info("HeliusWS k-gate ESTABLISHED %s: k=%.3e (pool_base=%d pool_quote=%d)",
-                                        mint[:8], k_raw,
-                                        event.get("pool_base", 0), event.get("pool_quote", 0))
-                        else:
-                            # Eventos seguintes: verifica consistência com k estabelecida
-                            ratio = max(k_raw, k_est) / min(k_raw, k_est)
-                            if ratio > _K_RATIO_MAX:
+                            # Primeiro evento válido para este mint: estabelece k de referência.
+                            # Guard de inicialização: k do primeiro evento deve estar próximo
+                            # do k teórico de migração (±60%). Protege contra secondary pools
+                            # com 10-79 SOL que passam o A.9 filter mas têm k muito menor
+                            # que a pool primária — se inicializássemos com esse k, eventos
+                            # subsequentes da pool primária (k maior) seriam rejeitados.
+                            k_init_min = _K_INIT_EXPECTED * (1.0 - _K_INIT_TOLERANCE)
+                            k_init_max = _K_INIT_EXPECTED * (1.0 + _K_INIT_TOLERANCE)
+                            if not (k_init_min <= k_raw <= k_init_max):
                                 logger.warning(
-                                    "HeliusWS k-gate REJECT %s: k=%.3e vs k_est=%.3e ratio=%.1fx "
+                                    "HeliusWS k-gate INIT SKIP %s: k=%.3e fora do range de inicialização "
+                                    "[%.2e, %.2e] — possível secondary pool; aguardando evento da pool primária",
+                                    mint[:8], k_raw, k_init_min, k_init_max,
+                                )
+                                # NÃO rejeita o evento — pode ser um evento legítimo após heavy trading.
+                                # Apenas não inicializa k_established com um valor suspeito.
+                                # O evento passa sem gate (primeira detecção melhor que nenhuma).
+                                # k_established ficará None até um evento com k na faixa esperada.
+                            else:
+                                with self._lock:
+                                    self._k_established[mint] = k_raw
+                                logger.info("HeliusWS k-gate ESTABLISHED %s: k=%.3e (pool_base=%d pool_quote=%d)",
+                                            mint[:8], k_raw,
+                                            event.get("pool_base", 0), event.get("pool_quote", 0))
+                        else:
+                            # Check 2 (direcional — o mais importante):
+                            # k_raw > k_established × (1 + tolerância) é FISICAMENTE impossível.
+                            # Fees só reduzem k. Aumento significa pool diferente → rejeitar.
+                            if k_raw > k_est * (1.0 + _K_INCREASE_TOLERANCE):
+                                logger.warning(
+                                    "HeliusWS k-gate INCREASE REJECT %s: k=%.3e > k_est=%.3e × %.2f "
+                                    "(aumento é impossível na mesma pool — secondary pool?) "
                                     "(pool_base=%d pool_quote=%d pool_quote_sol=%.1f)",
-                                    mint[:8], k_raw, k_est, ratio,
+                                    mint[:8], k_raw, k_est, 1.0 + _K_INCREASE_TOLERANCE,
                                     event.get("pool_base", 0), event.get("pool_quote", 0), pq_check,
                                 )
                                 return
-                            # k pode diminuir por fees — atualiza se diminuiu (ignora aumentos)
+                            # Check 3 (safety net): queda de >100x sugere k_established corrompido
+                            if k_raw < k_est / _K_RATIO_MAX:
+                                logger.warning(
+                                    "HeliusWS k-gate DROP REJECT %s: k=%.3e << k_est=%.3e (ratio>%.0fx) "
+                                    "— k_established pode estar corrompido; resetando "
+                                    "(pool_base=%d pool_quote=%d pool_quote_sol=%.1f)",
+                                    mint[:8], k_raw, k_est, _K_RATIO_MAX,
+                                    event.get("pool_base", 0), event.get("pool_quote", 0), pq_check,
+                                )
+                                # Reset k_established: assume que o evento atual é o novo baseline
+                                # (possível se o bot reiniciou e o pool já teve muita atividade).
+                                with self._lock:
+                                    self._k_established[mint] = k_raw
+                                # NÃO rejeita — apenas reseta o baseline e continua processando.
+                                # Um reset não implica que o evento é inválido.
+                            # k pode diminuir por fees — atualiza monotonicamente para baixo
                             if k_raw < k_est:
                                 with self._lock:
                                     if self._k_established.get(mint) == k_est:
