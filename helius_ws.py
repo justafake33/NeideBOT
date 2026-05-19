@@ -578,13 +578,14 @@ class HeliusWS:
                             if not (k_init_min <= k_raw <= k_init_max):
                                 logger.warning(
                                     "HeliusWS k-gate INIT SKIP %s: k=%.3e fora do range de inicialização "
-                                    "[%.2e, %.2e] — possível secondary pool; aguardando evento da pool primária",
+                                    "[%.2e, %.2e] — possível secondary pool; rejeitando evento",
                                     mint[:8], k_raw, k_init_min, k_init_max,
                                 )
-                                # NÃO rejeita o evento — pode ser um evento legítimo após heavy trading.
-                                # Apenas não inicializa k_established com um valor suspeito.
-                                # O evento passa sem gate (primeira detecção melhor que nenhuma).
+                                # Rejeita: k fora do range de inicialização indica secondary pool.
+                                # Não inicializar k_established com valor suspeito E não
+                                # passar o evento — um price update não-validado pode corromper mc_min.
                                 # k_established ficará None até um evento com k na faixa esperada.
+                                return
                             else:
                                 with self._lock:
                                     self._k_established[mint] = k_raw
@@ -604,21 +605,22 @@ class HeliusWS:
                                     event.get("pool_base", 0), event.get("pool_quote", 0), pq_check,
                                 )
                                 return
-                            # Check 3 (safety net): queda de >100x sugere k_established corrompido
+                            # Check 3 (safety net): queda de >100x é fisicamente impossível
+                            # em 60min de trading (após 200 trades a 1.25%/trade, k cai ~12x).
+                            # Indica que k_established foi corrompido OU pool diferente.
                             if k_raw < k_est / _K_RATIO_MAX:
                                 logger.warning(
                                     "HeliusWS k-gate DROP REJECT %s: k=%.3e << k_est=%.3e (ratio>%.0fx) "
-                                    "— k_established pode estar corrompido; resetando "
+                                    "— queda de 100x é impossível; resetando k_established para None "
                                     "(pool_base=%d pool_quote=%d pool_quote_sol=%.1f)",
                                     mint[:8], k_raw, k_est, _K_RATIO_MAX,
                                     event.get("pool_base", 0), event.get("pool_quote", 0), pq_check,
                                 )
-                                # Reset k_established: assume que o evento atual é o novo baseline
-                                # (possível se o bot reiniciou e o pool já teve muita atividade).
+                                # Limpa k_established: próximo evento válido re-estabelece via init guard.
+                                # Rejeita este evento — não sabemos se é pool primária ou secundária.
                                 with self._lock:
-                                    self._k_established[mint] = k_raw
-                                # NÃO rejeita — apenas reseta o baseline e continua processando.
-                                # Um reset não implica que o evento é inválido.
+                                    self._k_established.pop(mint, None)
+                                return
                             # k pode diminuir por fees — atualiza monotonicamente para baixo
                             if k_raw < k_est:
                                 with self._lock:
