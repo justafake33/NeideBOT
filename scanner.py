@@ -807,8 +807,10 @@ class HotMonitor:
                     supply  = state["total_supply"]
                     if close_p and close_p > 0 and supply:
                         # mc_low já foi calculado no passo 1 (com Helius + kline logic).
-                        # Bug fix: low_p foi renomeado para mc_low_kline no passo 1.
-                        mc_low_tick = mc_low if elapsed_sec < 90 else mc_low_kline
+                        # Usa mc_low diretamente: já incorpora Helius quando disponível,
+                        # garantindo que o tick armazena o mínimo mais preciso.
+                        # Nota: elapsed_sec < 90 é impossível aqui (continue acima descarta).
+                        mc_low_tick = mc_low
                         kline_ticks.append({
                             "mint":        mint,
                             "elapsed_sec": elapsed_sec,
