@@ -173,10 +173,11 @@ class HotMonitor:
             db.set_recovery_false(mint)
             return
 
-        # Pool em transição (primeiros 90s): trenches/Helius podem ter preços da bonding
-        # curve pré-migração. Não atualizar mc_min — _precise_bottom_tick cuida disso
-        # via A.9 (Helius-only para elapsed < BOUNCE_TIME_MIN_SEC).
-        if elapsed_sec >= 90 and mc < state["mc_min"]:
+        # Helius events passam pelo k-gate (invariante física do AMM) — confiáveis desde t=0.
+        # Trenches (usd_market_cap da API GMGN) não tem pool reserves, não é k-validado:
+        # guard de 90s protege contra GMGN ainda indexando bonding curve pós-migração.
+        helius_validated = token_data is None
+        if (helius_validated or elapsed_sec >= 90) and mc < state["mc_min"]:
             state["mc_min"] = mc
             state["time_min"] = elapsed_min
             state["ts_min"]   = datetime.now(timezone.utc)
@@ -747,7 +748,7 @@ class HotMonitor:
                     mc_low = None
 
                     if self._helius:
-                        candle_start = state["ts_mig_unix"] + max(90, elapsed_sec - 60)
+                        candle_start = state["ts_mig_unix"] + max(0, elapsed_sec - 60)
                         candle_end   = state["ts_mig_unix"] + elapsed_sec
                         mc_low_helius = self._helius.get_min_mc_in_window(mint, candle_start, candle_end)
 
