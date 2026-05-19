@@ -34592,6 +34592,176 @@ def _mc_migration_audit_inner():
     return html
 
 
+@app.route("/debug/faca-caindo")
+def debug_faca_caindo():
+    """
+    Diagnóstico de 'faca caindo': mostra a trajetória real de preço dos SLs
+    rápidos via token_ticks para confirmar se mc_min era um wick fictício
+    ou um fundo real.
+    """
+    horas = int(request.args.get("horas", "24"))
+    max_exit_sec = int(request.args.get("max_exit_sec", "300"))
+
+    with db._cursor() as cur:
+        # SLs rápidos recentes com dados de bounce
+        cur.execute("""
+            SELECT
+                t.id, t.mint, t.symbol, t.status,
+                t.ts_signal,
+                ROUND(EXTRACT(EPOCH FROM (t.exit_ts - t.ts_signal))) AS exit_sec,
+                bs.elapsed_sec       AS bounce_elapsed,
+                ROUND(bs.bounce_pct::numeric * 100, 1)        AS bounce_pct,
+                ROUND(bs.drop_from_mig::numeric * 100, 1)     AS drop_pct,
+                ROUND(bs.mc_migration::numeric)                AS mc_migration,
+                ROUND(bs.mc_min::numeric)                      AS mc_min,
+                ROUND(bs.mc_at_signal::numeric)                AS mc_at_signal,
+                bs.pool_quote_at_signal,
+                bs.absorption_events,
+                bs.net_sol_flow,
+                t.pnl_pct_real
+            FROM trades t
+            LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+            WHERE t.status = 'sl'
+              AND t.ts_signal > NOW() - INTERVAL %(horas)s
+              AND t.exit_ts IS NOT NULL
+              AND EXTRACT(EPOCH FROM (t.exit_ts - t.ts_signal)) <= %(max_exit_sec)s
+            ORDER BY (t.exit_ts - t.ts_signal) ASC
+            LIMIT 30
+        """, {"horas": f"{horas} hours", "max_exit_sec": max_exit_sec})
+        sls = cur.fetchall()
+
+        # Para cada SL, pegar trajetória de ticks na janela -10min até +2min ao redor do bounce
+        ticks_by_mint = {}
+        for r in sls:
+            mint = r['mint']
+            be = r['bounce_elapsed'] or 0
+            cur.execute("""
+                SELECT elapsed_sec,
+                       ROUND(mc::numeric) AS mc,
+                       ROUND(mc_low::numeric) AS mc_low,
+                       ROUND(mc_high::numeric) AS mc_high,
+                       source
+                FROM token_ticks
+                WHERE mint = %s
+                  AND elapsed_sec BETWEEN %s AND %s
+                ORDER BY elapsed_sec
+            """, (mint, max(0, be - 600), be + 180))
+            ticks_by_mint[mint] = cur.fetchall()
+
+    # Calcula estatísticas
+    # Para cada trade: o mc_min era wick ou fundo sustentado?
+    # Wick = nenhum tick com mc próximo ao mc_min antes do sinal
+    def classify_bottom(mc_min, mc_at_signal, ticks):
+        """Verifica se havia ticks sustentados perto do mc_min antes do sinal."""
+        if not ticks or not mc_min:
+            return "sem_dados"
+        # Quantos ticks têm mc dentro de 15% do mc_min?
+        near_bottom = [t for t in ticks if t['mc'] and abs(t['mc'] - mc_min) / mc_min < 0.15]
+        if len(near_bottom) == 0:
+            return "wick_ficticio"   # mc_min nunca apareceu nos ticks → era wick Helius
+        elif len(near_bottom) == 1:
+            return "wick_unico"      # apenas 1 tick perto → muito frágil
+        else:
+            return "fundo_real"      # múltiplos ticks perto → fundo sustentado
+
+    rows_html = ""
+    stats = {"wick_ficticio": 0, "wick_unico": 0, "fundo_real": 0, "sem_dados": 0}
+
+    for r in sls:
+        mint = r['mint']
+        ticks = ticks_by_mint.get(mint, [])
+        mc_min = r['mc_min']
+        mc_sig = r['mc_at_signal']
+        classification = classify_bottom(mc_min, mc_sig, ticks)
+        stats[classification] += 1
+
+        # Trajetória dos ticks
+        ticks_str = ""
+        for tk in ticks:
+            mc_val = tk['mc'] or 0
+            is_near = mc_min and mc_val > 0 and abs(mc_val - mc_min) / mc_min < 0.15
+            is_sig = mc_min and mc_sig and mc_val > 0 and abs(mc_val - mc_sig) / mc_sig < 0.10
+            color = "#3fb950" if is_sig else ("#f0883e" if is_near else "#8b949e")
+            mc_low_str = f"/{tk['mc_low']:,.0f}" if tk['mc_low'] else ""
+            ticks_str += f"<span style='color:{color}'>{tk['elapsed_sec']}s:${mc_val:,.0f}{mc_low_str}</span> "
+
+        pnl = r['pnl_pct_real']
+        pnl_str = f"{pnl*100:+.0f}%" if pnl else "—"
+        exit_sec = r['exit_sec'] or 0
+        bounce_pct = r['bounce_pct'] or 0
+
+        cls_color = {"wick_ficticio": "#f85149", "wick_unico": "#f0883e",
+                     "fundo_real": "#3fb950", "sem_dados": "#8b949e"}.get(classification, "#8b949e")
+
+        rows_html += f"""
+        <tr style='border-bottom:1px solid #21262d'>
+          <td style='padding:8px 6px;color:#8b949e'>#{r['id']} {r['symbol'] or ''}</td>
+          <td style='color:{cls_color};font-weight:bold'>{classification}</td>
+          <td style='color:#f85149'>{exit_sec:.0f}s / {pnl_str}</td>
+          <td>mc_mig=${r['mc_migration'] or 0:,.0f}</td>
+          <td style='color:#f0883e'>mc_min=${mc_min or 0:,.0f}</td>
+          <td>mc_sig=${mc_sig or 0:,.0f} (+{bounce_pct:.0f}%)</td>
+          <td style='color:#8b949e'>{r['bounce_elapsed'] or 0}s elapsed</td>
+          <td style='font-size:11px;max-width:400px;word-break:break-all'>
+            {ticks_str if ticks_str else '<i style="color:#8b949e">sem ticks</i>'}
+          </td>
+        </tr>"""
+
+    total = len(sls)
+    wick_total = stats['wick_ficticio'] + stats['wick_unico']
+
+    html = f"""<!DOCTYPE html><html><head><title>Faca Caindo</title>
+<style>
+body{{background:#0d1117;color:#e6edf3;font-family:monospace;padding:20px;font-size:13px}}
+table{{border-collapse:collapse;width:100%}}
+th{{background:#161b22;color:#58a6ff;padding:8px 6px;text-align:left;border-bottom:2px solid #30363d}}
+td{{padding:6px;vertical-align:top}}
+</style></head><body>
+<h2 style='color:#f85149'>⚠️ Diagnóstico: Bot Comprando Faca Caindo</h2>
+<p style='color:#8b949e'>
+  SLs com exit ≤ {max_exit_sec}s nas últimas {horas}h
+  &nbsp;|&nbsp; <a href='?horas=48' style='color:#58a6ff'>48h</a>
+  &nbsp;|&nbsp; <a href='?max_exit_sec=60' style='color:#58a6ff'>≤60s</a>
+  &nbsp;|&nbsp; <a href='?max_exit_sec=120' style='color:#58a6ff'>≤120s</a>
+  &nbsp;|&nbsp; <a href='?max_exit_sec=300' style='color:#58a6ff'>≤300s</a>
+</p>
+
+<div style='display:flex;gap:16px;margin-bottom:20px'>
+  <div style='background:#161b22;border:1px solid #f85149;padding:12px 20px;border-radius:6px'>
+    <div style='font-size:24px;color:#f85149;font-weight:bold'>{stats['wick_ficticio']}/{total}</div>
+    <div style='color:#8b949e'>wick fictício<br>(mc_min nunca nos ticks)</div>
+  </div>
+  <div style='background:#161b22;border:1px solid #f0883e;padding:12px 20px;border-radius:6px'>
+    <div style='font-size:24px;color:#f0883e;font-weight:bold'>{stats['wick_unico']}/{total}</div>
+    <div style='color:#8b949e'>wick único<br>(1 tick perto do fundo)</div>
+  </div>
+  <div style='background:#161b22;border:1px solid #3fb950;padding:12px 20px;border-radius:6px'>
+    <div style='font-size:24px;color:#3fb950;font-weight:bold'>{stats['fundo_real']}/{total}</div>
+    <div style='color:#8b949e'>fundo real<br>(≥2 ticks perto do fundo)</div>
+  </div>
+  <div style='background:#161b22;border:1px solid #8b949e;padding:12px 20px;border-radius:6px'>
+    <div style='font-size:24px;color:#8b949e;font-weight:bold'>{stats['sem_dados']}/{total}</div>
+    <div style='color:#8b949e'>sem dados<br>(token_ticks vazio)</div>
+  </div>
+</div>
+
+<p style='color:#e6edf3'>
+  <b style='color:#f85149'>{wick_total}/{total} ({wick_total/max(total,1)*100:.0f}%)</b> dos SLs rápidos compraram em wick fictício ou único.
+  <br><small style='color:#8b949e'>Verde nos ticks = mc_at_signal. Laranja = mc_min (fundo). Cinza = outros ticks.</small>
+</p>
+
+<table>
+<tr>
+  <th>Trade</th><th>Classificação</th><th>Exit/PnL</th>
+  <th>MC migração</th><th>mc_min (fundo)</th><th>mc_signal (entrada)</th>
+  <th>Bounce elapsed</th><th>Trajetória ticks (elapsed:mc/mc_low)</th>
+</tr>
+{rows_html}
+</table>
+</body></html>"""
+    return html
+
+
 @app.route("/debug/pool-depth")
 def debug_pool_depth():
     """

@@ -203,7 +203,10 @@ class HotMonitor:
     BOUNCE_MAX_PCT       = float(os.getenv("BOUNCE_MAX_PCT",         "9.99"))  # desativado por padrão — sem validação GMGN para threshold máximo (nota 87 CLAUDE.md)
     BOUNCE_DROP_MIN      = float(os.getenv("BOUNCE_DROP_MIN",        "0.30"))  # queda mínima da migração
     BOUNCE_TIME_MAX      = float(os.getenv("BOUNCE_TIME_MAX",        "20.0"))  # A.5: janela 30→20min (100% TPs em ≤20min)
-    BOUNCE_TIME_MIN_SEC  = int(os.getenv(  "BOUNCE_TIME_MIN_SEC",   "90"))    # A.9: pool em transição nos primeiros 90s — mc_min não atualizado, sinais bloqueados
+    # A.9: threshold duplo — sinal + seleção de fonte kline.
+    # Default 90s: bloqueia sinais na janela de transição bonding curve→pool E
+    # usa apenas Helius (não kline low) nesse intervalo (kline low pode incluir preço pré-migração).
+    BOUNCE_TIME_MIN_SEC  = int(os.getenv(  "BOUNCE_TIME_MIN_SEC",   "90"))    # A.9
     BOTTOM_FRESHNESS_SEC = int(os.getenv(  "BOTTOM_FRESHNESS_SEC",  "300"))   # A.6: máx 5min desde o último mc_min
 
     def _check_bounce(self, mint: str, state: dict, mc: float, elapsed_sec: int):
@@ -314,7 +317,9 @@ class HotMonitor:
         # RISE [ts_min    → ts_signal] : quem comprou durante a subida? — H26
         # PÓS  [ts_signal → ts_signal+60s]: coleta assíncrona (+60s via scheduler)
         now_ts     = datetime.now(timezone.utc).timestamp()
-        ts_min_obj = state.get("ts_min")
+        # Usa o snapshot de ts_min tirado dentro do lock no início da função
+        # (não state.get("ts_min") que pode ser cópia stale em _precise_bottom_tick).
+        ts_min_obj = ts_min
         ts_min_ts  = ts_min_obj.timestamp() if ts_min_obj else None
 
         absorption_window = {}  # alias para PRÉ window
@@ -737,27 +742,12 @@ class HotMonitor:
                     #      Kline low pode ser bonding curve pré-migração, muito abaixo do real.
                     #    - elapsed >= BOUNCE_TIME_MIN_SEC: pool estável. Usar MIN(helius, kline).
                     #      Helius é preço real (~5ms latência), kline pode ter lag (~200ms).
-                    low_price   = _float(c.get("low"))
-                    close_price = _float(c.get("close"))
-                    mc_low_kline   = low_price   * state["total_supply"] if (low_price   and low_price   > 0) else None
-                    mc_close_candle = close_price * state["total_supply"] if (close_price and close_price > 0) else None
+                    low_price = _float(c.get("low"))
+                    mc_low_kline = low_price * state["total_supply"] if (low_price and low_price > 0) else None
                     mc_low = None
 
-                    # Wick guard: em pools finos, um único whale sell empurra o AMM price
-                    # momentaneamente para 1/200x do normal e o kline registra isso como 'low'.
-                    # Mesmo problema que levou a usar close em vez de high para mc_max.
-                    # Se low < close × 0.50 → wick intra-candle, descarta o low.
-                    if mc_low_kline and mc_close_candle and mc_low_kline < mc_close_candle * 0.50:
-                        logger.debug("Wick ignorado %s: kline_low=$%.0f < close×0.50=$%.0f",
-                                     state.get("symbol", mint[:8]), mc_low_kline, mc_close_candle * 0.50)
-                        mc_low_kline = None
-
                     if self._helius:
-                        # A.9: janela Helius nunca começa antes de ts_mig+90s (fim da transição
-                        # bonding curve → pool). Para o primeiro candle válido (elapsed=90),
-                        # max(0,...) daria ts_mig+30 — ainda na janela de inicialização do pool
-                        # onde os preços NÃO correspondem a trades reais visíveis nos gráficos.
-                        candle_start = state["ts_mig_unix"] + max(90, elapsed_sec - 60)
+                        candle_start = state["ts_mig_unix"] + max(0, elapsed_sec - 60)
                         candle_end   = state["ts_mig_unix"] + elapsed_sec
                         mc_low_helius = self._helius.get_min_mc_in_window(mint, candle_start, candle_end)
 
@@ -815,9 +805,9 @@ class HotMonitor:
                     vol     = _float(c.get("volume"))
                     supply  = state["total_supply"]
                     if close_p and close_p > 0 and supply:
-                        # mc_low já foi calculado no passo 1 (com Helius + kline logic)
-                        mc_low_tick = (mc_low if elapsed_sec < 90
-                                       else (low_p * supply if (low_p and low_p > 0) else None))
+                        # mc_low já foi calculado no passo 1 (com Helius + kline logic).
+                        # Bug fix: low_p foi renomeado para mc_low_kline no passo 1.
+                        mc_low_tick = mc_low if elapsed_sec < 90 else mc_low_kline
                         kline_ticks.append({
                             "mint":        mint,
                             "elapsed_sec": elapsed_sec,
