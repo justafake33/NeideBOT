@@ -106,7 +106,12 @@ _K_RATIO_MAX    = 100.0   # safety net only — >100x queda sugere k_established
 #   k_established só é setado quando k do primeiro evento está na faixa esperada.
 #
 _K_INIT_EXPECTED  = 6.265e25   # k teórico de migração: 79 SOL × 793M tokens (unidades brutas)
-_K_INIT_TOLERANCE = 0.60       # ±60% — cobre supply variable (793M–1000M) e dump inicial
+_K_INIT_TOLERANCE = 0.80       # ±80% — cobre supply variable + dump pesado antes de subscrever.
+# Derivação do limite inferior: fees de 1.25%/trade. Após N trades: k × (0.9875)^N
+#   0.60 → cobre até ~73 trades (0.9875^73 = 0.40) — insuficiente para dumps intensos
+#   0.80 → cobre até ~130 trades (0.9875^130 = 0.20) — observado: 100 trades em 2.9min
+# k_init_min = 6.265e25 × 0.20 = 1.253e25.
+# Secondary pool com 15 SOL × 793M tokens: k = 1.19e25 < 1.253e25 → ainda bloqueado pelo init.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
