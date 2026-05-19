@@ -209,13 +209,43 @@ def _parse_swap_event_from_logs(logs: list, supply: float, sol_usd: float) -> di
     """
     Percorre os logs e retorna {mc, side, sol} do primeiro evento Anchor reconhecido.
     Prioridade: pump.fun pAMM → Meteora DAMM v2 → None.
-    Para Meteora (sem side/sol), retorna {mc, side='unknown', sol=0}.
+
+    CRÍTICO: rastreia qual programa está invocando via stack antes de parsear
+    qualquer "Program data:". Sem isso, dados de outros programas na mesma
+    transação são parseados como eventos do pAMM — gerando preços fictícios
+    que nunca aparecem em nenhum gráfico (causa raiz dos mc_min falsos).
     """
     supply = supply or 1_000_000_000
 
+    # Stack de programas invocando (Solana logs têm hierarquia de CPIs)
+    # "Program X invoke [N]" empilha X; "Program X success/failed" desempilha
+    program_stack: list[str] = []
+
     for log in logs:
+        # Rastreia programa atual
+        if " invoke [" in log and log.startswith("Program "):
+            parts = log.split()
+            if len(parts) >= 3:
+                program_stack.append(parts[1])
+            continue
+
+        if log.startswith("Program ") and (" success" in log or " failed" in log):
+            if program_stack:
+                program_stack.pop()
+            continue
+
         if not log.startswith("Program data: "):
             continue
+
+        # Só parseia se o programa atual é o pAMM ou Meteora
+        current = program_stack[-1] if program_stack else None
+        if current not in (PUMP_AMM_PROGRAM, METEORA_PROGRAM):
+            # WARNING visível nos logs Railway — confirma que o fix está bloqueando
+            # eventos de programas errados. Se aparecer nos logs, o fix é necessário.
+            logger.warning("HeliusWS: skip Program data de programa não-pAMM: %s (stack=%s)",
+                           current, program_stack[-3:] if program_stack else [])
+            continue
+
         b64 = log[len("Program data: "):]
         try:
             raw = base64.b64decode(b64)
@@ -227,21 +257,15 @@ def _parse_swap_event_from_logs(logs: list, supply: float, sol_usd: float) -> di
 
         disc = raw[:8]
 
-        if disc in _PUMP_AMM_DISCS:
+        if current == PUMP_AMM_PROGRAM and disc in _PUMP_AMM_DISCS:
             event = _parse_pump_amm_event(raw, sol_usd, supply)
             if event:
                 return event
 
-        elif disc in _METEORA_DISCS:
+        elif current == METEORA_PROGRAM and disc in _METEORA_DISCS:
             mc = _parse_meteora_mc(raw, sol_usd, supply)
             if mc:
                 return {"mc": mc, "side": "unknown", "sol": 0.0}
-
-        else:
-            logger.debug(
-                "HeliusWS: Program data desconhecido disc=%s len=%d",
-                disc.hex(), len(raw),
-            )
 
     return None
 
