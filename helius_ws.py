@@ -59,6 +59,21 @@ _SOL_DECIMALS   = 9        # SOL/WSOL em lamports
 _MC_MIN         = 1_000    # $1K — abaixo disso é ruído
 _MC_MAX         = 10_000_000  # $10M — acima é suspeito para micro-caps
 
+# ── Constante produto k da pool pAMM pump.fun ────────────────────────────────
+# Inicialização da migração: ~79 SOL (lamports) × ~793M tokens (unidades brutas)
+# k = pool_quote_lamports × pool_base_token_units
+# Valores em unidades brutas: lamports (×1e9 por SOL) × unidades token (×1e6 por token)
+# Faixa válida derivada dos extremos da bonding curve:
+#   Mínimo: 50 SOL × 100M tokens = 5×10^10 × 1×10^14 = 5×10^24 (após dump máximo)
+#   Máximo: 100 SOL × 1B tokens  = 1×10^11 × 1×10^15 = 1×10^26 (fresh pool)
+# Um evento de programa errado com bytes aleatórios produz k completamente diferente.
+_K_ABSOLUTE_MIN = 5e23   # abaixo disso é impossível para uma pool pump.fun real
+_K_ABSOLUTE_MAX = 5e26   # acima disso é fisicamente impossível
+# Ratio máximo entre k_established e k_event — cobre: degradação por fees em muitos trades,
+# dump severo (base sobe muito), e variação natural pós-migração.
+# Fake events têm k diferente por 10x–10000x. 5.0 detecta isso com margem larga.
+_K_RATIO_MAX    = 5.0
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Parse Anchor — discriminadores e parsers por programa
@@ -158,6 +173,10 @@ def _parse_pump_amm_event(raw: bytes, sol_usd: float, supply: float) -> dict | N
     # H25 — pool depth (SOL no pool no momento deste swap)
     pool_quote_sol = pool_quote / 10 ** _SOL_DECIMALS
 
+    # Constante produto k em unidades brutas (lamports × token_units)
+    # Retornada ao chamador para validação de consistência inter-eventos.
+    k_raw = pool_base * pool_quote  # unidades: token_units × lamports
+
     # H24 — wallet do usuário (offset 152, 32 bytes pubkey)
     wallet = None
     if len(raw) >= 184:
@@ -166,7 +185,8 @@ def _parse_pump_amm_event(raw: bytes, sol_usd: float, supply: float) -> dict | N
         except Exception:
             pass
 
-    return {"mc": mc, "side": side, "sol": sol_amount, "pool_quote_sol": pool_quote_sol, "wallet": wallet}
+    return {"mc": mc, "side": side, "sol": sol_amount, "pool_quote_sol": pool_quote_sol,
+            "wallet": wallet, "k_raw": k_raw, "pool_base": pool_base, "pool_quote": pool_quote}
 
 
 def _parse_meteora_mc(raw: bytes, sol_usd: float, supply: float) -> float | None:
@@ -295,6 +315,11 @@ class HeliusWS:
         # H25 — pool_quote (SOL) do último swap por mint
         self._pool_quote_last: dict[str, float] = {}
 
+        # k-consistency gate — constante produto da pool pAMM por mint
+        # Estabelecida no primeiro evento válido; usada para rejeitar eventos
+        # de secondary pools ou programas errados (k difere por ordens de magnitude).
+        self._k_established: dict[str, float] = {}
+
         self._lock      = threading.Lock()
         self._ws_lock   = threading.Lock()
         self._ws        = None
@@ -349,6 +374,7 @@ class HeliusWS:
             self._last_fetch.pop(mint, None)
             self._swap_events.pop(mint, None)
             self._pool_quote_last.pop(mint, None)
+            self._k_established.pop(mint, None)
             for sid, m in list(self._sub_id_mint.items()):
                 if m == mint:
                     sub_id_to_remove = sid
@@ -482,6 +508,42 @@ class HeliusWS:
                         logger.debug("HeliusWS A.9 skip %s: pool_quote=%.1f SOL < %.1f",
                                      mint[:8], pq_check, self._MIN_POOL_SOL)
                         return
+
+                    # ── k-consistency gate ────────────────────────────────────────────
+                    # Verifica que pool_base × pool_quote é consistente com a pool real.
+                    # Fake events (programa errado, secondary pool) têm k diferente por 10x–10000x.
+                    # Pool real: k decresce monotonicamente por fees (≤1.25%/trade), nunca salta.
+                    k_raw = event.get("k_raw", 0)
+                    if k_raw > 0:
+                        if not (_K_ABSOLUTE_MIN <= k_raw <= _K_ABSOLUTE_MAX):
+                            logger.warning("HeliusWS k-gate ABSOLUTE skip %s: k=%.2e fora de [%.0e, %.0e]",
+                                           mint[:8], k_raw, _K_ABSOLUTE_MIN, _K_ABSOLUTE_MAX)
+                            return
+                        with self._lock:
+                            k_est = self._k_established.get(mint)
+                        if k_est is None:
+                            # Primeiro evento válido para este mint: establece k de referência
+                            with self._lock:
+                                self._k_established[mint] = k_raw
+                            logger.info("HeliusWS k-gate ESTABLISHED %s: k=%.3e (pool_base=%d pool_quote=%d)",
+                                        mint[:8], k_raw,
+                                        event.get("pool_base", 0), event.get("pool_quote", 0))
+                        else:
+                            # Eventos seguintes: verifica consistência com k estabelecida
+                            ratio = max(k_raw, k_est) / min(k_raw, k_est)
+                            if ratio > _K_RATIO_MAX:
+                                logger.warning(
+                                    "HeliusWS k-gate REJECT %s: k=%.3e vs k_est=%.3e ratio=%.1fx "
+                                    "(pool_base=%d pool_quote=%d pool_quote_sol=%.1f)",
+                                    mint[:8], k_raw, k_est, ratio,
+                                    event.get("pool_base", 0), event.get("pool_quote", 0), pq_check,
+                                )
+                                return
+                            # k pode diminuir por fees — atualiza se diminuiu (ignora aumentos)
+                            if k_raw < k_est:
+                                with self._lock:
+                                    if self._k_established.get(mint) == k_est:
+                                        self._k_established[mint] = k_raw
 
                     # H22/H24/H25: acumula na rolling window — garantido pool primária (≥ _MIN_POOL_SOL)
                     if event["side"] != "unknown":
