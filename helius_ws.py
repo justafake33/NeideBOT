@@ -240,6 +240,10 @@ def _parse_swap_event_from_logs(logs: list, supply: float, sol_usd: float) -> di
         # Só parseia se o programa atual é o pAMM ou Meteora
         current = program_stack[-1] if program_stack else None
         if current not in (PUMP_AMM_PROGRAM, METEORA_PROGRAM):
+            # WARNING visível nos logs Railway — confirma que o fix está bloqueando
+            # eventos de programas errados. Se aparecer nos logs, o fix é necessário.
+            logger.warning("HeliusWS: skip Program data de programa não-pAMM: %s (stack=%s)",
+                           current, program_stack[-3:] if program_stack else [])
             continue
 
         b64 = log[len("Program data: "):]
