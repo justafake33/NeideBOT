@@ -261,7 +261,7 @@ class HotMonitor:
         bounce_pct = (mc - mc_min) / mc_min
         if bounce_pct < self.BOUNCE_MIN_PCT:
             return
-        if self.BOUNCE_MAX_PCT < 1.0 and bounce_pct > self.BOUNCE_MAX_PCT:
+        if self.BOUNCE_MAX_PCT < 9.99 and bounce_pct > self.BOUNCE_MAX_PCT:
             logger.debug("BOUNCE skip %s — bounce tardio=%.1f%% (max=%.0f%%)",
                          mint[:8], bounce_pct * 100, self.BOUNCE_MAX_PCT * 100)
             return
