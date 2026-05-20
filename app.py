@@ -34889,5 +34889,186 @@ Liq@migração = liq_migration do GMGN trenches no momento da migração (não n
     return html
 
 
+
+@app.route("/debug/fundo-check")
+def debug_fundo_check():
+    """
+    Compara mc_min registrado no bounce_signals com o mínimo real dos token_ticks.
+    Mostra se o bot está encontrando o fundo correto, com links GMGN para verificação visual.
+    ?hours=N  — janela em horas (default 48)
+    ?limit=N  — máx registros (default 50)
+    """
+    hours = int(request.args.get("hours", 48))
+    limit = int(request.args.get("limit", 50))
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                bs.mint,
+                bs.symbol,
+                bs.ts_signal,
+                bs.elapsed_sec,
+                bs.mc_migration,
+                bs.mc_min          AS mc_min_bot,
+                bs.mc_at_signal,
+                bs.bounce_pct,
+                bs.drop_from_mig,
+                bs.h23_window,
+                bs.absorption_events,
+                -- Mínimo real dos token_ticks nos primeiros 25 minutos
+                MIN(t.mc_low) FILTER (WHERE t.elapsed_sec BETWEEN 90 AND 1500)      AS mc_min_ticks_low,
+                MIN(t.mc)     FILTER (WHERE t.elapsed_sec BETWEEN 90 AND 1500)      AS mc_min_ticks_close,
+                COUNT(t.id)   FILTER (WHERE t.elapsed_sec BETWEEN 0   AND 1500)     AS n_ticks,
+                -- Preço no momento do sinal via ticks (elapsed_sec mais próximo)
+                (SELECT mc FROM token_ticks tt
+                 WHERE tt.mint = bs.mint
+                 AND ABS(tt.elapsed_sec - bs.elapsed_sec) < 120
+                 ORDER BY ABS(tt.elapsed_sec - bs.elapsed_sec)
+                 LIMIT 1) AS mc_at_signal_ticks
+            FROM bounce_signals bs
+            LEFT JOIN token_ticks t ON t.mint = bs.mint
+            WHERE bs.ts_signal > NOW() - INTERVAL '%s hours'
+            GROUP BY bs.mint, bs.symbol, bs.ts_signal, bs.elapsed_sec,
+                     bs.mc_migration, bs.mc_min, bs.mc_at_signal,
+                     bs.bounce_pct, bs.drop_from_mig, bs.h23_window, bs.absorption_events
+            ORDER BY bs.ts_signal DESC
+            LIMIT %s
+        """, (hours, limit))
+        rows = cur.fetchall()
+
+    html_rows = ""
+    for r in rows:
+        mint       = r['mint']
+        symbol     = r['symbol'] or mint[:8]
+        mc_bot     = r['mc_min_bot'] or 0
+        mc_ticks   = r['mc_min_ticks_low'] or r['mc_min_ticks_close'] or 0
+        mc_mig     = r['mc_migration'] or 0
+        mc_sig     = r['mc_at_signal'] or 0
+        n_ticks    = r['n_ticks'] or 0
+        elapsed    = (r['elapsed_sec'] or 0) / 60
+        helius_ev  = r['absorption_events'] or 0
+
+        # Discrepância: quanto o bot ficou acima do fundo real
+        if mc_ticks > 0 and mc_bot > 0:
+            discrepancy_pct = (mc_bot / mc_ticks - 1) * 100
+            disc_color = "#3fb950" if discrepancy_pct < 10 else ("#f0883e" if discrepancy_pct < 50 else "#f85149")
+            disc_str = f"+{discrepancy_pct:.0f}%"
+        else:
+            discrepancy_pct = None
+            disc_color = "#8b949e"
+            disc_str = "—"
+
+        # bounce_pct calculado com fundo real dos ticks
+        if mc_ticks > 0 and mc_sig > 0:
+            bounce_real = (mc_sig / mc_ticks - 1) * 100
+            bounce_real_str = f"{bounce_real:.0f}%"
+            bounce_color = "#3fb950" if bounce_real >= 30 else "#f85149"
+        else:
+            bounce_real_str = "—"
+            bounce_color = "#8b949e"
+
+        bounce_bot_str = f"{(r['bounce_pct'] or 0)*100:.0f}%" if r['bounce_pct'] else "—"
+        drop_str = f"{(r['drop_from_mig'] or 0)*100:.0f}%"
+
+        ts_str = r['ts_signal'].strftime("%d/%m %H:%M") if r['ts_signal'] else "—"
+
+        # Links GMGN
+        gmgn_url = f"https://gmgn.ai/sol/token/{mint}"
+        dex_url  = f"https://dexscreener.com/solana/{mint}"
+
+        mc_bot_str   = f"${mc_bot:,.0f}" if mc_bot else "—"
+        mc_ticks_str = f"${mc_ticks:,.0f}" if mc_ticks else "—"
+        mc_mig_str   = f"${mc_mig:,.0f}" if mc_mig else "—"
+        mc_sig_str   = f"${mc_sig:,.0f}" if mc_sig else "—"
+        helius_str   = str(helius_ev) if helius_ev else "—"
+        helius_color = "#3fb950" if helius_ev > 0 else "#8b949e"
+
+        html_rows += f"""
+        <tr>
+          <td style='color:#8b949e;white-space:nowrap'>{ts_str}</td>
+          <td>
+            <a href='{gmgn_url}' target='_blank' style='color:#58a6ff;font-weight:bold'>{symbol}</a><br>
+            <span style='color:#8b949e;font-size:10px'>{mint[:12]}...</span><br>
+            <a href='{dex_url}' target='_blank' style='color:#6e7681;font-size:10px'>DEX</a>
+          </td>
+          <td style='text-align:right'>{mc_mig_str}</td>
+          <td style='text-align:right;color:#f85149'>{mc_bot_str}</td>
+          <td style='text-align:right;color:#e6edf3'>{mc_ticks_str}</td>
+          <td style='text-align:right;color:{disc_color};font-weight:bold'>{disc_str}</td>
+          <td style='text-align:right;color:#8b949e'>{drop_str}</td>
+          <td style='text-align:right;color:#f0883e'>{bounce_bot_str}</td>
+          <td style='text-align:right;color:{bounce_color}'>{bounce_real_str}</td>
+          <td style='text-align:right;color:#8b949e'>{elapsed:.1f}min</td>
+          <td style='text-align:right;color:#8b949e'>{n_ticks}</td>
+          <td style='text-align:right;color:{helius_color}'>{helius_str}</td>
+        </tr>"""
+
+    # Summary stats
+    valid = [r for r in rows if (r['mc_min_ticks_low'] or r['mc_min_ticks_close']) and r['mc_min_bot']]
+    ok_count = sum(1 for r in valid if r['mc_min_bot'] / (r['mc_min_ticks_low'] or r['mc_min_ticks_close'] or r['mc_min_bot']) < 1.10)
+    ok_pct = ok_count / len(valid) * 100 if valid else 0
+
+    html = f"""<!DOCTYPE html><html><head>
+<title>Fundo Check</title>
+<style>
+body{{background:#0d1117;color:#e6edf3;font-family:monospace;padding:20px}}
+table{{border-collapse:collapse;width:100%}}
+th,td{{border:1px solid #30363d;padding:5px 10px;white-space:nowrap}}
+th{{background:#161b22;color:#58a6ff;text-align:center}}
+tr:hover{{background:#161b22}}
+a{{text-decoration:none}}
+</style>
+<meta http-equiv='refresh' content='30'>
+</head><body>
+<h2 style='color:#58a6ff'>🔍 Fundo Check — Bot vs Token Ticks</h2>
+<p style='color:#8b949e'>
+  Compara o <b style='color:#f85149'>mc_min registrado pelo bot</b> com o
+  <b style='color:#e6edf3'>mínimo real dos token_ticks</b> (kline 1m low).<br>
+  <b>Discrepância</b> = quanto o bot ficou <em>acima</em> do fundo real (ideal: &lt;10%).<br>
+  <b>Bounce BOT</b> = (mc_sinal / mc_min_bot − 1) &nbsp;|&nbsp;
+  <b>Bounce REAL</b> = (mc_sinal / mc_min_ticks − 1).<br>
+  Auto-refresh 30s &nbsp;|&nbsp; <a href='?hours={hours}&limit={limit}' style='color:#58a6ff'>Atualizar</a>
+  &nbsp;|&nbsp; <a href='?hours=6&limit=20' style='color:#58a6ff'>6h</a>
+  &nbsp; <a href='?hours=24&limit=30' style='color:#58a6ff'>24h</a>
+  &nbsp; <a href='?hours=48&limit=50' style='color:#58a6ff'>48h</a>
+  &nbsp; <a href='?hours=168&limit=100' style='color:#58a6ff'>7d</a>
+</p>
+
+<div style='display:flex;gap:24px;margin-bottom:16px'>
+  <div style='background:#161b22;border:1px solid #30363d;padding:12px 20px;border-radius:6px'>
+    <div style='color:#8b949e;font-size:11px'>Total bounces</div>
+    <div style='font-size:22px;font-weight:bold;color:#e6edf3'>{len(rows)}</div>
+  </div>
+  <div style='background:#161b22;border:1px solid #30363d;padding:12px 20px;border-radius:6px'>
+    <div style='color:#8b949e;font-size:11px'>Com ticks válidos</div>
+    <div style='font-size:22px;font-weight:bold;color:#e6edf3'>{len(valid)}</div>
+  </div>
+  <div style='background:#161b22;border:1px solid #30363d;padding:12px 20px;border-radius:6px'>
+    <div style='color:#8b949e;font-size:11px'>Fundo correto (&lt;10% erro)</div>
+    <div style='font-size:22px;font-weight:bold;color:{"#3fb950" if ok_pct > 70 else "#f85149"}'>{ok_count}/{len(valid)} ({ok_pct:.0f}%)</div>
+  </div>
+</div>
+
+<table>
+<tr>
+  <th>Sinal</th><th>Token</th><th>MC Migração</th>
+  <th>Fundo BOT 🤖</th><th>Fundo TICKS 📊</th>
+  <th>Discrepância</th><th>Queda</th>
+  <th>Bounce BOT</th><th>Bounce REAL</th>
+  <th>Elapsed</th><th>Ticks</th><th>Helius ev</th>
+</tr>
+{html_rows if html_rows else "<tr><td colspan='12' style='text-align:center;color:#8b949e;padding:20px'>Nenhum bounce nas últimas {hours}h</td></tr>"}
+</table>
+
+<p style='color:#8b949e;font-size:11px;margin-top:16px'>
+  <b>Fundo BOT</b>: mc_min salvo no bounce_signals (pode ser erpc retroativo ou kline poll).<br>
+  <b>Fundo TICKS</b>: MIN(mc_low) dos token_ticks entre elapsed 90s e 25min.<br>
+  <b>Helius ev</b>: eventos pAMM capturados pelo erpc no momento do bounce (H22).<br>
+  Clique no símbolo para abrir na GMGN e verificar o gráfico. Auto-refresh 30s.
+</p>
+</body></html>"""
+    return html
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
