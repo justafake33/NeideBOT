@@ -71,7 +71,9 @@ async def main():
                     {
                         "vote":     False,
                         "failed":   False,
-                        "accounts": [PAMM],
+                        "accounts": {
+                            "include": [PAMM],
+                        },
                     },
                     {
                         "commitment":               "processed",
