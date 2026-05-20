@@ -92,13 +92,23 @@ async def main():
             async for raw_msg in ws:
                 data = json.loads(raw_msg)
 
+                # Debug: mostrar primeiras 5 mensagens brutas
+                if tx_total + parse_ok + parse_fail < 5:
+                    print(f"[DEBUG] mensagem bruta: {str(raw_msg)[:300]}")
+
                 # Confirmação da subscrição
                 if "result" in data and isinstance(data.get("result"), int):
                     print(f"✅ Subscrito com ID: {data['result']}")
                     print(f"{'─'*60}\n")
                     continue
 
+                # Erros da API
+                if "error" in data:
+                    print(f"❌ Erro da API: {data['error']}")
+                    continue
+
                 if data.get("method") != "transactionNotification":
+                    print(f"[DEBUG] método desconhecido: {data.get('method')} | keys: {list(data.keys())}")
                     continue
 
                 tx_total += 1
