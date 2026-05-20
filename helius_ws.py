@@ -644,8 +644,7 @@ class HeliusWS:
 
         # Identifica o mint monitorado cruzando accounts com _mint_supply.
         with self._lock:
-            monitored  = set(self._mint_supply.keys())
-            pool_pdas  = dict(self._pool_pda)   # snapshot: mint → pda
+            monitored = set(self._mint_supply.keys())
 
         mint = None
         for account in accounts:
@@ -654,16 +653,6 @@ class HeliusWS:
                 break
 
         if not mint:
-            return
-
-        # Validação PDA: garante que a transação é da pool primária.
-        # PDA é o endereço canônico determinístico (seed: "pool" + mint + WSOL).
-        # Secondary pools têm PDAs diferentes — são rejeitadas aqui.
-        # Se o PDA ainda não foi derivado (thread assíncrona), usa k-gate como fallback.
-        pda = pool_pdas.get(mint)
-        if pda and pda not in accounts:
-            logger.debug("HeliusWS PDA skip %s: pool %s... não está nos accounts",
-                         mint[:8], pda[:8])
             return
 
         with self._lock:
