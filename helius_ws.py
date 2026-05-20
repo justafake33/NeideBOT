@@ -1,30 +1,25 @@
 """
-Helius WebSocket — preço real-time via logsSubscribe + parse Anchor direto.
+WebSocket de preço real-time — dois modos de operação:
 
-Fluxo por token:
-  1. subscribe(mint, total_supply)
-       → logsSubscribe(mentions=[mint]) — qualquer tx que mencione o mint,
-         sem precisar descobrir o pool address. Subscrição imediata na migração.
-  2. Swap detectado na notificação (~200ms pós on-chain):
-       → Tier 1: parse Program data: <base64> (zero chamadas, ~0ms)
-         pump.fun pAMM (pAMMBay6...) emite BuyEvent/SellEvent com pool reserves.
-         Preço calculado de pool_base/pool_quote — exato, sem ambiguidade de fee/direção.
-       → Tier 2: DexScreener fallback se parse falhar (1-3s, gratuito)
-  3. cancel(mint) → logsUnsubscribe
+MODO ERPC (primário, recomendado):
+  Uma única subscrição global `transactionSubscribe` no programa pAMM pump.fun.
+  Recebe TODAS as transações do pAMM desde o bloco 0, sem janela cega.
+  O mint de cada transação é identificado cruzando os accountKeys da tx com
+  os mints monitorados em _mint_supply. subscribe()/unsubscribe() apenas
+  atualizam o dict local — nenhuma mensagem WS enviada.
+  Requer: ERPC_API_KEY
 
-Por que mentions=[mint] e não mentions=[pool]:
-  - Pool address requer chamada ao DexScreener antes da subscrição
-  - DexScreener leva 1-5min para indexar tokens novos — janela do V-bottom perdida
-  - O mint já é conhecido na migração; está sempre presente em transações de swap
-  - Ruído extra (transfers, LP) filtrado pelo check de programa/instrução
+MODO HELIUS (fallback):
+  Uma subscrição `logsSubscribe(mentions=[mint])` por token.
+  Requer subscrição após a migração → gap de 10-30s (subscription timing gap).
+  Requer: HELIUS_API_KEY
 
-Programas suportados (Tier 1):
+Programas suportados (Tier 1 — parse Anchor inline, ~5ms):
   - pump.fun pAMM: pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA
-    Eventos: BuyEvent (disc=67f4521f...) e SellEvent (disc=3e2f370a...)
-    Layout: pool_base_token_reserves @ offset 48, pool_quote_token_reserves @ offset 56
+    BuyEvent/SellEvent — pool_base @ offset 48, pool_quote @ offset 56
   - Meteora DAMM v2: EvtSwap2 (candidato — não observado ainda)
 
-Rate limit: 1 parse por 2s por token.
+Tier 2 (fallback): DexScreener HTTP, rate-limitado a 2s por mint.
 """
 import base64
 import base58 as _base58
@@ -40,8 +35,14 @@ from typing import Callable
 
 logger = logging.getLogger(__name__)
 
+# ── Endpoints ────────────────────────────────────────────────────────────────
+ERPC_API_KEY   = os.getenv("ERPC_API_KEY", "")
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
-_WS_URL        = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+_ERPC_WS_URL   = f"wss://edge.erpc.global?api-key={ERPC_API_KEY}"
+_HELIUS_WS_URL = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+
+# Mantido para compatibilidade com referências externas (_WS_URL era público)
+_WS_URL = _HELIUS_WS_URL
 
 # Program IDs relevantes para filtrar swaps
 PUMP_AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
@@ -60,58 +61,95 @@ _MC_MIN         = 1_000    # $1K — abaixo disso é ruído
 _MC_MAX         = 10_000_000  # $10M — acima é suspeito para micro-caps
 
 # ── Constante produto k da pool pAMM pump.fun ────────────────────────────────
-# Inicialização da migração: ~79 SOL (lamports) × ~793M tokens (unidades brutas)
-# k = pool_quote_lamports × pool_base_token_units
-# Valores em unidades brutas: lamports (×1e9 por SOL) × unidades token (×1e6 por token)
-# Faixa válida derivada dos extremos da bonding curve:
-#   Mínimo: 50 SOL × 100M tokens = 5×10^10 × 1×10^14 = 5×10^24 (após dump máximo)
-#   Máximo: 100 SOL × 1B tokens  = 1×10^11 × 1×10^15 = 1×10^26 (fresh pool)
-# Um evento de programa errado com bytes aleatórios produz k completamente diferente.
-_K_ABSOLUTE_MIN = 5e23   # abaixo disso é impossível para uma pool pump.fun real
-_K_ABSOLUTE_MAX = 5e26   # acima disso é fisicamente impossível
-#
-# INVARIANTE DIRECIONAL (mais importante que ratio):
-#
-#   k pode APENAS diminuir ao longo do tempo (fees extraem valor do pool a cada trade).
-#   k = pool_base × pool_quote é aritmética de inteiros — sem erro de floating point.
-#   Um evento com k > k_established é FISICAMENTE IMPOSSÍVEL na mesma pool.
-#   Logo: k_raw > k_established × (1 + tolerância) → deve ser de pool diferente → rejeitar.
-#
-#   Tolerância de +2%: cobre o primeiro evento (k_established pode ser levemente baixo
-#   se o primeiro evento já tinha alguma fee) e variação de arredondamento de inteiros u64.
-#
-_K_INCREASE_TOLERANCE = 0.02   # 2% — k não pode aumentar mais que isso (fees são monotônicos)
-#
-# Para o lado de baixo: k pode diminuir muito com muitos trades.
-# Fee total por trade: 1% protocolo + 0.25% LP = 1.25%.
-# Após 200 trades (heavy activity em 60min): k × (1-0.0125)^200 ≈ 0.08 × k_initial (12x menor).
-# K_RATIO_MAX=5.0 estava muito apertado — rejeitaria eventos legítimos após ~128 trades.
-# Solução: verificar apenas o lado de AUMENTO (duro, físico) + absoluto_min como piso.
-# O K_RATIO_MAX abaixo é mantido apenas como "sanity check" para quedas extremas (>100x),
-# que indicam que k_established foi capturado incorretamente (ex: na pool de transição).
-_K_RATIO_MAX    = 100.0   # safety net only — >100x queda sugere k_established corrompido
-#
-# PROTEÇÃO NA INICIALIZAÇÃO:
-#
-#   pump.fun pAMM sempre migra com ~79 SOL × ~793M tokens → k_initial ≈ 6.265e25.
-#   Um secondary pool com 15 SOL × 800M tokens teria k = 1.2e25 (5x abaixo).
-#   Se o primeiro evento recebido é desse secondary pool, k_established = 1.2e25.
-#   Subsequentes eventos da pool primária (k ≈ 6e25) são rejeitados pelo directional check!
-#
-#   Solução: restringir inicialização a k próximo do valor teórico de migração.
-#   Tolerância ±50% cobre variação real de tokens pós-fees/burns (793M vs 1B) e deflação
-#   rápida no dump inicial.
-#
-#   Qualquer primeiro evento com k fora desse range → provavelmente de pool diferente.
-#   k_established só é setado quando k do primeiro evento está na faixa esperada.
-#
-_K_INIT_EXPECTED  = 6.265e25   # k teórico de migração: 79 SOL × 793M tokens (unidades brutas)
-_K_INIT_TOLERANCE = 0.80       # ±80% — cobre supply variable + dump pesado antes de subscrever.
-# Derivação do limite inferior: fees de 1.25%/trade. Após N trades: k × (0.9875)^N
-#   0.60 → cobre até ~73 trades (0.9875^73 = 0.40) — insuficiente para dumps intensos
-#   0.80 → cobre até ~130 trades (0.9875^130 = 0.20) — observado: 100 trades em 2.9min
-# k_init_min = 6.265e25 × 0.20 = 1.253e25.
-# Secondary pool com 15 SOL × 793M tokens: k = 1.19e25 < 1.253e25 → ainda bloqueado pelo init.
+_K_ABSOLUTE_MIN = 5e23
+_K_ABSOLUTE_MAX = 5e26
+_K_INCREASE_TOLERANCE = 0.02
+_K_RATIO_MAX    = 100.0
+_K_INIT_EXPECTED  = 6.265e25
+_K_INIT_TOLERANCE = 0.80
+# k_init_min = 6.265e25 × 0.20 = 1.253e25 — cobre pools com ~130 trades de fee acumulados.
+# Secondary pool com 15 SOL × 793M tokens: k = 1.19e25 < 1.253e25 → bloqueado.
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers para parse de transação Solana (modo erpc)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compact_u16(data: bytes, offset: int) -> tuple[int, int]:
+    """Decodifica Solana compact-u16. Retorna (valor, bytes_consumidos)."""
+    val = 0
+    shift = 0
+    consumed = 0
+    for _ in range(3):  # máx 3 bytes para compact-u16
+        if offset + consumed >= len(data):
+            break
+        b = data[offset + consumed]
+        consumed += 1
+        val |= (b & 0x7f) << shift
+        shift += 7
+        if not (b & 0x80):
+            break
+    return val, consumed
+
+
+def _parse_account_keys_from_tx(tx_b64: str) -> list[str]:
+    """
+    Extrai as chaves públicas (account keys) de uma transação Solana em base64.
+
+    Formato do wire (retornado pelo erpc com encoding='base64'):
+      [compact-u16 num_sigs] [64*num_sigs bytes de assinaturas] [mensagem]
+
+    Mensagem (legacy):
+      [3 bytes header] [compact-u16 num_accounts] [32*num_accounts bytes pubkeys] ...
+
+    Mensagem (versioned v0):
+      [0x80 byte de versão] [3 bytes header] [compact-u16 num_accounts] ...
+
+    Retorna lista de pubkeys em base58. Retorna [] em caso de erro.
+    """
+    try:
+        raw = base64.b64decode(tx_b64)
+    except Exception:
+        return []
+
+    if len(raw) < 70:  # mínimo plausível para uma tx com 1 sig
+        return []
+
+    offset = 0
+
+    # 1. Número de assinaturas (compact-u16)
+    num_sigs, consumed = _compact_u16(raw, offset)
+    offset += consumed
+
+    # 2. Pula bytes de assinatura (64 bytes cada)
+    offset += 64 * num_sigs
+
+    if offset >= len(raw):
+        return []
+
+    # 3. Detecta versioned transaction (bit mais significativo do primeiro byte da mensagem)
+    if raw[offset] & 0x80:
+        offset += 1  # pula byte de versão (ex: 0x80 = versão 0)
+
+    # 4. Pula header da mensagem (3 bytes fixos)
+    offset += 3
+
+    if offset >= len(raw):
+        return []
+
+    # 5. Número de accounts (compact-u16)
+    num_accounts, consumed = _compact_u16(raw, offset)
+    offset += consumed
+
+    # 6. Extrai pubkeys (32 bytes cada)
+    keys: list[str] = []
+    for _ in range(num_accounts):
+        if offset + 32 > len(raw):
+            break
+        keys.append(_base58.b58encode(raw[offset:offset + 32]).decode("ascii"))
+        offset += 32
+
+    return keys
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -124,12 +162,11 @@ def _anchor_disc(event_name: str) -> bytes:
 
 
 # pump.fun pAMM — confirmado via IDL pump-fun/pump-public-docs
-# BuyEvent disc=67f4521f2cf57777, SellEvent disc=3e2f370aa503dc2a
 _BUY_DISC  = _anchor_disc("BuyEvent")
 _SELL_DISC = _anchor_disc("SellEvent")
 _PUMP_AMM_DISCS: set[bytes] = {_BUY_DISC, _SELL_DISC}
 
-# Meteora DAMM v2 — candidatos (EvtSwap2 não observado ainda nos logs)
+# Meteora DAMM v2 — candidatos
 _METEORA_DISCS: set[bytes] = {
     _anchor_disc("Swap"),
     _anchor_disc("SwapEvent"),
@@ -143,47 +180,34 @@ _SWAP_ONLY_DISCS: set[bytes] = _PUMP_AMM_DISCS | _METEORA_DISCS
 def _parse_pump_amm_event(raw: bytes, sol_usd: float, supply: float) -> dict | None:
     """
     Parse pump.fun pAMM BuyEvent ou SellEvent.
-    Retorna {mc, side, sol_amount, pool_quote_sol, wallet} para uso em MC + absorção (H22/H24/H25), ou None.
+    Retorna {mc, side, sol_amount, pool_quote_sol, wallet, k_raw, pool_base, pool_quote} ou None.
 
-    Layout Borsh (offset a partir do início dos bytes, incluindo 8 bytes de disc):
+    Layout Borsh (a partir do início, incluindo 8 bytes de disc):
       offset  0: disc                          8 bytes
-      offset  8: timestamp                     i64  (ignorado)
-      offset 16: base_amount_out/in            u64  (tokens)
-      offset 24: max_quote_amount_in/min_...   u64  (limite, ignorado)
+      offset  8: timestamp                     i64
+      offset 16: base_amount_out/in            u64 (tokens)
+      offset 24: max_quote_amount_in/min_...   u64 (limite)
       offset 32: user_base_token_reserves      u64
       offset 40: user_quote_token_reserves     u64
-      offset 48: pool_base_token_reserves      u64  ← reservas de token no pool
-      offset 56: pool_quote_token_reserves     u64  ← reservas de SOL no pool
-      offset 64: quote_amount_in/out           u64  (SOL transacionado)
-      offset 72: lpFeeBasisPoints              u64  (ignorado)
-      offset 80: lpFee                         u64  (ignorado)
-      offset 88: protocolFeeBasisPoints        u64  (ignorado)
-      offset 96: protocolFee                   u64  (ignorado)
-      offset 104: quoteAmountInWithLpFee       u64  (ignorado)
-      offset 112: userQuoteAmountIn            u64  (ignorado)
-      offset 120: pool                         Pubkey 32 bytes (ignorado)
+      offset 48: pool_base_token_reserves      u64 ← reservas de token no pool
+      offset 56: pool_quote_token_reserves     u64 ← reservas de SOL no pool
+      offset 64: quote_amount_in/out           u64 (SOL transacionado)
       offset 152: user                         Pubkey 32 bytes ← wallet do trader
-
-    Fonte: pump-fun/pump-public-docs/idl/pump_amm.json
     """
     if len(raw) < 72:
         return None
 
-    # pump.fun tokens têm SEMPRE 1B de supply — não usar o parâmetro supply
-    # (GMGN às vezes retorna circulating_supply ou valor em unidades erradas,
-    # gerando mc_min 4× abaixo do real e entry_expected completamente errado)
     _PUMP_SUPPLY = 1_000_000_000
 
     disc         = raw[:8]
-    base_amount  = struct.unpack_from("<Q", raw, 16)[0]  # tokens
-    pool_base    = struct.unpack_from("<Q", raw, 48)[0]  # token reserves do pool
-    pool_quote   = struct.unpack_from("<Q", raw, 56)[0]  # SOL reserves do pool (lamports)
-    quote_amount = struct.unpack_from("<Q", raw, 64)[0]  # SOL transacionado
+    base_amount  = struct.unpack_from("<Q", raw, 16)[0]
+    pool_base    = struct.unpack_from("<Q", raw, 48)[0]
+    pool_quote   = struct.unpack_from("<Q", raw, 56)[0]
+    quote_amount = struct.unpack_from("<Q", raw, 64)[0]
 
     side       = "buy" if disc == _BUY_DISC else "sell"
     sol_amount = quote_amount / 10 ** _SOL_DECIMALS
 
-    # MC via pool reserves (primary — mais preciso que swap amounts)
     mc = None
     if pool_base > 0 and pool_quote > 0:
         price_sol = (pool_quote / 10 ** _SOL_DECIMALS) / (pool_base / 10 ** _TOKEN_DECIMALS)
@@ -191,7 +215,6 @@ def _parse_pump_amm_event(raw: bytes, sol_usd: float, supply: float) -> dict | N
         if _MC_MIN < mc_cand < _MC_MAX:
             mc = mc_cand
 
-    # Fallback: swap amounts
     if mc is None and base_amount > 0 and quote_amount > 0:
         if side == "buy":
             tok_out = base_amount / 10 ** _TOKEN_DECIMALS
@@ -209,14 +232,9 @@ def _parse_pump_amm_event(raw: bytes, sol_usd: float, supply: float) -> dict | N
     if mc is None:
         return None
 
-    # H25 — pool depth (SOL no pool no momento deste swap)
     pool_quote_sol = pool_quote / 10 ** _SOL_DECIMALS
+    k_raw = pool_base * pool_quote
 
-    # Constante produto k em unidades brutas (lamports × token_units)
-    # Retornada ao chamador para validação de consistência inter-eventos.
-    k_raw = pool_base * pool_quote  # unidades: token_units × lamports
-
-    # H24 — wallet do usuário (offset 152, 32 bytes pubkey)
     wallet = None
     if len(raw) >= 184:
         try:
@@ -229,10 +247,7 @@ def _parse_pump_amm_event(raw: bytes, sol_usd: float, supply: float) -> dict | N
 
 
 def _parse_meteora_mc(raw: bytes, sol_usd: float, supply: float) -> float | None:
-    """
-    Parse Meteora DAMM v2 swap event — layout legado: disc(8)+pool(32)+in(8)+out(8).
-    Tenta as duas direções SOL↔Token.
-    """
+    """Parse Meteora DAMM v2 swap event — layout legado: disc(8)+pool(32)+in(8)+out(8)."""
     if len(raw) < 56:
         return None
 
@@ -245,7 +260,6 @@ def _parse_meteora_mc(raw: bytes, sol_usd: float, supply: float) -> float | None
 
     supply = supply or 1_000_000_000
 
-    # Direção 1: in=SOL, out=token (compra)
     sol_in  = in_amount  / 10 ** _SOL_DECIMALS
     tok_out = out_amount / 10 ** _TOKEN_DECIMALS
     if tok_out > 0:
@@ -253,7 +267,6 @@ def _parse_meteora_mc(raw: bytes, sol_usd: float, supply: float) -> float | None
         if _MC_MIN < mc1 < _MC_MAX:
             return mc1
 
-    # Direção 2: in=token, out=SOL (venda)
     tok_in  = in_amount  / 10 ** _TOKEN_DECIMALS
     sol_out = out_amount / 10 ** _SOL_DECIMALS
     if tok_in > 0:
@@ -266,22 +279,17 @@ def _parse_meteora_mc(raw: bytes, sol_usd: float, supply: float) -> float | None
 
 def _parse_swap_event_from_logs(logs: list, supply: float, sol_usd: float) -> dict | None:
     """
-    Percorre os logs e retorna {mc, side, sol} do primeiro evento Anchor reconhecido.
+    Percorre logMessages e retorna {mc, side, sol, ...} do primeiro evento Anchor reconhecido.
     Prioridade: pump.fun pAMM → Meteora DAMM v2 → None.
 
-    CRÍTICO: rastreia qual programa está invocando via stack antes de parsear
-    qualquer "Program data:". Sem isso, dados de outros programas na mesma
-    transação são parseados como eventos do pAMM — gerando preços fictícios
-    que nunca aparecem em nenhum gráfico (causa raiz dos mc_min falsos).
+    CRÍTICO: rastreia o programa ativo via stack antes de parsear qualquer 'Program data:'.
+    Sem isso, dados de outros programas na mesma transação são parseados como eventos do
+    pAMM — gerando preços fictícios.
     """
     supply = supply or 1_000_000_000
-
-    # Stack de programas invocando (Solana logs têm hierarquia de CPIs)
-    # "Program X invoke [N]" empilha X; "Program X success/failed" desempilha
     program_stack: list[str] = []
 
     for log in logs:
-        # Rastreia programa atual
         if " invoke [" in log and log.startswith("Program "):
             parts = log.split()
             if len(parts) >= 3:
@@ -296,11 +304,8 @@ def _parse_swap_event_from_logs(logs: list, supply: float, sol_usd: float) -> di
         if not log.startswith("Program data: "):
             continue
 
-        # Só parseia se o programa atual é o pAMM ou Meteora
         current = program_stack[-1] if program_stack else None
         if current not in (PUMP_AMM_PROGRAM, METEORA_PROGRAM):
-            # WARNING visível nos logs Railway — confirma que o fix está bloqueando
-            # eventos de programas errados. Se aparecer nos logs, o fix é necessário.
             logger.warning("HeliusWS: skip Program data de programa não-pAMM: %s (stack=%s)",
                            current, program_stack[-3:] if program_stack else [])
             continue
@@ -334,30 +339,35 @@ def _parse_swap_event_from_logs(logs: list, supply: float, sol_usd: float) -> di
 # ─────────────────────────────────────────────────────────────────────────────
 
 class HeliusWS:
-    """WebSocket manager — subscrição por mint, sem depender de pool address."""
+    """
+    WebSocket manager de preço real-time.
 
-    # Janela de eventos por mint — maxlen impede crescimento ilimitado.
-    # Eventos mais velhos que _ABSORPTION_WINDOW_SEC são ignorados na consulta.
+    Modo ERPC (ERPC_API_KEY configurado):
+      Uma subscrição global no pAMM. subscribe()/unsubscribe() apenas atualizam
+      o dict local — sem mensagens WS. Sem subscription timing gap.
+
+    Modo Helius (fallback, HELIUS_API_KEY configurado):
+      Uma subscrição logsSubscribe por mint. Comportamento legado.
+    """
+
     _ABSORPTION_MAXLEN     = 300
-    _ABSORPTION_WINDOW_SEC = 90   # janela padrão para get_absorption_window()
+    _ABSORPTION_WINDOW_SEC = 90
+    _MIN_POOL_SOL = float(os.getenv("MIN_POOL_SOL", "10"))
 
     def __init__(self, on_price: Callable[[str, float], None]):
         """on_price(mint, market_cap_usd) — compatível com HotMonitor.push_mc."""
         self._on_price = on_price
 
-        self._mint_supply:    dict[str, float] = {}   # mint → total_supply
-        self._sub_id_mint:    dict[int, str]   = {}   # ws_sub_id → mint
-        self._req_mint:       dict[int, str]   = {}   # req_id → mint (aguardando confirmação)
-        self._last_fetch:     dict[str, float] = {}   # mint → timestamp último parse
-        # H22 — rolling window de swap events por mint (side, sol, mc, ts, wallet)
-        self._swap_events:    dict[str, deque] = {}
-        # H25 — pool_quote (SOL) do último swap por mint
+        # Estado compartilhado (ambos os modos)
+        self._mint_supply:     dict[str, float] = {}
+        self._last_fetch:      dict[str, float] = {}
+        self._swap_events:     dict[str, deque] = {}
         self._pool_quote_last: dict[str, float] = {}
+        self._k_established:   dict[str, float] = {}
 
-        # k-consistency gate — constante produto da pool pAMM por mint
-        # Estabelecida no primeiro evento válido; usada para rejeitar eventos
-        # de secondary pools ou programas errados (k difere por ordens de magnitude).
-        self._k_established: dict[str, float] = {}
+        # Helius mode only
+        self._sub_id_mint: dict[int, str] = {}
+        self._req_mint:    dict[int, str] = {}
 
         self._lock      = threading.Lock()
         self._ws_lock   = threading.Lock()
@@ -365,20 +375,30 @@ class HeliusWS:
         self._req_id    = 1
         self._running   = False
         self._connected = False
+        self._mode      = "none"   # "erpc" | "helius" | "none"
+        self._ws_url    = ""
 
     # ──────────────────────────────────────────────────────────────────
     # API pública
     # ──────────────────────────────────────────────────────────────────
 
     def start(self):
-        if not HELIUS_API_KEY:
-            logger.warning("HELIUS_API_KEY não configurado — HeliusWS desativado")
+        if ERPC_API_KEY:
+            self._mode   = "erpc"
+            self._ws_url = _ERPC_WS_URL
+            logger.info("HeliusWS: modo ERPC (global transactionSubscribe)")
+        elif HELIUS_API_KEY:
+            self._mode   = "helius"
+            self._ws_url = _HELIUS_WS_URL
+            logger.info("HeliusWS: modo Helius (logsSubscribe por mint)")
+        else:
+            logger.warning("HeliusWS: nem ERPC_API_KEY nem HELIUS_API_KEY — desativado")
             return
+
         self._running = True
-        # Inicializa _sol_usd_cached para o path inline estar pronto imediatamente
         threading.Thread(target=self._init_sol_usd, daemon=True, name="helius-sol-init").start()
-        threading.Thread(target=self._run_loop, daemon=True, name="helius-ws").start()
-        logger.info("HeliusWS iniciado (url=%s...)", _WS_URL[:40])
+        threading.Thread(target=self._run_loop,     daemon=True, name="helius-ws").start()
+        logger.info("HeliusWS iniciado (url=%s...)", self._ws_url[:55])
 
     def _init_sol_usd(self):
         global _sol_usd_cached
@@ -392,21 +412,21 @@ class HeliusWS:
             logger.debug("HeliusWS: _init_sol_usd: %s", e)
 
     def subscribe(self, mint: str, total_supply: float):
-        """Subscreve ao mint no WebSocket — sem precisar do pool address."""
+        """Registra o mint para monitoramento. No modo erpc, nenhuma mensagem WS é enviada."""
         with self._lock:
             if mint in self._mint_supply:
                 return
-            self._mint_supply[mint] = total_supply
-            self._swap_events[mint] = deque(maxlen=self._ABSORPTION_MAXLEN)
+            self._mint_supply[mint]     = total_supply
+            self._swap_events[mint]     = deque(maxlen=self._ABSORPTION_MAXLEN)
             self._pool_quote_last[mint] = 0.0
 
-        if self._connected:
-            self._send_subscribe(mint)
-        # Se não conectado ainda, _on_open resubscreve tudo de _mint_supply
+        if self._mode == "helius" and self._connected:
+            self._send_helius_subscribe(mint)
 
-        logger.info("HeliusWS: subscribe mint=%s...", mint[:8])
+        logger.info("HeliusWS: subscribe %s... (modo=%s)", mint[:8], self._mode)
 
     def unsubscribe(self, mint: str):
+        """Remove o mint do monitoramento. No modo erpc, nenhuma mensagem WS é enviada."""
         sub_id_to_remove = None
         with self._lock:
             self._mint_supply.pop(mint, None)
@@ -414,11 +434,12 @@ class HeliusWS:
             self._swap_events.pop(mint, None)
             self._pool_quote_last.pop(mint, None)
             self._k_established.pop(mint, None)
-            for sid, m in list(self._sub_id_mint.items()):
-                if m == mint:
-                    sub_id_to_remove = sid
-                    del self._sub_id_mint[sid]
-                    break
+            if self._mode == "helius":
+                for sid, m in list(self._sub_id_mint.items()):
+                    if m == mint:
+                        sub_id_to_remove = sid
+                        del self._sub_id_mint[sid]
+                        break
 
         if sub_id_to_remove is not None:
             self._ws_send({
@@ -453,7 +474,7 @@ class HeliusWS:
         while self._running:
             try:
                 ws = _ws_lib.WebSocketApp(
-                    _WS_URL,
+                    self._ws_url,
                     on_open=self._on_open,
                     on_message=self._on_message,
                     on_error=self._on_error,
@@ -472,14 +493,17 @@ class HeliusWS:
 
     def _on_open(self, ws):
         self._connected = True
-        with self._lock:
-            self._sub_id_mint.clear()
-            self._req_mint.clear()
-            active = list(self._mint_supply.keys())
-
-        logger.info("HeliusWS conectado — resubscrevendo %d tokens", len(active))
-        for mint in active:
-            self._send_subscribe(mint)
+        if self._mode == "erpc":
+            self._send_erpc_global_subscribe()
+        else:
+            # Helius: resubscreve todos os mints ativos
+            with self._lock:
+                self._sub_id_mint.clear()
+                self._req_mint.clear()
+                active = list(self._mint_supply.keys())
+            logger.info("HeliusWS conectado — resubscrevendo %d tokens", len(active))
+            for mint in active:
+                self._send_helius_subscribe(mint)
 
     def _on_message(self, ws, message):
         try:
@@ -489,18 +513,94 @@ class HeliusWS:
 
         # Confirmação de subscrição
         if isinstance(data.get("result"), int) and "id" in data:
-            req_id = data["id"]
-            sub_id = data["result"]
-            with self._lock:
-                mint = self._req_mint.pop(req_id, None)
-                if mint:
-                    self._sub_id_mint[sub_id] = mint
-            logger.debug("HeliusWS: sub confirmada %s sub_id=%d", (mint or "?")[:8], sub_id)
+            if self._mode == "helius":
+                req_id = data["id"]
+                sub_id = data["result"]
+                with self._lock:
+                    mint = self._req_mint.pop(req_id, None)
+                    if mint:
+                        self._sub_id_mint[sub_id] = mint
+                logger.debug("HeliusWS: sub confirmada %s sub_id=%d", (mint or "?")[:8], sub_id)
+            else:
+                logger.info("HeliusWS erpc: transactionSubscribe confirmado id=%d", data["result"])
             return
 
-        if data.get("method") != "logsNotification":
+        method = data.get("method")
+
+        if method == "transactionNotification" and self._mode == "erpc":
+            self._handle_transaction_notification(data)
+        elif method == "logsNotification" and self._mode == "helius":
+            self._handle_logs_notification(data)
+
+    def _on_error(self, ws, error):
+        logger.warning("HeliusWS erro: %s", error)
+
+    def _on_close(self, ws, code, msg):
+        self._connected = False
+        logger.info("HeliusWS fechado (code=%s)", code)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Modo ERPC — handler de transactionNotification
+    # ──────────────────────────────────────────────────────────────────
+
+    def _handle_transaction_notification(self, data: dict):
+        """
+        Processa uma transactionNotification do erpc.
+        Identifica o mint monitorado cruzando os accountKeys da tx com _mint_supply.
+        """
+        params  = data.get("params", {})
+        result  = params.get("result", {})
+        value   = result.get("value", result)   # erpc envolve em "value"
+        tx_data = value.get("transaction", {})
+        meta    = tx_data.get("meta", {})
+
+        # Rejeita transações com erro on-chain
+        if meta.get("err"):
             return
 
+        logs = meta.get("logMessages", [])
+        if not logs:
+            return
+
+        # Filtro rápido: transação envolve o pAMM?
+        if not any(PUMP_AMM_PROGRAM in log for log in logs):
+            return
+
+        # Extrai account keys da transação para identificar o mint
+        tx_array = tx_data.get("transaction", [])
+        if not tx_array:
+            return
+        accounts = _parse_account_keys_from_tx(tx_array[0])
+        if not accounts:
+            return
+
+        # Encontra o primeiro mint monitorado nos accounts da transação
+        with self._lock:
+            monitored = set(self._mint_supply.keys())
+
+        if not monitored:
+            return
+
+        mint = None
+        for account in accounts:
+            if account in monitored:
+                mint = account
+                break
+
+        if not mint:
+            return  # transação do pAMM para token não monitorado
+
+        with self._lock:
+            supply = self._mint_supply.get(mint) or 1_000_000_000
+
+        self._tier1_process(mint, logs, supply)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Modo Helius — handler de logsNotification
+    # ──────────────────────────────────────────────────────────────────
+
+    def _handle_logs_notification(self, data: dict):
+        """Processa uma logsNotification do Helius (modo legado)."""
         params = data.get("params", {})
         sub_id = params.get("subscription")
         value  = params.get("result", {}).get("value", {})
@@ -515,7 +615,6 @@ class HeliusWS:
 
         logs = value.get("logs", [])
 
-        # Filtra: só swaps dos DEXes relevantes
         is_swap = any(
             PUMP_AMM_PROGRAM in log
             or METEORA_PROGRAM in log
@@ -531,129 +630,116 @@ class HeliusWS:
         with self._lock:
             supply = self._mint_supply.get(mint) or 1_000_000_000
 
-        # ── Tier 1: INLINE, sem rate limit, sem thread ─────────────────
-        # Cada swap dispara _check_bounce imediatamente (~5ms no callback WS).
-        # Elimina a janela cega de 2s do rate limit antigo.
-        # Também acumula evento para janela de absorção H22.
-        if _sol_usd_cached > 0:
-            try:
-                event = _parse_swap_event_from_logs(logs, supply, _sol_usd_cached)
-                if event and event["mc"] > 0:
-                    # A.9: filtro de thin pool ANTES de qualquer append — impede contaminação
-                    # de _swap_events (H22/H23) e _pool_quote_last (H25) com eventos de
-                    # secondary pools. pq_check == 0 também é rejeitado (parse incompleto).
-                    pq_check = event.get("pool_quote_sol", 0)
-                    if pq_check < self._MIN_POOL_SOL:
-                        logger.debug("HeliusWS A.9 skip %s: pool_quote=%.1f SOL < %.1f",
-                                     mint[:8], pq_check, self._MIN_POOL_SOL)
-                        return
+        if not self._tier1_process(mint, logs, supply):
+            self._tier2_dexscreener(mint, supply)
 
-                    # ── k-consistency gate ────────────────────────────────────────────
-                    # INVARIANTE FÍSICA: k = pool_base × pool_quote é constante produto.
-                    # Fees reduzem k monotonicamente a cada trade (≤1.25%/trade).
-                    # k NUNCA pode aumentar na mesma pool — qualquer aumento indica pool diferente.
-                    #
-                    # Dois checks em ordem crescente de custo:
-                    #   1. Absolute range: k fora de [5e23, 5e26] → bytes inválidos ou pool impossível
-                    #   2. Direcional: k_raw > k_established × 1.02 → FISICAMENTE impossível na mesma pool
-                    #   3. Safety net: k_raw < k_established / 100 → k_established foi corrompido
-                    #
-                    # O check direcional (2) é a inovação central:
-                    #   - Rejeita secondary pools quando k salta para cima (diferente de k_established)
-                    #   - Permite queda legítima por fees sem limite fixo (>128 trades não é rejeitado)
-                    #   - Zero falsos positivos: k nunca aumenta na mesma pool (aritmética de inteiros u64)
-                    k_raw = event.get("k_raw", 0)
-                    if k_raw > 0:
-                        # Check 1: absolute range
-                        if not (_K_ABSOLUTE_MIN <= k_raw <= _K_ABSOLUTE_MAX):
-                            logger.warning("HeliusWS k-gate ABSOLUTE skip %s: k=%.2e fora de [%.0e, %.0e]",
-                                           mint[:8], k_raw, _K_ABSOLUTE_MIN, _K_ABSOLUTE_MAX)
-                            return
+    # ──────────────────────────────────────────────────────────────────
+    # Tier 1 — parse Anchor inline (ambos os modos)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _tier1_process(self, mint: str, logs: list, supply: float) -> bool:
+        """
+        Parseia o evento Anchor, aplica k-gate e A.9, chama _on_price.
+        Retorna True se um price update foi disparado.
+        No modo erpc: sem Tier 2 (fallback não faz sentido para stream global).
+        No modo helius: retorna False para acionar Tier 2 se necessário.
+        """
+        if _sol_usd_cached <= 0:
+            return False
+
+        try:
+            event = _parse_swap_event_from_logs(logs, supply, _sol_usd_cached)
+            if not event or event["mc"] <= 0:
+                return False
+
+            # A.9: filtro de thin pool — rejeita secondary pools
+            pq_check = event.get("pool_quote_sol", 0)
+            if pq_check < self._MIN_POOL_SOL:
+                logger.debug("HeliusWS A.9 skip %s: pool_quote=%.1f SOL < %.1f",
+                             mint[:8], pq_check, self._MIN_POOL_SOL)
+                return False
+
+            # ── k-consistency gate ────────────────────────────────────────────
+            # k = pool_base × pool_quote é constante produto. Fees reduzem k
+            # monotonicamente. k NUNCA pode aumentar na mesma pool.
+            k_raw = event.get("k_raw", 0)
+            if k_raw > 0:
+                # Check 1: absolute range
+                if not (_K_ABSOLUTE_MIN <= k_raw <= _K_ABSOLUTE_MAX):
+                    logger.warning("HeliusWS k-gate ABSOLUTE skip %s: k=%.2e fora de [%.0e, %.0e]",
+                                   mint[:8], k_raw, _K_ABSOLUTE_MIN, _K_ABSOLUTE_MAX)
+                    return False
+
+                with self._lock:
+                    k_est = self._k_established.get(mint)
+
+                if k_est is None:
+                    # Primeiro evento: verifica se k está próximo do valor de migração
+                    k_init_min = _K_INIT_EXPECTED * (1.0 - _K_INIT_TOLERANCE)
+                    k_init_max = _K_INIT_EXPECTED * (1.0 + _K_INIT_TOLERANCE)
+                    if not (k_init_min <= k_raw <= k_init_max):
+                        logger.warning(
+                            "HeliusWS k-gate INIT SKIP %s: k=%.3e fora de [%.2e, %.2e] "
+                            "— possível secondary pool",
+                            mint[:8], k_raw, k_init_min, k_init_max,
+                        )
+                        return False
+                    with self._lock:
+                        self._k_established[mint] = k_raw
+                    logger.info("HeliusWS k-gate ESTABLISHED %s: k=%.3e", mint[:8], k_raw)
+                else:
+                    # Check 2 (direcional): k não pode aumentar
+                    if k_raw > k_est * (1.0 + _K_INCREASE_TOLERANCE):
+                        logger.warning(
+                            "HeliusWS k-gate INCREASE REJECT %s: k=%.3e > k_est=%.3e "
+                            "(secondary pool?)", mint[:8], k_raw, k_est,
+                        )
+                        return False
+                    # Check 3 (safety net): queda de >100x indica k_established corrompido
+                    if k_raw < k_est / _K_RATIO_MAX:
+                        logger.warning(
+                            "HeliusWS k-gate DROP REJECT %s: k=%.3e << k_est=%.3e (>%.0fx) "
+                            "— resetando", mint[:8], k_raw, k_est, _K_RATIO_MAX,
+                        )
                         with self._lock:
-                            k_est = self._k_established.get(mint)
-                        if k_est is None:
-                            # Primeiro evento válido para este mint: estabelece k de referência.
-                            # Guard de inicialização: k do primeiro evento deve estar próximo
-                            # do k teórico de migração (±60%). Protege contra secondary pools
-                            # com 10-79 SOL que passam o A.9 filter mas têm k muito menor
-                            # que a pool primária — se inicializássemos com esse k, eventos
-                            # subsequentes da pool primária (k maior) seriam rejeitados.
-                            k_init_min = _K_INIT_EXPECTED * (1.0 - _K_INIT_TOLERANCE)
-                            k_init_max = _K_INIT_EXPECTED * (1.0 + _K_INIT_TOLERANCE)
-                            if not (k_init_min <= k_raw <= k_init_max):
-                                logger.warning(
-                                    "HeliusWS k-gate INIT SKIP %s: k=%.3e fora do range de inicialização "
-                                    "[%.2e, %.2e] — possível secondary pool; rejeitando evento",
-                                    mint[:8], k_raw, k_init_min, k_init_max,
-                                )
-                                # Rejeita: k fora do range de inicialização indica secondary pool.
-                                # Não inicializar k_established com valor suspeito E não
-                                # passar o evento — um price update não-validado pode corromper mc_min.
-                                # k_established ficará None até um evento com k na faixa esperada.
-                                return
-                            else:
-                                with self._lock:
-                                    self._k_established[mint] = k_raw
-                                logger.info("HeliusWS k-gate ESTABLISHED %s: k=%.3e (pool_base=%d pool_quote=%d)",
-                                            mint[:8], k_raw,
-                                            event.get("pool_base", 0), event.get("pool_quote", 0))
-                        else:
-                            # Check 2 (direcional — o mais importante):
-                            # k_raw > k_established × (1 + tolerância) é FISICAMENTE impossível.
-                            # Fees só reduzem k. Aumento significa pool diferente → rejeitar.
-                            if k_raw > k_est * (1.0 + _K_INCREASE_TOLERANCE):
-                                logger.warning(
-                                    "HeliusWS k-gate INCREASE REJECT %s: k=%.3e > k_est=%.3e × %.2f "
-                                    "(aumento é impossível na mesma pool — secondary pool?) "
-                                    "(pool_base=%d pool_quote=%d pool_quote_sol=%.1f)",
-                                    mint[:8], k_raw, k_est, 1.0 + _K_INCREASE_TOLERANCE,
-                                    event.get("pool_base", 0), event.get("pool_quote", 0), pq_check,
-                                )
-                                return
-                            # Check 3 (safety net): queda de >100x é fisicamente impossível
-                            # em 60min de trading (após 200 trades a 1.25%/trade, k cai ~12x).
-                            # Indica que k_established foi corrompido OU pool diferente.
-                            if k_raw < k_est / _K_RATIO_MAX:
-                                logger.warning(
-                                    "HeliusWS k-gate DROP REJECT %s: k=%.3e << k_est=%.3e (ratio>%.0fx) "
-                                    "— queda de 100x é impossível; resetando k_established para None "
-                                    "(pool_base=%d pool_quote=%d pool_quote_sol=%.1f)",
-                                    mint[:8], k_raw, k_est, _K_RATIO_MAX,
-                                    event.get("pool_base", 0), event.get("pool_quote", 0), pq_check,
-                                )
-                                # Limpa k_established: próximo evento válido re-estabelece via init guard.
-                                # Rejeita este evento — não sabemos se é pool primária ou secundária.
-                                with self._lock:
-                                    self._k_established.pop(mint, None)
-                                return
-                            # k pode diminuir por fees — atualiza monotonicamente para baixo
-                            if k_raw < k_est:
-                                with self._lock:
-                                    if self._k_established.get(mint) == k_est:
-                                        self._k_established[mint] = k_raw
-
-                    # H22/H24/H25: acumula na rolling window — garantido pool primária (≥ _MIN_POOL_SOL)
-                    if event["side"] != "unknown":
+                            self._k_established.pop(mint, None)
+                        return False
+                    # k legítimo pode cair por fees — atualiza monotonicamente
+                    if k_raw < k_est:
                         with self._lock:
-                            buf = self._swap_events.get(mint)
-                            self._pool_quote_last[mint] = pq_check  # H25: sempre da pool primária
-                        if buf is not None:
-                            buf.append({
-                                "ts":             time.time(),
-                                "side":           event["side"],
-                                "sol":            event["sol"],
-                                "mc":             event["mc"],
-                                "wallet":         event.get("wallet"),
-                                "pool_quote_sol": pq_check,
-                            })
-                    logger.info("HeliusWS price(anchor) %s: $%.0f MC [%s %.4f SOL pool=%.1f]",
-                                mint[:8], event["mc"], event["side"], event["sol"], pq_check)
-                    self._on_price(mint, event["mc"])
-                    return
-            except Exception as e:
-                logger.debug("HeliusWS anchor parse %s: %s", mint[:8], e)
+                            if self._k_established.get(mint) == k_est:
+                                self._k_established[mint] = k_raw
 
-        # ── Tier 2: DexScreener fallback — rate-limitado (HTTP externo) ─
+            # H22/H24/H25: acumula na rolling window
+            if event["side"] != "unknown":
+                with self._lock:
+                    buf = self._swap_events.get(mint)
+                    self._pool_quote_last[mint] = pq_check
+                if buf is not None:
+                    buf.append({
+                        "ts":             time.time(),
+                        "side":           event["side"],
+                        "sol":            event["sol"],
+                        "mc":             event["mc"],
+                        "wallet":         event.get("wallet"),
+                        "pool_quote_sol": pq_check,
+                    })
+
+            logger.info("HeliusWS price(anchor) %s: $%.0f MC [%s %.4f SOL pool=%.1f]",
+                        mint[:8], event["mc"], event["side"], event["sol"], pq_check)
+            self._on_price(mint, event["mc"])
+            return True
+
+        except Exception as e:
+            logger.debug("HeliusWS tier1 %s: %s", mint[:8], e)
+            return False
+
+    # ──────────────────────────────────────────────────────────────────
+    # Tier 2 — DexScreener fallback (modo Helius apenas)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _tier2_dexscreener(self, mint: str, supply: float):
+        """Fallback HTTP quando Tier 1 falha. Rate-limitado por mint."""
         now = time.time()
         with self._lock:
             if now - self._last_fetch.get(mint, 0) < _DEX_RATE_LIMIT_SEC:
@@ -667,15 +753,25 @@ class HeliusWS:
             name=f"hdex-{mint[:6]}",
         ).start()
 
-    def _on_error(self, ws, error):
-        logger.warning("HeliusWS erro: %s", error)
+    def _dexscreener_fallback(self, mint: str, supply: float):
+        global _sol_usd_cached
+        from gmgn_client import get_sol_usd
+        sol_usd = get_sol_usd()
+        if sol_usd:
+            _sol_usd_cached = sol_usd
 
-    def _on_close(self, ws, code, msg):
-        self._connected = False
-        logger.info("HeliusWS fechado (code=%s)", code)
+        from pool_resolver import get_price_usd
+        try:
+            price_usd = get_price_usd(mint)
+            if price_usd and price_usd > 0:
+                mc = price_usd * supply
+                logger.info("HeliusWS price(dex) %s: $%.0f MC", mint[:8], mc)
+                self._on_price(mint, mc)
+        except Exception as e:
+            logger.debug("HeliusWS dex fallback %s: %s", mint[:8], e)
 
     # ──────────────────────────────────────────────────────────────────
-    # Price resolution — Anchor logs → DexScreener fallback
+    # Métodos de análise (H22/H23/H24/H25) — inalterados
     # ──────────────────────────────────────────────────────────────────
 
     def get_absorption_window(self, mint: str, window_sec: int = 60,
@@ -683,12 +779,10 @@ class HeliusWS:
         """
         H22/H23 — retorna métricas de fluxo de ordens para um mint na janela de window_sec.
 
-        window_end_ts: timestamp Unix (float) do FIM da janela. Default = time.time() (agora).
-        Para capturar absorção REAL do dump (não momentum pós-bounce), passar
-        state["ts_min"].timestamp() — janela fica [ts_min - window_sec, ts_min].
-        Sem esse parâmetro, a janela captura o bounce subindo, não o fundo sendo absorvido.
+        window_end_ts: timestamp Unix do FIM da janela. Default = time.time() (agora).
+        Para capturar absorção do dump (não momentum), passar state["ts_min"].timestamp().
         """
-        end   = window_end_ts if window_end_ts is not None else time.time()
+        end    = window_end_ts if window_end_ts is not None else time.time()
         cutoff = end - window_sec
         with self._lock:
             events = list(self._swap_events.get(mint, []))
@@ -701,15 +795,15 @@ class HeliusWS:
         sell_vol = sum(e["sol"] for e in sells)
 
         return {
-            "buy_count":      len(buys),
-            "sell_count":     len(sells),
-            "buy_vol_sol":    buy_vol,
-            "sell_vol_sol":   sell_vol,
-            "largest_buy":    max((e["sol"] for e in buys),  default=0.0),
-            "largest_sell":   max((e["sol"] for e in sells), default=0.0),
-            "total_events":   len(recent),
-            "window_sec":     window_sec,
-            "window_end_ts":  end,
+            "buy_count":     len(buys),
+            "sell_count":    len(sells),
+            "buy_vol_sol":   buy_vol,
+            "sell_vol_sol":  sell_vol,
+            "largest_buy":   max((e["sol"] for e in buys),  default=0.0),
+            "largest_sell":  max((e["sol"] for e in sells), default=0.0),
+            "total_events":  len(recent),
+            "window_sec":    window_sec,
+            "window_end_ts": end,
         }
 
     def get_pool_quote(self, mint: str) -> float | None:
@@ -721,14 +815,7 @@ class HeliusWS:
     def get_dump_seller_concentration(
         self, mint: str, window_start_ts: float, window_end_ts: float
     ) -> dict:
-        """H24 — concentração de sellers durante o dump [window_start_ts → window_end_ts].
-
-        Calcula HHI (Herfindahl-Hirschman Index) por volume vendido por wallet única.
-        HHI=1.0: um único seller vendeu tudo (dump finito e previsível).
-        HHI→0: muitos sellers (pressão de venda estrutural, sem exaustão).
-
-        Retorna: seller_count, seller_hhi, top_seller_frac.
-        """
+        """H24 — concentração de sellers via HHI durante o dump."""
         with self._lock:
             events = list(self._swap_events.get(mint, []))
 
@@ -760,21 +847,10 @@ class HeliusWS:
             "top_seller_frac": round(max(shares), 4),
         }
 
-    # Profundidade mínima da pool primária do pump.fun pAMM (SOL).
-    # Derivado da matemática da bonding curve: com k = 79 SOL × 200M tokens e todos
-    # os 1B tokens possíveis vendidos, o mínimo absoluto da pool primária é ~15.8 SOL.
-    # Com nosso filtro MC ≥ $5k, o mínimo real é ~21.5 SOL.
-    # Eventos Helius com pool_quote_sol < 10 SOL são de secondary pools (MEV, thin pools)
-    # não visíveis nos gráficos — a fake pool do evento espúrio tinha 0.83 SOL.
-    _MIN_POOL_SOL = float(os.getenv("MIN_POOL_SOL", "10"))
-
     def get_min_mc_in_window(self, mint: str, from_ts: float, to_ts: float) -> float | None:
-        """Retorna o menor MC observado via Helius para um mint no intervalo [from_ts, to_ts].
-        Usado para substituir kline low na janela de transição (elapsed < 90s), onde o low
-        intra-candle do kline pode incluir preços da bonding curve pré-migração.
-        Filtra eventos com pool_quote_sol < MIN_POOL_SOL para rejeitar secondary pools e
-        thin pools que produzem preços fictícios não visíveis nos gráficos (A.9).
-        Retorna None se não há eventos Helius válidos nessa janela.
+        """
+        Retorna o menor MC observado via Helius/erpc para um mint no intervalo [from_ts, to_ts].
+        Filtra eventos com pool_quote_sol < MIN_POOL_SOL (A.9 — rejeita secondary pools).
         """
         with self._lock:
             events = list(self._swap_events.get(mint, []))
@@ -782,37 +858,42 @@ class HeliusWS:
             e["mc"] for e in events
             if from_ts <= e["ts"] <= to_ts
             and e["mc"] > 0
-            and e.get("pool_quote_sol", 0) >= self._MIN_POOL_SOL  # A.9: rejeita secondary pools
+            and e.get("pool_quote_sol", 0) >= self._MIN_POOL_SOL
         ]
         return min(window) if window else None
 
-    def _dexscreener_fallback(self, mint: str, supply: float):
-        """
-        Tier 2 — DexScreener fallback quando Anchor parse falha (token não é pAMM).
-        Também atualiza _sol_usd_cached para o path inline do Tier 1.
-        """
-        global _sol_usd_cached
-        from gmgn_client import get_sol_usd
-
-        sol_usd = get_sol_usd()
-        if sol_usd:
-            _sol_usd_cached = sol_usd  # alimenta o path inline sem bloqueio
-
-        from pool_resolver import get_price_usd
-        try:
-            price_usd = get_price_usd(mint)
-            if price_usd and price_usd > 0:
-                mc = price_usd * supply
-                logger.info("HeliusWS price(dex) %s: $%.0f MC", mint[:8], mc)
-                self._on_price(mint, mc)
-        except Exception as e:
-            logger.debug("HeliusWS dex fallback %s: %s", mint[:8], e)
-
     # ──────────────────────────────────────────────────────────────────
-    # Helpers
+    # Helpers internos
     # ──────────────────────────────────────────────────────────────────
 
-    def _send_subscribe(self, mint: str):
+    def _send_erpc_global_subscribe(self):
+        """Envia UMA subscrição global no pAMM (modo erpc)."""
+        req_id = self._next_req_id()
+        self._ws_send({
+            "jsonrpc": "2.0",
+            "id":      req_id,
+            "method":  "transactionSubscribe",
+            "params":  [
+                {
+                    "vote":     False,
+                    "failed":   False,
+                    "accounts": {
+                        "include": [PUMP_AMM_PROGRAM],
+                    },
+                },
+                {
+                    "commitment":                    "processed",
+                    "encoding":                      "base64",
+                    "transactionDetails":            "full",
+                    "showRewards":                   False,
+                    "maxSupportedTransactionVersion": 0,
+                },
+            ],
+        })
+        logger.info("HeliusWS erpc: transactionSubscribe enviado (req_id=%d)", req_id)
+
+    def _send_helius_subscribe(self, mint: str):
+        """Envia logsSubscribe para um mint (modo Helius)."""
         req_id = self._next_req_id()
         with self._lock:
             self._req_mint[req_id] = mint

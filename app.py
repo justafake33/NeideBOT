@@ -31979,7 +31979,7 @@ def debug_microstructure():
             if not active_mints:
                 live_rows = "<tr><td colspan=4>Nenhum token ativo no HotMonitor</td></tr>"
         else:
-            live_rows = "<tr><td colspan=4>HeliusWS não inicializado (sem HELIUS_API_KEY?)</td></tr>"
+            live_rows = "<tr><td colspan=4>HeliusWS não inicializado (sem ERPC_API_KEY nem HELIUS_API_KEY?)</td></tr>"
 
         # ── Seção 2: últimos 30 bounce_signals com novos campos ───────────
         conn = psycopg2.connect(DATABASE_URL)
