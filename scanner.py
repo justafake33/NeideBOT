@@ -130,33 +130,57 @@ class HotMonitor:
             except Exception as e:
                 logger.debug("helius.subscribe %s: %s", mint[:8], e)
 
-        # Retroativamente inicializa mc_min a partir do deque erpc.
-        # Problema: push_mc retorna imediatamente quando _tokens.get(mint)=None (estado ainda
-        # não existe). Durante o gap entre migração e hot.add() (5-15s), o token pode já ter
-        # dumpado e atingido o fundo — os eventos estão no deque mas nunca foram aplicados.
-        # Fix: ao criar o estado, consulta o deque pelo menor MC desde ts_migration e usa
-        # o timestamp REAL do evento (não now) para que A.6 funcione corretamente.
-        if added and self._helius:
-            try:
-                # Margem de 5s: cobre drift de relógio entre Railway e Solana validator.
-                ts_mig_ts = ts_migration.timestamp() - 5.0
-                min_mc, min_ts = self._helius.get_min_mc_in_window(
-                    mint, ts_mig_ts, time.time(), return_ts=True
-                )
-                if min_mc is not None:
-                    with self._lock:
-                        s = self._tokens.get(mint)
-                        # Compara com s["mc_min"] (não mc_migration): push_mc pode ter
-                        # atualizado mc_min entre get_min_mc_in_window e este lock.
-                        if s and min_mc < s["mc_min"]:
-                            s["mc_min"] = min_mc
-                            s["ts_min"] = datetime.fromtimestamp(min_ts, tz=timezone.utc)
-                    logger.info(
-                        "hot.add() %s: mc_min retroativo=$%.0f (era $%.0f, helius deque)",
-                        symbol, min_mc, mc_migration,
-                    )
-            except Exception as e:
-                logger.debug("hot.add() retroativo %s: %s", mint[:8], e)
+        # Gap coverage: dispara um kline imediato para cobrir os 5-15s entre migração
+        # e o primeiro ciclo do _precise_loop. mc_min só vem do kline — nunca do deque erpc.
+        if added:
+            threading.Thread(
+                target=self._precise_bottom_single,
+                args=(mint,),
+                daemon=True,
+                name=f"precise1-{mint[:8]}",
+            ).start()
+
+    def _precise_bottom_single(self, mint: str):
+        """
+        Kline imediato chamado uma vez ao adicionar o token (hot.add).
+        Cobre o gap de 5-15s entre migração e o primeiro ciclo do _precise_loop.
+        mc_min só é atualizado via kline — nunca via deque erpc.
+        """
+        time.sleep(2)  # aguarda GMGN indexar os primeiros candles
+        with self._lock:
+            state = self._tokens.get(mint)
+        if not state or mint in self._cancelled:
+            return
+        try:
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            ts_mig = state["ts_mig_unix"]
+            candles = self.gmgn.get_token_kline(
+                mint, "sol", "1m",
+                from_ts=ts_mig,
+                to_ts=now_ts,
+            )
+            if not candles:
+                return
+            for c in sorted(candles, key=lambda c: int(c.get("time", 0))):
+                candle_ts   = int(c.get("time", 0)) / 1000
+                elapsed_sec = int(candle_ts - ts_mig)
+                if elapsed_sec < 90 or elapsed_sec > 3660:
+                    continue
+                low_price = _float(c.get("low"))
+                if not low_price or low_price <= 0:
+                    continue
+                mc_low = low_price * state["total_supply"]
+                with self._lock:
+                    inner = self._tokens.get(mint)
+                    if inner and mc_low < inner["mc_min"]:
+                        inner["mc_min"]   = mc_low
+                        inner["time_min"] = elapsed_sec / 60
+                        inner["ts_min"]   = datetime.fromtimestamp(candle_ts, tz=timezone.utc)
+                        db.update_bottom(mint, mc_low, elapsed_sec / 60)
+                        logger.info("Fundo(kline1) %s: $%.0f em %.1fmin",
+                                    state["symbol"], mc_low, elapsed_sec / 60)
+        except Exception as e:
+            logger.debug("_precise_bottom_single %s: %s", mint[:8], e)
 
     def cancel(self, mint: str):
         with self._lock:
@@ -201,18 +225,16 @@ class HotMonitor:
             db.set_recovery_false(mint)
             return
 
-        # Helius events passam pelo k-gate (invariante física do AMM) — confiáveis desde t=0.
-        # Trenches (usd_market_cap da API GMGN) não tem pool reserves, não é k-validado:
-        # guard de 90s protege contra GMGN ainda indexando bonding curve pós-migração.
-        helius_validated = token_data is None
-        if (helius_validated or elapsed_sec >= 90) and mc < state["mc_min"]:
+        # erpc (token_data is None, PDA validado) escreve mc_min sem restrição de tempo.
+        # A pool pAMM só existe após migração — não há contaminação de bonding curve.
+        # kline (_precise_bottom_tick) complementa com candles fechados (elapsed >= 90s).
+        # Trenches NÃO escreve mc_min — poll de 5s, não é tempo real.
+        if token_data is None and mc < state["mc_min"]:
             state["mc_min"] = mc
             state["time_min"] = elapsed_min
             state["ts_min"]   = datetime.now(timezone.utc)
             db.update_bottom(mint, mc, elapsed_min)
-            logger.info("Fundo(poll) %s: $%.0f em %.1fmin (%.0f%% abaixo ATH)",
-                        state["symbol"], mc, elapsed_min,
-                        (1 - mc / state["mc_migration"]) * 100)
+            logger.info("Fundo(erpc) %s: $%.0f em %.1fmin", state["symbol"], mc, elapsed_min)
 
         if mc > state["mc_max"]:
             state["mc_max"] = mc
@@ -276,11 +298,6 @@ class HotMonitor:
         if mc_min <= 0 or mc_migration <= 0:
             return
 
-        # A.9 — Data source selection by pool maturity:
-        # elapsed < BOUNCE_TIME_MIN_SEC: pool ainda em transição bonding curve → pool novo.
-        #   Usar APENAS Helius (preço real das pool reserves), ignorar kline (pode ter bonding curve).
-        # elapsed >= BOUNCE_TIME_MIN_SEC: pool estável, usar MIN(helius, kline) como antes.
-        # Impacto: sinais cedo (< ~5min) usam dado mais preciso, aumentam confiabilidade.
 
         drop_from_mig = (mc_migration - mc_min) / mc_migration
         if drop_from_mig < self.BOUNCE_DROP_MIN:
@@ -317,20 +334,9 @@ class HotMonitor:
                 )
                 return
 
-        # A.2 — Dead zone: bounce 20-30% tem WR 4% e EV -10%. Permitir <20% ou ≥30%.
-        if 0.20 <= bounce_pct < 0.30:
-            logger.debug("BOUNCE skip %s — dead zone bounce=%.1f%%", mint[:8], bounce_pct * 100)
-            return
-
         # A.8 — Preço acima da migração: sinal é artifact de wick intra-candle, não bounce real.
         if mc >= mc_migration:
             logger.debug("BOUNCE skip %s — A.8 mc=$%.0f >= mig=$%.0f", mint[:8], mc, mc_migration)
-            return
-
-        # A.3 — Entry ratio 50-65% da migração: WR 0% em 15 tokens. Rejeitar.
-        entry_ratio = mc / mc_migration if mc_migration > 0 else 0
-        if 0.50 <= entry_ratio <= 0.65:
-            logger.debug("BOUNCE skip %s — entry ratio=%.2f (dead zone 50-65%%)", mint[:8], entry_ratio)
             return
 
         # B.3 — Backfill retroativo: insere kline completo desde a migração para cobertura de ticks.
@@ -775,29 +781,10 @@ class HotMonitor:
                     # 1. Atualiza mc_min com o low desta vela ANTES de checar bounce.
                     #    Garante que bounce_pct e A.6 usam o fundo correto desta vela.
                     #
-                    #    A.9 — Data source selection by pool maturity:
-                    #    - elapsed < BOUNCE_TIME_MIN_SEC: pool em transição. Usar APENAS Helius.
-                    #      Kline low pode ser bonding curve pré-migração, muito abaixo do real.
-                    #    - elapsed >= BOUNCE_TIME_MIN_SEC: pool estável. Usar MIN(helius, kline).
-                    #      Helius é preço real (~5ms latência), kline pode ter lag (~200ms).
+                    # mc_min: fonte única = kline low (pool primária GMGN).
+                    # erpc excluído — pode conter preços de secondary pools.
                     low_price = _float(c.get("low"))
-                    mc_low_kline = low_price * state["total_supply"] if (low_price and low_price > 0) else None
-                    mc_low = None
-
-                    if self._helius:
-                        candle_start = state["ts_mig_unix"] + max(0, elapsed_sec - 60)
-                        candle_end   = state["ts_mig_unix"] + elapsed_sec
-                        mc_low_helius = self._helius.get_min_mc_in_window(mint, candle_start, candle_end)
-
-                        if elapsed_sec < self.BOUNCE_TIME_MIN_SEC:
-                            # A.9: pool em transição — confiar APENAS em Helius
-                            mc_low = mc_low_helius
-                        else:
-                            # A.9: pool maduro — usar MIN(helius, kline)
-                            mc_low = min(v for v in [mc_low_helius, mc_low_kline] if v is not None) if any([mc_low_helius, mc_low_kline]) else None
-                    else:
-                        # Sem Helius: usar kline
-                        mc_low = mc_low_kline
+                    mc_low = low_price * state["total_supply"] if (low_price and low_price > 0) else None
 
                     if mc_low and mc_low > 0 and mc_low < state["mc_min"]:
                             candle_dt = datetime.fromtimestamp(candle_ts, tz=timezone.utc)
@@ -834,19 +821,12 @@ class HotMonitor:
                             state["mc_max"] = mc_close_peak
 
                     # 3. Acumula tick kline com OHLC completo.
-                    #    mc_low para elapsed < BOUNCE_TIME_MIN_SEC (90s) vem APENAS do Helius — pool em transição da bonding curve.
-                    #    mc_low para elapsed >= BOUNCE_TIME_MIN_SEC usa MIN(helius, kline) — pool estável.
-                    #    mc_low já foi calculado no passo 1, reutiliza aqui.
                     close_p = _float(c.get("close"))
                     open_p  = _float(c.get("open"))
                     high_p  = _float(c.get("high"))
                     vol     = _float(c.get("volume"))
                     supply  = state["total_supply"]
                     if close_p and close_p > 0 and supply:
-                        # mc_low já foi calculado no passo 1 (com Helius + kline logic).
-                        # Usa mc_low diretamente: já incorpora Helius quando disponível,
-                        # garantindo que o tick armazena o mínimo mais preciso.
-                        # Nota: elapsed_sec < 90 é impossível aqui (continue acima descarta).
                         mc_low_tick = mc_low
                         kline_ticks.append({
                             "mint":        mint,
