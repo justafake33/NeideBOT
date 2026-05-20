@@ -847,20 +847,27 @@ class HeliusWS:
             "top_seller_frac": round(max(shares), 4),
         }
 
-    def get_min_mc_in_window(self, mint: str, from_ts: float, to_ts: float) -> float | None:
+    def get_min_mc_in_window(self, mint: str, from_ts: float, to_ts: float,
+                             return_ts: bool = False):
         """
         Retorna o menor MC observado via Helius/erpc para um mint no intervalo [from_ts, to_ts].
         Filtra eventos com pool_quote_sol < MIN_POOL_SOL (A.9 — rejeita secondary pools).
+
+        return_ts=False (padrão): retorna float | None
+        return_ts=True: retorna (float, float) | (None, None) — (mc, ts_evento)
         """
         with self._lock:
             events = list(self._swap_events.get(mint, []))
         window = [
-            e["mc"] for e in events
+            e for e in events
             if from_ts <= e["ts"] <= to_ts
             and e["mc"] > 0
             and e.get("pool_quote_sol", 0) >= self._MIN_POOL_SOL
         ]
-        return min(window) if window else None
+        if not window:
+            return (None, None) if return_ts else None
+        best = min(window, key=lambda e: e["mc"])
+        return (best["mc"], best["ts"]) if return_ts else best["mc"]
 
     # ──────────────────────────────────────────────────────────────────
     # Helpers internos

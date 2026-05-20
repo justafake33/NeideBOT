@@ -134,17 +134,23 @@ class HotMonitor:
         # Problema: push_mc retorna imediatamente quando _tokens.get(mint)=None (estado ainda
         # não existe). Durante o gap entre migração e hot.add() (5-15s), o token pode já ter
         # dumpado e atingido o fundo — os eventos estão no deque mas nunca foram aplicados.
-        # Fix: ao criar o estado, consulta o deque pelo menor MC desde ts_migration.
+        # Fix: ao criar o estado, consulta o deque pelo menor MC desde ts_migration e usa
+        # o timestamp REAL do evento (não now) para que A.6 funcione corretamente.
         if added and self._helius:
             try:
-                ts_mig_ts = ts_migration.timestamp()
-                min_mc = self._helius.get_min_mc_in_window(mint, ts_mig_ts, time.time())
-                if min_mc and min_mc < mc_migration:
+                # Margem de 5s: cobre drift de relógio entre Railway e Solana validator.
+                ts_mig_ts = ts_migration.timestamp() - 5.0
+                min_mc, min_ts = self._helius.get_min_mc_in_window(
+                    mint, ts_mig_ts, time.time(), return_ts=True
+                )
+                if min_mc is not None:
                     with self._lock:
                         s = self._tokens.get(mint)
-                        if s:
+                        # Compara com s["mc_min"] (não mc_migration): push_mc pode ter
+                        # atualizado mc_min entre get_min_mc_in_window e este lock.
+                        if s and min_mc < s["mc_min"]:
                             s["mc_min"] = min_mc
-                            s["ts_min"] = datetime.now(timezone.utc)
+                            s["ts_min"] = datetime.fromtimestamp(min_ts, tz=timezone.utc)
                     logger.info(
                         "hot.add() %s: mc_min retroativo=$%.0f (era $%.0f, helius deque)",
                         symbol, min_mc, mc_migration,
