@@ -225,9 +225,16 @@ class HotMonitor:
             db.set_recovery_false(mint)
             return
 
-        # mc_min: fonte única = kline 1m low (via _precise_bottom_tick).
-        # erpc/trenches NÃO escrevem mc_min — podem ter preços de secondary pools.
-        # push_mc só atualiza mc_last/mc_max e dispara _check_bounce com timing real.
+        # erpc (token_data is None, PDA validado) escreve mc_min sem restrição de tempo.
+        # A pool pAMM só existe após migração — não há contaminação de bonding curve.
+        # kline (_precise_bottom_tick) complementa com candles fechados (elapsed >= 90s).
+        # Trenches NÃO escreve mc_min — poll de 5s, não é tempo real.
+        if token_data is None and mc < state["mc_min"]:
+            state["mc_min"] = mc
+            state["time_min"] = elapsed_min
+            state["ts_min"]   = datetime.now(timezone.utc)
+            db.update_bottom(mint, mc, elapsed_min)
+            logger.info("Fundo(erpc) %s: $%.0f em %.1fmin", state["symbol"], mc, elapsed_min)
 
         if mc > state["mc_max"]:
             state["mc_max"] = mc
@@ -327,20 +334,9 @@ class HotMonitor:
                 )
                 return
 
-        # A.2 — Dead zone: bounce 20-30% tem WR 4% e EV -10%. Permitir <20% ou ≥30%.
-        if 0.20 <= bounce_pct < 0.30:
-            logger.debug("BOUNCE skip %s — dead zone bounce=%.1f%%", mint[:8], bounce_pct * 100)
-            return
-
         # A.8 — Preço acima da migração: sinal é artifact de wick intra-candle, não bounce real.
         if mc >= mc_migration:
             logger.debug("BOUNCE skip %s — A.8 mc=$%.0f >= mig=$%.0f", mint[:8], mc, mc_migration)
-            return
-
-        # A.3 — Entry ratio 50-65% da migração: WR 0% em 15 tokens. Rejeitar.
-        entry_ratio = mc / mc_migration if mc_migration > 0 else 0
-        if 0.50 <= entry_ratio <= 0.65:
-            logger.debug("BOUNCE skip %s — entry ratio=%.2f (dead zone 50-65%%)", mint[:8], entry_ratio)
             return
 
         # B.3 — Backfill retroativo: insere kline completo desde a migração para cobertura de ticks.

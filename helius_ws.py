@@ -73,6 +73,59 @@ _K_INIT_TOLERANCE = 0.80
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PDA derivation — pool primária pump.fun pAMM
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Constantes da curva ed25519 — usadas para verificar se um ponto está on-curve.
+# Pré-calculadas para evitar recalcular a cada chamada.
+_ED25519_P = 2**255 - 19
+_ED25519_D = (-121665 * pow(121666, _ED25519_P - 2, _ED25519_P)) % _ED25519_P
+
+
+def _is_on_curve_ed25519(point: bytes) -> bool:
+    """
+    Retorna True se os 32 bytes representam um ponto válido na curva ed25519.
+    Implementação via aritmética modular pura — sem dependência de cryptography.
+    Equação: -x² + y² = 1 + d·x²·y² (mod p)
+    Verificamos se x² = (y²-1)/(d·y²+1) tem raiz quadrada mod p.
+    """
+    try:
+        p  = _ED25519_P
+        d  = _ED25519_D
+        y  = int.from_bytes(point, "little") & ~(1 << 255)
+        y2 = (y * y) % p
+        u  = (y2 - 1) % p
+        v  = (d * y2 + 1) % p
+        x2 = (u * pow(v, p - 2, p)) % p   # x² = u/v mod p (inverso de Fermat)
+        if x2 == 0:
+            return True   # ponto (0, y) está na curva
+        # Verifica se x² tem raiz quadrada mod p (Euler criterion)
+        return pow(x2, (p - 1) // 2, p) == 1
+    except Exception:
+        return False
+
+
+def _derive_pool_pda(base_mint: str) -> str | None:
+    """
+    Deriva o endereço PDA da pool primária pump.fun pAMM para um mint.
+    Seeds: [b"pool", base_mint_bytes, wsol_bytes, bump_byte]
+    Retorna o endereço Base58 do PDA, ou None em caso de erro.
+    """
+    try:
+        mint_b = _base58.b58decode(base_mint)
+        wsol_b = _base58.b58decode(WSOL_MINT)
+        prog_b = _base58.b58decode(PUMP_AMM_PROGRAM)
+        for bump in range(255, -1, -1):
+            data = b"pool" + mint_b + wsol_b + bytes([bump]) + prog_b + b"ProgramDerivedAddress"
+            candidate = hashlib.sha256(data).digest()
+            if not _is_on_curve_ed25519(candidate):
+                return _base58.b58encode(candidate).decode()
+    except Exception as e:
+        logger.debug("_derive_pool_pda %s: %s", base_mint[:8], e)
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Helpers para parse de transação Solana (modo erpc)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -365,6 +418,7 @@ class HeliusWS:
         self._swap_events:     dict[str, deque] = {}
         self._pool_quote_last: dict[str, float] = {}
         self._k_established:   dict[str, float] = {}
+        self._pool_pda:        dict[str, str]   = {}  # mint → PDA da pool primária
 
         # Helius mode only
         self._sub_id_mint: dict[int, str] = {}
@@ -422,6 +476,17 @@ class HeliusWS:
                 self._swap_events[mint] = deque(maxlen=self._ABSORPTION_MAXLEN)
             self._pool_quote_last[mint] = 0.0
 
+        # Deriva PDA da pool primária em thread própria (não bloqueia o caller)
+        def _derive_async():
+            pda = _derive_pool_pda(mint)
+            if pda:
+                with self._lock:
+                    self._pool_pda[mint] = pda
+                logger.info("HeliusWS: PDA %s... → %s...", mint[:8], pda[:8])
+            else:
+                logger.warning("HeliusWS: falha ao derivar PDA para %s", mint[:8])
+        threading.Thread(target=_derive_async, daemon=True, name=f"pda-{mint[:8]}").start()
+
         if self._mode == "helius" and self._connected:
             self._send_helius_subscribe(mint)
 
@@ -436,6 +501,7 @@ class HeliusWS:
             self._swap_events.pop(mint, None)
             self._pool_quote_last.pop(mint, None)
             self._k_established.pop(mint, None)
+            self._pool_pda.pop(mint, None)
             if self._mode == "helius":
                 for sid, m in list(self._sub_id_mint.items()):
                     if m == mint:
@@ -576,10 +642,10 @@ class HeliusWS:
         if not accounts:
             return
 
-        # Tenta identificar o mint monitorado nos accounts da transação.
-        # Layout fixo pump.fun pAMM: accountKeys[3] = base_mint, accountKeys[4] = WSOL.
+        # Identifica o mint monitorado cruzando accounts com _mint_supply.
         with self._lock:
-            monitored = set(self._mint_supply.keys())
+            monitored  = set(self._mint_supply.keys())
+            pool_pdas  = dict(self._pool_pda)   # snapshot: mint → pda
 
         mint = None
         for account in accounts:
@@ -588,8 +654,16 @@ class HeliusWS:
                 break
 
         if not mint:
-            # Mint não monitorado — descarta o evento.
-            # mc_min vem exclusivamente do kline GMGN (pool primária).
+            return
+
+        # Validação PDA: garante que a transação é da pool primária.
+        # PDA é o endereço canônico determinístico (seed: "pool" + mint + WSOL).
+        # Secondary pools têm PDAs diferentes — são rejeitadas aqui.
+        # Se o PDA ainda não foi derivado (thread assíncrona), usa k-gate como fallback.
+        pda = pool_pdas.get(mint)
+        if pda and pda not in accounts:
+            logger.debug("HeliusWS PDA skip %s: pool %s... não está nos accounts",
+                         mint[:8], pda[:8])
             return
 
         with self._lock:
