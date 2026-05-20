@@ -115,8 +115,10 @@ async def main():
 
                 tx_total += 1
                 result = data["params"]["result"]
-                sig    = result.get("signature", "?")
-                meta   = result.get("transaction", {}).get("meta", {})
+                # erpc envolve em "value"; fallback para acesso direto
+                value  = result.get("value", result)
+                sig    = value.get("signature", result.get("signature", "?"))
+                meta   = value.get("transaction", {}).get("meta", {})
                 logs   = meta.get("logMessages", [])
 
                 if not logs:
