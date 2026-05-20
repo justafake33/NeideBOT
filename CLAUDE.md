@@ -754,12 +754,21 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 150. **`_K_INIT_TOLERANCE = 0.80` — causa raiz do mc_bottom tardio (sessão 11, 2026-05-19)**. Tolerância anterior de 0.60 definia `k_init_min = 6.265e25 × 0.40 = 2.51e25`. Após ~100 trades de fee (1.25%/trade cada), k da pool decai para `6.265e25 × (0.9875)^100 ≈ 1.767e25` — abaixo do mínimo. Todos os eventos Helius do mint eram INIT SKIP'd → bot cego em tempo real → mc_min vinha do kline (1-2 min lag) ou trenches (2-4 min lag). Para tokens que fazem fundo em t=2min e bounce imediato (ZUCC, TIMMY, MK4), o sinal disparava 4-5 minutos depois — com o token já +200-600% acima do fundo. O bot capturava o fundo correto via kline (ex: ZUCC $13K), mas apenas quando a janela de 1min fechava e GMGN indexava. Fix: `_K_INIT_TOLERANCE = 0.80` → `k_init_min = 1.253e25` → cobre dumps de até ~130 trades de fee acumulados. **Hardcoded no commit `28ba86b`, sem env var.** Secondary pools (0.83 SOL, k≈1.19e25) continuam bloqueadas abaixo do novo mínimo com margem segura.
 151. **`BOUNCE_MAX_PCT` guard bug — `< 1.0` deveria ser `< 9.99` (sessão 11, 2026-05-19)**. O guard `if self.BOUNCE_MAX_PCT < 1.0 and bounce_pct > self.BOUNCE_MAX_PCT` desativava o filtro para qualquer threshold ≥ 100% porque `1.50 < 1.0 = False`. Setar `BOUNCE_MAX_PCT=1.50` no Railway **não tinha efeito nenhum** com o código antigo. Fix: guard mudado para `< 9.99` (o default é 9.99 = desativado). Agora `BOUNCE_MAX_PCT=1.50` bloqueia sinais onde bounce > 150% — compras tardias como ZUCC (208%) são rejeitadas. Commited em `9bbdaf2`.
 152. **Causa raiz estrutural do problema de entrada: Helius cego + BOUNCE_MAX_PCT desativado (sessão 11)**. O bot consistentemente capturava tokens corredores (tokens que sobem 300-600%) mas entrava na posição errada porque: (1) sem Helius real-time, mc_min vinha do kline/trenches com lag de 2-4 minutos; (2) sinal disparava quando o bounce já estava 150-300% completo; (3) BOUNCE_MAX_PCT estava quebrado e não bloqueava. Efeito: comprar o topo de tokens que depois caem ao SL. Com os dois fixes (28ba86b + 9bbdaf2) e `BOUNCE_MAX_PCT=1.50` no Railway: (a) Helius acompanha em tempo real desde t=0; (b) sinal dispara no real início do bounce (30% do fundo); (c) bounces tardios >150% são rejeitados como safety net. **Env var necessária no Railway: apenas `BOUNCE_MAX_PCT=1.50`. K_INIT_TOLERANCE=0.80 já está hardcoded no código.**
+153. **erpc.global `transactionSubscribe` — solução para o gap de subscrição (sessão 12, 2026-05-20)**: ValidatorsDAO-backed RPC ("Powered by ShredStream"). Endpoint: `wss://edge.erpc.global?api-key=<key>`. Uma subscrição global no pAMM (`pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA`) entrega TODAS as transações do programa em tempo real. Substitui o modelo per-mint do Helius logsSubscribe — elimina o gap de 10-30s entre detecção do token e primeira subscrição. Resultado no teste local: ~450 eventos/4s, 45% parse rate. Preço: €42/mês (developer plan), 42M tokens/mês. Testado e validado em 2026-05-20.
+154. **erpc formato de parâmetros (diferente do Helius gRPC)**: `accounts: {"include": [PUBKEY]}` (objeto, não array). `"accounts": [PUBKEY]` → erro "invalid type string". `"accountInclude"` não existe no erpc — é sintaxe do Helius gRPC. Response path: `data["params"]["result"].get("value", result)["transaction"]["meta"]["logMessages"]`. O erpc envolve a notificação em `result.value`, diferente do Helius que acessa `result` diretamente.
+155. **HeliusWS dual-mode — erpc primário, Helius fallback (sessão 12)**: `helius_ws.py` suporta dois modos transparentes. `ERPC_API_KEY` → modo erpc: `_send_erpc_global_subscribe()` na abertura do WS, `subscribe/unsubscribe` só atualizam `_mint_supply` dict (sem mensagens WS). `HELIUS_API_KEY` (sem erpc) → modo Helius: comportamento original com logsSubscribe por mint. Ambos convergem para `_tier1_process(mint, logs, supply)` — lógica única de k-gate + A.9 + rolling window. Mint identificado no modo erpc via `_parse_account_keys_from_tx()` cross-referenciando com `_mint_supply`.
+156. **`_parse_account_keys_from_tx()` — extração de accountKeys do wire format Solana**: Solana transaction: `[compact-u16 num_sigs][64×num_sigs bytes][message]`. Legacy message: `[3 bytes header][compact-u16 num_accounts][32×n pubkeys]`. Versioned (v0): byte `0x80` antes do header. `_compact_u16(data, offset)` decodifica o formato variable-length integer da Solana (high bit = continue). ALT (Address Lookup Tables) em transações versioned não são resolvidas — mints em ALT são silenciosamente perdidas (aceitável para V1; ~5% dos casos).
+157. **scanner.py instanciava HeliusWS apenas com `HELIUS_API_KEY` (bug crítico corrigido sessão 12)**: `if os.getenv("HELIUS_API_KEY"):` não instanciava HeliusWS quando apenas `ERPC_API_KEY` estava configurado. Resultado: modo erpc nunca ativaria em produção. Fix: `if os.getenv("ERPC_API_KEY") or os.getenv("HELIUS_API_KEY"):`. Commit `8241f1f`.
+158. **Todos os filtros baseados em WR histórico são inválidos após descoberta do elapsed_sec bug (sessão 12)**: mc_min estava corrompido para praticamente todos os 139+ trades históricos (candle de transição bonding curve→pool incluído como fundo). BOUNCE_MIN_PCT=0.55, FILTER_SMART_MIN=3 e outros filtros agressivos eram baseados nesse dado corrompido. Resetar para baselines defensáveis: `BOUNCE_MIN_PCT=0.30` (mínimo matemático provado), `BOUNCE_MAX_PCT=1.50` (novo, bloqueia entradas tardias), `FILTER_SMART_MIN=2` (smart=1→0% WR é confiável mesmo com mc_min errado — se o token nunca bounceou, smart count não importa). Acumular 30+ trades limpos pós-deploy antes de qualquer ajuste de filtro.
 
 ---
 
-## 🔄 Estado Atual: BOT PAUSADO — aguardando deploy das correções (sessão 11, 2026-05-19)
+## 🔄 Estado Atual: BOT PAUSADO — aguardando Railway liberar deploys (sessão 12, 2026-05-20)
 
-### Pipeline (após deploy das correções — branch `claude/audit-neidenbot-purchases-8k0Tn`)
+### Contexto do outage
+Railway sofreu outage por conta bloqueada pelo Google Cloud (2026-05-19/20). O site voltou mas deploys ainda estavam pausados no final da sessão 12. Branch `claude/audit-neidenbot-purchases-8k0Tn` está 100% pronto para merge — apenas aguardando Railway liberar.
+
+### Pipeline (após deploy — branch `claude/audit-neidenbot-purchases-8k0Tn`)
 `TRADING_ENABLED=false` ← BOT PAUSADO para deploy seguro.
 `CALIBRATION_AMOUNT_USD=1.0`, `CALIBRATION_MAX_TRADES=999999`.
 `TRADE_SL_PCT=0.25` (testando — 15% disparava em segundos por volatilidade pAMM).
@@ -767,7 +776,7 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 
 **Portfolio:** ~$50 restantes de 1 SOL original (~$170). 70% perdido em trades com dados de entrada corrompidos (mc_min fictício do candle de transição).
 
-**Correções pendentes de merge (branch `claude/audit-neidenbot-purchases-8k0Tn`):**
+**Todas as correções do branch (prontas para merge):**
 - ✅ **Bug 1 (CRÍTICO)**: `ts_migration` agora usa `complete_timestamp` on-chain (sessão 9)
 - ✅ **Bug 3 (CRÍTICO)**: `bounce_fired` check-and-set atômico sob `_lock` (sessão 9)
 - ✅ **Bug 5 (ALTO)**: `_graduate` ignora candle de transição (sessão 9)
@@ -779,6 +788,8 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 - ✅ **`_K_INIT_TOLERANCE = 0.80`**: cobre pools com k degradado por ~130 trades de fee (sessão 11, `28ba86b`)
 - ✅ **`BOUNCE_MAX_PCT` guard fix**: `< 1.0` → `< 9.99` — filtro agora funciona para thresholds > 100% (sessão 11, `9bbdaf2`)
 - ✅ **trailing_active fill recovery**: `_recover_fill` agora chamado para trades `trailing_active` sem `entry_price_usd` (sessão 11, `aced744`)
+- ✅ **erpc global transactionSubscribe**: `helius_ws.py` dual-mode — erpc primário (global sub no pAMM), Helius logsSubscribe fallback (sessão 12, `84252a7`)
+- ✅ **scanner.py erpc fix**: HeliusWS instanciado com `ERPC_API_KEY` ou `HELIUS_API_KEY` (sessão 12, `8241f1f`)
 
 **Filtros ativos (ordem de aplicação no _check_bounce):**
 - A.2: bloqueia bounce_pct 20-30% (redundante com A.7 mas mantido como safety net)
@@ -793,14 +804,21 @@ Dados históricos anteriores ao fix do elapsed_sec < 90 são suspeitos. Primeiro
 
 **Maior discriminador live encontrado: bounce_pct >70% → WR 74% (n=23, +45pp)**
 
-**Checklist para religar o bot (sessão 11):**
-1. Fazer merge do branch `claude/audit-neidenbot-purchases-8k0Tn` → `main` no Railway
-2. Aguardar redeploy completo
-3. Setar `BOUNCE_MAX_PCT=1.50` no Railway (bloqueia bounces tardios >150%)
-4. `K_INIT_TOLERANCE=0.80` já está hardcoded — zero ação necessária
-5. `MIN_POOL_SOL=10` já é o default — zero ação necessária
-6. Mudar `TRADING_ENABLED=true`
-7. Opcional: `BOUNCE_MIN_PCT=0.50` para focar em bounces de qualidade
+**⚠️ Todos os filtros baseados em WR histórico foram invalidados** pela corrupção do mc_min (candle de transição bug). Resetar para baselines defensáveis e acumular 30+ trades limpos antes de qualquer decisão nova.
+
+**Checklist para religar o bot (aguardando Railway):**
+1. Verificar que `status.railway.com` mostra deploys habilitados
+2. Fazer merge do branch `claude/audit-neidenbot-purchases-8k0Tn` → `main` no Railway
+3. Aguardar redeploy completo e verificar logs: "HeliusWS: modo ERPC (global transactionSubscribe)"
+4. Setar env vars no Railway:
+   - `ERPC_API_KEY=e5b9b243-9188-41b4-a59f-596119afda77` (NOVO — ativa modo erpc)
+   - `BOUNCE_MAX_PCT=1.50` (NOVO — bloqueia bounces tardios >150%)
+   - `BOUNCE_MIN_PCT=0.30` (resetar de 0.55 corrompido para baseline defensável)
+   - `FILTER_SMART_MIN=2` (smart=1 → 0% WR confirmado on-chain; menos afetado por corrupção)
+5. `K_INIT_TOLERANCE=0.80` já está hardcoded — zero ação
+6. `MIN_POOL_SOL=10` já é o default — zero ação
+7. Mudar `TRADING_ENABLED=true`
+8. Monitorar consumo de tokens erpc no dashboard (validar billing model)
 
 **Regra de ouro para novos filtros:** só implementar com n≥30 trades validados no GMGN. **Nunca usar DB WR como fonte.**
 
