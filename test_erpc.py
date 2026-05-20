@@ -69,9 +69,9 @@ async def main():
                 "method": "transactionSubscribe",
                 "params": [
                     {
-                        "vote":           False,
-                        "failed":         False,
-                        "accountInclude": [PAMM],
+                        "vote":     False,
+                        "failed":   False,
+                        "accounts": [PAMM],
                     },
                     {
                         "commitment":               "processed",
