@@ -1,6 +1,6 @@
 # NeideBOT — Contexto do Projeto
 
-## O que é
+## O que é:
 Bot autônomo de trading em Solana.
 Estratégia central: detectar tokens recém-migrados (Pump.fun/Meteora DAMM v2), aguardar o dump pós-migração e comprar o fundo com filtros de qualidade.
 
