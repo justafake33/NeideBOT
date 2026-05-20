@@ -93,9 +93,9 @@ class HotMonitor:
         self._tick_buffer: list = []
         self._tick_lock = threading.Lock()
 
-        # Helius WebSocket — preço real-time via logsSubscribe + DexScreener
+        # Helius WebSocket — preço real-time (erpc global ou Helius por mint)
         self._helius = None
-        if os.getenv("HELIUS_API_KEY"):
+        if os.getenv("ERPC_API_KEY") or os.getenv("HELIUS_API_KEY"):
             try:
                 from helius_ws import HeliusWS
                 self._helius = HeliusWS(on_price=self.push_mc)
