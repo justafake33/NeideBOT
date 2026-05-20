@@ -223,6 +223,14 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO 2026-05-04)
 
 ## 🔍 ESTADO ATUAL
 
+> ### ⚠️ LEITURA OBRIGATÓRIA ANTES DE ANALISAR QUALQUER NÚMERO DESTA SEÇÃO
+>
+> **Todos os WR, recovery rates, n=, e análises de filtros registrados aqui ANTES de 2026-05-20 não têm comprovação na blockchain e devem ser lidos como contexto histórico, não como verdades operacionais.**
+>
+> **O único número confirmado on-chain até hoje:** WR = **10.1%** (14 TP / 125 SL / 139 trades), medido por scan completo de todas as transações da wallet via Helius getSignaturesForAddress (sessão 5, 2026-05-14).
+>
+> Todo o resto veio de: (a) DB com status inferido por estimativa MC, não blockchain; (b) mc_bottom corrompido pelo candle de transição bonding curve→pool; (c) ts_migration usando tempo de detecção do bot, não timestamp on-chain. Os primeiros dados limpos serão os trades executados após o deploy do branch `claude/audit-neidenbot-purchases-8k0Tn`.
+
 ### Situação (2026-05-12) — BOT ATIVO $1/TRADE
 
 **Descobertas desta sessão:**
@@ -234,10 +242,10 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO 2026-05-04)
 - **TradeMonitor trailing exit**: adicionado `_check_trailing_exit()` — simula drawdown 30% do pico via token_ticks para detectar quando GMGN executa o trailing. Funciona para tokens com ticks disponíveis (dentro dos 60min do HotMonitor).
 - **Filtros baseados em DB inválido foram adicionados E revertidos**: bounce>50%, TTB<15min, CTO block — todos implementados e revertidos na mesma sessão. Lição: nunca implementar filtro sem validação com GMGN como ground truth.
 
-### Situação (2026-05-09) — HISTÓRICO
-- **1175+ tokens** coletados no banco, **1134** com `recovery` definido
-- Recovery rate baseline: **23.5%**
-- **251 bounce signals** analisados: 119 válidos (47.4%) / 132 inválidos (52.6%)
+### Situação (2026-05-09) — HISTÓRICO 🔴 DADOS CORROMPIDOS
+- **1175+ tokens** coletados no banco, **1134** com `recovery` definido — 🔴 `recovery` usa mc_bottom corrompido
+- Recovery rate baseline: **23.5%** — 🔴 INVÁLIDO
+- **251 bounce signals** analisados: 119 válidos (47.4%) / 132 inválidos (52.6%) — 🔴 classificação baseada em bounce_pct corrompido
 - **Fase A**: A.2 ✅, A.3 ✅, A.5 ✅. A.1 slope REMOVIDO (H13 refutada). **A.4 DESATIVADO** (90s wait → entrada 53% acima do fundo, matava R:R). **A.6 NOVO** (bottom freshness ≤5min).
 - **Fase B ATIVA**: ts_min bug fix, kline backfill, hot-precise 30s
 - **Fase 2 ativa**: token_signals type 12 a cada 5s
@@ -248,24 +256,25 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO 2026-05-04)
 
 ### Resultado da Calibração — 50 trades de $1 (2026-05-07/08) — Auditoria on-chain final
 
-| Métrica | Valor | Observação |
+> 🟡 **INCERTO** — A contagem on-chain de TPs/SLs foi auditada via scan de transações da wallet (válido). Porém os 53 trades foram **executados com mc_bottom corrompido** como input — o bot comprava em posições baseadas em um "fundo" que nunca existiu. O WR 15.1% reflete a realidade de execução desse período, mas como as condições de entrada estavam erradas, não é extrapolável para o bot com dados corretos.
+
+| Métrica | Valor | Confiabilidade |
 |---------|-------|-----------|
-| Trades on-chain reais | 53 | (excl. 1 mystery = transferência manual + 4 tiny legacy) |
-| TPs confirmados | 8 | WR = 15.1% |
-| SLs | 44 | Retorno médio 64.6% do investido |
-| WR real | 15.1% | on-chain auditado — acima do break-even de 11% (sem fees) |
-| Net trading | -$14.63 | excluindo transferência manual de $10.85 |
-| Jito tips | $0.00 | GMGN NÃO usa Jito |
-| Base fees | $1.14 | ~$0.01/tx |
-| ATA rent "perdido" | ~$8.64 | 44 × ~$0.20 por SL — recuperável via "Reclaim Rent" no GMGN |
+| Trades on-chain reais | 53 | 🟢 VÁLIDO — contagem on-chain |
+| TPs confirmados | 8 | 🟡 INCERTO — on-chain real, mas entrada era corrompida |
+| SLs | 44 | 🟡 INCERTO — on-chain real, mas entrada era corrompida |
+| WR real | 15.1% | 🟡 INCERTO — on-chain real, mas sob condições corrompidas |
+| Net trading | -$14.63 | 🟢 VÁLIDO — valor real perdido na carteira |
+| Jito tips | $0.00 | 🟢 VÁLIDO — GMGN NÃO usa Jito |
+| Base fees | $1.14 | 🟢 VÁLIDO — ~$0.01/tx |
+| ATA rent "perdido" | ~$8.64 | 🟢 VÁLIDO — 44 × ~$0.20 por SL — recuperável via "Reclaim Rent" no GMGN |
 
 **Diagnóstico real da perda (2026-05-10, auditoria on-chain 115 txs):**
-- Jito tips = $0 — hipótese original REFUTADA
-- SL executa correto em -15% — GMGN condition_orders funciona em segundos
-- O "extra -13%" por SL era o **ATA rent** (~0.002 SOL/trade) não devolvido ao vender
-- GMGN tem botão "Reclaim Rent" na UI da carteira → recupera ~$8.64 dos 44 SLs
-- **Perda real de trading: -$5.99** (após reclaim do rent)
-- **Conclusão: a estratégia é viável a $1/trade. O friction dominante é o ATA rent, não fees.**
+- Jito tips = $0 — REFUTADA ✅ (on-chain, válido)
+- SL executa correto — GMGN condition_orders funciona em segundos ✅ (on-chain, válido)
+- O "extra -13%" por SL era o **ATA rent** (~0.002 SOL/trade) não devolvido ao vender ✅ (on-chain, válido)
+- GMGN tem botão "Reclaim Rent" na UI da carteira → recupera ~$8.64 dos 44 SLs ✅
+- **Perda real de trading: -$5.99** (após reclaim do rent) ✅
 
 **Análise de sinais inválidos (2026-05-09):**
 - 52% dos sinais disparavam depois do pico — hipótese de latência REFUTADA (P50 atraso = 6.7min)
@@ -334,32 +343,56 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO 2026-05-04)
 ## 📐 HIPÓTESES FORMAIS
 Registradas ANTES de ver os dados. Não alterar retroativamente.
 
-| # | Hipótese | Resultado |
-|---|----------|-----------|
-| H1 | ≥70% dos tokens caem ≥20% do ATH nos primeiros 60min | ✅ **91.4%** |
-| H2 | Em tokens com recovery=TRUE, o fundo ocorre em ≤15min | ❌ **49.7%** (meta: ≥70%) |
-| H3 | smart_wallets ≥3 têm recovery rate ≥15pp maior que smart<3 | ❌ **+0.2pp** — sem discriminação |
-| H4 | sniper_wallets ≥30% têm recovery rate <30% | ❌ sniper alto levemente positivo (+0.7pp) |
-| H5 | top10_holder_rate ≥0.80 → var_24h <-80% em ≥60% | ⚠️ descartado — 24h fora do escopo |
-| H6 | Entradas entre -25% e -45% têm melhor R:R em var_4h/24h | ⚠️ descartado — 4h/24h fora do escopo |
-| H7 | liq_migration <$5k gera slippage inaceitável para >$50 | ⏳ pendente validação em execução |
-| H8 | is_wash_trading=TRUE tem recovery rate ≥20pp menor | ❌ **-0.1pp** — sem discriminação |
-| H9 | Tokens com ≥1 signal type 12 com trigger_mc < mc_migration têm recovery rate ≥20pp maior | ⏳ **pendente** — aguardando acumulação de token_signals (~100 tokens) |
-| H10 | time_to_bottom < 25min → recovery rate ≥20pp maior que time_to_bottom ≥ 25min | ✅ **+21.8pp** confirmado (61.2% vs 39.3%, n=425) |
-| H11 | Deceleração de preço (d²p/dt²→0) precede o fundo em recovery tokens | ❌ **REFUTADA** — direção invertida. Recovery tokens ACELERAM no fundo (capitulação brusca), não desaceleram |
-| H12 | dump_depth + time_elapsed definem zona probabilística de entrada (P(recovery) > 50%) | ⚠️ **PARCIAL** — time domina sobre depth. 3 zonas acionáveis (N≥15, rate≥60%) mas todas já cobertas por H10. Insight novo: zona 5-10min tem recovery 51% (dead zone). |
-| H13 | Slope íngreme pré-fundo (≤ -0.0008 %/s) → WR de bounce ≥40pp maior que slope gradual | ❌ **REFUTADA** com n=153 (metodologia correta). Avg slope recovery TRUE=-0.003829 vs FALSE=-0.003696 (diff=0.000133, essencialmente zero). Recovery rate flat em todas as faixas (25-44%, ruído). H13 original n=17 era seleção enviesada (20.5% cobertura, ts_signal errado). A.1 removido do pipeline. |
-| H14 | bounce_pct entre 20-30% é dead zone — WR inferior a 15-20% e 30%+ | ✅ **confirmado** (3.1% WR vs 18.5% e 21.1%, n=32). Dead-cat zone reforçada com n maior. |
-| H15 | Entry entre 50-65% do mc_migration tem WR=0% | ✅ **confirmado** (0/21 = 0% WR, n=21 — amostra maior). Zona morta absoluta. |
-| H16 | 3 ticks consecutivos acima do entry pós-sinal → WR ≥20pp maior | ✅ **+18.0pp** confirmado (28.6% vs 10.6%, n=14/66). Efeito menor que n=71 (+24.3pp) mas consistente. |
-| H17 | 100% dos TPs ocorrem em ≤20min após o sinal de bounce | ✅ **confirmado** (11/11 TPs em ≤20min, 82% em ≤10min, n=83). Mediana 6.1min, média 7.3min. |
-| H18 | Velocidade de subida do fundo ao sinal (bounce velocity) discrimina WR | ❌ **REFUTADA** — todas as tercis têm WR 40% flat. TTB<25min+Slow=43% vs TTB<25min+Fast=29% (contrário do esperado). Não implementar. |
-| H19 | Aguardar 1-2min após sinal melhora EV vs entrada imediata | ✅ **+6.6pp WR** com 1min delay (18.8% vs 12.2%). **Coberto pelo A.4** (90s persistence wait). Sem implementação adicional necessária. |
-| H20 | W-bottom (double-dip) é sinal de confirmação de suporte | ❌ **NÃO É FILTRO** — 98% dos bounces têm W-bottom, incluindo SLs. Ubíquo demais. Sem W-bottom (n=2) tem 100% WR mas amostra insuficiente. |
-| H21 | SL ancorado no mc_bottom (× 0.90) resolveria maioria dos SLs | ❌ **REFUTADA** (2026-05-12, n=68) — 90% dos SLs caem muito abaixo do fundo (mediana 0.55×). TPs nunca voltam ao fundo (min/bottom > 1.0). Dynamic SL descartado. |
-| H22 | Buy volume > sell volume nos 60s pós-fundo discrimina WR ≥15pp | ⏳ **DATA COLLECTION** — janela rolante ativa em HeliusWS, métricas brutas salvas em bounce_signals. Score aguarda n≥30 bounces com absorption_events > 0 e outcomes GMGN. |
+---
+
+> ### ⚠️ ALERTA CRÍTICO DE DADOS CORROMPIDOS — Válido para TODO o conteúdo abaixo
+>
+> **Todos os resultados numéricos (WR, recovery rate, n=, pp) produzidos antes de 2026-05-20 são fictícios e não têm comprovação on-chain.**
+>
+> **Três bugs críticos corromperam os dados históricos:**
+>
+> 1. **`elapsed_sec < 90` (Bug 5/6, corrigido sessão 9):** O kline incluía o candle de transição bonding curve→pool (primeiros 90s pós-migração), cujo `low` continha preços da bonding curve (muito mais baixos que a pool). Resultado: `mc_bottom` artificialmente baixo para TODOS os tokens → `bounce_pct` inflado → `time_to_bottom` errado → filtros calibrados com referências que nunca existiram.
+>
+> 2. **`ts_migration` errado (Bug 1, corrigido sessão 9):** Usava o momento de detecção do bot (`datetime.now()`), não o timestamp on-chain (`complete_timestamp`). Tokens detectados 5-15 min após migração entravam no HotMonitor com `elapsed=0s` → A.5 nunca bloqueava → bounce disparava em tokens fora da janela.
+>
+> 3. **TradeMonitor inferindo TP/SL por estimativa MC (corrigido sessão 5):** Status do DB era calculado por `mc_estimado vs threshold`, não por execução real na blockchain. WR do DB: ~32-34%. WR real blockchain (sell-recovery audit): **10.1%**. A única verdade é a blockchain.
+>
+> **Legenda de confiabilidade:**
+> - 🔴 **DADOS INVÁLIDOS** — resultado numérico corrompido, não usar para decisões
+> - 🟡 **INCERTO** — direção possivelmente correta, números não confiáveis
+> - 🟢 **VÁLIDO** — não depende de mc_bottom/bounce_pct/WR-DB, ou confirmado on-chain
+> - ⚫ **DESCARTADO** — fora do escopo da estratégia (independente da corrupção)
+
+---
+
+| # | Hipótese | Resultado | Confiabilidade |
+|---|----------|-----------|----------------|
+| H1 | ≥70% dos tokens caem ≥20% do ATH nos primeiros 60min | ✅ **91.4%** | 🟡 INCERTO — usa mc_bottom corrompido para calcular pct_drop. Direção (tokens dumpam muito) é verdadeira, percentual exato não. |
+| H2 | Em tokens com recovery=TRUE, o fundo ocorre em ≤15min | ❌ **49.7%** (meta: ≥70%) | 🔴 INVÁLIDO — `recovery` usa mc_bottom corrompido. `time_to_bottom` usa mc_bottom corrompido. Resultado sem valor. |
+| H3 | smart_wallets ≥3 têm recovery rate ≥15pp maior que smart<3 | ❌ **+0.2pp** — sem discriminação | 🔴 INVÁLIDO — `recovery` usa mc_bottom corrompido. Conclusão "não discrimina" pode estar errada. |
+| H4 | sniper_wallets ≥30% têm recovery rate <30% | ❌ sniper alto levemente positivo (+0.7pp) | 🔴 INVÁLIDO — `recovery` usa mc_bottom corrompido. |
+| H5 | top10_holder_rate ≥0.80 → var_24h <-80% em ≥60% | ⚫ descartado — 24h fora do escopo | ⚫ DESCARTADO |
+| H6 | Entradas entre -25% e -45% têm melhor R:R em var_4h/24h | ⚫ descartado — 4h/24h fora do escopo | ⚫ DESCARTADO |
+| H7 | liq_migration <$5k gera slippage inaceitável para >$50 | ⏳ pendente validação em execução | 🟢 VÁLIDO — não depende de mc_bottom |
+| H8 | is_wash_trading=TRUE tem recovery rate ≥20pp menor | ❌ **-0.1pp** — sem discriminação | 🔴 INVÁLIDO — `recovery` usa mc_bottom corrompido. |
+| H9 | Tokens com ≥1 signal type 12 com trigger_mc < mc_migration têm recovery rate ≥20pp maior | ⏳ **pendente** — aguardando acumulação de token_signals (~100 tokens) | 🔴 INVÁLIDO — `recovery` usa mc_bottom corrompido. `mc_migration` também afetado pelo bug de ts_migration. Reiniciar coleta pós-deploy. |
+| H10 | time_to_bottom < 25min → recovery rate ≥20pp maior que time_to_bottom ≥ 25min | ✅ **+21.8pp** confirmado (61.2% vs 39.3%, n=425) | 🔴 INVÁLIDO — ambas as variáveis corrompidas: `time_to_bottom` usa mc_bottom falso, `recovery` usa mc_bottom falso. O insight qualitativo (fundo rápido = melhor) pode ser verdadeiro, mas os números são ficção. |
+| H11 | Deceleração de preço (d²p/dt²→0) precede o fundo em recovery tokens | ❌ **REFUTADA** — direção invertida. Recovery tokens ACELERAM no fundo (capitulação brusca), não desaceleram | 🔴 INVÁLIDO — análise sobre token_ticks com mc_bottom corrompido. O padrão de "capitulação brusca" pode ser artefato do candle de transição. |
+| H12 | dump_depth + time_elapsed definem zona probabilística de entrada (P(recovery) > 50%) | ⚠️ **PARCIAL** — time domina sobre depth. 3 zonas acionáveis (N≥15, rate≥60%) mas todas já cobertas por H10. | 🔴 INVÁLIDO — dump_depth usa mc_bottom corrompido. time_elapsed usa ts_migration errado. |
+| H13 | Slope íngreme pré-fundo (≤ -0.0008 %/s) → WR de bounce ≥40pp maior que slope gradual | ❌ **REFUTADA** com n=153. Avg slope recovery TRUE=-0.003829 vs FALSE=-0.003696 (diff=0.000133, essencialmente zero). A.1 removido do pipeline. | 🔴 INVÁLIDO — slope calculado sobre token_ticks com mc_bottom corrompido. Conclusão "não discrimina" pode estar errada por mc_min errado. Permanece removido por precaução. |
+| H14 | bounce_pct entre 20-30% é dead zone — WR inferior a 15-20% e 30%+ | ✅ **confirmado** (3.1% WR vs 18.5% e 21.1%, n=32). Dead-cat zone reforçada com n maior. | 🔴 INVÁLIDO — bounce_pct = (mc_signal - mc_min)/mc_min, mc_min corrompido → bounce_pct inflado → faixas completamente erradas. Tokens categorizados como "20-30% bounce" podiam ser 5-8% bounce real. |
+| H15 | Entry entre 50-65% do mc_migration tem WR=0% | ✅ **confirmado** (0/21 = 0% WR, n=21 — amostra maior). Zona morta absoluta. | 🔴 INVÁLIDO — entry_ratio = mc_at_signal / mc_migration. mc_migration afetado pelo bug de ts_migration. WR do DB não confiável. |
+| H16 | 3 ticks consecutivos acima do entry pós-sinal → WR ≥20pp maior | ✅ **+18.0pp** confirmado (28.6% vs 10.6%, n=14/66). | 🔴 INVÁLIDO — WR usa status do DB (fictício). entry calculado com mc_bottom corrompido. A.4 permanece removido por razões independentes (entrava 53% acima do fundo). |
+| H17 | 100% dos TPs ocorrem em ≤20min após o sinal de bounce | ✅ **confirmado** (11/11 TPs em ≤20min, 82% em ≤10min, n=83). Mediana 6.1min, média 7.3min. | 🔴 INVÁLIDO — TP/SL inferidos pelo TradeMonitor via estimativa MC (não on-chain). Os "11 TPs" podem incluir falsos positivos. Tempo medido com ts_migration errado. |
+| H18 | Velocidade de subida do fundo ao sinal (bounce velocity) discrimina WR | ❌ **REFUTADA** — todas as tercis têm WR 40% flat. TTB<25min+Slow=43% vs TTB<25min+Fast=29%. | 🔴 INVÁLIDO — WR do DB fictício. TTB usa mc_bottom corrompido. |
+| H19 | Aguardar 1-2min após sinal melhora EV vs entrada imediata | ✅ **+6.6pp WR** com 1min delay (18.8% vs 12.2%). Coberto pelo A.4 (90s). | 🔴 INVÁLIDO — WR do DB fictício. A.4 foi desativado por razões independentes (entrada tardia). |
+| H20 | W-bottom (double-dip) é sinal de confirmação de suporte | ❌ **NÃO É FILTRO** — 98% dos bounces têm W-bottom, incluindo SLs. Ubíquo demais. | 🟡 INCERTO — a observação "98% prevalência" pode ser artefato do mc_min baixo criando double-dip artificial. WR analysis corrompida. Conclusão "não é filtro" provavelmente correta mas por razões diferentes. |
+| H21 | SL ancorado no mc_bottom (× 0.90) resolveria maioria dos SLs | ❌ **REFUTADA** (2026-05-12, n=68) — 90% dos SLs caem muito abaixo do fundo (mediana 0.55×). TPs nunca voltam ao fundo (min/bottom > 1.0). Dynamic SL descartado. | 🔴 INVÁLIDO — mc_bottom corrompido. Análise sobre token_ticks com mc_min artificial. O "fundo" que o bot detectava nunca foi o fundo real → conclusão baseada em referência errada. |
+| H22 | Buy volume > sell volume nos 60s pós-fundo discrimina WR ≥15pp | ⏳ **DATA COLLECTION** — janela rolante ativa em HeliusWS, métricas brutas salvas em bounce_signals. | 🟡 INCERTO — a janela de absorção estava usando `time.time()` em vez de `ts_min` (bug H23 corrigido sessão 7). Dados históricos com `h23_window='bounce'` capturam momentum pós-bounce, não absorção do dump. Dados com `h23_window='bottom'` são mais confiáveis mas ainda poucos (n<30). |
 
 ### Análises de tick-features — resultados documentados
+
+> 🔴 **DADOS INVÁLIDOS** — `recovery` usa `mc_bottom` corrompido (Bug 5, candle de transição). `time_to_bottom` usa `mc_bottom` corrompido. Análise preservada como referência histórica e contexto arquitetural, mas os números não devem orientar filtros ou decisões.
 
 | Feature | avg recovery | avg no_rec | Conclusão |
 |---------|-------------|-----------|-----------|
@@ -369,48 +402,46 @@ Registradas ANTES de ver os dados. Não alterar retroativamente.
 | delta_holders | 15.46 | 15.31 | ❌ flat — não discrimina |
 | vol_spike (volume no fundo) | null | null | ⏳ dados indisponíveis — fix aplicado |
 | vol5m_slope | null | null | ⏳ dados indisponíveis — fix aplicado |
-| time_to_bottom | 19.5 min | 40.2 min | ✅ **maior discriminador encontrado** |
-| slope_c (2min antes do fundo) | **-0.171** %MC/s | -0.107 %MC/s | ⚡ **invertido útil** — recovery = capitulação mais brusca |
+| time_to_bottom | 19.5 min | 40.2 min | 🔴 INVÁLIDO — ambas as métricas usam mc_bottom corrompido |
+| slope_c (2min antes do fundo) | **-0.171** %MC/s | -0.107 %MC/s | 🔴 INVÁLIDO — token_ticks com mc_min corrompido |
 
 ### Análise de bounce quality — resultados (2026-05-05, n=83 bounces reais)
 
-WR base: **13.3%** (EV -3%, TP75/SL15). WR estimado pós-filtros A.2+A.3: **~29%**.
+> 🔴 **DADOS INVÁLIDOS** — toda esta seção usa `bounce_pct = (mc_signal - mc_min) / mc_min` onde `mc_min` estava corrompido (candle de transição bonding curve→pool). Os WR por faixa de bounce_pct são baseados em categorias erradas: tokens classificados como "20-30% bounce" podiam ser 5-8% bounce real. Os WR do DB também são fictícios (TradeMonitor inferia por estimativa, não por blockchain). **Preservado como contexto histórico — não usar para calibrar filtros.**
 
-| Feature | Resultado | Status | Nota |
+WR base: **13.3%** (EV -3%, TP75/SL15) — 🔴 INVÁLIDO (DB WR). WR blockchain real: **10.1%** (sell-recovery audit, sessão 5).
+
+| Feature | Resultado Registrado | Status Original | Confiabilidade |
 |---------|-----------|--------|------|
-| slope pré-fundo ≤ -0.0008 | Recovery rate flat: 34-44% em todas faixas | ❌ A.1 REMOVIDO | n=153, ts_min correto. Original n=17 era seleção enviesada. Slope é característica universal dos bounces, não discrimina. |
-| bounce_pct 15-20% | 18.5% WR (n=27) | ✅ faixa válida | — |
-| bounce_pct 20-30% | 3.1% WR (n=32) | ✅ A.2 bloqueia | Dead zone — 39% de todos os bounces |
-| bounce_pct 30-50% | 21.1% WR (n=19) | ✅ faixa válida | — |
-| bounce_pct >50% | 20.0% WR (n=5) | ✅ faixa válida | n pequeno |
-| entry 50-65% de mc_migration | 0% WR (n=21) | ✅ A.3 bloqueia | Zona morta absoluta |
-| entry 40-50% de mc_migration | 22.2% WR (n=9) | ✅ zona válida | Bom sinal com dump profundo |
-| entry >65% de mc_migration | 18.4% WR (n=49) | ✅ zona normal | Maioria dos bounces |
-| 3 ticks persistentes acima entry | 28.6% vs 10.6% WR (+18pp) | ✅ A.4 implementado | n=14/66. Efeito robusto |
-| 1min entry delay | 18.8% vs 12.2% WR (+6.6pp) | ✅ coberto por A.4 (90s) | Sem implementação adicional |
-| bounce velocity (velocidade subida) | 40% WR flat (todas as tercis) | ❌ não discrimina | TTB+Slow=43% > TTB+Fast=29% — não implementar |
-| creator_close (dev vendeu) | 15.4% vs 6.2% WR (+9.1pp) | ⏳ monitorar | n=65/16 — efeito modesto, aguardar mais dados |
-| W-bottom (double-dip) | 98% prevalência — não discrimina | ❌ não é filtro | Ubíquo em TPs e SLs. A.4 trata implicitamente |
-| tempo para TP hit | mediana 6.1min, 100% ≤20min | ✅ time-stop = 20min | 82% em ≤10min. Zero TPs entre 20-40min |
+| slope pré-fundo ≤ -0.0008 | Recovery rate flat: 34-44% em todas faixas | ❌ A.1 REMOVIDO | 🔴 INVÁLIDO — slope sobre token_ticks corrompidos |
+| bounce_pct 15-20% | 18.5% WR (n=27) | faixa "válida" | 🔴 INVÁLIDO — bounce_pct e WR corrompidos |
+| bounce_pct 20-30% | 3.1% WR (n=32) | A.2 bloqueia | 🔴 INVÁLIDO — bounce_pct corrompido. A.2 mantido como safety net até revalidação |
+| bounce_pct 30-50% | 21.1% WR (n=19) | faixa "válida" | 🔴 INVÁLIDO |
+| bounce_pct >50% | 20.0% WR (n=5) | faixa "válida" | 🔴 INVÁLIDO |
+| entry 50-65% de mc_migration | 0% WR (n=21) | A.3 bloqueia | 🔴 INVÁLIDO — entry_ratio e WR corrompidos. A.3 mantido como safety net até revalidação |
+| entry 40-50% de mc_migration | 22.2% WR (n=9) | zona "válida" | 🔴 INVÁLIDO |
+| entry >65% de mc_migration | 18.4% WR (n=49) | zona normal | 🔴 INVÁLIDO |
+| 3 ticks persistentes acima entry | 28.6% vs 10.6% WR (+18pp) | A.4 (desativado) | 🔴 INVÁLIDO — A.4 desativado por razões independentes |
+| 1min entry delay | 18.8% vs 12.2% WR (+6.6pp) | coberto por A.4 | 🔴 INVÁLIDO |
+| bounce velocity (velocidade subida) | 40% WR flat | não discrimina | 🔴 INVÁLIDO |
+| creator_close (dev vendeu) | 15.4% vs 6.2% WR (+9.1pp) | monitorar | 🔴 INVÁLIDO — WR do DB fictício |
+| W-bottom (double-dip) | 98% prevalência — não discrimina | não é filtro | 🟡 INCERTO — prevalência pode ser artefato do mc_min baixo |
+| tempo para TP hit | mediana 6.1min, 100% ≤20min | time-stop = 20min | 🔴 INVÁLIDO — TP inferido por estimativa, ts_migration errado |
 
-> **Por que 70 SLs em <2min:** bounce dispara sinal, preço sobe 15-20%, imediatamente despenca. Não é bounce — é micro-recuperação dentro de downtrend que não terminou. W-bottom nesses casos: o "W" cruza abaixo do SL floor antes de recuperar. A.4 (persistência 90s + 3 ticks) é o único filtro ativo para isso.
-
-> **WR pós-filtros estimado:** remover A.2 (32 trades, WR 3.1%) + A.3 (21 trades, WR 0%, ~8 overlap com A.2) → ~38 trades restantes com 11 TPs = **~29% WR estimado**. Confirmar após 30+ bounces com Fase A ativa.
-
-> **Por que delta_smart é invertido:** `smart_count` do trenches/ticks = snapshot de posições acumuladas (inclui quem comprou há dias e segura). NÃO é compra ativa. Tokens com dump longo (que não bounceam) acumulam mais smart wallets simplesmente porque o dump dura mais. O sinal correto de compra ativa é o signal type 12.
-
-> **slope_c invertido mas útil:** recovery tokens têm dump 60% mais rápido nos 2 minutos antes do fundo (−0.171 vs −0.107). Não é deceleração — é capitulação brusca. Padrão: queda moderada → leve pausa → spike de capitulação → fundo. No-recovery: queda lenta e gradual sem spike. Caveat: análise sobre tokens com fundo ≥10min (n=49) — os de fundo rápido (H10, maior recovery) foram excluídos por densidade de ticks insuficiente.
+> **Por que delta_smart é invertido (ainda válido como raciocínio):** `smart_count` do trenches/ticks = snapshot de posições acumuladas (inclui quem comprou há dias e segura). NÃO é compra ativa. Tokens com dump longo (que não bounceam) acumulam mais smart wallets simplesmente porque o dump dura mais. O sinal correto de compra ativa é o signal type 12. Este raciocínio qualitativo permanece válido mesmo com dados corrompidos.
 
 ### Backtester tick-level — resultados consolidados (2026-05-04)
 
-**Metodologia:** entry = mc_bottom × 1.15. Caminha token_ticks cronologicamente após o fundo.
+> 🔴 **DADOS INVÁLIDOS** — O backtester usava `entry = mc_bottom × 1.15` onde `mc_bottom` estava corrompido (candle de transição bonding curve→pool). A nota 121 já identificou `mc_min × 1.15` como entrada incorreta (`entry correto = mc_at_signal`), mas o problema vai além: o próprio `mc_bottom` referenciado era fictício. Os token_ticks inseridos pelo `_backfill_slope_ticks` também tinham o mesmo bug (Bug 6). Os WR e EV abaixo são ficção matemática sobre dados de entrada errados. **Preservado como referência de metodologia — a lógica do backtester está correta, os dados de input não estavam.**
+
+**Metodologia (preservada para referência):** entry = mc_bottom × 1.15. Caminha token_ticks cronologicamente após o fundo.
 - Ticks `source=kline`: usa `mc_high` para TP e `mc_low` para SL (intra-vela). Desempate via `mc_open` vs midpoint.
 - Ticks `source=trenches`: usa `mc` (close) para SL e TP.
 - Fim da janela sem hit → saída no último tick com P&L real.
 
-**Filtros:** drop ≥ 30%, time_to_bottom < 30min → 560 tokens elegíveis, **68 com ticks** (expansão em curso via kline OHLC).
+**Filtros usados:** drop ≥ 30%, time_to_bottom < 30min → 560 tokens elegíveis, **68 com ticks** — ambos os filtros usavam mc_bottom corrompido.
 
-| TP | SL | Win Rate | EV | Payoff | n_tp | n_sl |
+| TP | SL | Win Rate (🔴 INVÁLIDO) | EV (🔴 INVÁLIDO) | Payoff | n_tp | n_sl |
 |----|----|----------|----|--------|------|------|
 | 15% | 15% | 39.7% | -2.5% | 1.1x | 27 | 38 |
 | 30% | 15% | 33.8% | +1.1% | 2.2x | 23 | 40 |
@@ -418,11 +449,7 @@ WR base: **13.3%** (EV -3%, TP75/SL15). WR estimado pós-filtros A.2+A.3: **~29%
 | **75%** | **15%** | **27.9%** | **+11.5%** | **5.7x** | 19 | 43 |
 | **100%** | **15%** | **23.5%** | **+14.7%** | **8.7x** | 16 | 44 |
 
-**SL=15% domina todos os níveis de TP.** Signal estável em 3 runs consecutivos.
-
-**Bias de cobertura:** 492/560 tokens sem ticks. Diagnóstico: recovery_rate dos sem-ticks = 57.7% (similar ao baseline 52%) — não são piores, apenas sem cobertura histórica. Kline OHLC resolvendo progressivamente.
-
-**⚠️ O que o backtest NÃO captura:** taxas de swap, priority fee, slippage, MEV/sandwich, latência. EV_real = EV_backtest − friction_total. Friction só mensurável em live trading ($1 trades).
+**⚠️ O que o backtest NÃO captura (ainda válido como lembrete):** taxas de swap, priority fee, slippage, MEV/sandwich, latência. EV_real = EV_backtest − friction_total.
 
 ---
 
@@ -799,12 +826,11 @@ Railway sofreu outage por conta bloqueada pelo Google Cloud (2026-05-19/20). O s
 - A.7: bloqueia bounce_pct < 30% (BOUNCE_MIN_PCT=0.30)
 - FILTER_PUMP_ONLY: garante cobertura H22
 
-**WR real blockchain (sessão 5, 2026-05-14): 10.1%** (14 TP / 125 SL / 139 trades — todos com dados corrompidos de mc_min).
-Dados históricos anteriores ao fix do elapsed_sec < 90 são suspeitos. Primeiros dados limpos serão os trades pós-deploy deste branch.
+**WR real blockchain (sessão 5, 2026-05-14): 10.1%** (14 TP / 125 SL / 139 trades) — este é o único número confiável, porque veio de scan on-chain de todas as transações da wallet. Porém: as condições de entrada desses 139 trades foram geradas com mc_bottom corrompido, então a amostra está enviesada.
 
-**Maior discriminador live encontrado: bounce_pct >70% → WR 74% (n=23, +45pp)**
+**"Maior discriminador live: bounce_pct >70% → WR 74% (n=23)"** — 🔴 INVÁLIDO. bounce_pct calculado com mc_min corrompido. O que o bot chamava de "bounce 70%" pode ter sido 10-15% real.
 
-**⚠️ Todos os filtros baseados em WR histórico foram invalidados** pela corrupção do mc_min (candle de transição bug). Resetar para baselines defensáveis e acumular 30+ trades limpos antes de qualquer decisão nova.
+**⚠️ Todos os filtros baseados em WR histórico foram invalidados** pela corrupção do mc_min (candle de transição bug). Os primeiros dados limpos são os trades pós-deploy deste branch (pós-2026-05-20).
 
 **Checklist para religar o bot (aguardando Railway):**
 1. Verificar que `status.railway.com` mostra deploys habilitados
@@ -904,21 +930,23 @@ PRIORITY_FEE_MICRO_LAMPORTS=1000  # priority fee controlado (não GMGN default)
 
 ## 🎯 KPIs de Sucesso
 
-| Fase | Métrica | Meta | Status |
-|------|---------|------|--------|
-| Coleta | Migrações com bottom + mc_1h | ≥200 | ✅ 425 |
-| Coleta | Cobertura campos Fase 1 | ≥80% dos tokens novos | ✅ |
-| Análise | H10 validada | delta_pp ≥ 20pp | ✅ +21.8pp |
-| Backtester | EV positivo com SL=15% | EV > 0 em TP ≥ 30% | ✅ confirmado (n=68) |
-| Backtester | Cobertura de ticks | n_trades ≥ 200 | ⏳ kline OHLC acumulando |
-| Fase A | WR pós-filtros ≥ 25% | WR ≥ 25% com 30+ bounces filtrados | ⏳ aguardando dados |
-| Fase B | Cobertura slope ≥ 50% | 50% dos bounces com slope calculável | ⏳ impacto esperado |
-| Fase 6-lite | Friction total medida | 53 trades on-chain auditados | ✅ CONCLUÍDA — ATA rent é o principal custo |
-| Fase 6-lite | EV_real > 0 após friction | EV_real > 0 | 🟡 -$5.99 após reclaim rent — viável |
-| Fase 6 | WR real confirmado | ≥15% | ✅ 15.1% on-chain (acima break-even de 11%) |
-| Fase 6 | Bot ativo | TRADING_ENABLED=true | ✅ relançado 2026-05-10 a $1/trade |
-| Fase 6 | Re-entry em tokens com TP | rastrear tokens com TP e monitorar novo bounce | ⏳ ROADMAP |
-| H9 | Validação smart money signal | delta_pp ≥ 20pp | 🟡 +11.8pp na faixa <50% (n=14) |
+> 🔴 **ATENÇÃO:** KPIs marcados como ✅ abaixo foram validados com dados históricos corrompidos (mc_bottom fictício, WR do DB não-blockchain). Devem ser tratados como metas a revalidar com dados limpos (pós-2026-05-20), não como conquistas confirmadas.
+
+| Fase | Métrica | Meta | Status | Confiabilidade |
+|------|---------|------|--------|----------------|
+| Coleta | Migrações com bottom + mc_1h | ≥200 | ✅ 425 | 🔴 mc_bottom corrompido; mc_1h é válido |
+| Coleta | Cobertura campos Fase 1 | ≥80% dos tokens novos | ✅ | 🟢 campos do trenches, não afetados |
+| Análise | H10 validada | delta_pp ≥ 20pp | ✅ +21.8pp | 🔴 INVÁLIDO — ambas as variáveis corrompidas |
+| Backtester | EV positivo com SL=15% | EV > 0 em TP ≥ 30% | ✅ confirmado (n=68) | 🔴 INVÁLIDO — mc_bottom corrompido |
+| Backtester | Cobertura de ticks | n_trades ≥ 200 | ⏳ kline OHLC acumulando | 🔴 ticks com mc_min corrompido |
+| Fase A | WR pós-filtros ≥ 25% | WR ≥ 25% com 30+ bounces filtrados | ⏳ aguardando dados limpos | 🔴 REINICIAR pós-deploy |
+| Fase B | Cobertura slope ≥ 50% | 50% dos bounces com slope calculável | ⏳ impacto esperado | 🔴 slope sobre ticks corrompidos |
+| Fase 6-lite | Friction total medida | 53 trades on-chain auditados | ✅ CONCLUÍDA | 🟢 VÁLIDO — valores financeiros on-chain |
+| Fase 6-lite | EV_real > 0 após friction | EV_real > 0 | 🟡 -$5.99 após reclaim rent | 🟡 P&L on-chain real, mas entrada corrompida |
+| Fase 6 | WR real confirmado | ≥15% | 🟡 15.1% on-chain (sob condições corrompidas) | 🟡 on-chain real, entrada corrompida |
+| Fase 6 | Bot ativo | TRADING_ENABLED=true | ✅ relançado 2026-05-10 a $1/trade | 🟢 VÁLIDO — fato operacional |
+| Fase 6 | Re-entry em tokens com TP | rastrear tokens com TP e monitorar novo bounce | ⏳ ROADMAP | — |
+| H9 | Validação smart money signal | delta_pp ≥ 20pp | 🟡 +11.8pp na faixa <50% (n=14) | 🔴 recovery corrompido — reiniciar |
 
 ---
 
