@@ -48,6 +48,7 @@ _WS_URL = _HELIUS_WS_URL
 PUMP_AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
 METEORA_PROGRAM  = "cpamdpKoS7RUn9RDdHsS3SuRH5BVTTvovCHQnGFumm9"
 RAYDIUM_PROGRAM  = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+WSOL_MINT        = "So11111111111111111111111111111111111111112"
 
 # Tier 1 (Anchor parse inline): sem rate limit — cada swap dispara _check_bounce
 # Tier 2 (DexScreener fallback): rate limit de 2s — chamada HTTP externa
@@ -417,7 +418,11 @@ class HeliusWS:
             if mint in self._mint_supply:
                 return
             self._mint_supply[mint]     = total_supply
-            self._swap_events[mint]     = deque(maxlen=self._ABSORPTION_MAXLEN)
+            # Preserva _swap_events[mint] se já existe — pode ter eventos pré-subscrição
+            # armazenados por _store_unmonitored_event antes de hot.add() ser chamado.
+            # Sobrescrever aqui perderia o mc_min retroativo que get_min_mc_in_window precisa.
+            if mint not in self._swap_events:
+                self._swap_events[mint] = deque(maxlen=self._ABSORPTION_MAXLEN)
             self._pool_quote_last[mint] = 0.0
 
         if self._mode == "helius" and self._connected:
@@ -574,12 +579,10 @@ class HeliusWS:
         if not accounts:
             return
 
-        # Encontra o primeiro mint monitorado nos accounts da transação
+        # Tenta identificar o mint monitorado nos accounts da transação.
+        # Layout fixo pump.fun pAMM: accountKeys[3] = base_mint, accountKeys[4] = WSOL.
         with self._lock:
             monitored = set(self._mint_supply.keys())
-
-        if not monitored:
-            return
 
         mint = None
         for account in accounts:
@@ -588,12 +591,67 @@ class HeliusWS:
                 break
 
         if not mint:
-            return  # transação do pAMM para token não monitorado
+            # Mint não está em _mint_supply (ainda não monitorado).
+            # Armazena o evento para que hot.add() encontre mc_min retroativamente
+            # via get_min_mc_in_window() quando o token for descoberto pelo trenches.
+            if len(accounts) > 4 and accounts[4] == WSOL_MINT:
+                possible_mint = accounts[3]
+                if possible_mint not in (PUMP_AMM_PROGRAM, WSOL_MINT):
+                    self._store_unmonitored_event(possible_mint, logs)
+            return
 
         with self._lock:
             supply = self._mint_supply.get(mint) or 1_000_000_000
 
         self._tier1_process(mint, logs, supply)
+
+    def _store_unmonitored_event(self, mint: str, logs: list):
+        """
+        Parseia e armazena um evento pAMM para um mint ainda não monitorado.
+
+        Objetivo: quando hot.add() for chamado mais tarde (descoberta via trenches),
+        get_min_mc_in_window() encontra o mc_min real retroativamente — capturando
+        o fundo verdadeiro ocorrido durante o gap de 5-15s antes do poll.
+
+        Não chama _on_price: HotMonitor ainda não tem estado para este mint.
+        Usa apenas validações absolutas (sem k_established): k_absolute + A.9.
+        """
+        if _sol_usd_cached <= 0:
+            return
+        try:
+            event = _parse_swap_event_from_logs(logs, 1_000_000_000, _sol_usd_cached)
+            if not event or event["mc"] <= 0:
+                return
+
+            # A.9: rejeita secondary pools com pool pequena
+            pq = event.get("pool_quote_sol", 0)
+            if pq < self._MIN_POOL_SOL:
+                return
+
+            # k-gate: valida apenas range absoluto (sem k_established para mint novo)
+            # Proteção primária contra secondary pools já está no A.9 (pool_quote >= 10 SOL)
+            k_raw = event.get("k_raw", 0)
+            if k_raw > 0 and not (_K_ABSOLUTE_MIN <= k_raw <= _K_ABSOLUTE_MAX):
+                return
+
+            # Cria deque para o mint se ainda não existe (preserva se já criado)
+            with self._lock:
+                if mint not in self._swap_events:
+                    self._swap_events[mint] = deque(maxlen=self._ABSORPTION_MAXLEN)
+                buf = self._swap_events[mint]
+
+            buf.append({
+                "ts":             time.time(),
+                "side":           event["side"],
+                "sol":            event["sol"],
+                "mc":             event["mc"],
+                "wallet":         event.get("wallet"),
+                "pool_quote_sol": pq,
+            })
+            logger.debug("ERPC unmonitored %s: $%.0f armazenado (pool=%.1fSOL)",
+                         mint[:8], event["mc"], pq)
+        except Exception as e:
+            logger.debug("_store_unmonitored_event %s: %s", mint[:8], e)
 
     # ──────────────────────────────────────────────────────────────────
     # Modo Helius — handler de logsNotification
