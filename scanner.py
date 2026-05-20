@@ -294,6 +294,15 @@ class HotMonitor:
                          mint[:8], bounce_pct * 100, self.BOUNCE_MAX_PCT * 100)
             return
 
+        # Anti-decline: rejeita se o preço está caindo em relação ao pico rastreado.
+        # Token que fez fundo→pico→queda passa em bounce_pct mas está em declínio real.
+        # Threshold 85%: tolera pullbacks normais de até 15%; bloqueia quedas pós-pico.
+        mc_max = mint_state["mc_max"]
+        if mc_max > mc_min and mc < mc_max * 0.85:
+            logger.debug("BOUNCE skip %s — declining: $%.0f < pico $%.0f × 85%%",
+                         mint[:8], mc, mc_max)
+            return
+
         # A.6 — Bottom freshness: sinal deve vir logo após o fundo ser confirmado.
         # Padrão inválido: token pica em <3min, dump por 10-20min, sinal dispara em mini-rally tardio.
         # Dados: 92% dos inválidos têm gap (ts_min → sinal) > 2min. P50 gap = 6.7min.
@@ -1191,9 +1200,9 @@ class Scanner:
         # Subscrição antecipada no erpc: token ainda na bonding curve mas já
         # monitorado. Quando migrar, o primeiro evento pAMM é processado em t=0
         # sem esperar o próximo poll do trenches (elimina gap de 5-10min).
-        if self._helius:
+        if self.hot._helius:
             supply = int(token.get("total_supply") or 1_000_000_000)
-            self._helius.subscribe(mint, supply)
+            self.hot._helius.subscribe(mint, supply)
 
         logger.info("Watchlist +%s (%s) bc=%.0f%% smart=%s rug=%.0f%%",
                     token.get("symbol"), mint[:8], bc,
