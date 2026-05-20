@@ -1159,6 +1159,14 @@ class Scanner:
             self._watchlist[mint] = entry
 
         db.upsert_watchlist(entry)
+
+        # Subscrição antecipada no erpc: token ainda na bonding curve mas já
+        # monitorado. Quando migrar, o primeiro evento pAMM é processado em t=0
+        # sem esperar o próximo poll do trenches (elimina gap de 5-10min).
+        if self._helius:
+            supply = int(token.get("total_supply") or 1_000_000_000)
+            self._helius.subscribe(mint, supply)
+
         logger.info("Watchlist +%s (%s) bc=%.0f%% smart=%s rug=%.0f%%",
                     token.get("symbol"), mint[:8], bc,
                     entry["smart_wallets"], (entry["rug_ratio"] or 0) * 100)
