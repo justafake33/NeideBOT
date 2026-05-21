@@ -873,6 +873,17 @@ class HeliusWS:
                         "pool_quote_sol": pq_check,
                     })
 
+            # Gate de pool confirmation: só emite price update quando a pool primária
+            # está confirmada por intersecção de 5 TXs. Antes disso, eventos podem vir
+            # de secondary pools que passaram pelo k-gate. Rolling window (H22) já foi
+            # preenchida acima — não é afetada por este gate.
+            with self._lock:
+                pool_confirmed = self._pool_account.get(mint)
+            if not pool_confirmed:
+                logger.debug("HeliusWS price(anchor) %s: $%.0f MC — pool não confirmada, mc_min não atualizado",
+                             mint[:8], event["mc"])
+                return True
+
             logger.info("HeliusWS price(anchor) %s: $%.0f MC [%s %.4f SOL pool=%.1f]",
                         mint[:8], event["mc"], event["side"], event["sol"], pq_check)
             self._on_price(mint, event["mc"])
