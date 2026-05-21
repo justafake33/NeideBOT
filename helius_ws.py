@@ -433,6 +433,7 @@ class HeliusWS:
         self._connected = False
         self._mode      = "none"   # "erpc" | "helius" | "none"
         self._ws_url    = ""
+        self._erpc_tx_count = 0    # contador de transactionNotifications recebidos
 
     # ──────────────────────────────────────────────────────────────────
     # API pública
@@ -598,7 +599,11 @@ class HeliusWS:
         method = data.get("method")
 
         if method == "transactionNotification" and self._mode == "erpc":
-            self._handle_transaction_notification(data)
+            try:
+                self._handle_transaction_notification(data)
+            except Exception as e:
+                logger.warning("HeliusWS _handle_transaction_notification erro: %s | data keys: %s",
+                               e, list(data.get("params", {}).get("result", {}).keys()))
         elif method == "logsNotification" and self._mode == "helius":
             self._handle_logs_notification(data)
 
@@ -618,6 +623,11 @@ class HeliusWS:
         Processa uma transactionNotification do erpc.
         Identifica o mint monitorado cruzando os accountKeys da tx com _mint_supply.
         """
+        self._erpc_tx_count += 1
+        # Log do primeiro evento e depois a cada 500 para confirmar que o pipe está ativo
+        if self._erpc_tx_count <= 3 or self._erpc_tx_count % 500 == 0:
+            logger.info("HeliusWS erpc: tx #%d recebida", self._erpc_tx_count)
+
         params  = data.get("params", {})
         result  = params.get("result", {})
         value   = result.get("value", result)   # erpc envolve em "value"
@@ -630,6 +640,10 @@ class HeliusWS:
 
         logs = meta.get("logMessages", [])
         if not logs:
+            # Log ocasional: ajuda a diagnosticar se logMessages não está chegando
+            if self._erpc_tx_count <= 10:
+                logger.warning("HeliusWS erpc tx #%d: logMessages vazio — meta keys: %s",
+                               self._erpc_tx_count, list(meta.keys()))
             return
 
         # Filtro rápido: transação envolve o pAMM?
@@ -639,9 +653,14 @@ class HeliusWS:
         # Extrai account keys da transação para identificar o mint
         tx_array = tx_data.get("transaction", [])
         if not tx_array:
+            logger.warning("HeliusWS erpc: pAMM tx sem transaction[] — tx_data keys: %s",
+                           list(tx_data.keys()))
             return
-        accounts = _parse_account_keys_from_tx(tx_array[0])
+        accounts = _parse_account_keys_from_tx(tx_array[0] if isinstance(tx_array, list) else tx_array)
         if not accounts:
+            logger.warning("HeliusWS erpc: _parse_account_keys falhou — tx_array[0] type=%s len=%d",
+                           type(tx_array[0] if isinstance(tx_array, list) else tx_array).__name__,
+                           len(tx_array[0] if isinstance(tx_array, list) else tx_array))
             return
 
         # Identifica o mint monitorado cruzando accounts com _mint_supply.
@@ -655,6 +674,9 @@ class HeliusWS:
                 break
 
         if not mint:
+            if monitored:
+                logger.debug("HeliusWS erpc: pAMM tx sem mint monitorado (monitored=%d, accounts=%d)",
+                             len(monitored), len(accounts))
             return
 
         with self._lock:
