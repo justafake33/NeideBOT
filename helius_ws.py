@@ -418,7 +418,8 @@ class HeliusWS:
         self._swap_events:     dict[str, deque] = {}
         self._pool_quote_last: dict[str, float] = {}
         self._k_established:   dict[str, float] = {}
-        self._pool_pda:        dict[str, str]   = {}  # mint → PDA da pool primária
+        self._pool_pda:        dict[str, str]   = {}  # mint → PDA derivado (seeds a confirmar)
+        self._pool_account:    dict[str, str]   = {}  # mint → pool account real (auto-aprendido)
 
         # Helius mode only
         self._sub_id_mint: dict[int, str] = {}
@@ -502,6 +503,7 @@ class HeliusWS:
             self._pool_quote_last.pop(mint, None)
             self._k_established.pop(mint, None)
             self._pool_pda.pop(mint, None)
+            self._pool_account.pop(mint, None)
             if self._mode == "helius":
                 for sid, m in list(self._sub_id_mint.items()):
                     if m == mint:
@@ -644,8 +646,7 @@ class HeliusWS:
 
         # Identifica o mint monitorado cruzando accounts com _mint_supply.
         with self._lock:
-            monitored  = set(self._mint_supply.keys())
-            pool_pdas  = dict(self._pool_pda)   # snapshot: mint → pda
+            monitored = set(self._mint_supply.keys())
 
         mint = None
         for account in accounts:
@@ -656,20 +657,10 @@ class HeliusWS:
         if not mint:
             return
 
-        # Validação PDA: garante que a transação é da pool primária.
-        # PDA é o endereço canônico determinístico (seed: "pool" + mint + WSOL).
-        # Secondary pools têm PDAs diferentes — são rejeitadas aqui.
-        # Se o PDA ainda não foi derivado (thread assíncrona), usa k-gate como fallback.
-        pda = pool_pdas.get(mint)
-        if pda and pda not in accounts:
-            logger.debug("HeliusWS PDA skip %s: pool %s... não está nos accounts",
-                         mint[:8], pda[:8])
-            return
-
         with self._lock:
             supply = self._mint_supply.get(mint) or 1_000_000_000
 
-        self._tier1_process(mint, logs, supply)
+        self._tier1_process(mint, logs, supply, accounts)
 
     # ──────────────────────────────────────────────────────────────────
     # Modo Helius — handler de logsNotification
@@ -713,12 +704,25 @@ class HeliusWS:
     # Tier 1 — parse Anchor inline (ambos os modos)
     # ──────────────────────────────────────────────────────────────────
 
-    def _tier1_process(self, mint: str, logs: list, supply: float) -> bool:
+    # Contas que NUNCA são o pool account (usadas para identificar a pool por eliminação)
+    _KNOWN_PROGRAMS = {
+        "11111111111111111111111111111111",               # System Program
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  # SPL Token
+        "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe8bXh", # Associated Token
+        "SysvarRent111111111111111111111111111111111",    # Sysvar Rent
+        "ComputeBudget111111111111111111111111111111",    # Compute Budget
+        "SysvarC1ock11111111111111111111111111111111",    # Sysvar Clock
+        PUMP_AMM_PROGRAM,
+        WSOL_MINT,
+    }
+
+    def _tier1_process(self, mint: str, logs: list, supply: float,
+                       accounts: list | None = None) -> bool:
         """
         Parseia o evento Anchor, aplica k-gate e A.9, chama _on_price.
+        accounts: lista de account keys da transação (erpc). Usado para
+        identificar e armazenar o endereço da pool primária no k_established.
         Retorna True se um price update foi disparado.
-        No modo erpc: sem Tier 2 (fallback não faz sentido para stream global).
-        No modo helius: retorna False para acionar Tier 2 se necessário.
         """
         if _sol_usd_cached <= 0:
             return False
@@ -762,6 +766,19 @@ class HeliusWS:
                         return False
                     with self._lock:
                         self._k_established[mint] = k_raw
+                    # Auto-aprende o endereço da pool primária por eliminação:
+                    # exclui mint, WSOL, programas conhecidos e o signer (accounts[0]).
+                    # O primeiro account restante que não é uma ATA (32b aleatório) é a pool.
+                    if accounts:
+                        signer = accounts[0] if accounts else None
+                        exclude = self._KNOWN_PROGRAMS | {mint, signer}
+                        candidates = [a for a in accounts[1:] if a not in exclude]
+                        if candidates:
+                            pool_acc = candidates[0]
+                            with self._lock:
+                                self._pool_account[mint] = pool_acc
+                            logger.info("HeliusWS pool-account LEARNED %s: pool=%s... accounts=%s",
+                                        mint[:8], pool_acc[:8], accounts)
                     logger.info("HeliusWS k-gate ESTABLISHED %s: k=%.3e", mint[:8], k_raw)
                 else:
                     # Check 2 (direcional): k não pode aumentar
@@ -785,6 +802,17 @@ class HeliusWS:
                         with self._lock:
                             if self._k_established.get(mint) == k_est:
                                 self._k_established[mint] = k_raw
+
+            # Pool account validation: após k_established, verifica que o pool
+            # account aprendido está nos accounts desta transação.
+            # Rejeita secondary pools que passaram k-gate por coincidência de k.
+            if accounts:
+                with self._lock:
+                    known_pool = self._pool_account.get(mint)
+                if known_pool and known_pool not in accounts:
+                    logger.debug("HeliusWS pool-account skip %s: pool %s... não encontrado",
+                                 mint[:8], known_pool[:8])
+                    return False
 
             # H22/H24/H25: acumula na rolling window
             if event["side"] != "unknown":
