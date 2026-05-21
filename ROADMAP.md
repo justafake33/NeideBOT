@@ -1,7 +1,7 @@
 # NeideBOT — Roadmap
 
-**Atualizado:** 2026-05-19 (sessão 11)
-**Estado:** Bot PAUSADO · correções k-gate + BOUNCE_MAX_PCT prontas para merge · branch ativo: `claude/audit-neidenbot-purchases-8k0Tn`
+**Atualizado:** 2026-05-21 (sessão 13)
+**Estado:** Bot ATIVO · erpc operacional · dados limpos acumulando desde 00:41 UTC 2026-05-21 · branch ativo: `claude/audit-neidenbot-purchases-8k0Tn`
 
 ---
 
@@ -71,6 +71,10 @@
 | **`BOUNCE_MAX_PCT` guard bug corrigido** | 2026-05-19 | Guard `< 1.0` desativava o filtro para qualquer threshold ≥ 100% (ex: `1.50 < 1.0 = False`). Setar `BOUNCE_MAX_PCT=1.50` no Railway **não tinha efeito**. Fix: `< 9.99`. Agora `BOUNCE_MAX_PCT=1.50` bloqueia bounces tardios >150%. Commit `9bbdaf2`. **Env var necessária: `BOUNCE_MAX_PCT=1.50`.** |
 | **trailing_active fill recovery** | 2026-05-19 | `_recover_fill` só era chamado para trades `open`. Trades que transicionavam para `trailing_active` sem `entry_price_usd` nunca tinham fill recuperado. Fix: loop `get_trailing_active_trades()` agora tenta `_recover_fill` antes de `_check_trailing_exit`. Commit `aced744`. |
 | **Diagnóstico ZUCC — case study de entrada tardia** | 2026-05-19 | Real bottom: $13K em t=2min após migração. Sinal disparou em t=4:40 com entrada a $40K (bounce 208%). Causa: k=1.767e25 < k_init_min=2.51e25 → INIT SKIP → Helius cego → kline 1-2min candle fechou, GMGN indexou, bot processou → $13K capturado correto mas com 2-3min de lag. Preço já estava a $40K. BOUNCE_MAX_PCT desativado (guard bug) → sinal disparou. Com fixes deployados: Helius teria visto fundo em tempo real, sinal teria disparado a ~$17K (30% bounce de $13K). |
+| **erpc pipeline fix — try/except + `_erpc_tx_count` + early-return logging** | 2026-05-21 | Após deploy do erpc (sessão 12), zero logs de price/k-gate em produção por 6+ minutos. Causa: exceptions silenciosas swalladas pelo websocket-client + zero logging nos early-returns. Fix: try/except no `_on_message` + counter `_erpc_tx_count` (log primeiras 3 + cada 500ª) + warning em cada early-return. Commit `a48cb3b`. Resultado: em 0.05s após o fix, `tx #1 recebida` + k-gate ESTABLISHED + `Fundo(erpc)` funcionando. |
+| **Pool-account learning por intersecção de 5 TXs** | 2026-05-21 | Seleção anterior (primeira TX, primeiro candidato) escolhia contas globais (vaults, fee accounts) antes do pool state PDA. Fix: acumular conjuntos de candidatos de 5 TXs diferentes e computar intersecção. ATAs de usuários são eliminados (variam por TX). Pool-specific accounts sobrevivem. Confirmado: `pool-account CONFIRMED GXyYU3xE: pool=CNa2muAa... (interseção de 5 TXs, 7 candidatos)` em ~300ms. Commit `70cd997`. |
+| **Log spam `skip não-pAMM` → debug level** | 2026-05-21 | WARNING aparecia a cada poucos segundos para transactions de aggregators que invocam múltiplos programas. Comportamento esperado — não é bug. Fix: `logger.warning` → `logger.debug`. Commit `70cd997`. |
+| **Primeiro token com dados limpos: JOB (DMircbtE)** | 2026-05-21 00:41 UTC | Marco zero da era de dados limpos. mc_migration=$35,412, smart=3. Todos os dados de mc_min coletados APÓS este timestamp são confiáveis (sem candle de transição, sem ts_migration bug, sem race condition). |
 
 > ⚠️ **WR REAL CORRIGIDO (2026-05-14 sessão 5):** banco tinha dados fictícios — TradeMonitor inferia saídas de MC snapshots, não da blockchain. Auditoria via Helius revelou WR real de **10.1%** (14 TP / 125 SL / 139 trades). WR anterior de 32% era inflado por falsos TPs. `/debug/sell-recovery` executado: 139 correções persistidas.
 > ⚠️ **DADOS HISTÓRICOS SUSPEITOS (sessão 9):** mc_min de todos os tokens antes do fix (elapsed_sec < 90) pode estar corrompido pelo candle de transição. Análises de WR baseadas em `mc_min` histórico (bounce_pct, entry_ratio, drop_from_mig) devem ser tratadas com cautela. Novos trades pós-deploy serão os primeiros com dados de entrada confiáveis.
@@ -79,22 +83,11 @@
 
 ## 🔜 Curto Prazo
 
-### 0. DEPLOY DAS CORREÇÕES ← FAZER AGORA (sessão 11)
+### 0. DEPLOY DAS CORREÇÕES ← ✅ CONCLUÍDO (sessão 13, 2026-05-21)
 
-**Branch com as correções:** `claude/audit-neidenbot-purchases-8k0Tn`
-Fazer merge para `main` no Railway.
-
-**Env vars a setar no Railway após deploy:**
-```
-BOUNCE_MAX_PCT=1.50     ← OBRIGATÓRIO (guard bug corrigido, filtro agora funciona)
-TRADING_ENABLED=true    ← RELIGAR o bot
-```
-
-**Env vars que NÃO precisam ser setadas** (já são defaults seguros):
-- `K_INIT_TOLERANCE`: hardcoded em 0.80 no código — zero ação
-- `MIN_POOL_SOL`: default 10 no código — zero ação
-
-**Verificação pós-deploy:** nos logs, confirmar que Helius eventos chegam para tokens que antes eram INIT SKIP'd. Se `bounce_pct` nos sinais está na faixa 30-150% (e não 150-300%+), o filtro BOUNCE_MAX_PCT está funcionando.
+Deploy completo do branch `claude/audit-neidenbot-purchases-8k0Tn` em produção.
+`TRADING_ENABLED=true`, `ERPC_API_KEY` configurado, `BOUNCE_MAX_PCT=1.50` ativo.
+Bot rodando com dados limpos desde 00:41 UTC 2026-05-21.
 
 ---
 
@@ -412,6 +405,9 @@ Dashboard mostra correlação H22 → outcome com n atual. 3 tabelas: por `absor
 22. **WR corrigido: 32% (42/132)**: 4 trades classificados como `sl` eram na verdade trailing TPs (HUMANITY +56%, Kevin +311%, SLEEP +41%, DrawPoorly +46%). TradeMonitor era cego após 60min porque `if not ticks: return`. Com a correção via `get_token_balance()` os novos trades serão classificados corretamente. Para dados históricos: usar `/debug/fix-trailing-outcomes` + verificação manual.
 23. **smart_wallets não discrimina WR em dados live**: smart=1→31%, smart=3→30%, smart=5+→19% (plano ou negativo). Contradiz análise anterior de n=6. FILTER_SMART_MIN=3 é conservador demais — pode estar rejeitando tokens válidos. Revisar após n≥50 trades com smart≥3 acumulados.
 24. **bounce_pct >70% é o maior discriminador live**: WR 74% (n=23) vs 29% base (+45pp). Gradiente claro e monotônico (12% / 23% / 40% / 74%). Mecanismo plausível: bounce mais forte = mais compradores reais = mais sustentação. BOUNCE_MIN_PCT=0.50 é a mudança de maior impacto disponível sem código.
+25. **Pipeline silencioso: instrumentar antes de refatorar**: quando um pipeline não produz logs, a hipótese errada é "o problema é arquitetural". A hipótese correta é "exceptions estão sendo swalladas silenciosamente ou não há logging nos pontos de descarte". Adicionar try/except + counter de eventos + logs em cada early-return resolve em minutos o que poderia ser dias de refactoring.
+26. **Pool-account por intersecção elimina ATAs de usuários**: ATAs são mint-específicos mas usuário-específicos — cada swapper tem um ATA diferente. A intersecção de accountKeys de 5 TXs elimina qualquer conta que não apareça em TODOS os swaps, deixando apenas pool state PDA e vaults. Não requer conhecimento prévio do endereço do pool.
+27. **Primeiro token limpo é o marco zero**: definir explicitamente o timestamp a partir do qual os dados são confiáveis (JOB 2026-05-21 00:41 UTC) cria um separador claro entre dados históricos corrompidos e dados novos. Qualquer análise de WR, bounce_pct ou filtros deve usar apenas dados após esse timestamp.
 25. **Todo o histórico de WR do DB era ficção (sessão 5)**: TradeMonitor nunca acessou a blockchain. Usava `entry_expected = mc_bottom × 1.15` (não entrada real), `token_ticks` (parava após 60min), e aplicava `pnl_pct = +TRAILING_ACTIVATION_PCT` quando o trade expirava — sem verificar se o GMGN realmente saiu com lucro. A blockchain (via Helius `getTransaction`) é a única fonte que não mente. `exit_type='helius_sell_recovery'` no campo `exit_type` é o único indicador de dado confiável.
 26. **Paginação determinística com cursor `before` vs janela deslizante**: qualquer endpoint de histórico deve paginar com cursor `before` último item processado, parando em timestamp floor. `?limit=N` sem cursor retorna janela deslizante — contagem muda a cada execução à medida que novas txs chegam. Para auditoria histórica, cursor é obrigatório.
 27. **`db._cursor()` usa `RealDictCursor` — nunca indexar por posição**: ficar indexando `r[0]`, `r[1]` em código que usa esse cursor falha com `KeyError: 0`. Padrão do projeto: sempre usar `r['coluna']`. O erro é silenciado por `try/except` em generators → difícil de debugar. Verificar com `isinstance(row, dict)` em caso de dúvida.

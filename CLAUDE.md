@@ -787,66 +787,55 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 156. **`_parse_account_keys_from_tx()` — extração de accountKeys do wire format Solana**: Solana transaction: `[compact-u16 num_sigs][64×num_sigs bytes][message]`. Legacy message: `[3 bytes header][compact-u16 num_accounts][32×n pubkeys]`. Versioned (v0): byte `0x80` antes do header. `_compact_u16(data, offset)` decodifica o formato variable-length integer da Solana (high bit = continue). ALT (Address Lookup Tables) em transações versioned não são resolvidas — mints em ALT são silenciosamente perdidas (aceitável para V1; ~5% dos casos).
 157. **scanner.py instanciava HeliusWS apenas com `HELIUS_API_KEY` (bug crítico corrigido sessão 12)**: `if os.getenv("HELIUS_API_KEY"):` não instanciava HeliusWS quando apenas `ERPC_API_KEY` estava configurado. Resultado: modo erpc nunca ativaria em produção. Fix: `if os.getenv("ERPC_API_KEY") or os.getenv("HELIUS_API_KEY"):`. Commit `8241f1f`.
 158. **Todos os filtros baseados em WR histórico são inválidos após descoberta do elapsed_sec bug (sessão 12)**: mc_min estava corrompido para praticamente todos os 139+ trades históricos (candle de transição bonding curve→pool incluído como fundo). BOUNCE_MIN_PCT=0.55, FILTER_SMART_MIN=3 e outros filtros agressivos eram baseados nesse dado corrompido. Resetar para baselines defensáveis: `BOUNCE_MIN_PCT=0.30` (mínimo matemático provado), `BOUNCE_MAX_PCT=1.50` (novo, bloqueia entradas tardias), `FILTER_SMART_MIN=2` (smart=1→0% WR é confiável mesmo com mc_min errado — se o token nunca bounceou, smart count não importa). Acumular 30+ trades limpos pós-deploy antes de qualquer ajuste de filtro.
+159. **erpc pipeline em silêncio: exceptions swalladas pelo websocket-client (sessão 13, 2026-05-21)**: após deploy do erpc (sessão 12), nenhum log de `price(anchor)`, `k-gate ESTABLISHED` ou `pool-account LEARNED` aparecia em produção mesmo com tokens no HotMonitor por 6+ minutos. Causa: `_handle_transaction_notification` não tinha try/except — qualquer exceção era capturada silenciosamente pela biblioteca websocket-client sem trace. Também não havia logging em early-returns (`if not logs: return`, `if not tx_array: return`) — se eventos chegavam e eram descartados, zero rastro. Fix: (1) try/except no `_on_message` em torno do handler com log do tipo de exceção + keys do data; (2) counter `_erpc_tx_count` com log das 3 primeiras TXs recebidas e a cada 500ª; (3) log de warning em cada ponto de early-return mostrando quais campos estavam ausentes. Commit `a48cb3b`. Após fix: primeiro log `tx #1 recebida` em 0.05s, k-gate ESTABLISHED imediatamente, `Fundo(erpc)` funcionando.
+160. **Diagnóstico incremental antes de refatorar**: a abordagem correta para "pipeline silencioso" é adicionar logging em cada ponto de early-return e um counter para confirmar que eventos chegam, ANTES de assumir bug estrutural. Em 0.05s após o fix, o primeiro log apareceu — o problema não era recepção de eventos, era exceptions silenciosas. Princípio: instrumentar antes de refatorar.
+161. **Pool-account learning por intersecção de 5 TXs (sessão 13)**: abordagem inicial (sessão 12) selecionava o primeiro candidato não-excluído da primeira transação — escolhia contas globais (vaults, fee accounts) no início do accountKeys antes do pool state PDA. Fix: acumular conjuntos de candidatos de 5 TXs diferentes e computar a intersecção. ATAs de usuários variam por TX (usuário diferente → ATA diferente) e são eliminados. Pool state PDA, vaults e fee accounts aparecem em TODOS os swaps e sobrevivem. Após 5 TXs, `inter = cands_list[0] & cands_list[1] & ... & cands_list[4]`. Confirmado em produção: `pool-account CONFIRMED GXyYU3xE: pool=CNa2muAa... (interseção de 5 TXs, 7 candidatos)` em ~300ms após primeiro evento válido. Commit `70cd997`.
+162. **Pool-account confirmado pode ser vault, não o pool state PDA**: a intersecção retorna qualquer conta que aparece em todo swap — pode ser o pool state PDA ou um dos vaults de tokens. Para o objetivo de filtrar secondary pools, qualquer das duas funciona: secondary pools têm vaults diferentes. Identificar especificamente o PDA exigiria comparar com o PDA derivado via seeds — complexidade desnecessária para V1.
+163. **Log spam `skip Program data de programa não-pAMM` — esperado, não é bug (sessão 13)**: transactions agregadas (MEV bots, aggregators) invocam múltiplos programas em uma única transação — Raydium CLMM (`CAMMCzo5...`), pump.fun original (`6EF8rrecthR5...`), `ZERor4xhb...`, etc. O erpc global retorna TODAS as transações do pAMM, incluindo essas onde o pAMM é apenas um dos programas invocados. O parser tentava processar log data de cada programa e logava WARNING para os não-pAMM. Fix: `logger.warning` → `logger.debug`. Commit `70cd997`. Regra: não usar WARNING para comportamento esperado e de alta frequência — reservar WARNING para situações genuinamente anômalas.
+164. **Primeiro token com dados limpos: JOB (DMircbtE), 2026-05-21 00:41 UTC**: entrou no HotMonitor às 00:41 UTC após deploy completo das correções. mc_migration=$35,412, smart=3, todos os filtros passados. Este é o marco zero da era de dados limpos — qualquer análise de WR, bounce_pct, entry_ratio ou mc_bottom baseada em dados coletados APÓS este timestamp é confiável. Dados anteriores continuam disponíveis no banco mas marcados como suspeitos (mc_min corrompido).
 
 ---
 
-## 🔄 Estado Atual: BOT PAUSADO — aguardando Railway liberar deploys (sessão 12, 2026-05-20)
+## 🔄 Estado Atual: BOT ATIVO — erpc operacional, dados limpos acumulando (sessão 13, 2026-05-21)
 
-### Contexto do outage
-Railway sofreu outage por conta bloqueada pelo Google Cloud (2026-05-19/20). O site voltou mas deploys ainda estavam pausados no final da sessão 12. Branch `claude/audit-neidenbot-purchases-8k0Tn` está 100% pronto para merge — apenas aguardando Railway liberar.
+### Situação atual
+Branch `claude/audit-neidenbot-purchases-8k0Tn` deployado e rodando. erpc confirmado operacional: ~180 TXs/s, preço em tempo real via pAMM parse inline. Primeiro token com dados limpos: **JOB (DMircbtE)**, HotMonitor às 00:41 UTC de 2026-05-21.
 
-### Pipeline (após deploy — branch `claude/audit-neidenbot-purchases-8k0Tn`)
-`TRADING_ENABLED=false` ← BOT PAUSADO para deploy seguro.
-`CALIBRATION_AMOUNT_USD=1.0`, `CALIBRATION_MAX_TRADES=999999`.
-`TRADE_SL_PCT=0.25` (testando — 15% disparava em segundos por volatilidade pAMM).
-`HELIUS_RPC_URL` configurado no Railway — `helius_rpc.py` ativo para fill + posição.
+**Todos os dados de mc_min capturados APÓS 2026-05-21 00:41 UTC são considerados limpos** — sem contaminação do candle de transição, sem bug de ts_migration, sem race condition de bounce_fired.
 
-**Portfolio:** ~$50 restantes de 1 SOL original (~$170). 70% perdido em trades com dados de entrada corrompidos (mc_min fictício do candle de transição).
+### Pipeline ativo (branch `claude/audit-neidenbot-purchases-8k0Tn`)
+`TRADING_ENABLED=true` · `CALIBRATION_AMOUNT_USD=1.0` · `CALIBRATION_MAX_TRADES=999999`
+`TRADE_SL_PCT=0.25` (testando — 15% disparava por volatilidade pAMM)
+`FILTER_SMART_MIN=3` · `BOUNCE_MIN_PCT=0.30` · `BOUNCE_MAX_PCT=1.50`
+`ERPC_API_KEY` configurado · `HELIUS_RPC_URL` configurado
 
-**Todas as correções do branch (prontas para merge):**
-- ✅ **Bug 1 (CRÍTICO)**: `ts_migration` agora usa `complete_timestamp` on-chain (sessão 9)
-- ✅ **Bug 3 (CRÍTICO)**: `bounce_fired` check-and-set atômico sob `_lock` (sessão 9)
-- ✅ **Bug 5 (ALTO)**: `_graduate` ignora candle de transição (sessão 9)
-- ✅ **Bug 6 (ALTO)**: `_backfill_slope_ticks` idem (sessão 9)
-- ✅ **A.9 pool depth filter**: `pool_quote_sol >= MIN_POOL_SOL` (sessão 10)
-- ✅ **Fix Helius window bug**: janela nunca começa antes de ts_mig+90s (sessão 10)
-- ✅ **k-gate INIT SKIP → rejeita**: eventos fora do range não passam mais (sessão 11, `9c25f6b`)
-- ✅ **k-gate DROP REJECT → limpa e rejeita**: `pop(mint)` + `return` (sessão 11, `9c25f6b`)
-- ✅ **`_K_INIT_TOLERANCE = 0.80`**: cobre pools com k degradado por ~130 trades de fee (sessão 11, `28ba86b`)
-- ✅ **`BOUNCE_MAX_PCT` guard fix**: `< 1.0` → `< 9.99` — filtro agora funciona para thresholds > 100% (sessão 11, `9bbdaf2`)
-- ✅ **trailing_active fill recovery**: `_recover_fill` agora chamado para trades `trailing_active` sem `entry_price_usd` (sessão 11, `aced744`)
-- ✅ **erpc global transactionSubscribe**: `helius_ws.py` dual-mode — erpc primário (global sub no pAMM), Helius logsSubscribe fallback (sessão 12, `84252a7`)
-- ✅ **scanner.py erpc fix**: HeliusWS instanciado com `ERPC_API_KEY` ou `HELIUS_API_KEY` (sessão 12, `8241f1f`)
+**Portfolio:** ~$50 restantes de 1 SOL original (~$170). 70% perdido em trades com dados corrompidos.
+
+**Todas as correções deployadas:**
+- ✅ **Bug 1 (CRÍTICO)**: `ts_migration` agora usa `complete_timestamp` on-chain
+- ✅ **Bug 3 (CRÍTICO)**: `bounce_fired` check-and-set atômico sob `_lock`
+- ✅ **Bug 5 (ALTO)**: `_graduate` ignora candle de transição (elapsed_sec < 90)
+- ✅ **Bug 6 (ALTO)**: `_backfill_slope_ticks` idem
+- ✅ **A.9 pool depth filter**: `pool_quote_sol >= MIN_POOL_SOL`
+- ✅ **k-gate INIT SKIP → rejeita** + **DROP REJECT → limpa e rejeita**
+- ✅ **`_K_INIT_TOLERANCE = 0.80`**: cobre pools com k degradado por ~130 trades de fee
+- ✅ **`BOUNCE_MAX_PCT` guard fix**: `< 1.0` → `< 9.99` — filtro funciona para thresholds > 100%
+- ✅ **erpc global transactionSubscribe**: dual-mode erpc/Helius
+- ✅ **erpc pipeline fix**: try/except + `_erpc_tx_count` counter — diagnóstico de eventos silenciosos
+- ✅ **pool-account por intersecção de 5 TXs**: substitui seleção do primeiro candidato (errônea)
+- ✅ **A.2 REMOVIDO**: dead zone 20-30% baseada em mc_min corrompido
+- ✅ **A.3 REMOVIDO**: entry ratio 50-65% baseada em dados corrompidos
 
 **Filtros ativos (ordem de aplicação no _check_bounce):**
-- A.2: bloqueia bounce_pct 20-30% (redundante com A.7 mas mantido como safety net)
-- A.3: bloqueia entry 50-65% do mc_migration
-- A.5: bloqueia elapsed > 20min
-- A.6: bloqueia fundo estagnado > 5min
+- A.5: bloqueia elapsed > 20min (do ts_migration on-chain)
+- A.6: bloqueia fundo estagnado > 5min (BOTTOM_FRESHNESS_SEC=300)
 - A.7: bloqueia bounce_pct < 30% (BOUNCE_MIN_PCT=0.30)
+- A.8: bloqueia bounce_pct > 150% (BOUNCE_MAX_PCT=1.50) — entradas tardias
 - FILTER_PUMP_ONLY: garante cobertura H22
 
-**WR real blockchain (sessão 5, 2026-05-14): 10.1%** (14 TP / 125 SL / 139 trades) — este é o único número confiável, porque veio de scan on-chain de todas as transações da wallet. Porém: as condições de entrada desses 139 trades foram geradas com mc_bottom corrompido, então a amostra está enviesada.
+**⚠️ WR histórico inválido.** Os primeiros dados confiáveis são trades pós-2026-05-21 00:41 UTC.
 
-**"Maior discriminador live: bounce_pct >70% → WR 74% (n=23)"** — 🔴 INVÁLIDO. bounce_pct calculado com mc_min corrompido. O que o bot chamava de "bounce 70%" pode ter sido 10-15% real.
-
-**⚠️ Todos os filtros baseados em WR histórico foram invalidados** pela corrupção do mc_min (candle de transição bug). Os primeiros dados limpos são os trades pós-deploy deste branch (pós-2026-05-20).
-
-**Checklist para religar o bot (aguardando Railway):**
-1. Verificar que `status.railway.com` mostra deploys habilitados
-2. Fazer merge do branch `claude/audit-neidenbot-purchases-8k0Tn` → `main` no Railway
-3. Aguardar redeploy completo e verificar logs: "HeliusWS: modo ERPC (global transactionSubscribe)"
-4. Setar env vars no Railway:
-   - `ERPC_API_KEY=e5b9b243-9188-41b4-a59f-596119afda77` (NOVO — ativa modo erpc)
-   - `BOUNCE_MAX_PCT=1.50` (NOVO — bloqueia bounces tardios >150%)
-   - `BOUNCE_MIN_PCT=0.30` (resetar de 0.55 corrompido para baseline defensável)
-   - `FILTER_SMART_MIN=2` (smart=1 → 0% WR confirmado on-chain; menos afetado por corrupção)
-5. `K_INIT_TOLERANCE=0.80` já está hardcoded — zero ação
-6. `MIN_POOL_SOL=10` já é o default — zero ação
-7. Mudar `TRADING_ENABLED=true`
-8. Monitorar consumo de tokens erpc no dashboard (validar billing model)
-
-**Regra de ouro para novos filtros:** só implementar com n≥30 trades validados no GMGN. **Nunca usar DB WR como fonte.**
+**Regra de ouro para novos filtros:** n≥30 trades GMGN com dados limpos. **Nunca usar DB WR como fonte.**
 
 **Próximos passos — ver ROADMAP.md**
 
