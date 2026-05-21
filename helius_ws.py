@@ -360,8 +360,8 @@ def _parse_swap_event_from_logs(logs: list, supply: float, sol_usd: float) -> di
 
         current = program_stack[-1] if program_stack else None
         if current not in (PUMP_AMM_PROGRAM, METEORA_PROGRAM):
-            logger.warning("HeliusWS: skip Program data de programa não-pAMM: %s (stack=%s)",
-                           current, program_stack[-3:] if program_stack else [])
+            logger.debug("HeliusWS: skip Program data de programa não-pAMM: %s (stack=%s)",
+                         current, program_stack[-3:] if program_stack else [])
             continue
 
         b64 = log[len("Program data: "):]
@@ -418,8 +418,9 @@ class HeliusWS:
         self._swap_events:     dict[str, deque] = {}
         self._pool_quote_last: dict[str, float] = {}
         self._k_established:   dict[str, float] = {}
-        self._pool_pda:        dict[str, str]   = {}  # mint → PDA derivado (seeds a confirmar)
-        self._pool_account:    dict[str, str]   = {}  # mint → pool account real (auto-aprendido)
+        self._pool_pda:        dict[str, str]       = {}  # mint → PDA derivado (seeds a confirmar)
+        self._pool_account:    dict[str, str]       = {}  # mint → pool account confirmado por intersecção
+        self._pool_candidates: dict[str, list[set]] = {}  # mint → lista de sets de candidatos por TX
 
         # Helius mode only
         self._sub_id_mint: dict[int, str] = {}
@@ -505,6 +506,7 @@ class HeliusWS:
             self._k_established.pop(mint, None)
             self._pool_pda.pop(mint, None)
             self._pool_account.pop(mint, None)
+            self._pool_candidates.pop(mint, None)
             if self._mode == "helius":
                 for sid, m in list(self._sub_id_mint.items()):
                     if m == mint:
@@ -788,19 +790,15 @@ class HeliusWS:
                         return False
                     with self._lock:
                         self._k_established[mint] = k_raw
-                    # Auto-aprende o endereço da pool primária por eliminação:
-                    # exclui mint, WSOL, programas conhecidos e o signer (accounts[0]).
-                    # O primeiro account restante que não é uma ATA (32b aleatório) é a pool.
+                    # Acumula candidates desta TX para identificar pool account por intersecção.
+                    # Contas que aparecem em TODAS as TXs do mint (mas não em outros mints)
+                    # são os accounts da pool — não ATAs de usuários específicos.
                     if accounts:
                         signer = accounts[0] if accounts else None
                         exclude = self._KNOWN_PROGRAMS | {mint, signer}
-                        candidates = [a for a in accounts[1:] if a not in exclude]
-                        if candidates:
-                            pool_acc = candidates[0]
-                            with self._lock:
-                                self._pool_account[mint] = pool_acc
-                            logger.info("HeliusWS pool-account LEARNED %s: pool=%s... accounts=%s",
-                                        mint[:8], pool_acc[:8], accounts)
+                        candidates = {a for a in accounts[1:] if a not in exclude}
+                        with self._lock:
+                            self._pool_candidates.setdefault(mint, []).append(candidates)
                     logger.info("HeliusWS k-gate ESTABLISHED %s: k=%.3e", mint[:8], k_raw)
                 else:
                     # Check 2 (direcional): k não pode aumentar
@@ -825,9 +823,33 @@ class HeliusWS:
                             if self._k_established.get(mint) == k_est:
                                 self._k_established[mint] = k_raw
 
-            # Pool account validation: após k_established, verifica que o pool
-            # account aprendido está nos accounts desta transação.
-            # Rejeita secondary pools que passaram k-gate por coincidência de k.
+                    # Acumula candidates e confirma pool account por intersecção após 5 TXs.
+                    # ATAs de usuários variam por TX; pool state aparece em todas.
+                    if accounts:
+                        signer = accounts[0] if accounts else None
+                        exclude = self._KNOWN_PROGRAMS | {mint, signer}
+                        candidates = {a for a in accounts[1:] if a not in exclude}
+                        with self._lock:
+                            pool_known = self._pool_account.get(mint)
+                            if not pool_known:
+                                cands_list = self._pool_candidates.setdefault(mint, [])
+                                cands_list.append(candidates)
+                                if len(cands_list) >= 5:
+                                    # Intersecção de 5 TXs: só pool accounts sobrevivem
+                                    inter = cands_list[0].copy()
+                                    for s in cands_list[1:]:
+                                        inter &= s
+                                    if inter:
+                                        pool_acc = next(iter(inter))
+                                        self._pool_account[mint] = pool_acc
+                                        logger.info(
+                                            "HeliusWS pool-account CONFIRMED %s: pool=%s... "
+                                            "(interseção de 5 TXs, %d candidatos)",
+                                            mint[:8], pool_acc[:8], len(inter),
+                                        )
+
+            # Pool account validation: após confirmação por intersecção, verifica que o
+            # pool account está nos accounts desta transação.
             if accounts:
                 with self._lock:
                     known_pool = self._pool_account.get(mint)
