@@ -35070,6 +35070,378 @@ a{{text-decoration:none}}
     return html
 
 
+@app.route("/analise/token-outcome")
+def analise_token_outcome():
+    """
+    Análise limpa de outcomes de tokens pós-migração.
+    Fonte de verdade: token_ticks (OHLC real), NÃO mc_bottom do banco.
+
+    Métricas por token:
+      - drop_pct: queda de mc_migration até o fundo real nos ticks (90s-25min)
+      - bounce_pct: recuperação do fundo real até o pico nos ticks (até 60min)
+      - bounced: bounce_pct >= 30%
+      - tp_eq: atingiu mc_migration × 1.75 em algum momento (equivalente ao TP)
+
+    Segmenta cada campo de filtro para mostrar qual prediz bounce.
+
+    ?days=N     janela em dias (default 14)
+    ?min_ticks=N mínimo de ticks por token (default 5)
+    """
+    days       = int(request.args.get("days", 14))
+    min_ticks  = int(request.args.get("min_ticks", 5))
+
+    with db._cursor() as cur:
+        # Computa outcomes limpos por token a partir de token_ticks
+        cur.execute("""
+            WITH tick_outcomes AS (
+                SELECT
+                    tt.mint,
+                    COUNT(*)                                                    AS tick_count,
+                    -- Fundo real: mínimo de mc_low (kline) ou mc (trenches) entre 90s e 25min
+                    MIN(COALESCE(tt.mc_low, tt.mc))
+                        FILTER (WHERE tt.elapsed_sec BETWEEN 90 AND 1500)      AS bottom_mc,
+                    -- Pico real: máximo de mc_high (kline) ou mc (trenches) até 60min
+                    MAX(COALESCE(tt.mc_high, tt.mc))
+                        FILTER (WHERE tt.elapsed_sec BETWEEN 90 AND 3600)      AS peak_mc,
+                    -- Elapsed no fundo (para time_to_bottom)
+                    MIN(tt.elapsed_sec)
+                        FILTER (WHERE tt.elapsed_sec BETWEEN 90 AND 1500
+                            AND COALESCE(tt.mc_low, tt.mc) = (
+                                SELECT MIN(COALESCE(t2.mc_low, t2.mc))
+                                FROM token_ticks t2
+                                WHERE t2.mint = tt.mint
+                                  AND t2.elapsed_sec BETWEEN 90 AND 1500
+                            ))                                                  AS elapsed_at_bottom
+                FROM token_ticks tt
+                GROUP BY tt.mint
+                HAVING COUNT(*) >= %(min_ticks)s
+            ),
+            joined AS (
+                SELECT
+                    m.mint,
+                    m.token_nome,
+                    m.ts_migration,
+                    m.mc_migration,
+                    m.smart_wallets,
+                    m.renowned_wallets,
+                    m.top10_holder_rate,
+                    m.top70_sniper_hold_rate,
+                    m.bundler_trader_amount_rate,
+                    m.rat_trader_rate,
+                    m.bot_degen_rate,
+                    m.creator_token_status,
+                    m.cto_flag,
+                    m.has_social,
+                    m.x_follower_count,
+                    m.suspected_insider_rate,
+                    m.entrapment_ratio,
+                    to_.tick_count,
+                    to_.bottom_mc,
+                    to_.peak_mc,
+                    to_.elapsed_at_bottom,
+                    -- drop do MC de migração até o fundo real
+                    CASE WHEN m.mc_migration > 0 AND to_.bottom_mc IS NOT NULL
+                        THEN (m.mc_migration - to_.bottom_mc) / m.mc_migration
+                    END                                                         AS drop_pct,
+                    -- bounce do fundo real até o pico
+                    CASE WHEN to_.bottom_mc > 0 AND to_.peak_mc IS NOT NULL
+                        THEN (to_.peak_mc - to_.bottom_mc) / to_.bottom_mc
+                    END                                                         AS bounce_pct,
+                    -- atingiu TP equivalente (+75% de mc_migration)?
+                    CASE WHEN to_.peak_mc IS NOT NULL AND m.mc_migration > 0
+                        THEN to_.peak_mc >= m.mc_migration * 1.75
+                    END                                                         AS tp_eq,
+                    -- fundo abaixo de 30% do mc_migration?
+                    CASE WHEN m.mc_migration > 0 AND to_.bottom_mc IS NOT NULL
+                        THEN to_.bottom_mc <= m.mc_migration * 0.70
+                    END                                                         AS had_30pct_drop
+                FROM migrations m
+                JOIN tick_outcomes to_ ON to_.mint = m.mint
+                WHERE m.ts_migration >= NOW() - INTERVAL '%(days)s days'
+                  AND m.mc_migration > 0
+            )
+            SELECT * FROM joined
+            ORDER BY ts_migration DESC
+        """ % {"min_ticks": min_ticks, "days": days})
+        rows = [dict(r) for r in cur.fetchall()]
+
+    if not rows:
+        return f"<p style='font-family:monospace;padding:20px'>Sem tokens com ticks nos últimos {days} dias. Tente ?days=30</p>"
+
+    n_total = len(rows)
+    # Tokens com drop ≥30% (tiveram dump relevante — candidatos a bounce)
+    dumped = [r for r in rows if r["drop_pct"] is not None and r["drop_pct"] >= 0.30]
+    bounced_30 = [r for r in dumped if r["bounce_pct"] is not None and r["bounce_pct"] >= 0.30]
+    tp_hits = [r for r in rows if r["tp_eq"]]
+
+    # Medians e avgs
+    def avg(lst, key):
+        vals = [r[key] for r in lst if r.get(key) is not None]
+        return sum(vals) / len(vals) if vals else None
+
+    def median(lst, key):
+        vals = sorted([r[key] for r in lst if r.get(key) is not None])
+        n = len(vals)
+        return vals[n // 2] if n else None
+
+    avg_drop   = avg(rows, "drop_pct")
+    avg_bounce = avg(dumped, "bounce_pct")
+    med_bottom = median(rows, "elapsed_at_bottom")
+
+    # --- Segmentação por campo ---
+    def segment(field_fn, buckets, rows_subset=None):
+        """
+        field_fn: função que dado um row retorna o valor do campo
+        buckets: lista de (label, filter_fn)
+        Retorna lista de dicts com stats por bucket.
+        """
+        src = rows_subset if rows_subset is not None else rows
+        result = []
+        for label, fn in buckets:
+            bucket = [r for r in src if fn(field_fn(r))]
+            n = len(bucket)
+            if n == 0:
+                result.append({"label": label, "n": 0, "bounce30": 0, "tp_eq": 0,
+                                "avg_drop": None, "avg_bounce": None, "med_bottom_min": None})
+                continue
+            b30 = sum(1 for r in bucket if r.get("bounce_pct") is not None and r["bounce_pct"] >= 0.30)
+            tp  = sum(1 for r in bucket if r.get("tp_eq"))
+            result.append({
+                "label":          label,
+                "n":              n,
+                "bounce30_rate":  b30 / n,
+                "bounce30_n":     b30,
+                "tp_rate":        tp / n,
+                "tp_n":           tp,
+                "avg_drop":       avg(bucket, "drop_pct"),
+                "avg_bounce":     avg(bucket, "bounce_pct"),
+                "med_bottom_min": (median(bucket, "elapsed_at_bottom") or 0) / 60,
+            })
+        return result
+
+    def v(r, k):
+        return r.get(k)
+
+    SEGMENTS = [
+        ("Smart Wallets",          lambda r: v(r,"smart_wallets"),
+         [("0",   lambda x: x == 0),
+          ("1",   lambda x: x == 1),
+          ("2",   lambda x: x == 2),
+          ("3",   lambda x: x == 3),
+          ("4-5", lambda x: x is not None and 4 <= x <= 5),
+          ("6-10",lambda x: x is not None and 6 <= x <= 10),
+          (">10", lambda x: x is not None and x > 10),
+          ("N/A", lambda x: x is None)]),
+
+        ("Renowned (KOL)",          lambda r: v(r,"renowned_wallets"),
+         [("0",   lambda x: x == 0),
+          ("1",   lambda x: x == 1),
+          ("2",   lambda x: x == 2),
+          ("3+",  lambda x: x is not None and x >= 3),
+          ("N/A", lambda x: x is None)]),
+
+        ("Top 10 Holders",         lambda r: v(r,"top10_holder_rate"),
+         [("<20%", lambda x: x is not None and x < 0.20),
+          ("20-30%", lambda x: x is not None and 0.20 <= x < 0.30),
+          ("30-40%", lambda x: x is not None and 0.30 <= x < 0.40),
+          ("40-50%", lambda x: x is not None and 0.40 <= x < 0.50),
+          ("50-65%", lambda x: x is not None and 0.50 <= x < 0.65),
+          (">65%",   lambda x: x is not None and x >= 0.65),
+          ("N/A",    lambda x: x is None)]),
+
+        ("Sniper Hold (top70)",    lambda r: v(r,"top70_sniper_hold_rate"),
+         [("<2%",  lambda x: x is not None and x < 0.02),
+          ("2-5%", lambda x: x is not None and 0.02 <= x < 0.05),
+          ("5-10%",lambda x: x is not None and 0.05 <= x < 0.10),
+          (">10%", lambda x: x is not None and x >= 0.10),
+          ("N/A",  lambda x: x is None)]),
+
+        ("Bundler Rate",           lambda r: v(r,"bundler_trader_amount_rate"),
+         [("<20%", lambda x: x is not None and x < 0.20),
+          ("20-40%",lambda x: x is not None and 0.20 <= x < 0.40),
+          ("40-60%",lambda x: x is not None and 0.40 <= x < 0.60),
+          (">60%",  lambda x: x is not None and x >= 0.60),
+          ("N/A",   lambda x: x is None)]),
+
+        ("Rat Trader Rate",        lambda r: v(r,"rat_trader_rate"),
+         [("<10%", lambda x: x is not None and x < 0.10),
+          ("10-20%",lambda x: x is not None and 0.10 <= x < 0.20),
+          ("20-30%",lambda x: x is not None and 0.20 <= x < 0.30),
+          (">30%",  lambda x: x is not None and x >= 0.30),
+          ("N/A",   lambda x: x is None)]),
+
+        ("Bot Degen Rate",         lambda r: v(r,"bot_degen_rate"),
+         [("<30%", lambda x: x is not None and x < 0.30),
+          ("30-50%",lambda x: x is not None and 0.30 <= x < 0.50),
+          ("50-70%",lambda x: x is not None and 0.50 <= x < 0.70),
+          (">70%",  lambda x: x is not None and x >= 0.70),
+          ("N/A",   lambda x: x is None)]),
+
+        ("Suspected Insiders",     lambda r: v(r,"suspected_insider_rate"),
+         [("<5%",  lambda x: x is not None and x < 0.05),
+          ("5-10%",lambda x: x is not None and 0.05 <= x < 0.10),
+          ("10-20%",lambda x: x is not None and 0.10 <= x < 0.20),
+          (">20%", lambda x: x is not None and x >= 0.20),
+          ("N/A",  lambda x: x is None)]),
+
+        ("Dev Status",             lambda r: v(r,"creator_token_status"),
+         [("hold", lambda x: x == "creator_hold"),
+          ("close",lambda x: x == "creator_close"),
+          ("N/A",  lambda x: not x)]),
+
+        ("CTO Flag",               lambda r: v(r,"cto_flag"),
+         [("Sim",  lambda x: x is True),
+          ("Não",  lambda x: x is False or x is None)]),
+
+        ("Tem Social",             lambda r: v(r,"has_social"),
+         [("Sim",  lambda x: x is True),
+          ("Não",  lambda x: x is False or x is None)]),
+
+        ("Entrapment Ratio",       lambda r: v(r,"entrapment_ratio"),
+         [("<5%",  lambda x: x is not None and x < 0.05),
+          ("5-15%",lambda x: x is not None and 0.05 <= x < 0.15),
+          (">15%", lambda x: x is not None and x >= 0.15),
+          ("N/A",  lambda x: x is None)]),
+    ]
+
+    # Baseline bounce30 e tp_eq
+    baseline_b30 = len(bounced_30) / len(dumped) if dumped else 0
+    baseline_tp  = len(tp_hits) / n_total if n_total else 0
+
+    CSS = """<style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;font-size:12px;padding:16px}
+    h1{color:#58a6ff;font-size:16px;margin-bottom:4px}
+    .sub{color:#8b949e;font-size:11px;margin-bottom:16px}
+    h2{color:#e3b341;font-size:12px;margin:18px 0 6px;border-bottom:1px solid #30363d;padding-bottom:3px}
+    .kv{display:flex;gap:20px;flex-wrap:wrap;background:#161b22;border:1px solid #30363d;
+        border-radius:6px;padding:12px 16px;margin-bottom:12px}
+    .kv div span{color:#8b949e;font-size:10px;display:block}
+    .kv div b{color:#c9d1d9;font-size:16px}
+    .wrap{display:flex;flex-wrap:wrap;gap:20px}
+    .block{min-width:380px}
+    .block h3{color:#c9d1d9;font-size:11px;margin-bottom:5px;padding:3px 0;
+              border-bottom:1px solid #21262d}
+    table{width:100%;border-collapse:collapse;font-size:11px}
+    th{background:#161b22;color:#8b949e;padding:4px 8px;text-align:right;
+       border-bottom:1px solid #30363d;font-size:10px}
+    th:first-child{text-align:left}
+    td{padding:3px 8px;border-bottom:1px solid #21262d;text-align:right}
+    td:first-child{text-align:left;color:#8b949e;min-width:60px}
+    .green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}.blue{color:#58a6ff}
+    .best{background:#0d2818}.worst{background:#2d1212}
+    .neutral{background:#0d1117}
+    .bar{display:inline-block;height:8px;border-radius:2px;vertical-align:middle;margin-left:4px}
+    .note{background:#1c2128;border:1px solid #30363d;border-radius:4px;
+          padding:8px 14px;margin:8px 0 16px;font-size:10px;color:#8b949e;line-height:1.7}
+    .filter-rec{background:#0d2818;border:1px solid #3fb950;border-radius:4px;
+                padding:8px 14px;margin:8px 0;font-size:11px;color:#c9d1d9}
+    .filter-rec code{color:#3fb950}
+    </style>"""
+
+    def fmt_pct(v):
+        if v is None: return "<span style='color:#484f58'>N/A</span>"
+        return f"{v:.0%}"
+
+    def fmt_x(v):
+        if v is None: return "<span style='color:#484f58'>N/A</span>"
+        return f"{v:.1f}×"
+
+    def fmt_min(v):
+        if v is None: return "<span style='color:#484f58'>N/A</span>"
+        return f"{v:.1f}min"
+
+    def row_class(bounce_rate, baseline):
+        if bounce_rate is None: return "neutral"
+        delta = bounce_rate - baseline
+        if delta >= 0.10: return "best"
+        if delta <= -0.10: return "worst"
+        return "neutral"
+
+    def bar_html(rate, baseline, width=60):
+        if rate is None: return ""
+        color = "#3fb950" if rate >= baseline else "#f85149"
+        w = int(rate * width)
+        return f"<span class='bar' style='width:{w}px;background:{color}'></span>"
+
+    h = f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Token Outcome — Análise Limpa</title>{CSS}</head><body>"
+    h += f"<h1>Token Outcome — Análise Limpa (token_ticks)</h1>"
+    h += f"<p class='sub'>Fonte: token_ticks (OHLC real) · NÃO usa mc_bottom corrompido · Últimos {days} dias · min {min_ticks} ticks/token</p>"
+
+    h += "<div class='kv'>"
+    h += f"<div><span>Tokens com ticks</span><b class='blue'>{n_total}</b></div>"
+    h += f"<div><span>Com drop ≥30%</span><b class='yellow'>{len(dumped)} ({len(dumped)/n_total:.0%})</b></div>"
+    h += f"<div><span>Bounce ≥30% (de dumped)</span><b class='green'>{len(bounced_30)} ({baseline_b30:.0%})</b></div>"
+    h += f"<div><span>TP equiv (+75% mig)</span><b class='green'>{len(tp_hits)} ({baseline_tp:.0%})</b></div>"
+    h += f"<div><span>Avg drop</span><b class='red'>{fmt_pct(avg_drop)}</b></div>"
+    h += f"<div><span>Avg bounce (dumped)</span><b class='green'>{fmt_pct(avg_bounce)}</b></div>"
+    h += f"<div><span>Fundo mediano</span><b class='yellow'>{fmt_min((med_bottom or 0)/60)}</b></div>"
+    h += "</div>"
+
+    h += "<div class='note'>"
+    h += f"<b>Como ler:</b> <b>Bounce ≥30%</b> = de todos os tokens neste bucket, qual % teve bounce ≥30% do fundo. "
+    h += f"<b>TP equiv</b> = atingiu mc_migration × 1.75 (+75%). "
+    h += f"<b>Baseline bounce30 = {baseline_b30:.0%}</b> dos tokens que dumparam. "
+    h += f"Células <span class='green'>verdes</span> = ≥+10pp vs baseline. <span class='red'>Vermelhas</span> = ≤−10pp.<br>"
+    h += f"<b>Atenção:</b> análise apenas de tokens que PASSARAM os filtros atuais + chegaram ao HotMonitor. "
+    h += f"Tokens rejeitados pelos filtros não aparecem aqui."
+    h += "</div>"
+
+    h += "<div class='wrap'>"
+
+    for seg_name, field_fn, buckets in SEGMENTS:
+        seg_rows = segment(field_fn, buckets)
+        h += "<div class='block'>"
+        h += f"<h3>{seg_name}</h3>"
+        h += "<table>"
+        h += "<tr><th>Faixa</th><th>n</th><th>Bounce≥30%</th><th>TP equiv</th><th>Avg drop</th><th>Avg bounce</th><th>Fundo</th></tr>"
+        for s in seg_rows:
+            if s["n"] == 0: continue
+            rc = row_class(s["bounce30_rate"], baseline_b30)
+            b30_color = "green" if s["bounce30_rate"] >= baseline_b30 + 0.08 else ("red" if s["bounce30_rate"] < baseline_b30 - 0.08 else "")
+            tp_color  = "green" if s["tp_rate"] >= baseline_tp + 0.05 else ("red" if s["tp_rate"] < baseline_tp - 0.05 else "")
+            h += f"<tr class='{rc}'>"
+            h += f"<td>{s['label']}</td>"
+            h += f"<td>{s['n']}</td>"
+            h += f"<td class='{b30_color}'>{s['bounce30_rate']:.0%} ({s['bounce30_n']}){bar_html(s['bounce30_rate'], baseline_b30)}</td>"
+            h += f"<td class='{tp_color}'>{s['tp_rate']:.0%} ({s['tp_n']})</td>"
+            h += f"<td>{fmt_pct(s['avg_drop'])}</td>"
+            h += f"<td>{fmt_pct(s['avg_bounce'])}</td>"
+            h += f"<td>{fmt_min(s['med_bottom_min'])}</td>"
+            h += "</tr>"
+        h += "</table></div>"
+
+    h += "</div>"  # wrap
+
+    # Top tokens — maior bounce (dados limpos)
+    top_bounce = sorted([r for r in rows if r.get("bounce_pct") is not None], key=lambda r: r["bounce_pct"], reverse=True)[:20]
+    h += "<h2>Top 20 — Maior Bounce (dados limpos, últimos {days} dias)</h2>".format(days=days)
+    h += "<table>"
+    h += "<tr><th>Token</th><th>Data</th><th>MC Mig</th><th>Drop</th><th>Bounce</th><th>TP eq</th><th>Smart</th><th>Top10</th><th>Dev</th><th>Ticks</th></tr>"
+    for r in top_bounce:
+        tp_mark = "<span class='green'>✓</span>" if r.get("tp_eq") else ""
+        gmgn_url = f"https://gmgn.ai/sol/token/{r['mint']}"
+        dia = r["ts_migration"].strftime("%m/%d %H:%M") if r.get("ts_migration") else ""
+        mc_k = f"${(r['mc_migration'] or 0)/1000:.0f}K" if r.get("mc_migration") else "?"
+        h += f"<tr>"
+        h += f"<td><a href='{gmgn_url}' target='_blank' style='color:#58a6ff'>{r['token_nome'] or r['mint'][:8]}</a></td>"
+        h += f"<td style='color:#484f58'>{dia}</td>"
+        h += f"<td>{mc_k}</td>"
+        h += f"<td class='red'>{fmt_pct(r.get('drop_pct'))}</td>"
+        h += f"<td class='green'>{fmt_pct(r.get('bounce_pct'))}</td>"
+        h += f"<td>{tp_mark}</td>"
+        h += f"<td>{r.get('smart_wallets') or '-'}</td>"
+        h += f"<td>{fmt_pct(r.get('top10_holder_rate'))}</td>"
+        h += f"<td style='color:#8b949e'>{(r.get('creator_token_status') or '-').replace('creator_','')}</td>"
+        h += f"<td style='color:#484f58'>{r.get('tick_count')}</td>"
+        h += "</tr>"
+    h += "</table>"
+
+    h += f"<p class='note' style='margin-top:12px'>Use ?days=7 / ?days=30 para ajustar janela · ?min_ticks=10 para mais cobertura</p>"
+    h += "</body></html>"
+    return h
+
+
 @app.route("/debug/pipeline-audit")
 def debug_pipeline_audit():
     """
