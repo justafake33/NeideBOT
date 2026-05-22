@@ -15032,13 +15032,13 @@ pre.errbox{color:#f85149;background:#1a0000;padding:14px;border-radius:6px;
             sol_usd = _get_sol_usd() or 150.0
             yield f"<p class='log'>SOL/USD: ${sol_usd:.2f} | Mints rastreados: {len(mints_needed)}</p>{PAD}"
 
-            MAY_6_TS  = _dt.datetime(2026, 5, 6, tzinfo=_dt.timezone.utc).timestamp()
+            FLOOR_TS  = _dt.datetime(2026, 5, 20, tzinfo=_dt.timezone.utc).timestamp()
             oldest_ts = min(
                 min(t['created_at'].timestamp() for t in trades),
-                MAY_6_TS
+                FLOOR_TS
             )
             oldest_str = _dt.datetime.fromtimestamp(oldest_ts, tz=_dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-            yield f"<p class='log'>Scan desde: {oldest_str} (piso = 06/05)</p>{PAD}"
+            yield f"<p class='log'>Scan desde: {oldest_str} (piso = 20/05)</p>{PAD}"
 
             # ── 3. Pagina TODAS as assinaturas da wallet ───────────────────
             yield "<h3>Buscando assinaturas no Helius</h3>"
