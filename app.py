@@ -35447,6 +35447,204 @@ def _analise_token_outcome_clean_inner():
     return h
 
 
+@app.route("/analise/entrada")
+def analise_entrada():
+    """
+    Para cada trade, compara a entrada com o comportamento real do token nos ticks.
+    Objetivo: separar "token ruim" de "entrada tardia / SL prematuro".
+
+    Veredicto por trade:
+      ✅ TP          — acertamos
+      🟡 perdemos TP — token chegou ao TP level mas SL disparou antes
+      🔴 entrada alta — token subiu mas não o suficiente (entramos no topo do bounce)
+      ⚫ token ruim  — token nunca subiu significativamente após nosso sinal
+
+    ?since=YYYY-MM-DD  (default 2026-05-21)
+    """
+    since = request.args.get("since", "2026-05-21")
+
+    with db._cursor() as cur:
+        cur.execute(f"""
+            WITH trade_base AS (
+                SELECT
+                    t.id,
+                    t.symbol,
+                    t.status,
+                    t.pnl_pct_real,
+                    t.ts_signal,
+                    t.mint,
+                    m.ts_migration,
+                    m.mc_migration,
+                    bs.mc_at_signal,
+                    bs.bounce_pct           AS bs_bounce_pct,
+                    bs.elapsed_sec          AS bs_elapsed_sec,
+                    EXTRACT(EPOCH FROM (t.ts_signal - m.ts_migration)) AS signal_elapsed_sec
+                FROM trades t
+                JOIN migrations m ON m.mint = t.mint
+                LEFT JOIN bounce_signals bs ON bs.mint = t.mint
+                WHERE t.created_at >= %s
+                  AND t.status IN ('tp', 'sl')
+                  AND t.pnl_pct_real IS NOT NULL
+            ),
+            tick_stats AS (
+                SELECT
+                    tb.id AS trade_id,
+                    COUNT(tt.id)                                 AS ticks_after,
+                    MIN(COALESCE(tt.mc_low, tt.mc))              AS min_mc_after,
+                    MAX(COALESCE(tt.mc_high, tt.mc))             AS max_mc_after
+                FROM trade_base tb
+                LEFT JOIN token_ticks tt ON tt.mint = tb.mint
+                    AND tt.elapsed_sec > tb.signal_elapsed_sec
+                GROUP BY tb.id
+            )
+            SELECT tb.*, tk.ticks_after, tk.min_mc_after, tk.max_mc_after
+            FROM trade_base tb
+            LEFT JOIN tick_stats tk ON tk.trade_id = tb.id
+            ORDER BY tb.id DESC
+        """, (since,))
+        rows = [dict(r) for r in cur.fetchall()]
+
+    if not rows:
+        return f"<p style='font-family:monospace;padding:20px'>Sem trades desde {since}.</p>"
+
+    # --- Veredicto por trade ---
+    def verdict(r):
+        status = r.get("status")
+        mc_sig = r.get("mc_at_signal") or 0
+        mc_max = r.get("max_mc_after") or 0
+        mc_min = r.get("min_mc_after") or 0
+        if not mc_sig or not mc_max:
+            return "❓ sem ticks", "dim"
+        gain_avail = (mc_max - mc_sig) / mc_sig   # melhor ganho disponível após entrada
+        loss_seen  = (mc_sig - mc_min) / mc_sig    # pior queda vista após entrada
+
+        if status == "tp":
+            return "✅ TP acertado", "green"
+        # SL cases
+        if gain_avail >= 0.75:
+            return "🟡 perdemos TP (SL prematuro)", "yellow"
+        if gain_avail >= 0.30:
+            return "🔴 entrada alta (topo do bounce)", "orange"
+        return "⚫ token ruim (não subiu)", "red"
+
+    # --- Contagem de veredictos ---
+    counts = {"✅ TP acertado": 0, "🟡 perdemos TP (SL prematuro)": 0,
+              "🔴 entrada alta (topo do bounce)": 0, "⚫ token ruim (não subiu)": 0,
+              "❓ sem ticks": 0}
+    for r in rows:
+        v, _ = verdict(r)
+        counts[v] = counts.get(v, 0) + 1
+
+    n_total = len(rows)
+    n_tp    = sum(1 for r in rows if r["status"] == "tp")
+    n_sl    = sum(1 for r in rows if r["status"] == "sl")
+
+    CSS = """<style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;font-size:12px;padding:16px}
+    h1{color:#58a6ff;font-size:15px;margin-bottom:4px}
+    .sub{color:#8b949e;font-size:11px;margin-bottom:14px}
+    h2{color:#e3b341;font-size:12px;margin:16px 0 6px;border-bottom:1px solid #30363d;padding-bottom:3px}
+    .kv{display:flex;gap:20px;flex-wrap:wrap;background:#161b22;border:1px solid #30363d;
+        border-radius:6px;padding:10px 16px;margin-bottom:12px}
+    .kv div span{color:#8b949e;font-size:10px;display:block}
+    .kv div b{font-size:15px}
+    table{width:100%;border-collapse:collapse;font-size:11px;margin-bottom:16px}
+    th{background:#161b22;color:#8b949e;padding:4px 8px;text-align:right;
+       border-bottom:1px solid #30363d;font-size:10px}
+    th:first-child,th:nth-child(2),th:nth-child(3){text-align:left}
+    td{padding:3px 8px;border-bottom:1px solid #21262d;text-align:right}
+    td:first-child,td:nth-child(2),td:nth-child(3){text-align:left}
+    .green{color:#3fb950}.yellow{color:#d29922}.orange{color:#e3b341}
+    .red{color:#f85149}.dim{color:#484f58}.blue{color:#58a6ff}
+    .note{background:#1c2128;border:1px solid #30363d;border-radius:4px;
+          padding:8px 14px;margin:8px 0 14px;font-size:10px;color:#8b949e;line-height:1.7}
+    .verd-green{color:#3fb950}.verd-yellow{color:#d29922}
+    .verd-orange{color:#e3b341}.verd-red{color:#f85149}.verd-dim{color:#484f58}
+    </style>"""
+
+    def fp(v, decimals=0):
+        if v is None: return "<span class='dim'>N/A</span>"
+        return f"{v*100:.{decimals}f}%"
+
+    def fk(v):
+        if v is None: return "<span class='dim'>N/A</span>"
+        return f"${v/1000:.1f}K"
+
+    h = f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Análise de Entrada</title>{CSS}</head><body>"
+    h += "<h1>Análise de Entrada — Token vs Trade</h1>"
+    h += f"<p class='sub'>Compara mc_at_signal com o comportamento real nos ticks após o sinal · Desde {since}</p>"
+
+    h += "<div class='kv'>"
+    h += f"<div><span>Total trades</span><b class='blue'>{n_total}</b></div>"
+    h += f"<div><span>TP</span><b class='green'>{n_tp}</b></div>"
+    h += f"<div><span>SL</span><b class='red'>{n_sl}</b></div>"
+    h += f"<div><span>WR real</span><b class='{'green' if n_tp/n_total>=0.25 else 'red'}'>{n_tp/n_total:.0%}</b></div>"
+    h += "</div>"
+
+    h += "<h2>Diagnóstico — Por que perdemos?</h2>"
+    h += "<div class='note'>"
+    h += "<b>Como ler os veredictos:</b><br>"
+    h += "✅ <b>TP acertado</b> — trade certo, execução correta.<br>"
+    h += "🟡 <b>Perdemos TP</b> — token chegou a +75% do sinal mas SL disparou antes. Problema: SL muito apertado ou volatilidade pAMM.<br>"
+    h += "🔴 <b>Entrada alta</b> — token subiu +30-75% após entrada mas não chegou ao TP. Sinal disparou no meio do bounce, compramos tarde.<br>"
+    h += "⚫ <b>Token ruim</b> — token mal subiu após nosso sinal. A cripto em si não tinha força de bounce real.<br>"
+    h += "</div>"
+
+    h += "<table>"
+    h += "<tr><th>Veredicto</th><th>n</th><th>%</th></tr>"
+    for verd, cnt in counts.items():
+        if cnt == 0: continue
+        color = {"✅ TP acertado": "green", "🟡 perdemos TP (SL prematuro)": "yellow",
+                 "🔴 entrada alta (topo do bounce)": "orange", "⚫ token ruim (não subiu)": "red",
+                 "❓ sem ticks": "dim"}.get(verd, "")
+        h += f"<tr><td class='{color}'>{verd}</td><td>{cnt}</td><td>{cnt/n_total:.0%}</td></tr>"
+    h += "</table>"
+
+    h += "<h2>Trades — Detalhe por token</h2>"
+    h += "<table>"
+    h += ("<tr><th>#</th><th>Token</th><th>Veredicto</th>"
+          "<th>P&L real</th><th>Entrada (mc_sig)</th><th>Max após</th><th>Min após</th>"
+          "<th>Max gain disp.</th><th>Max loss vista</th>"
+          "<th>Bounce%</th><th>Elapsed</th><th>Ticks pós</th></tr>")
+
+    for r in rows:
+        v, vc = verdict(r)
+        mc_sig  = r.get("mc_at_signal") or 0
+        mc_max  = r.get("max_mc_after") or 0
+        mc_min  = r.get("min_mc_after") or 0
+        gain_av = (mc_max - mc_sig) / mc_sig if mc_sig and mc_max else None
+        loss_av = (mc_sig - mc_min) / mc_sig if mc_sig and mc_min else None
+        pnl     = r.get("pnl_pct_real")
+        pnl_str = f"{pnl*100:+.1f}%" if pnl is not None else "N/A"
+        pnl_cls = "green" if pnl and pnl > 0 else "red"
+        elapsed = r.get("bs_elapsed_sec")
+        el_str  = f"{elapsed/60:.1f}m" if elapsed else "N/A"
+        bounce  = r.get("bs_bounce_pct")
+        b_str   = fp(bounce) if bounce else "N/A"
+        ticks_a = r.get("ticks_after") or 0
+
+        h += f"<tr>"
+        h += f"<td class='dim'>{r['id']}</td>"
+        h += f"<td>{r['symbol'] or r['mint'][:8]}</td>"
+        h += f"<td class='verd-{vc}'>{v}</td>"
+        h += f"<td class='{pnl_cls}'>{pnl_str}</td>"
+        h += f"<td>{fk(mc_sig) if mc_sig else '<span class=dim>N/A</span>'}</td>"
+        h += f"<td class='green'>{fk(mc_max) if mc_max else '<span class=dim>N/A</span>'}</td>"
+        h += f"<td class='red'>{fk(mc_min) if mc_min else '<span class=dim>N/A</span>'}</td>"
+        h += f"<td class='{'green' if gain_av and gain_av>=0.75 else 'yellow' if gain_av and gain_av>=0.30 else 'red'}'>{fp(gain_av, 0) if gain_av is not None else '<span class=dim>N/A</span>'}</td>"
+        h += f"<td class='red'>{fp(loss_av, 0) if loss_av is not None else '<span class=dim>N/A</span>'}</td>"
+        h += f"<td>{b_str}</td>"
+        h += f"<td>{el_str}</td>"
+        h += f"<td class='dim'>{ticks_a}</td>"
+        h += "</tr>"
+
+    h += "</table>"
+    h += f"<p class='note'>?since=2026-05-19 para incluir trades pré-era limpa · max_gain_disp = (max_mc_após - mc_sinal) / mc_sinal</p>"
+    h += "</body></html>"
+    return h
+
+
 @app.route("/debug/pipeline-audit")
 def debug_pipeline_audit():
     """
