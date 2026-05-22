@@ -35075,6 +35075,16 @@ def analise_token_outcome_clean():
     """
     Análise limpa de outcomes de tokens pós-migração.
     Fonte de verdade: token_ticks (OHLC real), NÃO mc_bottom do banco.
+    """
+    import traceback as _tb
+    try:
+        return _analise_token_outcome_clean_inner()
+    except Exception:
+        err = _tb.format_exc()
+        return f"<pre style='font-family:monospace;padding:20px;color:#f85149;background:#0d1117'>{err}</pre>", 500
+
+def _analise_token_outcome_clean_inner():
+    """
 
     Métricas por token:
       - drop_pct: queda de mc_migration até o fundo real nos ticks (90s-25min)
