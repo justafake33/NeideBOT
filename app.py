@@ -35102,19 +35102,17 @@ def _analise_token_outcome_clean_inner():
     min_ticks = int(request.args.get("min_ticks", 5))
 
     with db._cursor() as cur:
-        # Computa outcomes limpos por token a partir de token_ticks
-        cur.execute("""
+        # min_ticks é int — embedding direto é seguro. since usa %s para evitar
+        # "argument formats can't be mixed" do psycopg2 (%(name)s + * 1.75 confunde parser).
+        cur.execute(f"""
             WITH tick_outcomes AS (
                 SELECT
                     tt.mint,
                     COUNT(*)                                                    AS tick_count,
-                    -- Fundo real: mínimo de mc_low (kline) ou mc (trenches) entre 90s e 25min
                     MIN(COALESCE(tt.mc_low, tt.mc))
                         FILTER (WHERE tt.elapsed_sec BETWEEN 90 AND 1500)      AS bottom_mc,
-                    -- Pico real: máximo de mc_high (kline) ou mc (trenches) até 60min
                     MAX(COALESCE(tt.mc_high, tt.mc))
                         FILTER (WHERE tt.elapsed_sec BETWEEN 90 AND 3600)      AS peak_mc,
-                    -- Elapsed no fundo (para time_to_bottom)
                     MIN(tt.elapsed_sec)
                         FILTER (WHERE tt.elapsed_sec BETWEEN 90 AND 1500
                             AND COALESCE(tt.mc_low, tt.mc) = (
@@ -35125,7 +35123,7 @@ def _analise_token_outcome_clean_inner():
                             ))                                                  AS elapsed_at_bottom
                 FROM token_ticks tt
                 GROUP BY tt.mint
-                HAVING COUNT(*) >= %(min_ticks)s
+                HAVING COUNT(*) >= {min_ticks}
             ),
             joined AS (
                 SELECT
@@ -35150,30 +35148,26 @@ def _analise_token_outcome_clean_inner():
                     to_.bottom_mc,
                     to_.peak_mc,
                     to_.elapsed_at_bottom,
-                    -- drop do MC de migração até o fundo real
                     CASE WHEN m.mc_migration > 0 AND to_.bottom_mc IS NOT NULL
                         THEN (m.mc_migration - to_.bottom_mc) / m.mc_migration
                     END                                                         AS drop_pct,
-                    -- bounce do fundo real até o pico
                     CASE WHEN to_.bottom_mc > 0 AND to_.peak_mc IS NOT NULL
                         THEN (to_.peak_mc - to_.bottom_mc) / to_.bottom_mc
                     END                                                         AS bounce_pct,
-                    -- atingiu TP equivalente (+75% de mc_migration)?
                     CASE WHEN to_.peak_mc IS NOT NULL AND m.mc_migration > 0
                         THEN to_.peak_mc >= m.mc_migration * 1.75
                     END                                                         AS tp_eq,
-                    -- fundo abaixo de 30% do mc_migration?
                     CASE WHEN m.mc_migration > 0 AND to_.bottom_mc IS NOT NULL
                         THEN to_.bottom_mc <= m.mc_migration * 0.70
                     END                                                         AS had_30pct_drop
                 FROM migrations m
                 JOIN tick_outcomes to_ ON to_.mint = m.mint
-                WHERE m.ts_migration >= %(since)s
+                WHERE m.ts_migration >= %s
                   AND m.mc_migration > 0
             )
             SELECT * FROM joined
             ORDER BY ts_migration DESC
-        """, {"min_ticks": min_ticks, "since": since})
+        """, (since,))
         rows = [dict(r) for r in cur.fetchall()]
 
     if not rows:
