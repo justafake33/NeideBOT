@@ -18101,7 +18101,7 @@ def analise_token_outcome():
             pct = n / n_mig * 100 if n_mig else 0
             label, color, interp = q_labels[q_key]
             out.append(f"<tr><td class='{color}'>{label}</td><td>{n}</td><td>{pct:.0f}%</td><td class='dim'>{interp}</td></tr>")
-        out.append(f"<tr><td class='dim'><i>Sem dados migrations</i></td><td>{n_all - n_mig}</td><td>{(n_all-n_mig)/n_all*100:.0f}%</td><td class='dim'>mint não encontrado nas migrations</td></tr>")
+        out.append(f"<tr><td class='dim'><i>Sem dados migrations</i></td><td>{n_all - n_mig}</td><td>{(n_all-n_mig)/n_all*100:.0f}%</td><td class='dim'>mint não encontrado nas migrations</td></tr>" if n_all else "")
         out.append("</table>")
 
         # Key diagnostic
@@ -35084,11 +35084,12 @@ def analise_token_outcome_clean():
 
     Segmenta cada campo de filtro para mostrar qual prediz bounce.
 
-    ?days=N     janela em dias (default 14)
-    ?min_ticks=N mínimo de ticks por token (default 5)
+    Padrão: apenas dados limpos (pós 2026-05-20), antes estava corrompido.
+    ?since=YYYY-MM-DD  data de início (default 2026-05-20)
+    ?min_ticks=N       mínimo de ticks por token (default 5)
     """
-    days       = int(request.args.get("days", 14))
-    min_ticks  = int(request.args.get("min_ticks", 5))
+    since     = request.args.get("since", "2026-05-20")
+    min_ticks = int(request.args.get("min_ticks", 5))
 
     with db._cursor() as cur:
         # Computa outcomes limpos por token a partir de token_ticks
@@ -35157,16 +35158,16 @@ def analise_token_outcome_clean():
                     END                                                         AS had_30pct_drop
                 FROM migrations m
                 JOIN tick_outcomes to_ ON to_.mint = m.mint
-                WHERE m.ts_migration >= NOW() - INTERVAL '%(days)s days'
+                WHERE m.ts_migration >= %(since)s
                   AND m.mc_migration > 0
             )
             SELECT * FROM joined
             ORDER BY ts_migration DESC
-        """ % {"min_ticks": min_ticks, "days": days})
+        """, {"min_ticks": min_ticks, "since": since})
         rows = [dict(r) for r in cur.fetchall()]
 
     if not rows:
-        return f"<p style='font-family:monospace;padding:20px'>Sem tokens com ticks nos últimos {days} dias. Tente ?days=30</p>"
+        return f"<p style='font-family:monospace;padding:20px'>Sem tokens com ticks desde {since}. Tente ?since=2026-05-01</p>"
 
     n_total = len(rows)
     # Tokens com drop ≥30% (tiveram dump relevante — candidatos a bounce)
@@ -35366,7 +35367,7 @@ def analise_token_outcome_clean():
 
     h = f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Token Outcome — Análise Limpa</title>{CSS}</head><body>"
     h += f"<h1>Token Outcome — Análise Limpa (token_ticks)</h1>"
-    h += f"<p class='sub'>Fonte: token_ticks (OHLC real) · NÃO usa mc_bottom corrompido · Últimos {days} dias · min {min_ticks} ticks/token</p>"
+    h += f"<p class='sub'>Fonte: token_ticks (OHLC real) · NÃO usa mc_bottom corrompido · Desde {since} (dados limpos) · min {min_ticks} ticks/token</p>"
 
     h += "<div class='kv'>"
     h += f"<div><span>Tokens com ticks</span><b class='blue'>{n_total}</b></div>"
@@ -35415,7 +35416,7 @@ def analise_token_outcome_clean():
 
     # Top tokens — maior bounce (dados limpos)
     top_bounce = sorted([r for r in rows if r.get("bounce_pct") is not None], key=lambda r: r["bounce_pct"], reverse=True)[:20]
-    h += "<h2>Top 20 — Maior Bounce (dados limpos, últimos {days} dias)</h2>".format(days=days)
+    h += f"<h2>Top 20 — Maior Bounce (dados limpos, desde {since})</h2>"
     h += "<table>"
     h += "<tr><th>Token</th><th>Data</th><th>MC Mig</th><th>Drop</th><th>Bounce</th><th>TP eq</th><th>Smart</th><th>Top10</th><th>Dev</th><th>Ticks</th></tr>"
     for r in top_bounce:
@@ -35437,7 +35438,7 @@ def analise_token_outcome_clean():
         h += "</tr>"
     h += "</table>"
 
-    h += f"<p class='note' style='margin-top:12px'>Use ?days=7 / ?days=30 para ajustar janela · ?min_ticks=10 para mais cobertura</p>"
+    h += f"<p class='note' style='margin-top:12px'>Use ?since=2026-05-01 para incluir mais histórico · ?min_ticks=10 para exigir mais cobertura</p>"
     h += "</body></html>"
     return h
 
