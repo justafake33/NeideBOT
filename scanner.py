@@ -25,7 +25,7 @@ HOT_WINDOW_MIN     = 60
 F_RUG_MAX        = float(os.getenv("FILTER_RUG_MAX",        "0.50"))  # score interno GMGN (raramente >0.5)
 F_BUNDLER_MAX    = float(os.getenv("FILTER_BUNDLER_MAX",    "0.60"))  # dados: >60% recovery cai para 14%
 F_BOT_MAX        = float(os.getenv("FILTER_BOT_MAX",        "0.80"))  # dados: sweet spot 30-60%, só bloquear extremo
-F_SNIPER_MAX     = float(os.getenv("FILTER_SNIPER_MAX",     "1.00"))  # desativado: análise baseada em recovery corrompido (nota 158 CLAUDE.md)
+F_SNIPER_MAX     = float(os.getenv("FILTER_SNIPER_MAX",     "0.10"))  # 10% default — revalidar com dados limpos via /analise/token-outcome-clean
 F_RAT_MAX        = float(os.getenv("FILTER_RAT_MAX",        "0.20"))
 F_TOP10_MAX      = float(os.getenv("FILTER_TOP10_MAX",      "0.80"))  # volta ao original: 0.50 era análise em recovery corrompido
 F_SMART_MIN      = int(os.getenv(  "FILTER_SMART_MIN",      "2"))     # live: smart=1 → 0% WR (n=6). smart=2 → 20%, smart=3 → 57%
