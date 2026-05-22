@@ -35447,8 +35447,8 @@ def _analise_token_outcome_clean_inner():
     return h
 
 
-@app.route("/analise/entrada")
-def analise_entrada():
+@app.route("/analise/entrada-ticks")
+def analise_entrada_ticks():
     """
     Para cada trade, compara a entrada com o comportamento real do token nos ticks.
     Objetivo: separar "token ruim" de "entrada tardia / SL prematuro".
