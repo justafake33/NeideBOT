@@ -35070,5 +35070,261 @@ a{{text-decoration:none}}
     return html
 
 
+@app.route("/debug/pipeline-audit")
+def debug_pipeline_audit():
+    """
+    Diagnóstico completo do pipeline: quantos tokens chegam por dia,
+    quais filtros estão bloqueando, e quantos trades limpos foram executados.
+    Investiga queda no volume do HotMonitor.
+    """
+    import os as _os
+
+    # Filtros ativos no código (defaults se Railway não sobrescrever)
+    filters_code = {
+        "FILTER_SNIPER_MAX":  _os.getenv("FILTER_SNIPER_MAX",  "0.05"),
+        "FILTER_TOP10_MAX":   _os.getenv("FILTER_TOP10_MAX",   "0.50"),
+        "FILTER_BUNDLER_MAX": _os.getenv("FILTER_BUNDLER_MAX", "0.60"),
+        "FILTER_BOT_MAX":     _os.getenv("FILTER_BOT_MAX",     "0.80"),
+        "FILTER_RUG_MAX":     _os.getenv("FILTER_RUG_MAX",     "0.50"),
+        "FILTER_RAT_MAX":     _os.getenv("FILTER_RAT_MAX",     "0.20"),
+        "FILTER_SMART_MIN":   _os.getenv("FILTER_SMART_MIN",   "2"),
+        "FILTER_WASH_BLOCK":  _os.getenv("FILTER_WASH_BLOCK",  "true"),
+        "FILTER_PUMP_ONLY":   _os.getenv("FILTER_PUMP_ONLY",   "true"),
+        "BOUNCE_MIN_PCT":     _os.getenv("BOUNCE_MIN_PCT",     "0.30"),
+        "BOUNCE_MAX_PCT":     _os.getenv("BOUNCE_MAX_PCT",     "9.99"),
+        "FILTER_MC_MIN":      _os.getenv("FILTER_MC_MIN",      "5000"),
+        "FILTER_MC_MAX":      _os.getenv("FILTER_MC_MAX",      "200000"),
+        "FILTER_LIQ_MIN":     _os.getenv("FILTER_LIQ_MIN",    "10000"),
+        "FILTER_FEE_MIN":     _os.getenv("FILTER_FEE_MIN",    "1.0"),
+    }
+
+    with db._cursor() as cur:
+        # 1. Migrações por dia (últimos 21 dias)
+        cur.execute("""
+            SELECT DATE(ts_migration AT TIME ZONE 'UTC') as dia,
+                   COUNT(*) as total,
+                   COUNT(*) FILTER (WHERE exchange ILIKE '%pump%') as pump_count
+            FROM migrations
+            WHERE ts_migration >= NOW() - INTERVAL '21 days'
+            GROUP BY dia ORDER BY dia DESC
+        """)
+        mig_per_day = cur.fetchall()
+
+        # 2. Trades por dia (últimos 21 dias)
+        cur.execute("""
+            SELECT DATE(ts_signal AT TIME ZONE 'UTC') as dia,
+                   COUNT(*) as total,
+                   COUNT(*) FILTER (WHERE status IN ('tp','trailing_active')) as tps,
+                   COUNT(*) FILTER (WHERE status IN ('sl','expired')) as sls
+            FROM trades
+            WHERE ts_signal >= NOW() - INTERVAL '21 days'
+            GROUP BY dia ORDER BY dia DESC
+        """)
+        trades_per_day = cur.fetchall()
+
+        # 3. Distribuição do sniper field nos tokens que PASSARAM (histórico)
+        cur.execute("""
+            SELECT
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE top70_sniper_hold_rate IS NULL) as sem_sniper,
+                COUNT(*) FILTER (WHERE top70_sniper_hold_rate <= 0.05) as sniper_le5,
+                COUNT(*) FILTER (WHERE top70_sniper_hold_rate > 0.05 AND top70_sniper_hold_rate <= 0.10) as sniper_5_10,
+                COUNT(*) FILTER (WHERE top70_sniper_hold_rate > 0.10 AND top70_sniper_hold_rate <= 0.20) as sniper_10_20,
+                COUNT(*) FILTER (WHERE top70_sniper_hold_rate > 0.20) as sniper_gt20,
+                AVG(top70_sniper_hold_rate) FILTER (WHERE top70_sniper_hold_rate IS NOT NULL) as avg_sniper
+            FROM migrations
+        """)
+        sniper_dist = dict(cur.fetchone())
+
+        # 4. Distribuição do top10 field
+        cur.execute("""
+            SELECT
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE top10_holder_rate IS NULL) as sem_top10,
+                COUNT(*) FILTER (WHERE top10_holder_rate <= 0.50) as top10_le50,
+                COUNT(*) FILTER (WHERE top10_holder_rate > 0.50 AND top10_holder_rate <= 0.65) as top10_50_65,
+                COUNT(*) FILTER (WHERE top10_holder_rate > 0.65 AND top10_holder_rate <= 0.80) as top10_65_80,
+                COUNT(*) FILTER (WHERE top10_holder_rate > 0.80) as top10_gt80,
+                AVG(top10_holder_rate) FILTER (WHERE top10_holder_rate IS NOT NULL) as avg_top10
+            FROM migrations
+        """)
+        top10_dist = dict(cur.fetchone())
+
+        # 5. Trades limpos (pós-2026-05-21 00:41 UTC = era clean)
+        cur.execute("""
+            SELECT
+                COUNT(*) as total_clean,
+                COUNT(*) FILTER (WHERE status IN ('tp','trailing_active')) as tps_clean,
+                COUNT(*) FILTER (WHERE status IN ('sl','expired')) as sls_clean,
+                COUNT(*) FILTER (WHERE status IN ('open','pending')) as open_clean,
+                MIN(ts_signal) as primeiro_trade_clean
+            FROM trades
+            WHERE ts_signal >= '2026-05-21 00:41:00+00'
+        """)
+        clean_trades = dict(cur.fetchone())
+
+        # 6. Migrações limpas (pós clean epoch)
+        cur.execute("""
+            SELECT COUNT(*) as total,
+                   COUNT(*) FILTER (WHERE exchange ILIKE '%pump%') as pump
+            FROM migrations
+            WHERE ts_migration >= '2026-05-21 00:41:00+00'
+        """)
+        clean_migs = dict(cur.fetchone())
+
+        # 7. Bounces limpos
+        cur.execute("""
+            SELECT COUNT(*) as total
+            FROM bounce_signals
+            WHERE ts_signal >= '2026-05-21 00:41:00+00'
+        """)
+        clean_bounces = dict(cur.fetchone())
+
+        # 8. Simulação: quantos tokens históricos o sniper filter TERIA bloqueado
+        cur.execute("""
+            SELECT
+                COUNT(*) FILTER (WHERE top70_sniper_hold_rate > 0.05) as blocked_by_sniper5,
+                COUNT(*) FILTER (WHERE top70_sniper_hold_rate > 0.10) as blocked_by_sniper10,
+                COUNT(*) FILTER (WHERE top70_sniper_hold_rate > 0.20) as blocked_by_sniper20,
+                COUNT(*) FILTER (WHERE top10_holder_rate > 0.50) as blocked_by_top10_50,
+                COUNT(*) FILTER (WHERE top10_holder_rate > 0.65) as blocked_by_top10_65,
+                COUNT(*) FILTER (WHERE top10_holder_rate > 0.80) as blocked_by_top10_80,
+                COUNT(*) as total_com_campos
+            FROM migrations
+            WHERE top70_sniper_hold_rate IS NOT NULL OR top10_holder_rate IS NOT NULL
+        """)
+        sim_block = dict(cur.fetchone())
+
+    CSS = """<style>
+    *{box-sizing:border-box}
+    body{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;font-size:12px;padding:16px}
+    h1{color:#58a6ff;font-size:16px;margin-bottom:16px}
+    h2{color:#e3b341;font-size:13px;margin:20px 0 8px;border-bottom:1px solid #30363d;padding-bottom:4px}
+    h3{color:#8b949e;font-size:11px;margin:12px 0 4px}
+    table{width:100%;border-collapse:collapse;margin-bottom:16px}
+    th{background:#161b22;color:#8b949e;padding:5px 10px;text-align:right;border-bottom:1px solid #30363d;font-size:10px}
+    th:first-child{text-align:left}
+    td{padding:4px 10px;border-bottom:1px solid #21262d;text-align:right}
+    td:first-child{text-align:left;color:#8b949e}
+    .red{color:#f85149}.green{color:#3fb950}.yellow{color:#d29922}.blue{color:#58a6ff}
+    .box{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px 16px;margin-bottom:12px}
+    .alert{background:#2d1b1b;border:1px solid #f85149;border-radius:6px;padding:12px 16px;margin-bottom:12px}
+    .ok{background:#0d2818;border:1px solid #3fb950;border-radius:6px;padding:12px 16px;margin-bottom:12px}
+    .kv{display:flex;gap:20px;flex-wrap:wrap}
+    .kv span{color:#8b949e;font-size:11px}
+    .kv b{color:#c9d1d9;font-size:14px;display:block}
+    .tag-red{background:#5a1e1e;color:#f85149;padding:2px 6px;border-radius:3px;font-size:10px}
+    .tag-ok{background:#0d2818;color:#3fb950;padding:2px 6px;border-radius:3px;font-size:10px}
+    .tag-warn{background:#3d2a00;color:#d29922;padding:2px 6px;border-radius:3px;font-size:10px}
+    </style>"""
+
+    h = f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Pipeline Audit</title>{CSS}</head><body>"
+    h += "<h1>Pipeline Audit — Volume do HotMonitor e Trades Limpos</h1>"
+
+    # Filtros ativos
+    h += "<h2>Filtros Ativos (Railway env vars / defaults de código)</h2>"
+    h += "<div class='box'><table>"
+    h += "<tr><th>Variável</th><th>Valor Railway</th><th>Avaliação</th></tr>"
+
+    filter_eval = {
+        "FILTER_SNIPER_MAX": ("0.05", "CRÍTICO — baseado em dados corrompidos. 5% bloqueia maioria dos tokens.", "red"),
+        "FILTER_TOP10_MAX":  ("0.50", "ALTO — original era 0.80. Análise baseada em recovery corrompido.", "red"),
+        "FILTER_BUNDLER_MAX":("0.60", "OK — threshold razoável.", "ok"),
+        "FILTER_BOT_MAX":    ("0.80", "OK — nota 81: bot_degen não discrimina WR em live trades.", "ok"),
+        "FILTER_RUG_MAX":    ("0.50", "OK — score interno GMGN, raramente > 0.5.", "ok"),
+        "FILTER_RAT_MAX":    ("0.20", "OK.", "ok"),
+        "FILTER_SMART_MIN":  ("2",    "OK — smart=1 → 0% WR confirmado live (nota 78).", "ok"),
+        "FILTER_WASH_BLOCK": ("true", "OK.", "ok"),
+        "FILTER_PUMP_ONLY":  ("true", "OK — necessário para H22.", "ok"),
+    }
+
+    for k, v in filters_code.items():
+        if k in filter_eval:
+            _, descr, color = filter_eval[k]
+            tag_class = f"tag-{color}"
+            h += f"<tr><td>{k}</td><td class='{color}'><b>{v}</b></td><td><span class='{tag_class}'>{filter_eval[k][0]}</span> {descr}</td></tr>"
+        else:
+            h += f"<tr><td>{k}</td><td>{v}</td><td></td></tr>"
+    h += "</table></div>"
+
+    # Simulação de impacto
+    total_sim = sim_block.get("total_com_campos", 1) or 1
+    sniper5_pct = (sim_block.get("blocked_by_sniper5") or 0) / total_sim
+    sniper10_pct = (sim_block.get("blocked_by_sniper10") or 0) / total_sim
+    top10_50_pct = (sim_block.get("blocked_by_top10_50") or 0) / total_sim
+    top10_65_pct = (sim_block.get("blocked_by_top10_65") or 0) / total_sim
+
+    h += "<h2>Impacto dos Filtros — Simulação em Dados Históricos</h2>"
+    h += f"<div class='alert'>"
+    h += f"<b>⚠️ FILTER_SNIPER_MAX=5%</b> bloquearia <span class='red'><b>{sniper5_pct:.0%}</b></span> dos tokens históricos ({sim_block.get('blocked_by_sniper5',0)}/{total_sim})<br>"
+    h += f"<b>FILTER_SNIPER_MAX=10%</b> bloquearia <span class='yellow'><b>{sniper10_pct:.0%}</b></span> dos tokens históricos<br>"
+    h += f"<b>FILTER_TOP10_MAX=50%</b> bloquearia <span class='red'><b>{top10_50_pct:.0%}</b></span> dos tokens históricos<br>"
+    h += f"<b>FILTER_TOP10_MAX=65%</b> bloquearia <span class='yellow'><b>{top10_65_pct:.0%}</b></span> dos tokens históricos<br>"
+    h += f"<br><b>Distribuição sniper histórico</b>: avg={sniper_dist.get('avg_sniper', 0) or 0:.1%} | "
+    h += f"≤5%: {sniper_dist.get('sniper_le5',0)} | 5-10%: {sniper_dist.get('sniper_5_10',0)} | 10-20%: {sniper_dist.get('sniper_10_20',0)} | >20%: {sniper_dist.get('sniper_gt20',0)} | NULL: {sniper_dist.get('sem_sniper',0)}<br>"
+    h += f"<b>Distribuição top10 histórico</b>: avg={top10_dist.get('avg_top10', 0) or 0:.1%} | "
+    h += f"≤50%: {top10_dist.get('top10_le50',0)} | 50-65%: {top10_dist.get('top10_50_65',0)} | 65-80%: {top10_dist.get('top10_65_80',0)} | >80%: {top10_dist.get('top10_gt80',0)} | NULL: {top10_dist.get('sem_top10',0)}"
+    h += "</div>"
+
+    # Era limpa
+    h += "<h2>Era de Dados Limpos (pós 2026-05-21 00:41 UTC)</h2>"
+    ct = clean_trades
+    tp_c = ct.get('tps_clean') or 0
+    sl_c = ct.get('sls_clean') or 0
+    open_c = ct.get('open_clean') or 0
+    total_c = ct.get('total_clean') or 0
+    wr_c = tp_c / (tp_c + sl_c) if (tp_c + sl_c) > 0 else 0
+
+    h += "<div class='kv box'>"
+    h += f"<div><span>Migrações limpas</span><b class='blue'>{clean_migs.get('total',0)}</b></div>"
+    h += f"<div><span>Bounces limpos</span><b class='blue'>{clean_bounces.get('total',0)}</b></div>"
+    h += f"<div><span>Trades limpos</span><b class='blue'>{total_c}</b></div>"
+    h += f"<div><span>TPs (GMGN)</span><b class='green'>{tp_c}</b></div>"
+    h += f"<div><span>SLs</span><b class='red'>{sl_c}</b></div>"
+    h += f"<div><span>Abertos</span><b class='yellow'>{open_c}</b></div>"
+    h += f"<div><span>WR limpo</span><b class='{'green' if wr_c >= 0.20 else 'red'}'>{wr_c:.0%}</b></div>"
+    h += "</div>"
+    h += "<p style='color:#8b949e;font-size:10px;margin-bottom:12px'>⚠️ WR limpo precisa ser confirmado via GMGN — DB status pode ter trades ainda abertos.</p>"
+
+    # Migrações por dia
+    h += "<h2>Migrações por Dia (últimos 21 dias)</h2>"
+    h += "<table><tr><th>Data</th><th>Total</th><th>Pump</th><th>Outros</th></tr>"
+    for r in mig_per_day:
+        total_d = r['total']
+        pump_d = r['pump_count'] or 0
+        outros_d = total_d - pump_d
+        h += f"<tr><td>{r['dia']}</td><td>{total_d}</td><td class='blue'>{pump_d}</td><td class='yellow'>{outros_d}</td></tr>"
+    if not mig_per_day:
+        h += "<tr><td colspan='4' style='text-align:center;color:#8b949e'>Sem dados</td></tr>"
+    h += "</table>"
+
+    # Trades por dia
+    h += "<h2>Trades por Dia (últimos 21 dias)</h2>"
+    h += "<table><tr><th>Data</th><th>Total</th><th>TPs</th><th>SLs</th></tr>"
+    for r in trades_per_day:
+        h += f"<tr><td>{r['dia']}</td><td>{r['total']}</td><td class='green'>{r['tps']}</td><td class='red'>{r['sls']}</td></tr>"
+    if not trades_per_day:
+        h += "<tr><td colspan='4' style='text-align:center;color:#8b949e'>Sem dados</td></tr>"
+    h += "</table>"
+
+    # Recomendações
+    h += "<h2>Recomendações — Railway Env Vars</h2>"
+    h += "<div class='alert'>"
+    h += "<b>Filtros baseados em dados corrompidos — resetar imediatamente:</b><br><br>"
+    h += "<code>FILTER_SNIPER_MAX=1.00</code> &nbsp;→ desativa filtro (dados de recovery corrompidos, nota 158 CLAUDE.md)<br>"
+    h += "<code>FILTER_TOP10_MAX=0.80</code> &nbsp;→ volta ao original antes da análise corrompida<br>"
+    h += "</div>"
+    h += "<div class='ok'>"
+    h += "<b>Filtros confirmados por dados limpos — manter:</b><br><br>"
+    h += "<code>FILTER_SMART_MIN=2</code> ou <code>3</code> (smart=1 → 0% WR confirmado live, nota 78)<br>"
+    h += "<code>FILTER_PUMP_ONLY=true</code> (necessário para cobertura H22)<br>"
+    h += "<code>BOUNCE_MIN_PCT=0.30</code> (mínimo matemático)<br>"
+    h += "<code>BOUNCE_MAX_PCT=1.50</code> (bloqueio de entradas tardias)<br>"
+    h += "</div>"
+
+    h += "</body></html>"
+    return h
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
