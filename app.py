@@ -35070,8 +35070,8 @@ a{{text-decoration:none}}
     return html
 
 
-@app.route("/analise/token-outcome")
-def analise_token_outcome():
+@app.route("/analise/token-outcome-clean")
+def analise_token_outcome_clean():
     """
     Análise limpa de outcomes de tokens pós-migração.
     Fonte de verdade: token_ticks (OHLC real), NÃO mc_bottom do banco.
