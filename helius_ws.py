@@ -421,6 +421,7 @@ class HeliusWS:
         self._pool_pda:        dict[str, str]       = {}  # mint → PDA derivado (seeds a confirmar)
         self._pool_account:    dict[str, str]       = {}  # mint → pool account confirmado por intersecção
         self._pool_candidates: dict[str, list[set]] = {}  # mint → lista de sets de candidatos por TX
+        self._pre_confirm_min: dict[str, float]     = {}  # mint → mc mínimo visto antes da pool confirmar
 
         # Helius mode only
         self._sub_id_mint: dict[int, str] = {}
@@ -507,6 +508,7 @@ class HeliusWS:
             self._pool_pda.pop(mint, None)
             self._pool_account.pop(mint, None)
             self._pool_candidates.pop(mint, None)
+            self._pre_confirm_min.pop(mint, None)
             if self._mode == "helius":
                 for sid, m in list(self._sub_id_mint.items()):
                     if m == mint:
@@ -816,6 +818,7 @@ class HeliusWS:
                         )
                         with self._lock:
                             self._k_established.pop(mint, None)
+                            self._pre_confirm_min.pop(mint, None)
                         return False
                     # k legítimo pode cair por fees — atualiza monotonicamente
                     if k_raw < k_est:
@@ -877,12 +880,27 @@ class HeliusWS:
             # está confirmada por intersecção de 5 TXs. Antes disso, eventos podem vir
             # de secondary pools que passaram pelo k-gate. Rolling window (H22) já foi
             # preenchida acima — não é afetada por este gate.
+            # Pré-confirmação: bufferiza o mínimo para emitir retroativamente quando pool confirmar.
             with self._lock:
                 pool_confirmed = self._pool_account.get(mint)
+                if not pool_confirmed:
+                    cur_min = self._pre_confirm_min.get(mint, float("inf"))
+                    if event["mc"] < cur_min:
+                        self._pre_confirm_min[mint] = event["mc"]
+
             if not pool_confirmed:
-                logger.debug("HeliusWS price(anchor) %s: $%.0f MC — pool não confirmada, mc_min não atualizado",
+                logger.debug("HeliusWS price(anchor) %s: $%.0f MC — pool não confirmada, buffering mc_min",
                              mint[:8], event["mc"])
                 return True
+
+            # Pool confirmada — flush do mínimo buffered pré-confirmação (o fundo real pode ter
+            # ocorrido nas primeiras 1-4 TXs, antes da confirmação por intersecção).
+            with self._lock:
+                pre_min = self._pre_confirm_min.pop(mint, None)
+            if pre_min is not None and pre_min < event["mc"]:
+                logger.info("HeliusWS pre-confirm flush %s: mc mínimo real $%.0f < atual $%.0f — emitindo",
+                            mint[:8], pre_min, event["mc"])
+                self._on_price(mint, pre_min)
 
             logger.info("HeliusWS price(anchor) %s: $%.0f MC [%s %.4f SOL pool=%.1f]",
                         mint[:8], event["mc"], event["side"], event["sol"], pq_check)
