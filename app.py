@@ -30780,7 +30780,7 @@ def analise_elapsed_granular():
           {trs}
         </table>
         <p class='note' style='margin-top:16px'>
-          Auto-refresh 60s. Verde = faixas a manter. Vermelho = candidatas a bloquear com BOUNCE_TIME_MIN_SEC.<br>
+          Auto-refresh 60s. Verde = faixas a manter. Vermelho = candidatas a bloquear.<br>
           avg bounce% = bounce médio dos trades nessa janela (TP e SL juntos).<br>
           avg dump% = queda média da migração até o fundo nesses trades.
         </p>

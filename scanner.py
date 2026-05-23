@@ -189,15 +189,25 @@ class HotMonitor:
         if self._helius:
             self._helius.unsubscribe(mint)
 
-    def push_mc(self, mint: str, mc: float, token_data: dict = None):
-        """Chamado pelo Scanner a cada poll — detecção rápida de rug, bottom e coleta de série temporal."""
+    def push_mc(self, mint: str, mc: float, token_data: dict = None,
+                event_ts: datetime = None):
+        """
+        Chamado pelo Scanner a cada poll, pelo HeliusWS (erpc_live) e pelo replay
+        de learning window (erpc_replay).
+
+        event_ts: timestamp real do evento on-chain. Quando fornecido, ts_min e
+        elapsed_min refletem o momento do evento, não o de processamento.
+        Usado pelo replay para que A.6 (freshness) calcule secs_since_bottom
+        corretamente mesmo quando a pool demorou para ser confirmada.
+        """
         with self._lock:
             self._mc_live[mint] = mc  # captura sempre, mesmo após graduação
             state = self._tokens.get(mint)
             if not state or mint in self._cancelled:
                 return
 
-        elapsed_sec = int((datetime.now(timezone.utc) - state["ts_migration"]).total_seconds())
+        ref_ts = event_ts or datetime.now(timezone.utc)
+        elapsed_sec = int((ref_ts - state["ts_migration"]).total_seconds())
         elapsed_min = elapsed_sec / 60
 
         state["mc_last"] = mc
@@ -230,11 +240,17 @@ class HotMonitor:
         # kline (_precise_bottom_tick) complementa com candles fechados (elapsed >= 90s).
         # Trenches NÃO escreve mc_min — poll de 5s, não é tempo real.
         if token_data is None and mc < state["mc_min"]:
-            state["mc_min"] = mc
+            mc_old  = state["mc_min"]
+            source  = "erpc_replay" if event_ts else "erpc_live"
+            state["mc_min"]   = mc
             state["time_min"] = elapsed_min
-            state["ts_min"]   = datetime.now(timezone.utc)
+            state["ts_min"]   = ref_ts   # timestamp do evento real (não do processamento)
             db.update_bottom(mint, mc, elapsed_min)
-            logger.info("Fundo(erpc) %s: $%.0f em %.1fmin", state["symbol"], mc, elapsed_min)
+            logger.info(
+                "Fundo(%s) %s: mint=%s mc_old=$%.0f mc_new=$%.0f "
+                "event_ts=%.3f elapsed=%.1fmin",
+                source, state["symbol"], mint, mc_old, mc, ref_ts.timestamp(), elapsed_min,
+            )
 
         if mc > state["mc_max"]:
             state["mc_max"] = mc
@@ -254,10 +270,6 @@ class HotMonitor:
     BOUNCE_MAX_PCT       = float(os.getenv("BOUNCE_MAX_PCT",         "9.99"))  # desativado por padrão — sem validação GMGN para threshold máximo (nota 87 CLAUDE.md)
     BOUNCE_DROP_MIN      = float(os.getenv("BOUNCE_DROP_MIN",        "0.30"))  # queda mínima da migração
     BOUNCE_TIME_MAX      = float(os.getenv("BOUNCE_TIME_MAX",        "20.0"))  # A.5: janela 30→20min (100% TPs em ≤20min)
-    # A.9: threshold duplo — sinal + seleção de fonte kline.
-    # Default 90s: bloqueia sinais na janela de transição bonding curve→pool E
-    # usa apenas Helius (não kline low) nesse intervalo (kline low pode incluir preço pré-migração).
-    BOUNCE_TIME_MIN_SEC  = int(os.getenv(  "BOUNCE_TIME_MIN_SEC",   "90"))    # A.9
     BOTTOM_FRESHNESS_SEC = int(os.getenv(  "BOTTOM_FRESHNESS_SEC",  "300"))   # A.6: máx 5min desde o último mc_min
 
     def _check_bounce(self, mint: str, state: dict, mc: float, elapsed_sec: int):
@@ -291,10 +303,6 @@ class HotMonitor:
         if elapsed_sec < 0 or elapsed_min > self.BOUNCE_TIME_MAX:
             return
 
-        # A.9 — Janela mínima: sinais nos primeiros N segundos têm WR muito baixo (dados: 0-5min → 12.9% WR vs 5-20min → 27% WR)
-        if self.BOUNCE_TIME_MIN_SEC > 0 and elapsed_sec < self.BOUNCE_TIME_MIN_SEC:
-            logger.debug("BOUNCE skip %s — A.9 muito cedo: %ds < min=%ds", mint[:8], elapsed_sec, self.BOUNCE_TIME_MIN_SEC)
-            return
         if mc_min <= 0 or mc_migration <= 0:
             return
 

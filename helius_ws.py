@@ -23,6 +23,7 @@ Tier 2 (fallback): DexScreener HTTP, rate-limitado a 2s por mint.
 """
 import base64
 import base58 as _base58
+from datetime import datetime, timezone
 import hashlib
 import json
 import logging
@@ -408,8 +409,8 @@ class HeliusWS:
     _ABSORPTION_WINDOW_SEC = 90
     _MIN_POOL_SOL = float(os.getenv("MIN_POOL_SOL", "10"))
 
-    def __init__(self, on_price: Callable[[str, float], None]):
-        """on_price(mint, market_cap_usd) — compatível com HotMonitor.push_mc."""
+    def __init__(self, on_price: Callable):
+        """on_price(mint, mc_usd, *, event_ts=None) — compatível com HotMonitor.push_mc."""
         self._on_price = on_price
 
         # Estado compartilhado (ambos os modos)
@@ -421,7 +422,8 @@ class HeliusWS:
         self._pool_pda:        dict[str, str]       = {}  # mint → PDA derivado (seeds a confirmar)
         self._pool_account:    dict[str, str]       = {}  # mint → pool account confirmado por intersecção
         self._pool_candidates: dict[str, list[set]] = {}  # mint → lista de sets de candidatos por TX
-        self._pre_confirm_min: dict[str, float]     = {}  # mint → mc mínimo visto antes da pool confirmar
+        self._pre_confirm_min: dict[str, tuple]     = {}  # mint → (mc, event_ts) mínimo antes da pool confirmar
+        self._ts_subscribe:    dict[str, float]     = {}  # mint → unix ts de subscribe()
 
         # Helius mode only
         self._sub_id_mint: dict[int, str] = {}
@@ -479,6 +481,7 @@ class HeliusWS:
             if mint not in self._swap_events:
                 self._swap_events[mint] = deque(maxlen=self._ABSORPTION_MAXLEN)
             self._pool_quote_last[mint] = 0.0
+            self._ts_subscribe[mint]    = time.time()
 
         # Deriva PDA da pool primária em thread própria (não bloqueia o caller)
         def _derive_async():
@@ -509,6 +512,7 @@ class HeliusWS:
             self._pool_account.pop(mint, None)
             self._pool_candidates.pop(mint, None)
             self._pre_confirm_min.pop(mint, None)
+            self._ts_subscribe.pop(mint, None)
             if self._mode == "helius":
                 for sid, m in list(self._sub_id_mint.items()):
                     if m == mint:
@@ -832,6 +836,7 @@ class HeliusWS:
                         signer = accounts[0] if accounts else None
                         exclude = self._KNOWN_PROGRAMS | {mint, signer}
                         candidates = {a for a in accounts[1:] if a not in exclude}
+                        _replay_on_confirm = None
                         with self._lock:
                             pool_known = self._pool_account.get(mint)
                             if not pool_known:
@@ -845,11 +850,27 @@ class HeliusWS:
                                     if inter:
                                         pool_acc = next(iter(inter))
                                         self._pool_account[mint] = pool_acc
+                                        # Captura e remove o mínimo buffered na learning window.
+                                        # Flush disparado imediatamente (fora do lock abaixo).
+                                        _replay_on_confirm = self._pre_confirm_min.pop(mint, None)
+                                        ts_sub = self._ts_subscribe.get(mint, 0)
                                         logger.info(
                                             "HeliusWS pool-account CONFIRMED %s: pool=%s... "
-                                            "(interseção de 5 TXs, %d candidatos)",
-                                            mint[:8], pool_acc[:8], len(inter),
+                                            "(interseção de 5 TXs, %d candidatos, ts_subscribe=%.3f)",
+                                            mint[:8], pool_acc[:8], len(inter), ts_sub,
                                         )
+                        # Flush imediato do mínimo da learning window — chamado fora do lock
+                        # para não segurar o lock durante o callback _on_price.
+                        if _replay_on_confirm is not None:
+                            _replay_mc, _replay_ts = _replay_on_confirm
+                            logger.info(
+                                "HeliusWS erpc_replay %s: source=erpc_replay mint=%s "
+                                "mc_new=$%.0f mc_old=inf event_ts=%.3f "
+                                "reason=pool_confirmed_learning_window_flush",
+                                mint[:8], mint, _replay_mc, _replay_ts,
+                            )
+                            _event_dt = datetime.fromtimestamp(_replay_ts, tz=timezone.utc)
+                            self._on_price(mint, _replay_mc, event_ts=_event_dt)
 
             # Pool account validation: após confirmação por intersecção, verifica que o
             # pool account está nos accounts desta transação.
@@ -880,27 +901,36 @@ class HeliusWS:
             # está confirmada por intersecção de 5 TXs. Antes disso, eventos podem vir
             # de secondary pools que passaram pelo k-gate. Rolling window (H22) já foi
             # preenchida acima — não é afetada por este gate.
-            # Pré-confirmação: bufferiza o mínimo para emitir retroativamente quando pool confirmar.
+            # Pré-confirmação: bufferiza (mc, event_ts) para replay quando pool confirmar.
+            event_ts = time.time()
             with self._lock:
                 pool_confirmed = self._pool_account.get(mint)
                 if not pool_confirmed:
-                    cur_min = self._pre_confirm_min.get(mint, float("inf"))
-                    if event["mc"] < cur_min:
-                        self._pre_confirm_min[mint] = event["mc"]
+                    cur = self._pre_confirm_min.get(mint)
+                    cur_mc = cur[0] if cur else float("inf")
+                    if event["mc"] < cur_mc:
+                        self._pre_confirm_min[mint] = (event["mc"], event_ts)
 
             if not pool_confirmed:
                 logger.debug("HeliusWS price(anchor) %s: $%.0f MC — pool não confirmada, buffering mc_min",
                              mint[:8], event["mc"])
                 return True
 
-            # Pool confirmada — flush do mínimo buffered pré-confirmação (o fundo real pode ter
-            # ocorrido nas primeiras 1-4 TXs, antes da confirmação por intersecção).
+            # Pool confirmada — flush tardio do mínimo pré-confirmação.
+            # Normalmente já foi disparado imediatamente no bloco de confirmação por intersecção.
+            # Este fallback cobre o caso em que o flush imediato não ocorreu (ex: sem accounts).
             with self._lock:
-                pre_min = self._pre_confirm_min.pop(mint, None)
-            if pre_min is not None and pre_min < event["mc"]:
-                logger.info("HeliusWS pre-confirm flush %s: mc mínimo real $%.0f < atual $%.0f — emitindo",
-                            mint[:8], pre_min, event["mc"])
-                self._on_price(mint, pre_min)
+                pre_min_tuple = self._pre_confirm_min.pop(mint, None)
+            if pre_min_tuple is not None:
+                pre_mc, pre_ts = pre_min_tuple
+                if pre_mc < event["mc"]:
+                    logger.info(
+                        "HeliusWS erpc_replay %s: source=erpc_replay mint=%s "
+                        "mc_new=$%.0f mc_current=$%.0f event_ts=%.3f reason=lazy_flush",
+                        mint[:8], mint, pre_mc, event["mc"], pre_ts,
+                    )
+                    _event_dt = datetime.fromtimestamp(pre_ts, tz=timezone.utc)
+                    self._on_price(mint, pre_mc, event_ts=_event_dt)
 
             logger.info("HeliusWS price(anchor) %s: $%.0f MC [%s %.4f SOL pool=%.1f]",
                         mint[:8], event["mc"], event["side"], event["sol"], pq_check)
