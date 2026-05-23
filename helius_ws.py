@@ -784,14 +784,19 @@ class HeliusWS:
                     k_est = self._k_established.get(mint)
 
                 if k_est is None:
-                    # Primeiro evento: verifica se k está próximo do valor de migração
-                    k_init_min = _K_INIT_EXPECTED * (1.0 - _K_INIT_TOLERANCE)
+                    # Primeiro evento: verifica apenas se k não excede o máximo esperado
+                    # (k_init_min REMOVIDO: k decai com fee por trade ~1.25%/swap.
+                    #  Após ~140 trades antes do subscribe, k < k_init × 0.20 → todos os
+                    #  eventos eram INIT SKIP, pre_confirm_min nunca populado, mc_min
+                    #  nunca atualizado via erpc — apenas kline em t≥90s capturava o fundo.
+                    #  Proteção contra secondary pools mantida por A.9 (pool_quote≥10 SOL)
+                    #  e pool-account confirmation (intersecção de 5 TXs).)
                     k_init_max = _K_INIT_EXPECTED * (1.0 + _K_INIT_TOLERANCE)
-                    if not (k_init_min <= k_raw <= k_init_max):
+                    if k_raw > k_init_max:
                         logger.warning(
-                            "HeliusWS k-gate INIT SKIP %s: k=%.3e fora de [%.2e, %.2e] "
-                            "— possível secondary pool",
-                            mint[:8], k_raw, k_init_min, k_init_max,
+                            "HeliusWS k-gate INIT SKIP %s: k=%.3e > k_max=%.2e "
+                            "— possível secondary pool com liquidez inflada",
+                            mint[:8], k_raw, k_init_max,
                         )
                         return False
                     with self._lock:
@@ -805,7 +810,15 @@ class HeliusWS:
                         candidates = {a for a in accounts[1:] if a not in exclude}
                         with self._lock:
                             self._pool_candidates.setdefault(mint, []).append(candidates)
-                    logger.info("HeliusWS k-gate ESTABLISHED %s: k=%.3e", mint[:8], k_raw)
+                    k_decay_pct = max(0.0, (1.0 - k_raw / _K_INIT_EXPECTED) * 100)
+                    if k_decay_pct > 30:
+                        logger.info(
+                            "HeliusWS k-gate ESTABLISHED %s: k=%.3e (decaído %.0f%% — "
+                            "token com trades antes do subscribe)",
+                            mint[:8], k_raw, k_decay_pct,
+                        )
+                    else:
+                        logger.info("HeliusWS k-gate ESTABLISHED %s: k=%.3e", mint[:8], k_raw)
                 else:
                     # Check 2 (direcional): k não pode aumentar
                     if k_raw > k_est * (1.0 + _K_INCREASE_TOLERANCE):

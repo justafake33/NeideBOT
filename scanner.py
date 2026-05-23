@@ -143,8 +143,9 @@ class HotMonitor:
     def _precise_bottom_single(self, mint: str):
         """
         Kline imediato chamado uma vez ao adicionar o token (hot.add).
-        Cobre o gap de 5-15s entre migração e o primeiro ciclo do _precise_loop.
-        mc_min só é atualizado via kline — nunca via deque erpc.
+        Contingência para candles fechados (elapsed ≥ 90s) — erpc é a fonte primária
+        de mc_min via push_mc (token_data=None). Kline complementa candles que
+        erpc possa ter perdido por polling gap ou reconexão.
         """
         time.sleep(2)  # aguarda GMGN indexar os primeiros candles
         with self._lock:
@@ -789,8 +790,10 @@ class HotMonitor:
                     # 1. Atualiza mc_min com o low desta vela ANTES de checar bounce.
                     #    Garante que bounce_pct e A.6 usam o fundo correto desta vela.
                     #
-                    # mc_min: fonte única = kline low (pool primária GMGN).
-                    # erpc excluído — pode conter preços de secondary pools.
+                    # Hierarquia de fontes para mc_min:
+                    #   1ª) erpc (push_mc com token_data=None) — real-time, sub-segundo
+                    #   2ª) kline (esta função) — candles fechados, elapsed ≥ 90s, contingência
+                    # Atualização monotônica (só reduz) — kline nunca sobe mc_min que erpc já baixou.
                     low_price = _float(c.get("low"))
                     mc_low = low_price * state["total_supply"] if (low_price and low_price > 0) else None
 
