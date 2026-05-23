@@ -189,15 +189,25 @@ class HotMonitor:
         if self._helius:
             self._helius.unsubscribe(mint)
 
-    def push_mc(self, mint: str, mc: float, token_data: dict = None):
-        """Chamado pelo Scanner a cada poll — detecção rápida de rug, bottom e coleta de série temporal."""
+    def push_mc(self, mint: str, mc: float, token_data: dict = None,
+                event_ts: datetime = None):
+        """
+        Chamado pelo Scanner a cada poll, pelo HeliusWS (erpc_live) e pelo replay
+        de learning window (erpc_replay).
+
+        event_ts: timestamp real do evento on-chain. Quando fornecido, ts_min e
+        elapsed_min refletem o momento do evento, não o de processamento.
+        Usado pelo replay para que A.6 (freshness) calcule secs_since_bottom
+        corretamente mesmo quando a pool demorou para ser confirmada.
+        """
         with self._lock:
             self._mc_live[mint] = mc  # captura sempre, mesmo após graduação
             state = self._tokens.get(mint)
             if not state or mint in self._cancelled:
                 return
 
-        elapsed_sec = int((datetime.now(timezone.utc) - state["ts_migration"]).total_seconds())
+        ref_ts = event_ts or datetime.now(timezone.utc)
+        elapsed_sec = int((ref_ts - state["ts_migration"]).total_seconds())
         elapsed_min = elapsed_sec / 60
 
         state["mc_last"] = mc
@@ -230,15 +240,16 @@ class HotMonitor:
         # kline (_precise_bottom_tick) complementa com candles fechados (elapsed >= 90s).
         # Trenches NÃO escreve mc_min — poll de 5s, não é tempo real.
         if token_data is None and mc < state["mc_min"]:
-            mc_old = state["mc_min"]
+            mc_old  = state["mc_min"]
+            source  = "erpc_replay" if event_ts else "erpc_live"
             state["mc_min"]   = mc
             state["time_min"] = elapsed_min
-            state["ts_min"]   = datetime.now(timezone.utc)
+            state["ts_min"]   = ref_ts   # timestamp do evento real (não do processamento)
             db.update_bottom(mint, mc, elapsed_min)
             logger.info(
-                "Fundo(erpc) %s: source=erpc_live mint=%s mc_old=$%.0f mc_new=$%.0f "
+                "Fundo(%s) %s: mint=%s mc_old=$%.0f mc_new=$%.0f "
                 "event_ts=%.3f elapsed=%.1fmin",
-                state["symbol"], mint, mc_old, mc, time.time(), elapsed_min,
+                source, state["symbol"], mint, mc_old, mc, ref_ts.timestamp(), elapsed_min,
             )
 
         if mc > state["mc_max"]:

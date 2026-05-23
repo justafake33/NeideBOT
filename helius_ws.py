@@ -23,6 +23,7 @@ Tier 2 (fallback): DexScreener HTTP, rate-limitado a 2s por mint.
 """
 import base64
 import base58 as _base58
+from datetime import datetime, timezone
 import hashlib
 import json
 import logging
@@ -408,8 +409,8 @@ class HeliusWS:
     _ABSORPTION_WINDOW_SEC = 90
     _MIN_POOL_SOL = float(os.getenv("MIN_POOL_SOL", "10"))
 
-    def __init__(self, on_price: Callable[[str, float], None]):
-        """on_price(mint, market_cap_usd) — compatível com HotMonitor.push_mc."""
+    def __init__(self, on_price: Callable):
+        """on_price(mint, mc_usd, *, event_ts=None) — compatível com HotMonitor.push_mc."""
         self._on_price = on_price
 
         # Estado compartilhado (ambos os modos)
@@ -868,7 +869,8 @@ class HeliusWS:
                                 "reason=pool_confirmed_learning_window_flush",
                                 mint[:8], mint, _replay_mc, _replay_ts,
                             )
-                            self._on_price(mint, _replay_mc)
+                            _event_dt = datetime.fromtimestamp(_replay_ts, tz=timezone.utc)
+                            self._on_price(mint, _replay_mc, event_ts=_event_dt)
 
             # Pool account validation: após confirmação por intersecção, verifica que o
             # pool account está nos accounts desta transação.
@@ -927,7 +929,8 @@ class HeliusWS:
                         "mc_new=$%.0f mc_current=$%.0f event_ts=%.3f reason=lazy_flush",
                         mint[:8], mint, pre_mc, event["mc"], pre_ts,
                     )
-                    self._on_price(mint, pre_mc)
+                    _event_dt = datetime.fromtimestamp(pre_ts, tz=timezone.utc)
+                    self._on_price(mint, pre_mc, event_ts=_event_dt)
 
             logger.info("HeliusWS price(anchor) %s: $%.0f MC [%s %.4f SOL pool=%.1f]",
                         mint[:8], event["mc"], event["side"], event["sol"], pq_check)
