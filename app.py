@@ -36276,25 +36276,44 @@ def debug_mint_trace():
 
         onchain = []   # lista de {slot, ts, sig, mc, side, pool_quote_sol, source}
 
+        ts_signal_unix = None
+        window_label   = f"{window_min}min"
+
         if _helius_ok() and ts_mig:
             from datetime import timezone as _tz
             ts_from = int(ts_mig.replace(tzinfo=_tz.utc).timestamp()) if ts_mig.tzinfo is None else int(ts_mig.timestamp())
-            ts_to   = ts_from + window_min * 60
 
-            # getSignaturesForAddress no mint — filtra apenas txs que mencionam o mint
-            sigs_raw = _rpc("getSignaturesForAddress", [mint, {
-                "limit": 500,
-                "commitment": "confirmed",
-            }])
+            # Upper bound = ts_signal (pré-compra), não window_min arbitrário
+            if bounce and bounce['ts_signal']:
+                _bts = bounce['ts_signal']
+                ts_signal_unix = int(_bts.replace(tzinfo=_tz.utc).timestamp()) if _bts.tzinfo is None else int(_bts.timestamp())
+                ts_to = ts_signal_unix + 5  # +5s tolerância
+                window_label = f"migration → entry ({ts_signal_unix - ts_from}s)"
+            else:
+                ts_to = ts_from + window_min * 60
 
-            if sigs_raw:
-                # Filtra pela janela de tempo
-                sigs_in_window = [
-                    s for s in sigs_raw
-                    if s.get("blockTime") and ts_from <= s["blockTime"] <= ts_to
-                    and not s.get("err")
-                ]
-                sigs_in_window.sort(key=lambda s: s["blockTime"])
+            # Paginação regressiva: API retorna mais-recentes primeiro.
+            # Para capturar os primeiros segundos pós-migração precisamos paginar
+            # até encontrar blockTime < ts_from.
+            all_sigs_map = {}
+            before_cursor = None
+            for _page in range(15):  # limite de segurança: 15 × 200 = 3000 txs
+                params = {"limit": 200, "commitment": "confirmed"}
+                if before_cursor:
+                    params["before"] = before_cursor
+                batch = _rpc("getSignaturesForAddress", [mint, params])
+                if not batch:
+                    break
+                for s in batch:
+                    bt = s.get("blockTime")
+                    if bt and ts_from <= bt <= ts_to and not s.get("err"):
+                        all_sigs_map[s["signature"]] = s
+                oldest_bt = min((s.get("blockTime") or 999999999 for s in batch), default=0)
+                if oldest_bt < ts_from:
+                    break  # chegamos antes da migração
+                before_cursor = batch[-1]["signature"]
+
+            sigs_in_window = sorted(all_sigs_map.values(), key=lambda s: s["blockTime"])
 
                 for sig_info in sigs_in_window[:80]:  # max 80 txs
                     sig = sig_info["signature"]
@@ -36372,7 +36391,7 @@ def debug_mint_trace():
         if mc_min_onchain is not None and mc_min_db is not None:
             gap_color = "red" if gap_erpc_vs_onchain and gap_erpc_vs_onchain > 3 else "green"
             h += "<h2>Diagnóstico do Gap</h2><div class='box'>"
-            h += "On-chain mínimo: <b class='yellow'>$" + f"{mc_min_onchain/1000:.2f}k" + "</b> &nbsp;·&nbsp; "
+            h += "On-chain mínimo (pré-entry): <b class='yellow'>$" + f"{mc_min_onchain/1000:.2f}k" + "</b> &nbsp;·&nbsp; "
             h += "DB mc_min (erpc): <b class='blue'>$" + f"{mc_min_db/1000:.2f}k" + "</b> &nbsp;·&nbsp; "
             h += "Gap: <b class='" + gap_color + "'>" + (f"{gap_erpc_vs_onchain:+.1f}%" if gap_erpc_vs_onchain is not None else "?") + "</b><br>"
             if mc_min_ticks:
@@ -36381,16 +36400,27 @@ def debug_mint_trace():
         elif not _helius_ok():
             h += "<div class='box'><span class='red'>Helius RPC não configurado — apenas dados do DB disponíveis</span></div>"
         elif not onchain:
-            h += "<div class='box'><span class='yellow'>Nenhuma transação pAMM encontrada na janela de " + str(window_min) + "min. "
-            h += "Tente aumentar ?window=40</span></div>"
+            h += "<div class='box'><span class='yellow'>Nenhuma transação pAMM encontrada na janela " + window_label + ". "
+            h += "Se o token é novo, tente sem ?window (usa ts_signal automaticamente)</span></div>"
+
+        # Marcador de entrada (ts_signal) para referência na tabela
+        ts_signal_elapsed = (ts_signal_unix - ts_from) if ts_signal_unix and ts_mig else None
 
         # Tabela on-chain
         if onchain:
             mc_floor = mc_min_onchain or 0
-            h += "<h2>Transações on-chain — pAMM (" + str(len(onchain)) + " txs, janela " + str(window_min) + "min)</h2>"
+            h += "<h2>Transações on-chain — pAMM (" + str(len(onchain)) + " txs · janela: " + window_label + ")</h2>"
             h += "<table><tr><th>Elapsed</th><th>Side</th><th>MC</th><th>pool SOL</th><th>Δ from min</th><th>Sig</th></tr>"
+            entry_marker_shown = False
             for e in onchain:
                 elapsed_s = e['elapsed']
+                # Insere marcador de entrada antes da primeira tx após ts_signal
+                if ts_signal_elapsed is not None and elapsed_s >= ts_signal_elapsed and not entry_marker_shown:
+                    entry_marker_shown = True
+                    h += "<tr style='border-top:2px solid #58a6ff'>"
+                    h += "<td colspan='6' class='blue' style='text-align:center;padding:3px'>"
+                    h += "▲ ENTRY / ts_signal (+{:d}s) — comparação termina aqui".format(ts_signal_elapsed)
+                    h += "</td></tr>"
                 side_color = "green" if e['side'] == "buy" else "red"
                 mc_val = e['mc']
                 delta = (mc_val - mc_floor) / mc_floor * 100 if mc_floor > 0 else 0
@@ -36439,7 +36469,7 @@ def debug_mint_trace():
                 h += "<br>"
             h += "</div>"
 
-        h += "<p class='grey'>★ = mínimo on-chain · Gap positivo = erpc registrou mais alto que o real</p>"
+        h += "<p class='grey'>★ = mínimo on-chain (pré-entry) · Gap positivo = erpc registrou mais alto que o real · Janela: " + window_label + "</p>"
         h += "</body></html>"
         return h
 
