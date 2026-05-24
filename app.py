@@ -35902,7 +35902,7 @@ def debug_pipeline_audit():
 
 
 @app.route("/debug/bottom-audit")
-def debug_bottom_audit():
+def debug_bottom_audit():  # noqa: C901
     """
     Valida se o fix do k-gate INIT SKIP está funcionando:
     compara mc_min registrado no DB (bounce_signals) contra o mínimo real
@@ -35918,153 +35918,7 @@ def debug_bottom_audit():
     - time_to_bottom < 1.5min → provável fonte erpc (sub-90s)
     - time_to_bottom ≥ 1.5min → provável fonte kline
     """
-    import os as _os
-
-    days = int(request.args.get("days", 7))
-    min_gap_pct = float(request.args.get("min_gap", 0))  # filtrar apenas gaps acima desse %
-
-    ERA_LIMPA = "2026-05-21 00:41:00+00"
-
-    with db._cursor() as cur:
-        # Detalhes por bounce: mc_min do DB vs mínimo dos ticks
-        cur.execute("""
-            SELECT
-                b.mint,
-                b.ts_signal,
-                b.mc_min                    AS db_mc_min,
-                b.mc_at_signal              AS mc_at_signal,
-                b.elapsed_sec / 60.0        AS time_to_bottom,
-                b.bounce_pct                AS bounce_pct,
-                m.token_nome,
-                m.ts_migration,
-                m.mc_migration,
-                (
-                    SELECT MIN(LEAST(
-                        COALESCE(t.mc_low, t.mc),
-                        t.mc
-                    ))
-                    FROM token_ticks t
-                    WHERE t.mint = b.mint
-                      AND t.ts >= m.ts_migration
-                      AND t.ts <= b.ts_signal + INTERVAL '30 seconds'
-                ) AS tick_mc_min,
-                (
-                    SELECT COUNT(*)
-                    FROM token_ticks t
-                    WHERE t.mint = b.mint
-                      AND t.ts >= m.ts_migration
-                      AND t.ts <= b.ts_signal + INTERVAL '30 seconds'
-                ) AS tick_count,
-                (
-                    SELECT COUNT(*) FILTER (WHERE t.mc_low IS NOT NULL)
-                    FROM token_ticks t
-                    WHERE t.mint = b.mint
-                      AND t.ts >= m.ts_migration
-                      AND t.ts <= b.ts_signal + INTERVAL '30 seconds'
-                ) AS ticks_with_low
-            FROM bounce_signals b
-            JOIN migrations m ON m.mint = b.mint
-            WHERE b.ts_signal >= NOW() - INTERVAL '{days} days'
-              AND b.ts_signal >= %s
-              AND b.mc_min IS NOT NULL
-              AND m.ts_migration IS NOT NULL
-            ORDER BY b.ts_signal DESC
-            LIMIT 200
-        """.format(days=days), (ERA_LIMPA,))
-        rows = cur.fetchall()
-
-        # Resumo por era
-        cur.execute("""
-            SELECT
-                COUNT(*) as total_bounces,
-                COUNT(*) FILTER (WHERE elapsed_sec IS NOT NULL AND elapsed_sec < 90) as fast_bottom,
-                COUNT(*) FILTER (WHERE elapsed_sec IS NOT NULL AND elapsed_sec >= 90) as slow_bottom,
-                AVG(elapsed_sec / 60.0) FILTER (WHERE elapsed_sec IS NOT NULL) as avg_ttb,
-                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY elapsed_sec / 60.0)
-                    FILTER (WHERE elapsed_sec IS NOT NULL) as median_ttb,
-                AVG(bounce_pct) FILTER (WHERE bounce_pct IS NOT NULL) as avg_bounce_pct
-            FROM bounce_signals b
-            WHERE b.ts_signal >= NOW() - INTERVAL '{days} days'
-              AND b.ts_signal >= %s
-        """.format(days=days), (ERA_LIMPA,))
-        summary = dict(cur.fetchone())
-
-        # Distribuição de time_to_bottom
-        cur.execute("""
-            SELECT
-                COUNT(*) FILTER (WHERE elapsed_sec < 30)  as lt_30s,
-                COUNT(*) FILTER (WHERE elapsed_sec >= 30  AND elapsed_sec < 60) as s30_60s,
-                COUNT(*) FILTER (WHERE elapsed_sec >= 60  AND elapsed_sec < 90) as s60_90s,
-                COUNT(*) FILTER (WHERE elapsed_sec >= 90  AND elapsed_sec < 180) as s90_3m,
-                COUNT(*) FILTER (WHERE elapsed_sec >= 180 AND elapsed_sec < 300) as s3_5m,
-                COUNT(*) FILTER (WHERE elapsed_sec >= 300 AND elapsed_sec < 600) as s5_10m,
-                COUNT(*) FILTER (WHERE elapsed_sec >= 600) as gt10m,
-                COUNT(*) FILTER (WHERE elapsed_sec IS NULL) as null_ttb
-            FROM bounce_signals
-            WHERE ts_signal >= NOW() - INTERVAL '{days} days'
-              AND ts_signal >= %s
-        """.format(days=days), (ERA_LIMPA,))
-        ttb_dist = dict(cur.fetchone())
-
-    # Calcular gaps
-    details = []
-    gap_lt0 = 0   # erpc capturou mais baixo
-    gap_0_5 = 0   # praticamente igual
-    gap_5_20 = 0  # suspeito
-    gap_gt20 = 0  # problema
-    no_ticks = 0
-
-    for r in rows:
-        db_min = r['db_mc_min']
-        tick_min = r['tick_mc_min']
-        ttb = r['time_to_bottom']
-        bounce = r['bounce_pct']
-
-        if tick_min is None or tick_min == 0:
-            gap_pct = None
-            no_ticks += 1
-            status = "no_ticks"
-        else:
-            gap_pct = (float(db_min) - float(tick_min)) / float(tick_min) * 100
-            if gap_pct < 0:
-                gap_lt0 += 1
-                status = "erpc_better"
-            elif gap_pct < 5:
-                gap_0_5 += 1
-                status = "ok"
-            elif gap_pct < 20:
-                gap_5_20 += 1
-                status = "warn"
-            else:
-                gap_gt20 += 1
-                status = "miss"
-
-        # inferir fonte do fundo
-        if ttb is not None and ttb < 1.5:
-            src = "erpc"
-        elif ttb is not None and ttb < 3.0:
-            src = "kline_early"
-        else:
-            src = "kline_late"
-
-        if gap_pct is None or abs(gap_pct) >= min_gap_pct:
-            details.append({
-                "mint": r['mint'],
-                "nome": r['token_nome'] or r['mint'][:8],
-                "ts": r['ts_signal'],
-                "db_min": float(db_min),
-                "tick_min": float(tick_min) if tick_min else None,
-                "gap_pct": gap_pct,
-                "ttb": ttb,
-                "bounce": float(bounce) if bounce else None,
-                "ticks": r['tick_count'] or 0,
-                "status": status,
-                "src": src,
-            })
-
-    total_with_ticks = len(details) - no_ticks
-    erpc_pct = gap_lt0 / total_with_ticks if total_with_ticks > 0 else 0
-    miss_pct = (gap_5_20 + gap_gt20) / total_with_ticks if total_with_ticks > 0 else 0
+    import traceback as _tb
 
     CSS = """<style>
     *{box-sizing:border-box}
@@ -36083,129 +35937,231 @@ def debug_bottom_audit():
     .kv{display:flex;gap:24px;flex-wrap:wrap}
     .kv span{color:#8b949e;font-size:10px}
     .kv b{color:#c9d1d9;font-size:15px;display:block}
+    pre{background:#161b22;padding:12px;border-radius:6px;overflow:auto;color:#f85149;font-size:11px}
     </style>"""
 
-    h = f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Bottom Audit</title>{CSS}</head><body>"
-    h += f"<h1>Bottom Audit — Validação do k-gate Fix</h1>"
-    h += f"<p style='color:#8b949e;font-size:10px;margin-bottom:16px'>Últimos {days} dias (pós era limpa 2026-05-21 00:41 UTC) · "
-    h += f"<a href='?days=3' style='color:#58a6ff'>3d</a> · "
-    h += f"<a href='?days=7' style='color:#58a6ff'>7d</a> · "
-    h += f"<a href='?days=14' style='color:#58a6ff'>14d</a> · "
-    h += f"?min_gap=5 para ver apenas suspeitos</p>"
+    try:
+        days = int(request.args.get("days", 7))
+        min_gap_pct = float(request.args.get("min_gap", 0))
+        ERA_LIMPA = "2026-05-21 00:41:00+00"
 
-    # Diagnóstico geral
-    verdict_class = "ok-box" if miss_pct < 0.10 else "warn-box"
-    verdict_icon = "✅" if miss_pct < 0.10 else "⚠️"
-    h += f"<div class='{verdict_class}'>"
-    h += f"<b>{verdict_icon} Fix status: "
-    if miss_pct < 0.05:
-        h += "EXCELENTE — erpc capturando fundos em tempo real"
-    elif miss_pct < 0.10:
-        h += "BOM — poucos misses"
-    elif miss_pct < 0.25:
-        h += "MODERADO — alguns misses, investigar"
-    else:
-        h += "PROBLEMA — muitos misses, fix pode não estar funcionando"
-    h += "</b><br>"
-    h += f"<span class='grey'>erpc melhor que kline: {gap_lt0} ({erpc_pct:.0%}) · "
-    h += f"gap 0-5%: {gap_0_5} · "
-    h += f"gap 5-20% (suspeito): <span class='{'yellow' if gap_5_20 > 0 else 'grey'}'>{gap_5_20}</span> · "
-    h += f"gap >20% (miss): <span class='{'red' if gap_gt20 > 0 else 'grey'}'>{gap_gt20}</span> · "
-    h += f"sem ticks: {no_ticks}</span>"
-    h += "</div>"
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT
+                    b.mint,
+                    b.ts_signal,
+                    b.mc_min                    AS db_mc_min,
+                    b.elapsed_sec               AS elapsed_sec,
+                    b.bounce_pct                AS bounce_pct,
+                    m.token_nome,
+                    m.ts_migration,
+                    (
+                        SELECT MIN(LEAST(COALESCE(t.mc_low, t.mc), t.mc))
+                        FROM token_ticks t
+                        WHERE t.mint = b.mint
+                          AND t.ts >= m.ts_migration
+                          AND t.ts <= b.ts_signal + INTERVAL '30 seconds'
+                    ) AS tick_mc_min,
+                    (
+                        SELECT COUNT(*)
+                        FROM token_ticks t
+                        WHERE t.mint = b.mint
+                          AND t.ts >= m.ts_migration
+                          AND t.ts <= b.ts_signal + INTERVAL '30 seconds'
+                    ) AS tick_count
+                FROM bounce_signals b
+                JOIN migrations m ON m.mint = b.mint
+                WHERE b.ts_signal >= NOW() - INTERVAL '{days} days'
+                  AND b.ts_signal >= %(era)s
+                  AND b.mc_min IS NOT NULL
+                  AND m.ts_migration IS NOT NULL
+                ORDER BY b.ts_signal DESC
+                LIMIT 200
+            """.format(days=days), {"era": ERA_LIMPA})
+            rows = cur.fetchall()
 
-    # Resumo estatístico
-    avg_ttb = summary.get('avg_ttb')
-    med_ttb = summary.get('median_ttb')
-    h += "<h2>Resumo Estatístico</h2>"
-    h += "<div class='kv box'>"
-    h += f"<div><span>Bounces (era limpa)</span><b class='blue'>{summary.get('total_bounces',0)}</b></div>"
-    h += f"<div><span>TTB < 1.5min (erpc)</span><b class='green'>{summary.get('fast_bottom',0)}</b></div>"
-    h += f"<div><span>TTB ≥ 1.5min (kline)</span><b class='yellow'>{summary.get('slow_bottom',0)}</b></div>"
-    h += f"<div><span>TTB médio</span><b>{f'{avg_ttb:.1f}min' if avg_ttb else 'N/A'}</b></div>"
-    h += f"<div><span>TTB mediana</span><b>{f'{med_ttb:.1f}min' if med_ttb else 'N/A'}</b></div>"
-    _avg_bp = summary.get('avg_bounce_pct')
-    _avg_bp_str = f"{_avg_bp*100:.0f}%" if _avg_bp else "N/A"
-    h += f"<div><span>Bounce% médio</span><b>{_avg_bp_str}</b></div>"
-    h += "</div>"
+            cur.execute("""
+                SELECT
+                    COUNT(*)                                                        AS total,
+                    COUNT(*) FILTER (WHERE elapsed_sec IS NOT NULL AND elapsed_sec < 90)  AS fast,
+                    COUNT(*) FILTER (WHERE elapsed_sec IS NOT NULL AND elapsed_sec >= 90) AS slow,
+                    AVG(elapsed_sec)     FILTER (WHERE elapsed_sec IS NOT NULL)    AS avg_sec,
+                    AVG(bounce_pct)      FILTER (WHERE bounce_pct  IS NOT NULL)    AS avg_bp
+                FROM bounce_signals
+                WHERE ts_signal >= NOW() - INTERVAL '{days} days'
+                  AND ts_signal >= %(era)s
+            """.format(days=days), {"era": ERA_LIMPA})
+            sumrow = cur.fetchone()
+            summary = dict(sumrow) if sumrow else {}
 
-    # Distribuição TTB
-    h += "<h2>Distribuição time_to_bottom</h2>"
-    h += "<div class='box'>"
-    total_ttb = sum([
-        ttb_dist.get('lt_30s',0), ttb_dist.get('s30_60s',0), ttb_dist.get('s60_90s',0),
-        ttb_dist.get('s90_3m',0), ttb_dist.get('s3_5m',0), ttb_dist.get('s5_10m',0),
-        ttb_dist.get('gt10m',0),
-    ])
-    buckets = [
-        ("< 30s", ttb_dist.get('lt_30s',0), "green", "erpc sub-30s — fix funcionando"),
-        ("30-60s", ttb_dist.get('s30_60s',0), "green", "erpc sub-60s — fix funcionando"),
-        ("60-90s", ttb_dist.get('s60_90s',0), "blue", "erpc pré-kline"),
-        ("90s-3min", ttb_dist.get('s90_3m',0), "yellow", "zona de transição kline/erpc"),
-        ("3-5min", ttb_dist.get('s3_5m',0), "yellow", "kline"),
-        ("5-10min", ttb_dist.get('s5_10m',0), "red", "kline tardio — possível miss erpc"),
-        (">10min", ttb_dist.get('gt10m',0), "red", "kline muito tardio"),
-        ("NULL", ttb_dist.get('null_ttb',0), "grey", "sem dados"),
-    ]
-    h += "<table><tr><th>Faixa TTB</th><th>Count</th><th>%</th><th>Interpretação</th></tr>"
-    for label, cnt, color, interp in buckets:
-        pct = cnt / total_ttb * 100 if total_ttb > 0 else 0
-        bar = "█" * int(pct / 3)
-        h += f"<tr><td>{label}</td><td class='{color}'>{cnt}</td><td class='{color}'>{pct:.0f}% {bar}</td><td class='grey'>{interp}</td></tr>"
-    h += "</table></div>"
+            cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE elapsed_sec < 30)                        AS lt_30s,
+                    COUNT(*) FILTER (WHERE elapsed_sec >= 30  AND elapsed_sec < 60) AS s30_60s,
+                    COUNT(*) FILTER (WHERE elapsed_sec >= 60  AND elapsed_sec < 90) AS s60_90s,
+                    COUNT(*) FILTER (WHERE elapsed_sec >= 90  AND elapsed_sec < 180)AS s90_3m,
+                    COUNT(*) FILTER (WHERE elapsed_sec >= 180 AND elapsed_sec < 300)AS s3_5m,
+                    COUNT(*) FILTER (WHERE elapsed_sec >= 300 AND elapsed_sec < 600)AS s5_10m,
+                    COUNT(*) FILTER (WHERE elapsed_sec >= 600)                      AS gt10m,
+                    COUNT(*) FILTER (WHERE elapsed_sec IS NULL)                     AS null_ttb
+                FROM bounce_signals
+                WHERE ts_signal >= NOW() - INTERVAL '{days} days'
+                  AND ts_signal >= %(era)s
+            """.format(days=days), {"era": ERA_LIMPA})
+            ttb_dist = dict(cur.fetchone() or {})
 
-    # Tabela detalhada
-    h += f"<h2>Detalhes por Bounce ({len(details)} registros · gap ≥ {min_gap_pct:.0f}%)</h2>"
-    h += "<table>"
-    h += "<tr><th>Ts</th><th>Token</th><th>DB mc_min</th><th>Tick mc_min</th><th>Gap%</th><th>TTB</th><th>Bounce%</th><th>Ticks</th><th>Status</th></tr>"
+        # ── calcular gaps ──────────────────────────────────────────
+        details = []
+        gap_lt0 = gap_0_5 = gap_5_20 = gap_gt20 = no_ticks = 0
 
-    status_color = {
-        "erpc_better": "green",
-        "ok": "blue",
-        "warn": "yellow",
-        "miss": "red",
-        "no_ticks": "grey",
-    }
-    status_label = {
-        "erpc_better": "erpc<kline ✓",
-        "ok": "ok (≈)",
-        "warn": "gap 5-20% ⚠",
-        "miss": "MISS >20% ✗",
-        "no_ticks": "sem ticks",
-    }
+        for r in rows:
+            db_min   = float(r['db_mc_min']) if r['db_mc_min'] is not None else None
+            tick_min = float(r['tick_mc_min']) if r['tick_mc_min'] is not None else None
+            elapsed  = r['elapsed_sec']
+            ttb_min  = elapsed / 60.0 if elapsed is not None else None
+            bounce   = float(r['bounce_pct']) if r['bounce_pct'] is not None else None
 
-    for d in details:
-        ts_str = d['ts'].strftime("%m-%d %H:%M") if d['ts'] else "?"
-        nome = d['nome'][:12]
-        db_min_str = f"${d['db_min']/1000:.1f}k" if d['db_min'] else "?"
-        tick_min_str = f"${d['tick_min']/1000:.1f}k" if d['tick_min'] else "N/A"
-        gap_str = f"{d['gap_pct']:+.1f}%" if d['gap_pct'] is not None else "N/A"
-        ttb_str = f"{d['ttb']:.1f}m" if d['ttb'] is not None else "?"
-        bounce_str = f"{d['bounce']*100:.0f}%" if d['bounce'] is not None else "?"
-        color = status_color.get(d['status'], 'grey')
-        label = status_label.get(d['status'], d['status'])
-        mint_link = f"<a href='https://dexscreener.com/solana/{d['mint']}' target='_blank' style='color:#58a6ff'>{nome}</a>"
-        h += f"<tr>"
-        h += f"<td class='grey'>{ts_str}</td>"
-        h += f"<td>{mint_link}</td>"
-        h += f"<td>{db_min_str}</td>"
-        h += f"<td>{tick_min_str}</td>"
-        h += f"<td class='{color}'><b>{gap_str}</b></td>"
-        h += f"<td class='{'green' if d['ttb'] is not None and d['ttb'] < 1.5 else 'yellow'}'>{ttb_str}</td>"
-        h += f"<td>{bounce_str}</td>"
-        h += f"<td class='grey'>{d['ticks']}</td>"
-        h += f"<td class='{color}'>{label}</td>"
-        h += "</tr>"
+            if tick_min is None or tick_min == 0 or db_min is None:
+                gap_pct = None
+                no_ticks += 1
+                status = "no_ticks"
+            else:
+                gap_pct = (db_min - tick_min) / tick_min * 100
+                if gap_pct < 0:
+                    gap_lt0 += 1; status = "erpc_better"
+                elif gap_pct < 5:
+                    gap_0_5 += 1; status = "ok"
+                elif gap_pct < 20:
+                    gap_5_20 += 1; status = "warn"
+                else:
+                    gap_gt20 += 1; status = "miss"
 
-    if not details:
-        h += "<tr><td colspan='9' style='text-align:center;color:#8b949e'>Sem dados para o período selecionado</td></tr>"
-    h += "</table>"
+            if gap_pct is None or abs(gap_pct) >= min_gap_pct:
+                details.append({
+                    "mint":     r['mint'],
+                    "nome":     (r['token_nome'] or r['mint'])[:12],
+                    "ts":       r['ts_signal'],
+                    "db_min":   db_min,
+                    "tick_min": tick_min,
+                    "gap_pct":  gap_pct,
+                    "ttb_min":  ttb_min,
+                    "bounce":   bounce,
+                    "ticks":    int(r['tick_count'] or 0),
+                    "status":   status,
+                })
 
-    h += "<p style='color:#8b949e;font-size:10px'>Gap% = (DB mc_min - tick mc_min) / tick mc_min. "
-    h += "Gap negativo = erpc capturou fundo mais baixo que os ticks kline (comportamento correto). "
-    h += "Gap positivo = kline viu fundo mais baixo que o DB registrou (possível miss erpc).</p>"
-    h += "</body></html>"
-    return h
+        total_w = len(details) - no_ticks
+        erpc_pct = gap_lt0 / total_w if total_w > 0 else 0
+        miss_pct = (gap_5_20 + gap_gt20) / total_w if total_w > 0 else 0
+
+        # ── HTML ────────────────────────────────────────────────────
+        h = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Bottom Audit</title>" + CSS + "</head><body>"
+        h += "<h1>Bottom Audit — Validação do k-gate Fix</h1>"
+        h += "<p style='color:#8b949e;font-size:10px;margin-bottom:16px'>"
+        h += "Últimos " + str(days) + " dias (pós era limpa 2026-05-21) · "
+        h += "<a href='?days=3' style='color:#58a6ff'>3d</a> · "
+        h += "<a href='?days=7' style='color:#58a6ff'>7d</a> · "
+        h += "<a href='?days=14' style='color:#58a6ff'>14d</a> · "
+        h += "?min_gap=5 apenas suspeitos</p>"
+
+        verdict_class = "ok-box" if miss_pct < 0.10 else "warn-box"
+        if miss_pct < 0.05:
+            verdict = "EXCELENTE — erpc capturando fundos em tempo real"
+        elif miss_pct < 0.10:
+            verdict = "BOM — poucos misses"
+        elif miss_pct < 0.25:
+            verdict = "MODERADO — alguns misses, investigar"
+        else:
+            verdict = "PROBLEMA — muitos misses, k-gate fix pode não estar ativo"
+
+        h += "<div class='" + verdict_class + "'>"
+        h += "<b>Fix status: " + verdict + "</b><br>"
+        h += "<span class='grey'>erpc melhor que kline: " + str(gap_lt0) + " (" + f"{erpc_pct:.0%}" + ") · "
+        h += "gap 0-5%: " + str(gap_0_5) + " · "
+        gap_5_20_color = "yellow" if gap_5_20 > 0 else "grey"
+        gap_gt20_color = "red" if gap_gt20 > 0 else "grey"
+        h += "gap 5-20%: <span class='" + gap_5_20_color + "'>" + str(gap_5_20) + "</span> · "
+        h += "gap >20% (miss): <span class='" + gap_gt20_color + "'>" + str(gap_gt20) + "</span> · "
+        h += "sem ticks: " + str(no_ticks) + "</span></div>"
+
+        # Resumo
+        avg_sec = summary.get('avg_sec')
+        avg_bp  = summary.get('avg_bp')
+        avg_ttb_str = f"{avg_sec/60:.1f}min" if avg_sec is not None else "N/A"
+        avg_bp_str  = f"{avg_bp*100:.0f}%" if avg_bp is not None else "N/A"
+        h += "<h2>Resumo</h2><div class='kv box'>"
+        h += "<div><span>Bounces era limpa</span><b class='blue'>" + str(summary.get('total', 0)) + "</b></div>"
+        h += "<div><span>elapsed &lt; 90s (erpc)</span><b class='green'>" + str(summary.get('fast', 0)) + "</b></div>"
+        h += "<div><span>elapsed ≥ 90s (kline)</span><b class='yellow'>" + str(summary.get('slow', 0)) + "</b></div>"
+        h += "<div><span>elapsed médio</span><b>" + avg_ttb_str + "</b></div>"
+        h += "<div><span>bounce% médio</span><b>" + avg_bp_str + "</b></div>"
+        h += "</div>"
+
+        # Distribuição elapsed
+        buckets = [
+            ("&lt; 30s",  ttb_dist.get('lt_30s',  0), "green",  "erpc sub-30s"),
+            ("30-60s",    ttb_dist.get('s30_60s',  0), "green",  "erpc sub-60s"),
+            ("60-90s",    ttb_dist.get('s60_90s',  0), "blue",   "erpc/kline overlap"),
+            ("90s-3min",  ttb_dist.get('s90_3m',   0), "yellow", "kline"),
+            ("3-5min",    ttb_dist.get('s3_5m',    0), "yellow", "kline"),
+            ("5-10min",   ttb_dist.get('s5_10m',   0), "red",    "kline tardio"),
+            ("&gt;10min", ttb_dist.get('gt10m',    0), "red",    "kline muito tardio"),
+            ("NULL",      ttb_dist.get('null_ttb', 0), "grey",   "sem elapsed_sec"),
+        ]
+        total_ttb = sum(v for _, v, _, _ in buckets[:-1])
+        h += "<h2>Distribuição elapsed_sec</h2><div class='box'>"
+        h += "<table><tr><th>Faixa</th><th>n</th><th>%</th><th>Fonte esperada</th></tr>"
+        for label, cnt, color, interp in buckets:
+            pct = cnt / total_ttb * 100 if total_ttb > 0 else 0
+            bar = "█" * int(pct / 3)
+            h += "<tr><td>" + label + "</td>"
+            h += "<td class='" + color + "'>" + str(cnt) + "</td>"
+            h += "<td class='" + color + "'>" + f"{pct:.0f}%" + " " + bar + "</td>"
+            h += "<td class='grey'>" + interp + "</td></tr>"
+        h += "</table></div>"
+
+        # Tabela detalhada
+        h += "<h2>Detalhes (" + str(len(details)) + " registros)</h2>"
+        h += "<table><tr><th>Ts</th><th>Token</th><th>DB mc_min</th><th>Tick mc_min</th>"
+        h += "<th>Gap%</th><th>elapsed</th><th>Bounce%</th><th>Ticks</th><th>Status</th></tr>"
+
+        STATUS_COLOR = {"erpc_better":"green","ok":"blue","warn":"yellow","miss":"red","no_ticks":"grey"}
+        STATUS_LABEL = {"erpc_better":"erpc<kline ✓","ok":"ok (≈)","warn":"5-20% ⚠","miss":"MISS ✗","no_ticks":"sem ticks"}
+
+        for d in details:
+            ts_str     = d['ts'].strftime("%m-%d %H:%M") if d['ts'] else "?"
+            db_str     = f"${d['db_min']/1000:.1f}k"   if d['db_min']   is not None else "?"
+            tick_str   = f"${d['tick_min']/1000:.1f}k" if d['tick_min'] is not None else "N/A"
+            gap_str    = f"{d['gap_pct']:+.1f}%"        if d['gap_pct']  is not None else "N/A"
+            ttb_str    = f"{d['ttb_min']:.1f}m"         if d['ttb_min']  is not None else "?"
+            bounce_str = f"{d['bounce']*100:.0f}%"      if d['bounce']   is not None else "?"
+            color      = STATUS_COLOR.get(d['status'], 'grey')
+            label      = STATUS_LABEL.get(d['status'], d['status'])
+            mint_link  = "<a href='https://dexscreener.com/solana/" + d['mint'] + "' target='_blank' style='color:#58a6ff'>" + d['nome'] + "</a>"
+            ttb_color  = "green" if d['ttb_min'] is not None and d['ttb_min'] < 1.5 else "yellow"
+            h += "<tr>"
+            h += "<td class='grey'>" + ts_str + "</td>"
+            h += "<td>" + mint_link + "</td>"
+            h += "<td>" + db_str + "</td>"
+            h += "<td>" + tick_str + "</td>"
+            h += "<td class='" + color + "'><b>" + gap_str + "</b></td>"
+            h += "<td class='" + ttb_color + "'>" + ttb_str + "</td>"
+            h += "<td>" + bounce_str + "</td>"
+            h += "<td class='grey'>" + str(d['ticks']) + "</td>"
+            h += "<td class='" + color + "'>" + label + "</td>"
+            h += "</tr>"
+
+        if not details:
+            h += "<tr><td colspan='9' style='text-align:center;color:#8b949e'>Sem dados</td></tr>"
+        h += "</table>"
+        h += "<p class='grey'>Gap% negativo = erpc capturou fundo mais baixo que kline (correto). Positivo = kline viu menor (miss erpc).</p>"
+        h += "</body></html>"
+        return h
+
+    except Exception:
+        err = _tb.format_exc()
+        return "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Bottom Audit Error</title>" + CSS + "</head><body>" \
+               "<h1 class='red'>Erro em /debug/bottom-audit</h1><pre>" + err + "</pre></body></html>", 500
 
 
 if __name__ == "__main__":
