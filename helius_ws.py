@@ -407,7 +407,7 @@ class HeliusWS:
 
     _ABSORPTION_MAXLEN     = 300
     _ABSORPTION_WINDOW_SEC = 90
-    _MIN_POOL_SOL = float(os.getenv("MIN_POOL_SOL", "10"))
+    _MIN_POOL_SOL = float(os.getenv("MIN_POOL_SOL", "2"))
 
     def __init__(self, on_price: Callable):
         """on_price(mint, mc_usd, *, event_ts=None) — compatível com HotMonitor.push_mc."""
