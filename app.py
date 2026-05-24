@@ -36164,5 +36164,290 @@ def debug_bottom_audit():  # noqa: C901
                "<h1 class='red'>Erro em /debug/bottom-audit</h1><pre>" + err + "</pre></body></html>", 500
 
 
+@app.route("/debug/mint-trace")
+def debug_mint_trace():
+    """
+    Reconstrói a curva de preço on-chain de um token via Helius getSignaturesForAddress
+    e compara com o que erpc/DB registrou.
+
+    Parâmetros:
+        ?mint=<address>   — mint do token (obrigatório)
+        ?window=25        — minutos a observar após ts_migration (default 25)
+    """
+    import struct
+    import base64
+    import traceback as _tb
+    import base58 as _b58
+
+    CSS = """<style>
+    *{box-sizing:border-box}
+    body{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;font-size:11px;padding:16px}
+    h1{color:#58a6ff;font-size:15px;margin-bottom:4px}
+    h2{color:#e3b341;font-size:12px;margin:16px 0 6px;border-bottom:1px solid #30363d;padding-bottom:3px}
+    table{width:100%;border-collapse:collapse;margin-bottom:12px}
+    th{background:#161b22;color:#8b949e;padding:4px 8px;text-align:right;border-bottom:1px solid #30363d;font-size:10px}
+    th:first-child{text-align:left}
+    td{padding:3px 8px;border-bottom:1px solid #21262d;text-align:right;font-size:10px}
+    td:first-child{text-align:left;font-family:monospace}
+    .red{color:#f85149}.green{color:#3fb950}.yellow{color:#d29922}.blue{color:#58a6ff}.grey{color:#8b949e}
+    .box{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px 14px;margin-bottom:10px}
+    pre{background:#161b22;padding:10px;border-radius:4px;overflow:auto;color:#f85149;font-size:10px}
+    .star{color:#f0e040;font-weight:bold}
+    </style>"""
+
+    try:
+        mint = request.args.get("mint", "").strip()
+        window_min = int(request.args.get("window", 25))
+
+        if not mint:
+            return "?mint=<address> obrigatório", 400
+
+        # ── 1. Contexto do DB ───────────────────────────────────────────
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT token_nome, ts_migration, mc_migration, exchange
+                FROM migrations WHERE mint = %s
+            """, (mint,))
+            mig = cur.fetchone()
+
+            cur.execute("""
+                SELECT ts_signal, mc_min, mc_at_signal, bounce_pct, elapsed_sec
+                FROM bounce_signals WHERE mint = %s
+            """, (mint,))
+            bounce = cur.fetchone()
+
+            cur.execute("""
+                SELECT tick_ts, elapsed_sec, mc, mc_low, mc_high, source
+                FROM token_ticks
+                WHERE mint = %s
+                ORDER BY tick_ts
+            """, (mint,))
+            ticks = cur.fetchall()
+
+            cur.execute("""
+                SELECT id, ts_signal, entry_expected, status, pnl_pct_real
+                FROM trades WHERE mint = %s ORDER BY ts_signal DESC LIMIT 3
+            """, (mint,))
+            trades = cur.fetchall()
+
+        if not mig:
+            return f"Mint {mint[:12]}... não encontrado no DB", 404
+
+        ts_mig  = mig['ts_migration']
+        nome    = mig['token_nome'] or mint[:8]
+        mc_mig  = mig['mc_migration']
+        sol_usd = gmgn._sol_usd_cached if hasattr(gmgn, '_sol_usd_cached') else 85.0
+
+        # ── 2. Constantes de parsing (duplicadas do helius_ws) ──────────
+        import hashlib
+        def _anchor_disc(name: str) -> bytes:
+            return hashlib.sha256(f"event:{name}".encode()).digest()[:8]
+
+        BUY_DISC  = _anchor_disc("BuyEvent")
+        SELL_DISC = _anchor_disc("SellEvent")
+        TOKEN_DEC = 6
+        SOL_DEC   = 9
+
+        def _parse_event_from_b64(b64data: str) -> dict | None:
+            try:
+                raw = base64.b64decode(b64data)
+                if len(raw) < 72:
+                    return None
+                disc = raw[:8]
+                if disc not in (BUY_DISC, SELL_DISC):
+                    return None
+                pool_base  = struct.unpack_from("<Q", raw, 48)[0]
+                pool_quote = struct.unpack_from("<Q", raw, 56)[0]
+                if pool_base == 0 or pool_quote == 0:
+                    return None
+                side = "buy" if disc == BUY_DISC else "sell"
+                price_sol = (pool_quote / 10**SOL_DEC) / (pool_base / 10**TOKEN_DEC)
+                supply    = 1_000_000_000
+                mc        = price_sol * sol_usd * supply
+                pq_sol    = pool_quote / 10**SOL_DEC
+                return {"mc": mc, "side": side, "pool_quote_sol": pq_sol,
+                        "pool_base": pool_base, "pool_quote": pool_quote}
+            except Exception:
+                return None
+
+        # ── 3. Helius: busca assinaturas na janela pós-migração ─────────
+        from helius_rpc import _rpc, available as _helius_ok
+        PAMP = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+
+        onchain = []   # lista de {slot, ts, sig, mc, side, pool_quote_sol, source}
+
+        if _helius_ok() and ts_mig:
+            from datetime import timezone as _tz
+            ts_from = int(ts_mig.replace(tzinfo=_tz.utc).timestamp()) if ts_mig.tzinfo is None else int(ts_mig.timestamp())
+            ts_to   = ts_from + window_min * 60
+
+            # getSignaturesForAddress no mint — filtra apenas txs que mencionam o mint
+            sigs_raw = _rpc("getSignaturesForAddress", [mint, {
+                "limit": 500,
+                "commitment": "confirmed",
+            }])
+
+            if sigs_raw:
+                # Filtra pela janela de tempo
+                sigs_in_window = [
+                    s for s in sigs_raw
+                    if s.get("blockTime") and ts_from <= s["blockTime"] <= ts_to
+                    and not s.get("err")
+                ]
+                sigs_in_window.sort(key=lambda s: s["blockTime"])
+
+                for sig_info in sigs_in_window[:80]:  # max 80 txs
+                    sig = sig_info["signature"]
+                    btime = sig_info["blockTime"]
+                    tx = _rpc("getTransaction", [sig, {
+                        "encoding": "jsonParsed",
+                        "maxSupportedTransactionVersion": 0,
+                        "commitment": "confirmed",
+                    }])
+                    if not tx:
+                        continue
+                    # Verifica se é transação do pAMM
+                    meta = tx.get("meta") or {}
+                    log_msgs = meta.get("logMessages") or []
+                    is_pamm = any(PAMP in msg for msg in log_msgs)
+                    if not is_pamm:
+                        continue
+                    # Extrai Program data do pAMM dos inner instructions
+                    event = None
+                    for ix_group in [meta.get("innerInstructions") or []]:
+                        for inner in ix_group:
+                            for ix in inner.get("instructions") or []:
+                                if ix.get("programId") == PAMP:
+                                    data_b64 = ix.get("data", "")
+                                    event = _parse_event_from_b64(data_b64)
+                                    if event:
+                                        break
+                            if event:
+                                break
+                    # Fallback: tenta nos log messages (formato "Program data: <b64>")
+                    if not event:
+                        for msg in log_msgs:
+                            if msg.startswith("Program data: "):
+                                b64 = msg[len("Program data: "):]
+                                event = _parse_event_from_b64(b64)
+                                if event:
+                                    break
+                    if event:
+                        elapsed = btime - ts_from
+                        onchain.append({
+                            "sig":    sig[:16] + "...",
+                            "ts":     btime,
+                            "elapsed": elapsed,
+                            "mc":     event["mc"],
+                            "side":   event["side"],
+                            "pq_sol": event["pool_quote_sol"],
+                        })
+
+        # ── 4. Mínimos: on-chain vs DB ───────────────────────────────────
+        mc_min_onchain = min((e["mc"] for e in onchain), default=None)
+        mc_min_db      = float(bounce["mc_min"]) if bounce and bounce["mc_min"] else None
+        mc_min_ticks   = min((float(t["mc_low"] or t["mc"]) for t in ticks if (t["mc_low"] or t["mc"])), default=None)
+
+        gap_erpc_vs_onchain = None
+        if mc_min_onchain and mc_min_db:
+            gap_erpc_vs_onchain = (mc_min_db - mc_min_onchain) / mc_min_onchain * 100
+
+        # ── 5. HTML ──────────────────────────────────────────────────────
+        h = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Mint Trace</title>" + CSS + "</head><body>"
+        h += "<h1>Mint Trace — " + nome + "</h1>"
+        h += "<p class='grey'>" + mint + "</p>"
+
+        # Contexto
+        h += "<div class='box'>"
+        h += "<b>" + nome + "</b> &nbsp;·&nbsp; "
+        h += "mc_migration: <b class='blue'>$" + (f"{mc_mig/1000:.1f}k" if mc_mig else "?") + "</b> &nbsp;·&nbsp; "
+        h += "ts_migration: <b>" + (ts_mig.strftime("%m/%d %H:%M:%S") if ts_mig else "?") + " UTC</b><br>"
+        if bounce:
+            h += "DB mc_min: <b class='green'>$" + f"{float(bounce['mc_min'])/1000:.1f}k" + "</b> &nbsp;·&nbsp; "
+            h += "elapsed: <b>" + str(bounce['elapsed_sec']) + "s</b> &nbsp;·&nbsp; "
+            h += "bounce_pct: <b>" + f"{float(bounce['bounce_pct'])*100:.0f}%" + "</b>"
+        h += "</div>"
+
+        # Diagnóstico do gap
+        if mc_min_onchain is not None and mc_min_db is not None:
+            gap_color = "red" if gap_erpc_vs_onchain and gap_erpc_vs_onchain > 3 else "green"
+            h += "<h2>Diagnóstico do Gap</h2><div class='box'>"
+            h += "On-chain mínimo: <b class='yellow'>$" + f"{mc_min_onchain/1000:.2f}k" + "</b> &nbsp;·&nbsp; "
+            h += "DB mc_min (erpc): <b class='blue'>$" + f"{mc_min_db/1000:.2f}k" + "</b> &nbsp;·&nbsp; "
+            h += "Gap: <b class='" + gap_color + "'>" + (f"{gap_erpc_vs_onchain:+.1f}%" if gap_erpc_vs_onchain is not None else "?") + "</b><br>"
+            if mc_min_ticks:
+                h += "Tick mc_low mínimo (kline): <b>$" + f"{mc_min_ticks/1000:.2f}k" + "</b>"
+            h += "</div>"
+        elif not _helius_ok():
+            h += "<div class='box'><span class='red'>Helius RPC não configurado — apenas dados do DB disponíveis</span></div>"
+        elif not onchain:
+            h += "<div class='box'><span class='yellow'>Nenhuma transação pAMM encontrada na janela de " + str(window_min) + "min. "
+            h += "Tente aumentar ?window=40</span></div>"
+
+        # Tabela on-chain
+        if onchain:
+            mc_floor = mc_min_onchain or 0
+            h += "<h2>Transações on-chain — pAMM (" + str(len(onchain)) + " txs, janela " + str(window_min) + "min)</h2>"
+            h += "<table><tr><th>Elapsed</th><th>Side</th><th>MC</th><th>pool SOL</th><th>Δ from min</th><th>Sig</th></tr>"
+            for e in onchain:
+                elapsed_s = e['elapsed']
+                side_color = "green" if e['side'] == "buy" else "red"
+                mc_val = e['mc']
+                delta = (mc_val - mc_floor) / mc_floor * 100 if mc_floor > 0 else 0
+                is_min = abs(mc_val - mc_floor) < 1
+                star = " ★" if is_min else ""
+                mc_color = "yellow" if is_min else ("green" if e['side'] == "buy" else "red")
+                h += "<tr>"
+                h += "<td class='grey'>+" + str(elapsed_s) + "s</td>"
+                h += "<td class='" + side_color + "'>" + e['side'] + "</td>"
+                h += "<td class='" + mc_color + "'><b>$" + f"{mc_val/1000:.2f}k" + star + "</b></td>"
+                h += "<td class='grey'>" + f"{e['pq_sol']:.1f}" + " SOL</td>"
+                h += "<td class='grey'>+" + f"{delta:.0f}%" + "</td>"
+                h += "<td class='grey'>" + e['sig'] + "</td>"
+                h += "</tr>"
+            h += "</table>"
+
+        # Tabela token_ticks do DB
+        if ticks:
+            h += "<h2>Token Ticks DB (" + str(len(ticks)) + " registros)</h2>"
+            h += "<table><tr><th>Ts</th><th>Elapsed</th><th>Source</th><th>mc_low</th><th>mc (close)</th></tr>"
+            for t in ticks:
+                mc_low = t['mc_low']
+                mc_c   = t['mc']
+                low_str  = ("$" + f"{float(mc_low)/1000:.2f}k") if mc_low else "-"
+                mc_str   = ("$" + f"{float(mc_c)/1000:.2f}k") if mc_c else "-"
+                src_color = "green" if t['source'] == 'kline' else "grey"
+                h += "<tr>"
+                h += "<td>" + (t['tick_ts'].strftime("%H:%M:%S") if t['tick_ts'] else "?") + "</td>"
+                h += "<td class='grey'>" + str(t['elapsed_sec']) + "s</td>"
+                h += "<td class='" + src_color + "'>" + (t['source'] or "?") + "</td>"
+                h += "<td class='green'>" + low_str + "</td>"
+                h += "<td>" + mc_str + "</td>"
+                h += "</tr>"
+            h += "</table>"
+
+        # Trades
+        if trades:
+            h += "<h2>Trades</h2><div class='box'>"
+            for t in trades:
+                status_color = "green" if t['status'] in ('tp','trailing_active') else "red"
+                h += "#" + str(t['id']) + " · " + (t['ts_signal'].strftime("%H:%M:%S") if t['ts_signal'] else "?")
+                h += " · entry_expected: $" + f"{float(t['entry_expected'])/1000:.2f}k" if t['entry_expected'] else ""
+                h += " · <span class='" + status_color + "'>" + (t['status'] or "?") + "</span>"
+                if t['pnl_pct_real']:
+                    h += " · pnl: " + f"{float(t['pnl_pct_real'])*100:+.1f}%"
+                h += "<br>"
+            h += "</div>"
+
+        h += "<p class='grey'>★ = mínimo on-chain · Gap positivo = erpc registrou mais alto que o real</p>"
+        h += "</body></html>"
+        return h
+
+    except Exception:
+        err = _tb.format_exc()
+        return "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Mint Trace Error</title>" + CSS + "</head><body>" \
+               "<h1 class='red'>Erro</h1><pre>" + err + "</pre></body></html>", 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
