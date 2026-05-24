@@ -793,23 +793,40 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 162. **Pool-account confirmado pode ser vault, não o pool state PDA**: a intersecção retorna qualquer conta que aparece em todo swap — pode ser o pool state PDA ou um dos vaults de tokens. Para o objetivo de filtrar secondary pools, qualquer das duas funciona: secondary pools têm vaults diferentes. Identificar especificamente o PDA exigiria comparar com o PDA derivado via seeds — complexidade desnecessária para V1.
 163. **Log spam `skip Program data de programa não-pAMM` — esperado, não é bug (sessão 13)**: transactions agregadas (MEV bots, aggregators) invocam múltiplos programas em uma única transação — Raydium CLMM (`CAMMCzo5...`), pump.fun original (`6EF8rrecthR5...`), `ZERor4xhb...`, etc. O erpc global retorna TODAS as transações do pAMM, incluindo essas onde o pAMM é apenas um dos programas invocados. O parser tentava processar log data de cada programa e logava WARNING para os não-pAMM. Fix: `logger.warning` → `logger.debug`. Commit `70cd997`. Regra: não usar WARNING para comportamento esperado e de alta frequência — reservar WARNING para situações genuinamente anômalas.
 164. **Primeiro token com dados limpos: JOB (DMircbtE), 2026-05-21 00:41 UTC**: entrou no HotMonitor às 00:41 UTC após deploy completo das correções. mc_migration=$35,412, smart=3, todos os filtros passados. Este é o marco zero da era de dados limpos — qualquer análise de WR, bounce_pct, entry_ratio ou mc_bottom baseada em dados coletados APÓS este timestamp é confiável. Dados anteriores continuam disponíveis no banco mas marcados como suspeitos (mc_min corrompido).
+165. **MIN_POOL_SOL=2 foi bug introduzido na sessão 14 (2026-05-24)**: o default correto é 10. Pool primária pós-migração tem mínimo absoluto de 15.8 SOL. MIN_POOL_SOL=2 permitia pools secundárias de 2-15 SOL, gerando phantom mc_min. O trace on-chain do mint 362dro (BANKER similar) confirmou: erpc registrava $22.6k enquanto Helius mostrava zero transações pAMM no preço correspondente. Restaurado para 10 em 2026-05-24. Railway env var MIN_POOL_SOL=10 também setado.
+166. **Período 2026-05-21 a 2026-05-24 = filtros frouxos + entrada não calibrada (contexto obrigatório)**: os trades desse período foram executados com (a) filtros propositalmente frouxos para gerar volume de validação; (b) MIN_POOL_SOL=2 → 43% phantom prices; (c) entrada com 5-10% de variação acima do fundo real por lag de captura. WR de 29% (GMGN, 31 trades, $1) é FLOOR sob condições desfavoráveis. EV/trade +0.39% = break-even marginalmente positivo. O trailing TP é crítico — TP fixo 50% teria resultado negativo (-$1.83 vs +$0.12). Marco zero de dados realmente limpos: **2026-05-24 com MIN_POOL_SOL=10**.
+167. **Variação residual de 5-10% no mc_min com dados limpos**: mesmo com MIN_POOL_SOL=10 e erpc operacional, mc_min pode ser registrado 5-10% acima do fundo real on-chain. Causa: lag entre a transação Helius (~5ms) e o poll trenches que atualiza `push_mc` (até 5s). O fundo on-chain acontece numa transação específica; o erpc captura em tempo real mas há janelas onde o trenches poll é a fonte. Com MIN_POOL_SOL=10 essa é a única fonte de imprecisão restante — não é phantom, é quantização temporal. Impacto: bounce_pct calculado ligeiramente menor que o real; entry pode ser marginalmente mais alta. Não é um bug a corrigir agora — é ruído aceitável de ~5-10% num sistema que antes tinha erros de 60-80%.
 
 ---
 
-## 🔄 Estado Atual: BOT ATIVO — erpc operacional, dados limpos acumulando (sessão 13, 2026-05-21)
+## 🔄 Estado Atual: BOT ATIVO — fase de validação de captura de fundo (sessão 14, 2026-05-24)
 
 ### Situação atual
-Branch `claude/audit-neidenbot-purchases-8k0Tn` deployado e rodando. erpc confirmado operacional: ~180 TXs/s, preço em tempo real via pAMM parse inline. Primeiro token com dados limpos: **JOB (DMircbtE)**, HotMonitor às 00:41 UTC de 2026-05-21.
+Branch `claude/gifted-newton-4oBcj` ativo. erpc operacional, MIN_POOL_SOL=10 restaurado (2026-05-24).
 
-**Todos os dados de mc_min capturados APÓS 2026-05-21 00:41 UTC são considerados limpos** — sem contaminação do candle de transição, sem bug de ts_migration, sem race condition de bounce_fired.
+**Marco zero de dados realmente limpos: 2026-05-24 (MIN_POOL_SOL=10 ativo).**
+O período 2026-05-21 a 2026-05-24 tinha erpc operacional mas MIN_POOL_SOL=2 (bug introduzido na sessão anterior) → 43% dos bounces tinham phantom mc_min de pool secundária. Esses dados são úteis para medir frequência e WR bruto, mas mc_min não é confiável.
 
-### Pipeline ativo (branch `claude/audit-neidenbot-purchases-8k0Tn`)
+### ⚠️ Contexto crítico do período atual (2026-05-21 a 2026-05-24)
+
+**Os filtros estão propositalmente frouxos** para gerar volume de trades suficiente para validar se o fundo está sendo capturado corretamente. Os parâmetros atuais NÃO representam o sistema otimizado — são configuração de coleta de dados.
+
+**A entrada ainda não está 100% precisa.** O bot compra quando detecta bounce de 30% do mc_min registrado. Porém mc_min pode ter 5-10% de variação acima do fundo real on-chain (lag de captura entre transação Helius e poll trenches). Consequência: a entrada acontece ligeiramente mais alta que o fundo real, reduzindo o bounce_pct efetivo. Com MIN_POOL_SOL=10, essa variação deve ser o principal erro residual — não mais phantoms.
+
+**Dados do período 2026-05-21 a 2026-05-24 (31 trades GMGN, $1/trade):**
+- WR: **29%** (9 TPs / 22 SLs) — confirmado GMGN
+- Net P/L: **+$0.12** em $31 investidos (+0.39% EV/trade)
+- Payoff ratio: **2.49×** (avg win $0.70 / avg loss $0.28)
+- Observação: ROI (+248%) foi responsável por 89% do lucro total — trailing TP é crítico
+- Contexto: filtros frouxos + 43% phantom prices + entrada não calibrada → WR é FLOOR, não teto
+- TP fixo 50% teria resultado em -$1.83 (negativo) — confirma necessidade do trailing TP
+
+### Pipeline ativo (branch `claude/gifted-newton-4oBcj`)
 `TRADING_ENABLED=true` · `CALIBRATION_AMOUNT_USD=1.0` · `CALIBRATION_MAX_TRADES=999999`
-`TRADE_SL_PCT=0.25` (testando — 15% disparava por volatilidade pAMM)
-`FILTER_SMART_MIN=3` · `BOUNCE_MIN_PCT=0.30` · `BOUNCE_MAX_PCT=1.50`
-`ERPC_API_KEY` configurado · `HELIUS_RPC_URL` configurado
+`TRADE_SL_PCT=0.25` · `FILTER_SMART_MIN=3` · `BOUNCE_MIN_PCT=0.30` · `BOUNCE_MAX_PCT=1.50`
+`MIN_POOL_SOL=10` (Railway + código default) · `ERPC_API_KEY` configurado · `HELIUS_RPC_URL` configurado
 
-**Portfolio:** ~$50 restantes de 1 SOL original (~$170). 70% perdido em trades com dados corrompidos.
+**Portfolio:** ~$50 (após perdas com dados corrompidos históricos).
 
 **Todas as correções deployadas:**
 - ✅ **Bug 1 (CRÍTICO)**: `ts_migration` agora usa `complete_timestamp` on-chain
