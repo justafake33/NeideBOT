@@ -35931,10 +35931,10 @@ def debug_bottom_audit():
             SELECT
                 b.mint,
                 b.ts_signal,
-                b.mc_min          AS db_mc_min,
-                b.mc_at_signal    AS mc_at_signal,
-                b.time_to_bottom  AS time_to_bottom,
-                b.bounce_pct      AS bounce_pct,
+                b.mc_min                    AS db_mc_min,
+                b.mc_at_signal              AS mc_at_signal,
+                b.elapsed_sec / 60.0        AS time_to_bottom,
+                b.bounce_pct                AS bounce_pct,
                 m.token_nome,
                 m.ts_migration,
                 m.mc_migration,
@@ -35956,7 +35956,7 @@ def debug_bottom_audit():
                       AND t.ts <= b.ts_signal + INTERVAL '30 seconds'
                 ) AS tick_count,
                 (
-                    SELECT COUNT(*) FILTER (WHERE t.source = 'erpc' OR t.mc_low IS NOT NULL)
+                    SELECT COUNT(*) FILTER (WHERE t.mc_low IS NOT NULL)
                     FROM token_ticks t
                     WHERE t.mint = b.mint
                       AND t.ts >= m.ts_migration
@@ -35977,12 +35977,12 @@ def debug_bottom_audit():
         cur.execute("""
             SELECT
                 COUNT(*) as total_bounces,
-                COUNT(*) FILTER (WHERE b.time_to_bottom IS NOT NULL AND b.time_to_bottom < 1.5) as fast_bottom,
-                COUNT(*) FILTER (WHERE b.time_to_bottom IS NOT NULL AND b.time_to_bottom >= 1.5) as slow_bottom,
-                AVG(b.time_to_bottom) FILTER (WHERE b.time_to_bottom IS NOT NULL) as avg_ttb,
-                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY b.time_to_bottom)
-                    FILTER (WHERE b.time_to_bottom IS NOT NULL) as median_ttb,
-                AVG(b.bounce_pct) FILTER (WHERE b.bounce_pct IS NOT NULL) as avg_bounce_pct
+                COUNT(*) FILTER (WHERE elapsed_sec IS NOT NULL AND elapsed_sec < 90) as fast_bottom,
+                COUNT(*) FILTER (WHERE elapsed_sec IS NOT NULL AND elapsed_sec >= 90) as slow_bottom,
+                AVG(elapsed_sec / 60.0) FILTER (WHERE elapsed_sec IS NOT NULL) as avg_ttb,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY elapsed_sec / 60.0)
+                    FILTER (WHERE elapsed_sec IS NOT NULL) as median_ttb,
+                AVG(bounce_pct) FILTER (WHERE bounce_pct IS NOT NULL) as avg_bounce_pct
             FROM bounce_signals b
             WHERE b.ts_signal >= NOW() - INTERVAL '{days} days'
               AND b.ts_signal >= %s
@@ -35992,14 +35992,14 @@ def debug_bottom_audit():
         # Distribuição de time_to_bottom
         cur.execute("""
             SELECT
-                COUNT(*) FILTER (WHERE time_to_bottom < 0.5)  as lt_30s,
-                COUNT(*) FILTER (WHERE time_to_bottom >= 0.5 AND time_to_bottom < 1.0) as s30_60s,
-                COUNT(*) FILTER (WHERE time_to_bottom >= 1.0 AND time_to_bottom < 1.5) as s60_90s,
-                COUNT(*) FILTER (WHERE time_to_bottom >= 1.5 AND time_to_bottom < 3.0) as s90_3m,
-                COUNT(*) FILTER (WHERE time_to_bottom >= 3.0 AND time_to_bottom < 5.0) as s3_5m,
-                COUNT(*) FILTER (WHERE time_to_bottom >= 5.0 AND time_to_bottom < 10.0) as s5_10m,
-                COUNT(*) FILTER (WHERE time_to_bottom >= 10.0) as gt10m,
-                COUNT(*) FILTER (WHERE time_to_bottom IS NULL) as null_ttb
+                COUNT(*) FILTER (WHERE elapsed_sec < 30)  as lt_30s,
+                COUNT(*) FILTER (WHERE elapsed_sec >= 30  AND elapsed_sec < 60) as s30_60s,
+                COUNT(*) FILTER (WHERE elapsed_sec >= 60  AND elapsed_sec < 90) as s60_90s,
+                COUNT(*) FILTER (WHERE elapsed_sec >= 90  AND elapsed_sec < 180) as s90_3m,
+                COUNT(*) FILTER (WHERE elapsed_sec >= 180 AND elapsed_sec < 300) as s3_5m,
+                COUNT(*) FILTER (WHERE elapsed_sec >= 300 AND elapsed_sec < 600) as s5_10m,
+                COUNT(*) FILTER (WHERE elapsed_sec >= 600) as gt10m,
+                COUNT(*) FILTER (WHERE elapsed_sec IS NULL) as null_ttb
             FROM bounce_signals
             WHERE ts_signal >= NOW() - INTERVAL '{days} days'
               AND ts_signal >= %s
