@@ -35960,14 +35960,14 @@ def debug_bottom_audit():  # noqa: C901
                         FROM token_ticks t
                         WHERE t.mint = b.mint
                           AND t.tick_ts >= m.ts_migration
-                          AND t.tick_ts <= b.ts_signal + INTERVAL '30 seconds'
+                          AND t.tick_ts <= b.ts_signal
                     ) AS tick_mc_min,
                     (
                         SELECT COUNT(*)
                         FROM token_ticks t
                         WHERE t.mint = b.mint
                           AND t.tick_ts >= m.ts_migration
-                          AND t.tick_ts <= b.ts_signal + INTERVAL '30 seconds'
+                          AND t.tick_ts <= b.ts_signal
                     ) AS tick_count
                 FROM bounce_signals b
                 JOIN migrations m ON m.mint = b.mint
@@ -36011,8 +36011,11 @@ def debug_bottom_audit():  # noqa: C901
             ttb_dist = dict(cur.fetchone() or {})
 
         # ── calcular gaps ──────────────────────────────────────────
+        # Phantom: erpc viu preço que não existe on-chain (pool secundária).
+        # Critério: gap < -30% OU bounce_pct > 100%.
+        # Valid erpc: gap negativo pequeno = erpc capturou fundo real que kline perdeu.
         details = []
-        gap_lt0 = gap_0_5 = gap_5_20 = gap_gt20 = no_ticks = 0
+        gap_valid = gap_0_5 = gap_5_20 = gap_gt20 = no_ticks = phantom = 0
 
         for r in rows:
             db_min   = float(r['db_mc_min']) if r['db_mc_min'] is not None else None
@@ -36027,14 +36030,22 @@ def debug_bottom_audit():  # noqa: C901
                 status = "no_ticks"
             else:
                 gap_pct = (db_min - tick_min) / tick_min * 100
-                if gap_pct < 0:
-                    gap_lt0 += 1; status = "erpc_better"
+                is_phantom = gap_pct < -30 or (bounce is not None and bounce > 1.0)
+                if is_phantom:
+                    phantom += 1
+                    status = "phantom"
+                elif gap_pct < 0:
+                    gap_valid += 1
+                    status = "erpc_better"
                 elif gap_pct < 5:
-                    gap_0_5 += 1; status = "ok"
+                    gap_0_5 += 1
+                    status = "ok"
                 elif gap_pct < 20:
-                    gap_5_20 += 1; status = "warn"
+                    gap_5_20 += 1
+                    status = "warn"
                 else:
-                    gap_gt20 += 1; status = "miss"
+                    gap_gt20 += 1
+                    status = "miss"
 
             if gap_pct is None or abs(gap_pct) >= min_gap_pct:
                 details.append({
@@ -36051,8 +36062,9 @@ def debug_bottom_audit():  # noqa: C901
                 })
 
         total_w = len(details) - no_ticks
-        erpc_pct = gap_lt0 / total_w if total_w > 0 else 0
-        miss_pct = (gap_5_20 + gap_gt20) / total_w if total_w > 0 else 0
+        valid_pct  = gap_valid / total_w if total_w > 0 else 0
+        phantom_pct = phantom / total_w if total_w > 0 else 0
+        miss_pct   = (gap_5_20 + gap_gt20) / total_w if total_w > 0 else 0
 
         # ── HTML ────────────────────────────────────────────────────
         h = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Bottom Audit</title>" + CSS + "</head><body>"
@@ -36064,25 +36076,32 @@ def debug_bottom_audit():  # noqa: C901
         h += "<a href='?days=14' style='color:#58a6ff'>14d</a> · "
         h += "?min_gap=5 apenas suspeitos</p>"
 
-        verdict_class = "ok-box" if miss_pct < 0.10 else "warn-box"
-        if miss_pct < 0.05:
-            verdict = "EXCELENTE — erpc capturando fundos em tempo real"
-        elif miss_pct < 0.10:
-            verdict = "BOM — poucos misses"
-        elif miss_pct < 0.25:
-            verdict = "MODERADO — alguns misses, investigar"
+        if phantom_pct > 0.20:
+            verdict_class = "warn-box"
+            verdict = "PROBLEMA — " + f"{phantom_pct:.0%}" + " phantom prices (pool secundária)"
+        elif phantom_pct > 0.05:
+            verdict_class = "warn-box"
+            verdict = "ATENÇÃO — " + f"{phantom_pct:.0%}" + " phantoms detectados"
+        elif miss_pct > 0.10:
+            verdict_class = "warn-box"
+            verdict = "MISS ALTO — kline vendo fundo menor que erpc"
         else:
-            verdict = "PROBLEMA — muitos misses, k-gate fix pode não estar ativo"
+            verdict_class = "ok-box"
+            verdict = "OK — erpc capturando fundos reais · " + f"{phantom_pct:.0%}" + " phantoms"
 
         h += "<div class='" + verdict_class + "'>"
-        h += "<b>Fix status: " + verdict + "</b><br>"
-        h += "<span class='grey'>erpc melhor que kline: " + str(gap_lt0) + " (" + f"{erpc_pct:.0%}" + ") · "
-        h += "gap 0-5%: " + str(gap_0_5) + " · "
-        gap_5_20_color = "yellow" if gap_5_20 > 0 else "grey"
-        gap_gt20_color = "red" if gap_gt20 > 0 else "grey"
-        h += "gap 5-20%: <span class='" + gap_5_20_color + "'>" + str(gap_5_20) + "</span> · "
-        h += "gap >20% (miss): <span class='" + gap_gt20_color + "'>" + str(gap_gt20) + "</span> · "
-        h += "sem ticks: " + str(no_ticks) + "</span></div>"
+        h += "<b>Status: " + verdict + "</b><br>"
+        h += "<span class='grey'>"
+        h += "erpc válido (fundo real): <b class='green'>" + str(gap_valid) + " (" + f"{valid_pct:.0%}" + ")</b> · "
+        phantom_color = "red" if phantom > 0 else "grey"
+        h += "phantom (gap>30% ou bounce>100%): <b class='" + phantom_color + "'>" + str(phantom) + " (" + f"{phantom_pct:.0%}" + ")</b> · "
+        h += "≈ kline: " + str(gap_0_5) + " · "
+        miss_color = "yellow" if gap_5_20 > 0 else "grey"
+        gt20_color = "red" if gap_gt20 > 0 else "grey"
+        h += "miss 5-20%: <span class='" + miss_color + "'>" + str(gap_5_20) + "</span> · "
+        h += "miss >20%: <span class='" + gt20_color + "'>" + str(gap_gt20) + "</span> · "
+        h += "sem ticks: " + str(no_ticks)
+        h += "</span></div>"
 
         # Resumo
         avg_sec = summary.get('avg_sec')
@@ -36125,8 +36144,8 @@ def debug_bottom_audit():  # noqa: C901
         h += "<table><tr><th>Ts</th><th>Token</th><th>DB mc_min</th><th>Tick mc_min</th>"
         h += "<th>Gap%</th><th>elapsed</th><th>Bounce%</th><th>Ticks</th><th>Status</th></tr>"
 
-        STATUS_COLOR = {"erpc_better":"green","ok":"blue","warn":"yellow","miss":"red","no_ticks":"grey"}
-        STATUS_LABEL = {"erpc_better":"erpc<kline ✓","ok":"ok (≈)","warn":"5-20% ⚠","miss":"MISS ✗","no_ticks":"sem ticks"}
+        STATUS_COLOR = {"erpc_better":"green","ok":"blue","warn":"yellow","miss":"red","no_ticks":"grey","phantom":"red"}
+        STATUS_LABEL = {"erpc_better":"erpc ✓","ok":"≈kline","warn":"5-20% ⚠","miss":"MISS ✗","no_ticks":"sem ticks","phantom":"PHANTOM ✗"}
 
         for d in details:
             ts_str     = d['ts'].strftime("%m-%d %H:%M") if d['ts'] else "?"
