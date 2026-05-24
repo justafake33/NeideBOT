@@ -35964,13 +35964,13 @@ def debug_bottom_audit():
                 ) AS ticks_with_low
             FROM bounce_signals b
             JOIN migrations m ON m.mint = b.mint
-            WHERE b.ts_signal >= NOW() - INTERVAL '%s days'
+            WHERE b.ts_signal >= NOW() - INTERVAL '{days} days'
               AND b.ts_signal >= %s
               AND b.mc_min IS NOT NULL
               AND m.ts_migration IS NOT NULL
             ORDER BY b.ts_signal DESC
             LIMIT 200
-        """, (days, ERA_LIMPA))
+        """.format(days=days), (ERA_LIMPA,))
         rows = cur.fetchall()
 
         # Resumo por era
@@ -35984,9 +35984,9 @@ def debug_bottom_audit():
                     FILTER (WHERE b.time_to_bottom IS NOT NULL) as median_ttb,
                 AVG(b.bounce_pct) FILTER (WHERE b.bounce_pct IS NOT NULL) as avg_bounce_pct
             FROM bounce_signals b
-            WHERE b.ts_signal >= NOW() - INTERVAL '%s days'
+            WHERE b.ts_signal >= NOW() - INTERVAL '{days} days'
               AND b.ts_signal >= %s
-        """, (days, ERA_LIMPA))
+        """.format(days=days), (ERA_LIMPA,))
         summary = dict(cur.fetchone())
 
         # Distribuição de time_to_bottom
@@ -36001,9 +36001,9 @@ def debug_bottom_audit():
                 COUNT(*) FILTER (WHERE time_to_bottom >= 10.0) as gt10m,
                 COUNT(*) FILTER (WHERE time_to_bottom IS NULL) as null_ttb
             FROM bounce_signals
-            WHERE ts_signal >= NOW() - INTERVAL '%s days'
+            WHERE ts_signal >= NOW() - INTERVAL '{days} days'
               AND ts_signal >= %s
-        """, (days, ERA_LIMPA))
+        """.format(days=days), (ERA_LIMPA,))
         ttb_dist = dict(cur.fetchone())
 
     # Calcular gaps
