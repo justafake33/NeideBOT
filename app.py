@@ -36200,7 +36200,43 @@ def debug_mint_trace():
         window_min = int(request.args.get("window", 25))
 
         if not mint:
-            return "?mint=<address> obrigatório", 400
+            # Mostra lista de bounces recentes para clicar
+            with db._cursor() as cur:
+                cur.execute("""
+                    SELECT b.mint, b.ts_signal, b.mc_min, b.mc_at_signal, b.bounce_pct,
+                           b.elapsed_sec, m.token_nome,
+                           t.status, t.pnl_pct_real
+                    FROM bounce_signals b
+                    JOIN migrations m ON m.mint = b.mint
+                    LEFT JOIN trades t ON t.mint = b.mint
+                        AND t.ts_signal = (SELECT MAX(ts_signal) FROM trades WHERE mint = b.mint)
+                    WHERE b.ts_signal >= NOW() - INTERVAL '7 days'
+                    ORDER BY b.ts_signal DESC LIMIT 60
+                """)
+                rows = cur.fetchall()
+            h = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Mint Trace</title>" + CSS + "</head><body>"
+            h += "<h1>Mint Trace — selecione um token</h1>"
+            h += "<p class='grey'>Últimos 7 dias · clique para analisar</p>"
+            h += "<table><tr><th>Token</th><th>ts_signal</th><th>mc_min</th><th>bounce%</th><th>elapsed</th><th>trade</th></tr>"
+            for r in rows:
+                nome_r   = r['token_nome'] or r['mint'][:8]
+                ts_r     = r['ts_signal'].strftime("%m/%d %H:%M") if r['ts_signal'] else "?"
+                mc_r     = f"${float(r['mc_min'])/1000:.1f}k" if r['mc_min'] else "?"
+                bp_r     = f"{float(r['bounce_pct'])*100:.0f}%" if r['bounce_pct'] else "?"
+                el_r     = str(r['elapsed_sec']) + "s" if r['elapsed_sec'] else "?"
+                st       = r['status'] or ""
+                pnl      = f"{float(r['pnl_pct_real'])*100:+.0f}%" if r['pnl_pct_real'] else ""
+                st_color = "green" if st in ('tp',) else ("red" if st == 'sl' else "grey")
+                h += "<tr onclick=\"location.href='/debug/mint-trace?mint=" + r['mint'] + "'\" style='cursor:pointer'>"
+                h += "<td><b>" + nome_r + "</b></td>"
+                h += "<td class='grey'>" + ts_r + "</td>"
+                h += "<td class='yellow'>" + mc_r + "</td>"
+                h += "<td>" + bp_r + "</td>"
+                h += "<td class='grey'>" + el_r + "</td>"
+                h += "<td class='" + st_color + "'>" + st + " " + pnl + "</td>"
+                h += "</tr>"
+            h += "</table></body></html>"
+            return h
 
         # ── 1. Contexto do DB ───────────────────────────────────────────
         with db._cursor() as cur:
