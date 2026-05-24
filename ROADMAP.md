@@ -1,7 +1,7 @@
 # NeideBOT — Roadmap
 
-**Atualizado:** 2026-05-21 (sessão 13)
-**Estado:** Bot ATIVO · erpc operacional · dados limpos acumulando desde 00:41 UTC 2026-05-21 · branch ativo: `claude/audit-neidenbot-purchases-8k0Tn`
+**Atualizado:** 2026-05-24 (sessão 14)
+**Estado:** Bot ATIVO · erpc operacional · MIN_POOL_SOL=10 restaurado · branch ativo: `claude/gifted-newton-4oBcj`
 
 ---
 
@@ -82,6 +82,113 @@
 ---
 
 ## 🔜 Curto Prazo
+
+---
+
+## 🎯 Plano de Entrada Precisa — 4 Fases (sessão 14, 2026-05-24)
+
+> **Diagnóstico atual (31 trades, $1/trade, WR=29%):**
+> - Problema 1: mc_min com variação residual de 5-10% acima do fundo real on-chain (lag de captura — erpc recebe evento em ~5ms mas mc_min só é atualizado no próximo ciclo de 5s)
+> - Problema 2: latência 1-3s do GMGN HTTP entre detecção e fill → preço move +5-15% entre `_check_bounce()` e a execução real
+> - Contexto atual: filtros frouxos propositalmente para coletar mais trades → WR=29% é FLOOR, não teto
+> - Trailing TP é crítico: responsável por 89% do lucro — TP fixo 50% teria resultado em -$1.83
+
+### Fase 0 — Validar captura do fundo (AGORA) ← EM ANDAMENTO
+
+**Objetivo:** Confirmar que MIN_POOL_SOL=10 eliminou phantoms e que mc_min capturado é confiável.
+
+**Critérios de gate:**
+- Acumular 30 trades com MIN_POOL_SOL=10 ativo (data de início: 2026-05-24)
+- `/debug/bottom-audit` phantom < 5% nos novos trades
+- WR ≥ 25% confirmado GMGN (não DB)
+
+**Ação:** Não mudar nenhum filtro, size ou infraestrutura. Apenas coletar.
+
+**Por que 30 trades:** com 1 change at a time, precisamos de baseline limpa para cada decisão subsequente.
+
+---
+
+### Fase 1 — ENTRY_MAX_BOUNCE_PCT (após Fase 0) ← PRÓXIMO CÓDIGO
+
+**Problema atacado:** bot detecta bounce em 30% do fundo via erpc (~5ms), mas o GMGN HTTP add 1-3s de latência para executar o swap. Nesse intervalo o preço já se moveu +5-15% — a compra acontece significativamente acima do ponto de detecção.
+
+**Solução:** Se no momento da execução o preço corrente já estiver acima de `mc_at_signal × (1 + ENTRY_MAX_BOUNCE_PCT)`, cancelar o trade (não executar o swap).
+
+**Implementação:**
+```python
+# executor.py — _execute(), antes de chamar swap()
+if ENTRY_MAX_BOUNCE_PCT > 0:
+    current_mc = helius_ws.get_latest_mc(mint)  # preço do erpc em tempo real
+    if current_mc and current_mc > bounce_signal['mc_at_signal'] * (1 + ENTRY_MAX_BOUNCE_PCT):
+        logger.warning(f"ENTRY_CANCEL: price moved {(current_mc/bounce_signal['mc_at_signal']-1)*100:.1f}% > {ENTRY_MAX_BOUNCE_PCT*100:.0f}% limit")
+        db.update_trade_status(trade_id, 'cancelled')
+        return
+```
+
+**Env var:** `ENTRY_MAX_BOUNCE_PCT=0.10` (cancela se preço já subiu >10% desde o sinal)
+
+**Calibração:** Começar em 0.10. Se WR sobe mas frequência cai demais, tentar 0.15.
+
+**Gate para ativar:** Fase 0 concluída (30 trades limpos).
+
+---
+
+### Fase 2 — Escala de Capital (após Fase 1 confirmada)
+
+**Regra:** Um salto de cada vez. Só escalar quando WR for confirmado no size atual.
+
+| Gate WR (GMGN, ≥30 trades) | Size alvo | Break-even WR | ATA rent % |
+|-----------------------------|-----------|---------------|------------|
+| WR ≥ 25% (meta atual) | $10/trade | ~12% | 2% |
+| WR ≥ 28% (a $10) | $25/trade | ~11% | 0.8% |
+| WR ≥ 30% (a $25) | $50/trade | ~11% | 0.4% |
+| WR ≥ 35% (a $50) | $100/trade | ~11% | 0.2% |
+
+**Nota:** a $1/trade o ATA rent (~$0.20/SL) representa 20% do investimento — o principal custo. A $10/trade cai para 2% — barreira de escala mínima para a estratégia ser lucrativa estruturalmente.
+
+---
+
+### Fase 3 — ATA Rent Reclaim
+
+**Problema:** Cada SL deixa ATA (Associated Token Account) vazio com ~$0.20 de rent preso. A $1/trade com SL=75%, são ~$0.15/trade em rent bloqueado (75% das vezes).
+
+**Solução curto prazo (manual):** 
+- Toda segunda-feira: acessar GMGN wallet → botão "Reclaim Rent"
+- Recupera ~$0.20 por SL acumulado
+
+**Solução médio prazo (automático):**
+```python
+# Após cada SL confirmado (status='sl'):
+# helius_rpc.close_ata(mint, wallet) → closeAccount instruction → SOL devolvido
+```
+Requer `WALLET_PRIVATE_KEY` configurado (já necessário para Fase 4).
+
+**Gate para automatizar:** Fase 2 ativa (trades a $10+, onde vale o custo de implementação).
+
+---
+
+### Fase 4 — Jupiter Swap (após WR ≥ 30% confirmado)
+
+**Por que:** GMGN cobra 1%×2 = 2% platform fee + não fecha ATA automaticamente. Jupiter = 0% platform fee + fecha ATA no sell → elimina o ATA rent problem.
+
+**Impacto a $10/trade:**
+
+| Custo | GMGN atual | Jupiter + Helius |
+|-------|------------|-----------------|
+| Platform fee | 2% (1%+1%) | 0% |
+| LP fee (DEX) | ~0.25%+0.25% | ~0.25%+0.25% |
+| ATA rent | ~$0.15/trade | ~$0 (fecha no sell) |
+| Tip/priority | ~$0.04 | ~$0.02 |
+| **Total a $10** | **~$0.92 (9.2%)** | **~$0.11 (1.1%)** |
+| Break-even WR | ~28% | ~18% |
+
+**Gate para iniciar:** WR ≥ 30% confirmado GMGN em ≥30 trades a $10+.
+
+**Pré-requisito técnico:** `WALLET_PRIVATE_KEY` (Base58 da wallet Solana) para assinar txs diretamente.
+
+**O que muda no código:** `executor.py` chama `jupiter_client.swap()` em vez de `gmgn.swap()`. TradeMonitor detecta exit via ticks → chama `jupiter_client.swap()` para sell. TP/SL gerenciados internamente (sem `condition_orders` do GMGN).
+
+---
 
 ### 0. DEPLOY DAS CORREÇÕES ← ✅ CONCLUÍDO (sessão 13, 2026-05-21)
 
