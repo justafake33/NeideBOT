@@ -35959,15 +35959,15 @@ def debug_bottom_audit():  # noqa: C901
                         SELECT MIN(LEAST(COALESCE(t.mc_low, t.mc), t.mc))
                         FROM token_ticks t
                         WHERE t.mint = b.mint
-                          AND t.ts >= m.ts_migration
-                          AND t.ts <= b.ts_signal + INTERVAL '30 seconds'
+                          AND t.tick_ts >= m.ts_migration
+                          AND t.tick_ts <= b.ts_signal + INTERVAL '30 seconds'
                     ) AS tick_mc_min,
                     (
                         SELECT COUNT(*)
                         FROM token_ticks t
                         WHERE t.mint = b.mint
-                          AND t.ts >= m.ts_migration
-                          AND t.ts <= b.ts_signal + INTERVAL '30 seconds'
+                          AND t.tick_ts >= m.ts_migration
+                          AND t.tick_ts <= b.ts_signal + INTERVAL '30 seconds'
                     ) AS tick_count
                 FROM bounce_signals b
                 JOIN migrations m ON m.mint = b.mint
