@@ -36315,52 +36315,52 @@ def debug_mint_trace():
 
             sigs_in_window = sorted(all_sigs_map.values(), key=lambda s: s["blockTime"])
 
-                for sig_info in sigs_in_window[:80]:  # max 80 txs
-                    sig = sig_info["signature"]
-                    btime = sig_info["blockTime"]
-                    tx = _rpc("getTransaction", [sig, {
-                        "encoding": "jsonParsed",
-                        "maxSupportedTransactionVersion": 0,
-                        "commitment": "confirmed",
-                    }])
-                    if not tx:
-                        continue
-                    # Verifica se é transação do pAMM
-                    meta = tx.get("meta") or {}
-                    log_msgs = meta.get("logMessages") or []
-                    is_pamm = any(PAMP in msg for msg in log_msgs)
-                    if not is_pamm:
-                        continue
-                    # Extrai Program data do pAMM dos inner instructions
-                    event = None
-                    for ix_group in [meta.get("innerInstructions") or []]:
-                        for inner in ix_group:
-                            for ix in inner.get("instructions") or []:
-                                if ix.get("programId") == PAMP:
-                                    data_b64 = ix.get("data", "")
-                                    event = _parse_event_from_b64(data_b64)
-                                    if event:
-                                        break
-                            if event:
-                                break
-                    # Fallback: tenta nos log messages (formato "Program data: <b64>")
-                    if not event:
-                        for msg in log_msgs:
-                            if msg.startswith("Program data: "):
-                                b64 = msg[len("Program data: "):]
-                                event = _parse_event_from_b64(b64)
+            for sig_info in sigs_in_window[:80]:  # max 80 txs
+                sig = sig_info["signature"]
+                btime = sig_info["blockTime"]
+                tx = _rpc("getTransaction", [sig, {
+                    "encoding": "jsonParsed",
+                    "maxSupportedTransactionVersion": 0,
+                    "commitment": "confirmed",
+                }])
+                if not tx:
+                    continue
+                # Verifica se é transação do pAMM
+                meta = tx.get("meta") or {}
+                log_msgs = meta.get("logMessages") or []
+                is_pamm = any(PAMP in msg for msg in log_msgs)
+                if not is_pamm:
+                    continue
+                # Extrai Program data do pAMM dos inner instructions
+                event = None
+                for ix_group in [meta.get("innerInstructions") or []]:
+                    for inner in ix_group:
+                        for ix in inner.get("instructions") or []:
+                            if ix.get("programId") == PAMP:
+                                data_b64 = ix.get("data", "")
+                                event = _parse_event_from_b64(data_b64)
                                 if event:
                                     break
-                    if event:
-                        elapsed = btime - ts_from
-                        onchain.append({
-                            "sig":    sig[:16] + "...",
-                            "ts":     btime,
-                            "elapsed": elapsed,
-                            "mc":     event["mc"],
-                            "side":   event["side"],
-                            "pq_sol": event["pool_quote_sol"],
-                        })
+                        if event:
+                            break
+                # Fallback: tenta nos log messages (formato "Program data: <b64>")
+                if not event:
+                    for msg in log_msgs:
+                        if msg.startswith("Program data: "):
+                            b64 = msg[len("Program data: "):]
+                            event = _parse_event_from_b64(b64)
+                            if event:
+                                break
+                if event:
+                    elapsed = btime - ts_from
+                    onchain.append({
+                        "sig":    sig[:16] + "...",
+                        "ts":     btime,
+                        "elapsed": elapsed,
+                        "mc":     event["mc"],
+                        "side":   event["side"],
+                        "pq_sol": event["pool_quote_sol"],
+                    })
 
         # ── 4. Mínimos: on-chain vs DB ───────────────────────────────────
         mc_min_onchain = min((e["mc"] for e in onchain), default=None)
