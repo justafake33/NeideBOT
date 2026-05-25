@@ -782,34 +782,17 @@ class HotMonitor:
                     elapsed_min = elapsed_sec / 60
                     if elapsed_sec < 0 or elapsed_sec > 3660:
                         continue
-                    # Ignora o primeiro candle (cobre transição bonding curve → pool).
-                    # O kline low desse candle inclui preços pré-migração e corrompe mc_min.
-                    if elapsed_sec < 90:
-                        continue
+                    # NÃO ignora os primeiros 90s — o gate de 90s foi removido.
+                    # Anteriormente, o low do candle de transição bonding curve → pool era
+                    # escrito em mc_min. Agora o kline NÃO escreve mc_min (erpc é a fonte).
+                    # O candle pode ser inserido em token_ticks normalmente.
 
-                    # 1. Atualiza mc_min com o low desta vela ANTES de checar bounce.
-                    #    Garante que bounce_pct e A.6 usam o fundo correto desta vela.
-                    #
-                    # Hierarquia de fontes para mc_min:
-                    #   1ª) erpc (push_mc com token_data=None) — real-time, sub-segundo
-                    #   2ª) kline (esta função) — candles fechados, elapsed ≥ 90s, contingência
-                    # Atualização monotônica (só reduz) — kline nunca sobe mc_min que erpc já baixou.
                     low_price = _float(c.get("low"))
                     mc_low = low_price * state["total_supply"] if (low_price and low_price > 0) else None
 
-                    if mc_low and mc_low > 0 and mc_low < state["mc_min"]:
-                            candle_dt = datetime.fromtimestamp(candle_ts, tz=timezone.utc)
-                            with self._lock:
-                                inner = self._tokens.get(mint)
-                                if inner and mc_low < inner["mc_min"]:
-                                    inner["mc_min"]   = mc_low
-                                    inner["time_min"] = elapsed_min
-                                    inner["ts_min"]   = candle_dt
-                            db.update_bottom(mint, mc_low, elapsed_min)
-                            logger.info("Fundo(kline) %s: $%.0f em %.1fmin (%.0f%% abaixo ATH)",
-                                        state["symbol"], mc_low, elapsed_min,
-                                        (1 - mc_low / state["mc_migration"]) * 100)
-                            state["mc_min"] = mc_low
+                    # mc_min vem exclusivamente do erpc (push_mc com token_data=None).
+                    # O kline NÃO atualiza mc_min — mantém baseline de decisão monotônico
+                    # e auditável apenas por eventos erpc. mc_low aqui é SOMENTE para ticks.
 
                     # 2. Atualiza mc_max com o CLOSE desta vela (não o high).
                     # Kline high captura spikes intra-candle de transações individuais

@@ -483,13 +483,20 @@ class HeliusWS:
             self._pool_quote_last[mint] = 0.0
             self._ts_subscribe[mint]    = time.time()
 
-        # Deriva PDA da pool primária em thread própria (não bloqueia o caller)
+        # Deriva PDA da pool primária em thread própria (não bloqueia o caller).
+        # Ao confirmar o PDA, pre-seed _pool_account para que a validação de pool-account
+        # proteja imediatamente contra secondary pools — sem depender das 5 TXs de aprendizado.
         def _derive_async():
             pda = _derive_pool_pda(mint)
             if pda:
                 with self._lock:
                     self._pool_pda[mint] = pda
-                logger.info("HeliusWS: PDA %s... → %s...", mint[:8], pda[:8])
+                    # Pre-seed: define pool_account como o PDA antes de qualquer evento.
+                    # Substitui o learning window de 5 TXs — eventos de secondary pools
+                    # são rejeitados imediatamente (PDA não estará nos seus accounts).
+                    if mint not in self._pool_account:
+                        self._pool_account[mint] = pda
+                logger.info("HeliusWS: PDA %s... → %s... (pool pre-seeded)", mint[:8], pda[:8])
             else:
                 logger.warning("HeliusWS: falha ao derivar PDA para %s", mint[:8])
         threading.Thread(target=_derive_async, daemon=True, name=f"pda-{mint[:8]}").start()
@@ -820,13 +827,32 @@ class HeliusWS:
                     else:
                         logger.info("HeliusWS k-gate ESTABLISHED %s: k=%.3e", mint[:8], k_raw)
                 else:
-                    # Check 2 (direcional): k não pode aumentar
+                    # Check 2 (direcional): k não pode aumentar.
+                    # Se pool ainda não confirmada → secondary pool pode ter envenenado k_init.
+                    # Nesse caso: RESET (descarta estado) em vez de REJECT (bloqueia primary).
                     if k_raw > k_est * (1.0 + _K_INCREASE_TOLERANCE):
-                        logger.warning(
-                            "HeliusWS k-gate INCREASE REJECT %s: k=%.3e > k_est=%.3e "
-                            "(secondary pool?)", mint[:8], k_raw, k_est,
-                        )
-                        return False
+                        with self._lock:
+                            pool_known = self._pool_account.get(mint)
+                        if not pool_known:
+                            # Pool não confirmada — provavelmente k_init veio de secondary pool.
+                            # Reset completo: permite que a primary pool estabeleça k do zero.
+                            with self._lock:
+                                self._k_established.pop(mint, None)
+                                self._pool_candidates.pop(mint, None)
+                                self._pre_confirm_min.pop(mint, None)
+                            logger.warning(
+                                "HeliusWS k-gate INCREASE RESET %s: k=%.3e > k_est=%.3e "
+                                "(pool não confirmada — secondary pool hijack? resetando)",
+                                mint[:8], k_raw, k_est,
+                            )
+                            return False  # Processa como INIT na próxima TX
+                        else:
+                            # Pool confirmada — pool-account validation já protege
+                            logger.warning(
+                                "HeliusWS k-gate INCREASE REJECT %s: k=%.3e > k_est=%.3e "
+                                "(pool confirmada — secondary pool?)", mint[:8], k_raw, k_est,
+                            )
+                            return False
                     # Check 3 (safety net): queda de >100x indica k_established corrompido
                     if k_raw < k_est / _K_RATIO_MAX:
                         logger.warning(
@@ -875,15 +901,24 @@ class HeliusWS:
                         # Flush imediato do mínimo da learning window — chamado fora do lock
                         # para não segurar o lock durante o callback _on_price.
                         if _replay_on_confirm is not None:
-                            _replay_mc, _replay_ts = _replay_on_confirm
-                            logger.info(
-                                "HeliusWS erpc_replay %s: source=erpc_replay mint=%s "
-                                "mc_new=$%.0f mc_old=inf event_ts=%.3f "
-                                "reason=pool_confirmed_learning_window_flush",
-                                mint[:8], mint, _replay_mc, _replay_ts,
-                            )
-                            _event_dt = datetime.fromtimestamp(_replay_ts, tz=timezone.utc)
-                            self._on_price(mint, _replay_mc, event_ts=_event_dt)
+                            _replay_mc, _replay_ts, _replay_accs = _replay_on_confirm
+                            # Só replica se a TX que gerou o mínimo continha a pool confirmada.
+                            # Evita phantoms de secondary pools que passaram A.9/k-gate.
+                            if pool_acc in _replay_accs:
+                                logger.info(
+                                    "HeliusWS erpc_replay %s: source=erpc_replay mint=%s "
+                                    "mc_new=$%.0f mc_old=inf event_ts=%.3f "
+                                    "reason=pool_confirmed_learning_window_flush",
+                                    mint[:8], mint, _replay_mc, _replay_ts,
+                                )
+                                _event_dt = datetime.fromtimestamp(_replay_ts, tz=timezone.utc)
+                                self._on_price(mint, _replay_mc, event_ts=_event_dt)
+                            else:
+                                logger.warning(
+                                    "HeliusWS replay_skip %s: mc_min=$%.0f descartado "
+                                    "— pool %s... não estava na TX (phantom secondary pool)",
+                                    mint[:8], _replay_mc, pool_acc[:8],
+                                )
 
             # Pool account validation: após confirmação por intersecção, verifica que o
             # pool account está nos accounts desta transação.
@@ -916,13 +951,16 @@ class HeliusWS:
             # preenchida acima — não é afetada por este gate.
             # Pré-confirmação: bufferiza (mc, event_ts) para replay quando pool confirmar.
             event_ts = time.time()
+            # Guarda accounts desta TX junto com mc para validar no replay.
+            # Evita que secondary pools (que passaram A.9 e k-gate) contaminem o mc_min.
+            event_accounts = set(accounts) if accounts else set()
             with self._lock:
                 pool_confirmed = self._pool_account.get(mint)
                 if not pool_confirmed:
                     cur = self._pre_confirm_min.get(mint)
                     cur_mc = cur[0] if cur else float("inf")
                     if event["mc"] < cur_mc:
-                        self._pre_confirm_min[mint] = (event["mc"], event_ts)
+                        self._pre_confirm_min[mint] = (event["mc"], event_ts, event_accounts)
 
             if not pool_confirmed:
                 logger.debug("HeliusWS price(anchor) %s: $%.0f MC — pool não confirmada, buffering mc_min",
@@ -934,9 +972,17 @@ class HeliusWS:
             # Este fallback cobre o caso em que o flush imediato não ocorreu (ex: sem accounts).
             with self._lock:
                 pre_min_tuple = self._pre_confirm_min.pop(mint, None)
+                lazy_pool = self._pool_account.get(mint)
             if pre_min_tuple is not None:
-                pre_mc, pre_ts = pre_min_tuple
-                if pre_mc < event["mc"]:
+                pre_mc, pre_ts, pre_accs = pre_min_tuple
+                # Validação de pool: só replica se a TX do mínimo continha a pool confirmada.
+                if lazy_pool and lazy_pool not in pre_accs:
+                    logger.warning(
+                        "HeliusWS lazy_replay_skip %s: mc_min=$%.0f descartado "
+                        "— pool %s... ausente na TX (phantom secondary pool)",
+                        mint[:8], pre_mc, lazy_pool[:8],
+                    )
+                elif pre_mc < event["mc"]:
                     logger.info(
                         "HeliusWS erpc_replay %s: source=erpc_replay mint=%s "
                         "mc_new=$%.0f mc_current=$%.0f event_ts=%.3f reason=lazy_flush",
