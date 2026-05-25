@@ -483,13 +483,20 @@ class HeliusWS:
             self._pool_quote_last[mint] = 0.0
             self._ts_subscribe[mint]    = time.time()
 
-        # Deriva PDA da pool primária em thread própria (não bloqueia o caller)
+        # Deriva PDA da pool primária em thread própria (não bloqueia o caller).
+        # Ao confirmar o PDA, pre-seed _pool_account para que a validação de pool-account
+        # proteja imediatamente contra secondary pools — sem depender das 5 TXs de aprendizado.
         def _derive_async():
             pda = _derive_pool_pda(mint)
             if pda:
                 with self._lock:
                     self._pool_pda[mint] = pda
-                logger.info("HeliusWS: PDA %s... → %s...", mint[:8], pda[:8])
+                    # Pre-seed: define pool_account como o PDA antes de qualquer evento.
+                    # Substitui o learning window de 5 TXs — eventos de secondary pools
+                    # são rejeitados imediatamente (PDA não estará nos seus accounts).
+                    if mint not in self._pool_account:
+                        self._pool_account[mint] = pda
+                logger.info("HeliusWS: PDA %s... → %s... (pool pre-seeded)", mint[:8], pda[:8])
             else:
                 logger.warning("HeliusWS: falha ao derivar PDA para %s", mint[:8])
         threading.Thread(target=_derive_async, daemon=True, name=f"pda-{mint[:8]}").start()
@@ -820,13 +827,32 @@ class HeliusWS:
                     else:
                         logger.info("HeliusWS k-gate ESTABLISHED %s: k=%.3e", mint[:8], k_raw)
                 else:
-                    # Check 2 (direcional): k não pode aumentar
+                    # Check 2 (direcional): k não pode aumentar.
+                    # Se pool ainda não confirmada → secondary pool pode ter envenenado k_init.
+                    # Nesse caso: RESET (descarta estado) em vez de REJECT (bloqueia primary).
                     if k_raw > k_est * (1.0 + _K_INCREASE_TOLERANCE):
-                        logger.warning(
-                            "HeliusWS k-gate INCREASE REJECT %s: k=%.3e > k_est=%.3e "
-                            "(secondary pool?)", mint[:8], k_raw, k_est,
-                        )
-                        return False
+                        with self._lock:
+                            pool_known = self._pool_account.get(mint)
+                        if not pool_known:
+                            # Pool não confirmada — provavelmente k_init veio de secondary pool.
+                            # Reset completo: permite que a primary pool estabeleça k do zero.
+                            with self._lock:
+                                self._k_established.pop(mint, None)
+                                self._pool_candidates.pop(mint, None)
+                                self._pre_confirm_min.pop(mint, None)
+                            logger.warning(
+                                "HeliusWS k-gate INCREASE RESET %s: k=%.3e > k_est=%.3e "
+                                "(pool não confirmada — secondary pool hijack? resetando)",
+                                mint[:8], k_raw, k_est,
+                            )
+                            return False  # Processa como INIT na próxima TX
+                        else:
+                            # Pool confirmada — pool-account validation já protege
+                            logger.warning(
+                                "HeliusWS k-gate INCREASE REJECT %s: k=%.3e > k_est=%.3e "
+                                "(pool confirmada — secondary pool?)", mint[:8], k_raw, k_est,
+                            )
+                            return False
                     # Check 3 (safety net): queda de >100x indica k_established corrompido
                     if k_raw < k_est / _K_RATIO_MAX:
                         logger.warning(
