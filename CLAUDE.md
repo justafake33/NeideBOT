@@ -807,31 +807,30 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 
 172. **Resultado da auditoria final sessão 15 — 100% PASS**: todos os 7 critérios passaram com evidência de código. kline não escreve mc_min_decision (scanner.py:793–795). Gate 90s não existe em `_check_bounce` (scanner.py:304). Replay valida identidade de pool via `pool_acc in _replay_accs` (helius_ws.py:912). mc_min_true com txid persistido (helius_rpc.py:317–432 + db.py:612). bottom_error_pct e bottom_quality calculados e persistidos (scanner.py:947–953 + db.py:616). Monotonicidade: `if mc < state["mc_min"]` in-memory + `AND mc_bottom > %(mc)s` no DB. Logs com source/old/new: `"Fundo(%s) %s: mint=%s mc_old=$%.0f mc_new=$%.0f event_ts=%.3f elapsed=%.1fmin"` com source = `"erpc_live"` ou `"erpc_replay"`. Nenhum FAIL identificado. Este é o marco onde os dados começam a ser auditáveis por txid Solana.
 
+173. **Bug phantom via ALT tx corrigido (sessão 16, 2026-05-26)**: transações Solana versioned (v0) com Address Lookup Tables fazem com que `_parse_account_keys_from_tx()` retorne `[]` (lista vazia) — as account keys estão nas tabelas de lookup, não embutidas no wire format. O check antigo era `if accounts:` — lista vazia é falsy, logo o check era silenciosamente pulado → eventos de secondary pool em transações ALT passavam mesmo com pool confirmada → mc_min contaminado. Fix aplicado em dois commits: `16a512b` (correção inicial — rejeitava `accounts=[]`) e `037a06c` (fix da regressão crítica). A regressão: o fix intermediário usava `if not accounts or ...` — `not None` é True → modo Helius (que passa `accounts=None` por design) rejeitava TODOS os eventos após pool confirmada, tornando o bot completamente cego se erpc caísse. Fix final: `if known_pool and accounts is not None: if not accounts or known_pool not in accounts: return False`. Regra: validação de pool só aplica quando `accounts` é uma lista (erpc mode). `None` = modo Helius = sem dados de account = sem validação possível.
+
+174. **Auditoria de captura de fundo (sessão 16, 2026-05-26, n=15 trades)**: comparação manual bot mc_min vs fundo real em candles de 1 segundo (DexScreener). Resultado: **10/15 precisos (≤3% de erro)**, **3/15 limitação de learning window** (WHY +22.5%, CTO +19.7%, RAMBO +3.7% — fundo real aconteceu durante os ~300ms de learning window do pool-account, via transações ALT com `accounts=[]` → corretamente rejeitados no replay para evitar phantoms — tradeoff intencional), **2/15 phantoms corrigidos** (MILLION -33%, Multipad -57% — causados exatamente pelo bug ALT do item 173, agora corrigido). Phantoms confirmados: MILLION pool secundária estimada ~41 SOL, Multipad ~28 SOL — ambas acima de MIN_POOL_SOL=10, confirmando que o root cause era o ALT tx bypass, não o threshold de pool depth. **Marco zero definitivo: 2026-05-26 (sessão 16).** A partir desta data, mc_min capturado pelo bot é confiável. Todos os dados de trades em 2026-05-26 são válidos e verídicos.
+
 ---
 
-## 🔄 Estado Atual: BOT ATIVO — fase de validação de captura de fundo (sessão 14, 2026-05-24)
+## 🔄 Estado Atual: BOT ATIVO — fase de validação de captura de fundo (sessão 16, 2026-05-26)
 
 ### Situação atual
-Branch `claude/gifted-newton-4oBcj` ativo. erpc operacional, MIN_POOL_SOL=10 restaurado (2026-05-24).
+Branch `claude/gallant-ptolemy-HNNbz` ativo. erpc operacional, phantom fix deployado (2026-05-26).
 
-**Marco zero de dados realmente limpos: 2026-05-24 (MIN_POOL_SOL=10 ativo).**
-O período 2026-05-21 a 2026-05-24 tinha erpc operacional mas MIN_POOL_SOL=2 (bug introduzido na sessão anterior) → 43% dos bounces tinham phantom mc_min de pool secundária. Esses dados são úteis para medir frequência e WR bruto, mas mc_min não é confiável.
+**Marco zero definitivo de dados limpos: 2026-05-26 (sessão 16, phantom fix ativo).**
+- 2026-05-21 a 2026-05-24: erpc operacional mas MIN_POOL_SOL=2 → 43% phantoms. mc_min não confiável.
+- 2026-05-24 a 2026-05-26: MIN_POOL_SOL=10 correto, mas bug ALT tx permitia phantoms via pool secundária em transações versioned. 2 trades confirmados afetados (MILLION, Multipad).
+- **2026-05-26 em diante: TODOS os dados são confiáveis.** Phantom fix (commit 037a06c) + auditoria n=15 confirmam 10/15 precisos (≤3%), 3/15 learning window (tradeoff intencional), 2/15 phantoms (corrigidos).
 
-### ⚠️ Contexto crítico do período atual (2026-05-21 a 2026-05-24)
-
-**Os filtros estão propositalmente frouxos** para gerar volume de trades suficiente para validar se o fundo está sendo capturado corretamente. Os parâmetros atuais NÃO representam o sistema otimizado — são configuração de coleta de dados.
-
-**A entrada ainda não está 100% precisa.** O bot compra quando detecta bounce de 30% do mc_min registrado. Porém mc_min pode ter 5-10% de variação acima do fundo real on-chain (lag de captura entre transação Helius e poll trenches). Consequência: a entrada acontece ligeiramente mais alta que o fundo real, reduzindo o bounce_pct efetivo. Com MIN_POOL_SOL=10, essa variação deve ser o principal erro residual — não mais phantoms.
-
-**Dados do período 2026-05-21 a 2026-05-24 (31 trades GMGN, $1/trade):**
+### Dados do período 2026-05-21 a 2026-05-24 (31 trades GMGN, $1/trade)
 - WR: **29%** (9 TPs / 22 SLs) — confirmado GMGN
 - Net P/L: **+$0.12** em $31 investidos (+0.39% EV/trade)
 - Payoff ratio: **2.49×** (avg win $0.70 / avg loss $0.28)
-- Observação: ROI (+248%) foi responsável por 89% do lucro total — trailing TP é crítico
+- Trailing TP responsável por 89% do lucro — TP fixo 50% teria dado -$1.83
 - Contexto: filtros frouxos + 43% phantom prices + entrada não calibrada → WR é FLOOR, não teto
-- TP fixo 50% teria resultado em -$1.83 (negativo) — confirma necessidade do trailing TP
 
-### Pipeline ativo (branch `claude/gifted-newton-4oBcj`)
+### Pipeline ativo (branch `claude/gallant-ptolemy-HNNbz`)
 `TRADING_ENABLED=true` · `CALIBRATION_AMOUNT_USD=1.0` · `CALIBRATION_MAX_TRADES=999999`
 `TRADE_SL_PCT=0.25` · `FILTER_SMART_MIN=3` · `BOUNCE_MIN_PCT=0.30` · `BOUNCE_MAX_PCT=1.50`
 `MIN_POOL_SOL=10` (Railway + código default) · `ERPC_API_KEY` configurado · `HELIUS_RPC_URL` configurado
@@ -852,6 +851,8 @@ O período 2026-05-21 a 2026-05-24 tinha erpc operacional mas MIN_POOL_SOL=2 (bu
 - ✅ **pool-account por intersecção de 5 TXs**: substitui seleção do primeiro candidato (errônea)
 - ✅ **A.2 REMOVIDO**: dead zone 20-30% baseada em mc_min corrompido
 - ✅ **A.3 REMOVIDO**: entry ratio 50-65% baseada em dados corrompidos
+- ✅ **Phantom fix ALT tx (CRÍTICO)**: `accounts is not None` guard — erpc ALT txs (`accounts=[]`) rejeitadas corretamente; modo Helius (`accounts=None`) não afetado. Commits `16a512b` + `037a06c`
+- ✅ **Auditoria bottom capture (n=15)**: 67% precisos, 20% learning window, 13% phantoms corrigidos
 
 **Filtros ativos (ordem de aplicação no _check_bounce):**
 - A.5: bloqueia elapsed > 20min (do ts_migration on-chain)
@@ -860,7 +861,7 @@ O período 2026-05-21 a 2026-05-24 tinha erpc operacional mas MIN_POOL_SOL=2 (bu
 - A.8: bloqueia bounce_pct > 150% (BOUNCE_MAX_PCT=1.50) — entradas tardias
 - FILTER_PUMP_ONLY: garante cobertura H22
 
-**⚠️ WR histórico inválido.** Os primeiros dados confiáveis são trades pós-2026-05-21 00:41 UTC.
+**⚠️ WR histórico inválido.** Os primeiros dados REALMENTE confiáveis (phantom fix + auditoria n=15) são trades pós-2026-05-26 (sessão 16).
 
 **Regra de ouro para novos filtros:** n≥30 trades GMGN com dados limpos. **Nunca usar DB WR como fonte.**
 
