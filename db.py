@@ -131,6 +131,8 @@ def init_db():
             "ADD COLUMN IF NOT EXISTS source_truth      TEXT",
             "ADD COLUMN IF NOT EXISTS bottom_error_pct  DOUBLE PRECISION",
             "ADD COLUMN IF NOT EXISTS bottom_quality    TEXT",
+            # Tiering de qualidade de dados
+            "ADD COLUMN IF NOT EXISTS data_quality      TEXT",
         ]:
             cur.execute(f"ALTER TABLE migrations {col}")
 
@@ -250,6 +252,8 @@ def init_db():
             "ADD COLUMN IF NOT EXISTS dump_top_seller_frac FLOAT",
             # H26 — concentração de buyers na subida (largest_buy / total_buy_vol)
             "ADD COLUMN IF NOT EXISTS buy_concentration FLOAT",
+            # Tiering de qualidade de dados
+            "ADD COLUMN IF NOT EXISTS data_quality      TEXT",
         ]:
             cur.execute(f"ALTER TABLE bounce_signals {col}")
 
@@ -342,6 +346,8 @@ def init_db():
             "ADD COLUMN IF NOT EXISTS config_trailing_drawdown_pct   FLOAT",
             "ADD COLUMN IF NOT EXISTS config_slippage_bps            INT",
             "ADD COLUMN IF NOT EXISTS git_sha                        TEXT",
+            # Tiering de qualidade de dados
+            "ADD COLUMN IF NOT EXISTS data_quality                   TEXT",
         ]:
             try:
                 cur.execute(f"ALTER TABLE trades {col}")
@@ -587,6 +593,104 @@ def update_bottom(mint: str, mc: float, time_to_bottom: float):
         """, {"mint": mint, "mc": mc, "ttb": time_to_bottom})
 
 
+# Timestamps de transição de era (epoch UTC)
+# Era 0: < ERA_CLEAN_START_ERPC — corrompido (ts_migration bug + elapsed_sec bug)
+# Era 1: ERA_CLEAN_START_ERPC to ERA_CLEAN_START_POOLFIX — erpc ativo, MIN_POOL_SOL=2 (43% phantoms)
+# Era 2: >= ERA_CLEAN_START_POOLFIX — dados confiáveis (erpc + MIN_POOL_SOL=10)
+_ERA_ERPC_START   = 1747788060  # 2026-05-21 00:41 UTC (primeiro token limpo JOB)
+_ERA_POOLFIX_START = 1748044800  # 2026-05-24 00:00 UTC (MIN_POOL_SOL=10 restaurado)
+
+
+def _classify_migration_quality(complete_timestamp, bottom_quality):
+    """Retorna (data_quality, truth_source) para um token de migração."""
+    if bottom_quality is not None:
+        return bottom_quality, "onchain_scan"
+    if complete_timestamp and complete_timestamp >= _ERA_POOLFIX_START:
+        return "ok", "none"  # era limpa mas mc_min_true ainda não chegou
+    return "bad", "none"
+
+
+def backfill_data_quality(mint: str = None):
+    """Classifica data_quality em migrations, bounce_signals e trades.
+
+    Se mint=None, processa TODOS os registros com data_quality IS NULL.
+    Se mint=str, processa apenas o token específico (chamado após update_bottom_truth).
+    Regras:
+      - bottom_quality preenchido → herda diretamente (evidência on-chain)
+      - Era 2 (>= 2026-05-24) sem bottom_quality → 'ok'
+      - Era 0/1 → 'bad'
+    Para trades/bounce_signals: herdado de migrations via JOIN. Trades em era < 2026-05-24 → 'bad'.
+    """
+    with _cursor() as cur:
+        mint_filter = "AND m.mint = %(mint)s" if mint else ""
+        params = {"mint": mint} if mint else {}
+        params["era_poolfix"] = _ERA_POOLFIX_START
+
+        # 1. migrations
+        cur.execute(f"""
+            UPDATE migrations m
+               SET data_quality = CASE
+                 WHEN m.bottom_quality IS NOT NULL THEN m.bottom_quality
+                 WHEN m.complete_timestamp >= %(era_poolfix)s THEN 'ok'
+                 ELSE 'bad'
+               END
+             WHERE m.data_quality IS NULL
+               OR  m.data_quality != CASE
+                 WHEN m.bottom_quality IS NOT NULL THEN m.bottom_quality
+                 WHEN m.complete_timestamp >= %(era_poolfix)s THEN 'ok'
+                 ELSE 'bad'
+               END
+               {mint_filter}
+        """, params)
+        n_mig = cur.rowcount
+
+        # 2. bounce_signals — herda de migrations; ts_signal < era_poolfix → 'bad'
+        cur.execute(f"""
+            UPDATE bounce_signals b
+               SET data_quality = CASE
+                 WHEN b.ts_signal < to_timestamp(%(era_poolfix)s) THEN 'bad'
+                 WHEN m.data_quality IS NOT NULL THEN m.data_quality
+                 ELSE 'ok'
+               END
+              FROM migrations m
+             WHERE b.mint = m.mint
+               AND (b.data_quality IS NULL
+                    OR b.data_quality != CASE
+                      WHEN b.ts_signal < to_timestamp(%(era_poolfix)s) THEN 'bad'
+                      WHEN m.data_quality IS NOT NULL THEN m.data_quality
+                      ELSE 'ok'
+                    END)
+               {mint_filter.replace('m.mint', 'b.mint')}
+        """, params)
+        n_bs = cur.rowcount
+
+        # 3. trades — herda de migrations; ts_signal < era_poolfix → 'bad'
+        cur.execute(f"""
+            UPDATE trades t
+               SET data_quality = CASE
+                 WHEN t.ts_signal < to_timestamp(%(era_poolfix)s) THEN 'bad'
+                 WHEN m.data_quality IS NOT NULL THEN m.data_quality
+                 ELSE 'ok'
+               END
+              FROM migrations m
+             WHERE t.mint = m.mint
+               AND (t.data_quality IS NULL
+                    OR t.data_quality != CASE
+                      WHEN t.ts_signal < to_timestamp(%(era_poolfix)s) THEN 'bad'
+                      WHEN m.data_quality IS NOT NULL THEN m.data_quality
+                      ELSE 'ok'
+                    END)
+               {mint_filter.replace('m.mint', 't.mint')}
+        """, params)
+        n_tr = cur.rowcount
+
+    if n_mig + n_bs + n_tr > 0:
+        logger.info(
+            "backfill_data_quality mint=%s: migrations=%d bounce_signals=%d trades=%d",
+            mint or "ALL", n_mig, n_bs, n_tr,
+        )
+
+
 def update_bottom_truth(
     mint: str,
     mc_min_true: float,
@@ -625,6 +729,8 @@ def update_bottom_truth(
             "bottom_error_pct": bottom_error_pct,
             "bottom_quality":   bottom_quality,
         })
+    # Propaga data_quality para trades e bounce_signals deste token
+    backfill_data_quality(mint=mint)
 
 
 def update_lock_percent(mint: str, lock_percent: float):
@@ -708,7 +814,7 @@ def insert_bounce_signal(data: dict):
                  rise_buy_vol, rise_sell_vol, rise_net_flow, rise_events, rise_lrg_buy,
                  pool_quote_at_signal,
                  dump_seller_count, dump_seller_hhi, dump_top_seller_frac,
-                 buy_concentration)
+                 buy_concentration, data_quality)
             VALUES
                 (%(mint)s, %(symbol)s, %(exchange)s, %(elapsed_sec)s, %(mc_migration)s, %(mc_min)s,
                  %(mc_at_signal)s, %(drop_from_mig)s, %(bounce_pct)s,
@@ -721,7 +827,7 @@ def insert_bounce_signal(data: dict):
                  %(rise_events)s, %(rise_lrg_buy)s,
                  %(pool_quote_at_signal)s,
                  %(dump_seller_count)s, %(dump_seller_hhi)s, %(dump_top_seller_frac)s,
-                 %(buy_concentration)s)
+                 %(buy_concentration)s, %(data_quality)s)
             ON CONFLICT (mint) DO UPDATE SET
                 absorption_score       = EXCLUDED.absorption_score,
                 absorption_grade       = EXCLUDED.absorption_grade,
@@ -767,6 +873,7 @@ def insert_bounce_signal(data: dict):
             "dump_seller_hhi":       data.get("dump_seller_hhi"),
             "dump_top_seller_frac":  data.get("dump_top_seller_frac"),
             "buy_concentration":     data.get("buy_concentration"),
+            "data_quality":          _trade_data_quality(data.get("ts_signal"), data.get("mint", "")),
         })
 
 
@@ -1007,8 +1114,27 @@ def get_all_migrations(limit: int = 2000) -> list:
 # Trades — Fase 6-lite
 # ==============================================================================
 
+def _trade_data_quality(ts_signal, mint: str) -> str:
+    """Determina data_quality de um trade no momento da inserção."""
+    import time as _time
+    ts_epoch = ts_signal.timestamp() if hasattr(ts_signal, "timestamp") else float(ts_signal or 0)
+    if ts_epoch < _ERA_POOLFIX_START:
+        return "bad"
+    # era limpa: herdar da migration se disponível
+    try:
+        with _cursor() as cur:
+            cur.execute("SELECT data_quality FROM migrations WHERE mint = %s", (mint,))
+            row = cur.fetchone()
+            if row and row["data_quality"]:
+                return row["data_quality"]
+    except Exception:
+        pass
+    return "ok"
+
+
 def insert_trade(data: dict) -> int:
     """Cria registro de trade. Retorna o id gerado."""
+    dq = _trade_data_quality(data.get("ts_signal"), data.get("mint", ""))
     with _cursor() as cur:
         cur.execute("""
             INSERT INTO trades
@@ -1017,7 +1143,8 @@ def insert_trade(data: dict) -> int:
                  mc_at_signal, bounce_pct_signal, drop_from_mig_signal, signal_elapsed_sec,
                  config_bounce_min_pct, config_bounce_max_pct, config_bounce_drop_min,
                  config_trade_sl_pct, config_trailing_activation_pct,
-                 config_trailing_drawdown_pct, config_slippage_bps, git_sha)
+                 config_trailing_drawdown_pct, config_slippage_bps, git_sha,
+                 data_quality)
             VALUES
                 (%(mint)s, %(symbol)s, %(ts_signal)s, %(mc_bottom)s, %(mc_migration)s,
                  %(entry_expected)s, %(amount_sol)s, %(amount_usd)s,
@@ -1027,9 +1154,10 @@ def insert_trade(data: dict) -> int:
                  %(config_bounce_min_pct)s, %(config_bounce_max_pct)s,
                  %(config_bounce_drop_min)s, %(config_trade_sl_pct)s,
                  %(config_trailing_activation_pct)s, %(config_trailing_drawdown_pct)s,
-                 %(config_slippage_bps)s, %(git_sha)s)
+                 %(config_slippage_bps)s, %(git_sha)s,
+                 %(data_quality)s)
             RETURNING id
-        """, data)
+        """, {**data, "data_quality": dq})
         return cur.fetchone()["id"]
 
 
