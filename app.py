@@ -6289,6 +6289,7 @@ def _start_services():
         logger.warning("DATABASE_URL não configurado — serviços não iniciados")
         return
     db.init_db()
+    db.backfill_data_quality()   # classifica dados históricos na inicialização
     gmgn      = GmgnClient()
     executor  = TradeExecutor(gmgn)
     monitor   = TradeMonitor()
@@ -9631,18 +9632,36 @@ def analise_wr_breakdown():
 
 
 def _wr_breakdown_inner():
-    # Parâmetro opcional: ?since=YYYY-MM-DD (padrão = todos os trades)
+    # Parâmetros opcionais:
+    #   ?since=YYYY-MM-DD    — filtra a partir desta data
+    #   ?tier=good|ok|bad    — filtra por data_quality (Tier A=good, B=ok, C=bad)
     since = request.args.get("since", "")
+    tier  = request.args.get("tier", "")
+    VALID_TIERS = ("good", "ok", "bad")
 
     TP_STATUSES = ("tp", "tp_hit", "trailing_active")
     SL_STATUSES = ("sl", "sl_hit")
 
     with db._cursor() as cur:
         since_clause = "AND t.created_at >= %s" if since else ""
-        params = [since] if since else []
+        tier_clause  = "AND t.data_quality = %s" if tier in VALID_TIERS else ""
+        params = []
+        if since:
+            params.append(since)
+        if tier in VALID_TIERS:
+            params.append(tier)
 
         # Diagnóstico: distribuição de status antes de filtrar
-        cur.execute(f"SELECT status, exit_type, COUNT(*) as n FROM trades {('WHERE created_at >= %s' if since else '')} GROUP BY status, exit_type ORDER BY n DESC", params)
+        where_diag = " AND ".join(filter(None, [
+            f"created_at >= '{since}'" if since else "",
+            f"data_quality = '{tier}'" if tier in VALID_TIERS else "",
+        ]))
+        cur.execute(
+            f"SELECT status, exit_type, COUNT(*) as n FROM trades"
+            f"{(' WHERE ' + where_diag) if where_diag else ''}"
+            f" GROUP BY status, exit_type ORDER BY n DESC"
+        )
+        status_dist = [dict(r) for r in cur.fetchall()]
         status_dist = [dict(r) for r in cur.fetchall()]
 
         cur.execute(f"""
@@ -9696,6 +9715,7 @@ def _wr_breakdown_inner():
             LEFT JOIN migrations     m ON m.mint = t.mint
             WHERE t.status IN ('tp','tp_hit','trailing_active','sl','sl_hit','expired','open','pending')
               {since_clause}
+              {tier_clause}
             ORDER BY t.id ASC
         """, params)
         trades = [dict(r) for r in cur.fetchall()]
@@ -9998,6 +10018,11 @@ tr:hover td{background:#161b22}
     )
 
     since_display = since or "todos os trades"
+    tier_colors = {"good": "#3fb950", "ok": "#d29922", "bad": "#f85149", "": "#8b949e"}
+    tier_labels = {"good": "Tier A — dados confiáveis (mc_min on-chain)", "ok": "Tier B — era limpa sem mc_min_true ainda", "bad": "Tier C — dados corrompidos", "": "todos os tiers"}
+    tier_banner = ""
+    if tier in VALID_TIERS:
+        tier_banner = f"<div style='background:#161b22;border:1px solid {tier_colors[tier]};border-radius:6px;padding:8px 14px;margin:8px 16px;color:{tier_colors[tier]}'><b>Filtro de qualidade: {tier_labels[tier]}</b> — análise restrita a trades data_quality='{tier}'.</div>"
     h = f"""<!DOCTYPE html><html><head><meta charset='utf-8'><title>WR Breakdown</title>{_CSS}</head><body>
 <h1>WR Breakdown — Discriminadores de TP vs SL</h1>
 <div class='nav'>
@@ -10005,10 +10030,15 @@ tr:hover td{background:#161b22}
   <a href='/analise'>Analise</a>
   <a href='/analise/sl-investigation'>SL Investigation</a>
   <a href='/analise/h9'>H9</a>
-  <a href='?since=2026-05-10'>Pós-fix (since 2026-05-10)</a>
+  <a href='/analise/data-quality'>Data Quality</a>
+  <a href='?tier=good'>Tier A (good)</a>
+  <a href='?tier=ok'>Tier B (ok)</a>
+  <a href='?tier=bad'>Tier C (bad)</a>
+  <a href='?since=2026-05-24'>Pós-fix (since 2026-05-24)</a>
   <a href='?'>Todos</a>
 </div>
-<div class='filt'>Filtro ativo: <b>{since_display}</b> | {total} trades fechados (TP+SL) | Baseline WR: <b>{wr_base*100:.1f}%</b> ({n_tp} TP / {n_sl} SL){f" | <span class='yellow'>⏳ {len(open_trades)} pendentes</span>" if open_trades else ""}{f" | <span class='red'>👻 {len(ghost_trades)} sem classificação (expired+pnl=NULL)</span>" if ghost_trades else ""}</div>
+{tier_banner}
+<div class='filt'>Filtro ativo: <b>{since_display}</b>{(' | tier=' + tier) if tier else ''} | {total} trades fechados (TP+SL) | Baseline WR: <b>{wr_base*100:.1f}%</b> ({n_tp} TP / {n_sl} SL){f" | <span class='yellow'>⏳ {len(open_trades)} pendentes</span>" if open_trades else ""}{f" | <span class='red'>👻 {len(ghost_trades)} sem classificação (expired+pnl=NULL)</span>" if ghost_trades else ""}</div>
 <div class='block'>
 <h2>Distribuição de status no DB (diagnóstico)</h2>
 <table><tr><th>status</th><th>exit_type</th><th>n</th><th>tipo</th></tr>{sd_rows}</table>
@@ -10533,6 +10563,155 @@ def analise_wbottom():
         return html
 
     except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
+@app.route("/analise/data-quality")
+def analise_data_quality():
+    """Visão geral da qualidade dos dados — distribuição por tier em migrations, trades e bounce_signals."""
+    try:
+        with db._cursor() as cur:
+            # migrations
+            cur.execute("""
+                SELECT
+                    COALESCE(data_quality, 'unknown') AS tier,
+                    COUNT(*) AS n,
+                    ROUND(AVG(bottom_error_pct) * 100, 1) AS avg_err_pct,
+                    COUNT(txid_min_true) AS n_with_txid
+                FROM migrations
+                GROUP BY 1 ORDER BY 1
+            """)
+            mig_rows = [dict(r) for r in cur.fetchall()]
+
+            cur.execute("SELECT COUNT(*) AS n FROM migrations")
+            n_mig_total = cur.fetchone()["n"]
+
+            # bounce_signals
+            cur.execute("""
+                SELECT COALESCE(data_quality, 'unknown') AS tier, COUNT(*) AS n
+                FROM bounce_signals GROUP BY 1 ORDER BY 1
+            """)
+            bs_rows = [dict(r) for r in cur.fetchall()]
+
+            cur.execute("SELECT COUNT(*) AS n FROM bounce_signals")
+            n_bs_total = cur.fetchone()["n"]
+
+            # trades (fechados — tp/sl)
+            cur.execute("""
+                SELECT
+                    COALESCE(data_quality, 'unknown') AS tier,
+                    COUNT(*) AS n,
+                    ROUND(100.0 * SUM(CASE WHEN status IN ('tp','tp_hit','trailing_active')
+                                           OR exit_type IN ('tp','tp_hit') THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) AS wr_pct,
+                    ROUND(AVG(pnl_pct_real) * 100, 1) AS avg_pnl_pct
+                FROM trades
+                WHERE status IN ('tp','tp_hit','trailing_active','sl','sl_hit','expired')
+                GROUP BY 1 ORDER BY 1
+            """)
+            tr_rows = [dict(r) for r in cur.fetchall()]
+
+            cur.execute("SELECT COUNT(*) AS n FROM trades")
+            n_tr_total = cur.fetchone()["n"]
+
+            # eras definition
+            cur.execute("""
+                SELECT
+                    SUM(CASE WHEN complete_timestamp < 1747788060 THEN 1 ELSE 0 END) AS era0,
+                    SUM(CASE WHEN complete_timestamp >= 1747788060 AND complete_timestamp < 1748044800 THEN 1 ELSE 0 END) AS era1,
+                    SUM(CASE WHEN complete_timestamp >= 1748044800 THEN 1 ELSE 0 END) AS era2,
+                    SUM(CASE WHEN complete_timestamp IS NULL THEN 1 ELSE 0 END) AS era_null
+                FROM migrations
+            """)
+            eras = dict(cur.fetchone())
+
+        def tier_color(t):
+            return {"good": "#3fb950", "ok": "#d29922", "bad": "#f85149"}.get(t, "#8b949e")
+
+        def tier_label(t):
+            return {"good": "A — good (on-chain)", "ok": "B — ok (era limpa)", "bad": "C — bad (corrompido)", "unknown": "? — sem classificação"}.get(t, t)
+
+        def table_rows(rows, total, extra_cols, extra_fn):
+            html = ""
+            for r in rows:
+                t = r["tier"]
+                pct = 100 * r["n"] / total if total else 0
+                extra = extra_fn(r)
+                html += f"<tr><td style='color:{tier_color(t)}'><b>{tier_label(t)}</b></td>"
+                html += f"<td>{r['n']} ({pct:.0f}%)</td>{extra}</tr>"
+            return html
+
+        mig_html = table_rows(mig_rows, n_mig_total, [], lambda r: (
+            f"<td>{r.get('avg_err_pct', '—')}%</td>"
+            f"<td>{'✅ ' + str(r['n_with_txid']) if r['n_with_txid'] else '—'}</td>"
+        ))
+        bs_html = table_rows(bs_rows, n_bs_total, [], lambda r: "")
+        tr_html = table_rows(tr_rows, n_tr_total, [], lambda r: (
+            f"<td>{r.get('wr_pct', '—')}%</td>"
+            f"<td>{r.get('avg_pnl_pct', '—')}%</td>"
+        ))
+
+        CSS = """<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;font-size:12px}
+h1{padding:14px 16px;color:#58a6ff;font-size:16px;border-bottom:1px solid #21262d}
+h2{font-size:13px;color:#58a6ff;padding:10px 0 4px}
+table{border-collapse:collapse;width:100%;margin:8px 0}
+th,td{border:1px solid #21262d;padding:5px 8px;text-align:left}
+th{background:#161b22;color:#8b949e}
+.block{padding:12px 16px}
+.nav{padding:6px 16px;border-bottom:1px solid #21262d;display:flex;gap:12px}
+.nav a{color:#58a6ff;text-decoration:none;font-size:11px}
+.note{color:#8b949e;font-size:11px;margin-top:6px}
+</style>"""
+
+        return f"""<!DOCTYPE html><html><head><meta charset='utf-8'><title>Data Quality</title>{CSS}</head><body>
+<h1>Data Quality — Distribuição por Tier</h1>
+<div class='nav'>
+  <a href='/analise/wr-breakdown'>WR Breakdown</a>
+  <a href='/analise/wr-breakdown?tier=good'>WR Tier A</a>
+  <a href='/analise/wr-breakdown?tier=ok'>WR Tier B</a>
+  <a href='/analise/sinal-puro'>Sinal Puro</a>
+</div>
+
+<div class='block'>
+<p class='note'><b>Eras:</b> Era 0 (corrompido, &lt; 2026-05-21 00:41 UTC) = <b>{eras['era0']}</b> tokens |
+Era 1 (MIN_POOL_SOL=2, 2026-05-21→24) = <b>{eras['era1']}</b> tokens |
+Era 2 (limpo, &gt;= 2026-05-24) = <b>{eras['era2']}</b> tokens |
+sem complete_ts = <b>{eras['era_null']}</b></p>
+
+<h2>migrations ({n_mig_total} total)</h2>
+<table>
+<tr><th>Tier</th><th>N (%)</th><th>avg bottom_error</th><th>com txid_proof</th></tr>
+{mig_html}
+</table>
+<p class='note'>bottom_error_pct = (mc_min_decision − mc_min_true) / mc_min_true. Positivo = bot viu fundo mais alto. good = |error|≤5%.</p>
+
+<h2>bounce_signals ({n_bs_total} total)</h2>
+<table>
+<tr><th>Tier</th><th>N (%)</th></tr>
+{bs_html}
+</table>
+
+<h2>trades fechados ({n_tr_total} total)</h2>
+<table>
+<tr><th>Tier</th><th>N (%)</th><th>WR</th><th>avg P&L</th></tr>
+{tr_html}
+</table>
+<p class='note'>WR e avg P&L calculados apenas sobre trades fechados (tp/sl/trailing/expired). Tier A = calibrar filtros aqui. Tier C = contexto histórico apenas.</p>
+
+<h2>Como usar este dashboard</h2>
+<ul class='note' style='padding-left:14px;line-height:1.8'>
+<li><b>Calibração de filtros:</b> usar apenas Tier A (<a href='/analise/wr-breakdown?tier=good'>WR Breakdown tier=good</a>)</li>
+<li><b>Sensibilidade:</b> rodar Tier A + Tier B — se resultado muda muito, dados Tier B têm ruído</li>
+<li><b>Tier C:</b> nunca usar para calibração — contexto histórico de regime de falha apenas</li>
+<li><b>Gate de escala:</b> N Tier A ≥ 100 + WR Tier A estável por 2 semanas → aumentar size</li>
+<li><b>Tier A cresce com:</b> cada token que gradua (60min) preenche mc_min_true via helius_rpc</li>
+</ul>
+</div>
+</body></html>"""
+
+    except Exception:
+        import traceback
         return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
