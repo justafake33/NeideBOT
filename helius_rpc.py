@@ -280,3 +280,153 @@ def extract_tx_signature(query_order_response: dict) -> str | None:
             state, list(data.keys()), list(conf.keys()),
         )
     return None
+
+
+import base64 as _b64
+import hashlib as _hashlib
+import struct as _struct
+
+_PAMM_BUY_DISC  = _hashlib.sha256(b"event:BuyEvent").digest()[:8]
+_PAMM_SELL_DISC = _hashlib.sha256(b"event:SellEvent").digest()[:8]
+
+
+def _parse_pamm_pool_state(log_messages: list) -> tuple | None:
+    """Extrai pool_base, pool_quote do último evento pAMM nos logMessages da tx."""
+    for line in reversed(log_messages or []):
+        if not line.startswith("Program data: "):
+            continue
+        try:
+            raw = _b64.b64decode(line[len("Program data: "):])
+        except Exception:
+            continue
+        if len(raw) < 64:
+            continue
+        disc = raw[:8]
+        if disc not in (_PAMM_BUY_DISC, _PAMM_SELL_DISC):
+            continue
+        try:
+            pool_base  = _struct.unpack_from("<q", raw, 48)[0]
+            pool_quote = _struct.unpack_from("<q", raw, 56)[0]
+            if pool_base > 0 and pool_quote > 0:
+                return float(pool_base), float(pool_quote)
+        except Exception:
+            continue
+    return None
+
+
+def get_pool_bottom(
+    pool_pda: str,
+    ts_migration: float,
+    ts_cutoff: float,
+    total_supply: float,
+    sol_usd: float,
+    max_txs: int = 60,
+) -> dict | None:
+    """Encontra o mc_min real da pool por varredura de transações on-chain.
+
+    Faz uma única chamada getSignaturesForAddress para obter a lista de txs
+    na janela [ts_migration+90s, ts_cutoff], depois chama getTransaction para
+    cada assinatura (até max_txs) e parseia pool_base/pool_quote do evento pAMM.
+
+    Args:
+        pool_pda:     endereço do pool state PDA da pool primária do token
+        ts_migration: unix timestamp da migração (complete_timestamp on-chain)
+        ts_cutoff:    unix timestamp limite (geralmente ts_migration + 3660)
+        total_supply: supply total do token (unidades display, ex: 1_000_000_000)
+        sol_usd:      preço SOL/USD no momento da consulta
+        max_txs:      máximo de transações a parsear (evita excesso de chamadas RPC)
+
+    Returns:
+        {
+            "mc_min_true":   float,  # MC mínimo confirmado on-chain
+            "ts_min_true":   float,  # unix timestamp da tx do mínimo
+            "txid_min_true": str,    # assinatura da tx — prova criptográfica
+            "source_truth":  str,    # "helius_scan"
+        }
+        None se RPC indisponível, pool_pda vazio, ou sem txs parseáveis.
+    """
+    if not available() or not pool_pda:
+        return None
+
+    # Passo 1: lista de assinaturas (uma única chamada RPC)
+    sigs_result = _rpc("getSignaturesForAddress", [
+        pool_pda,
+        {"limit": 500, "commitment": "confirmed"},
+    ])
+    if not sigs_result:
+        logger.warning("get_pool_bottom %s...: getSignaturesForAddress retornou vazio", pool_pda[:8])
+        return None
+
+    # Filtra para janela [ts_migration+90s, ts_cutoff]
+    # Os primeiros 90s são excluídos por serem ruído de inicialização do AMM
+    window_sigs = [
+        s for s in sigs_result
+        if not s.get("err")
+        and ts_migration + 90 <= (s.get("blockTime") or 0) <= ts_cutoff
+    ]
+
+    if not window_sigs:
+        logger.info(
+            "get_pool_bottom %s...: 0 txs na janela [+90s, +%ds]",
+            pool_pda[:8], int(ts_cutoff - ts_migration),
+        )
+        return None
+
+    scan_sigs = window_sigs[:max_txs]
+    logger.info(
+        "get_pool_bottom %s...: %d txs na janela, varrendo até %d",
+        pool_pda[:8], len(window_sigs), len(scan_sigs),
+    )
+
+    best_mc   = float("inf")
+    best_ts   = None
+    best_txid = None
+    parsed    = 0
+
+    for sig_info in scan_sigs:
+        sig        = sig_info["signature"]
+        block_time = sig_info.get("blockTime") or 0
+
+        tx_result = _rpc("getTransaction", [sig, {
+            "encoding":                       "jsonParsed",
+            "commitment":                     "confirmed",
+            "maxSupportedTransactionVersion": 0,
+        }])
+        if not tx_result:
+            continue
+
+        meta = tx_result.get("meta") or {}
+        logs = meta.get("logMessages") or []
+
+        pool_state = _parse_pamm_pool_state(logs)
+        if not pool_state:
+            continue
+
+        pool_base, pool_quote = pool_state
+        price_sol = (pool_quote / 1e9) / (pool_base / 1e6)
+        mc        = price_sol * sol_usd * total_supply
+        parsed   += 1
+
+        if mc < best_mc:
+            best_mc   = mc
+            best_ts   = float(block_time)
+            best_txid = sig
+
+    if best_txid is None:
+        logger.info(
+            "get_pool_bottom %s...: %d/%d txs varridas, 0 com evento pAMM parseável",
+            pool_pda[:8], len(scan_sigs), len(window_sigs),
+        )
+        return None
+
+    logger.info(
+        "get_pool_bottom %s...: mc_min_true=$%.0f ts=%.0f txid=%s... (%d/%d txs parseados)",
+        pool_pda[:8], best_mc, best_ts, best_txid[:16], parsed, len(scan_sigs),
+    )
+
+    return {
+        "mc_min_true":   best_mc,
+        "ts_min_true":   best_ts,
+        "txid_min_true": best_txid,
+        "source_truth":  "helius_scan",
+    }

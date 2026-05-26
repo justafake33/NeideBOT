@@ -124,6 +124,13 @@ def init_db():
             "ADD COLUMN IF NOT EXISTS bc_progress_migration   FLOAT",
             "ADD COLUMN IF NOT EXISTS complete_timestamp           BIGINT",
             "ADD COLUMN IF NOT EXISTS bundler_trader_amount_rate  FLOAT",
+            # mc_min truth — validação on-chain assíncrona pós-graduação
+            "ADD COLUMN IF NOT EXISTS mc_min_true       DOUBLE PRECISION",
+            "ADD COLUMN IF NOT EXISTS ts_min_true       TIMESTAMPTZ",
+            "ADD COLUMN IF NOT EXISTS txid_min_true     TEXT",
+            "ADD COLUMN IF NOT EXISTS source_truth      TEXT",
+            "ADD COLUMN IF NOT EXISTS bottom_error_pct  DOUBLE PRECISION",
+            "ADD COLUMN IF NOT EXISTS bottom_quality    TEXT",
         ]:
             cur.execute(f"ALTER TABLE migrations {col}")
 
@@ -578,6 +585,46 @@ def update_bottom(mint: str, mc: float, time_to_bottom: float):
             WHERE mint = %(mint)s
               AND (mc_bottom IS NULL OR mc_bottom > %(mc)s)
         """, {"mint": mint, "mc": mc, "ttb": time_to_bottom})
+
+
+def update_bottom_truth(
+    mint: str,
+    mc_min_true: float,
+    ts_min_true: float,
+    txid_min_true: str,
+    source_truth: str,
+    bottom_error_pct: float | None,
+    bottom_quality: str | None,
+):
+    """Persiste o mc_min real verificado on-chain com prova de txid.
+
+    Chamado de forma assíncrona durante a graduação do token.
+    bottom_error_pct = (mc_min_decision - mc_min_true) / mc_min_true
+      positivo → bot viu fundo mais alto (perdeu o fundo real)
+      negativo → bot viu fundo mais baixo (phantom ou secondary pool)
+    bottom_quality: 'good' (|error|≤5%), 'ok' (5-15%), 'bad' (>15%)
+    """
+    from datetime import datetime, timezone
+    ts_dt = datetime.fromtimestamp(ts_min_true, tz=timezone.utc) if ts_min_true else None
+    with _cursor() as cur:
+        cur.execute("""
+            UPDATE migrations
+               SET mc_min_true      = %(mc_min_true)s,
+                   ts_min_true      = %(ts_min_true)s,
+                   txid_min_true    = %(txid_min_true)s,
+                   source_truth     = %(source_truth)s,
+                   bottom_error_pct = %(bottom_error_pct)s,
+                   bottom_quality   = %(bottom_quality)s
+             WHERE mint = %(mint)s
+        """, {
+            "mint":             mint,
+            "mc_min_true":      mc_min_true,
+            "ts_min_true":      ts_dt,
+            "txid_min_true":    txid_min_true,
+            "source_truth":     source_truth,
+            "bottom_error_pct": bottom_error_pct,
+            "bottom_quality":   bottom_quality,
+        })
 
 
 def update_lock_percent(mint: str, lock_percent: float):
