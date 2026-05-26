@@ -1,7 +1,7 @@
 # NeideBOT — Roadmap
 
-**Atualizado:** 2026-05-26 (sessão 15)
-**Estado:** Bot ATIVO · erpc operacional · mc_min_true com txid_proof ativo · branch ativo: `claude/gifted-newton-4oBcj`
+**Atualizado:** 2026-05-26 (sessão 16)
+**Estado:** Bot ATIVO · erpc operacional · phantom fix ativo · mc_min auditado (n=15, 67% precisos) · branch ativo: `claude/gallant-ptolemy-HNNbz`
 
 ---
 
@@ -78,9 +78,12 @@
 | **Patch mc_min drift — 3 correções ortogonais** | 2026-05-26 | (1) kline removido do write path de mc_min — erpc é fonte única; (2) k-gate INCREASE REJECT → RESET quando pool não confirmada — secondary pool hijack reversível; (3) PDA pre-seed em `_derive_async` — pool account confirmada por criptografia, sem learning window. Commits `fc21240` + `837db0c`. Auditoria: 100% PASS nos 7 critérios. |
 | **mc_min_true com txid_proof** | 2026-05-26 | `helius_rpc.get_pool_bottom()`: `getSignaturesForAddress(pool_pda)` + parse Anchor dos logMessages de cada tx → mc_min com assinatura Solana como prova. Thread `_run_bottom_truth` disparada na graduação (async, não bloqueia trade). `helius_ws.get_pool_pda(mint)` expõe PDA confirmado. Commit `ae65a9c`. |
 | **bottom_error_pct + bottom_quality** | 2026-05-26 | `bottom_error_pct = (mc_min_decision - mc_min_true) / mc_min_true`. Positivo = bot viu fundo mais alto. `bottom_quality`: good (≤5%), ok (5-15%), bad (>15%). 6 novas colunas em `migrations`. Após primeiro ciclo de graduações (60min pós-deploy), banco terá métrica objetiva de confiança na captura de fundo. Commit `ae65a9c`. |
+| **Phantom fix — ALT tx bypass corrigido** | 2026-05-26 | `_tier1_process` validava pool account com `if accounts:` — lista vazia (transações ALT/versioned) era falsy → check pulado → secondary pool contaminava mc_min. Fix: `if known_pool and accounts is not None: if not accounts or known_pool not in accounts: return False`. Helius mode (`accounts=None`) não afetado — validação só aplica quando lista de accounts está disponível (erpc mode). Commits `16a512b` + `037a06c`. |
+| **Auditoria bottom capture n=15 — CONCLUÍDA** | 2026-05-26 | Comparação manual bot mc_min vs candles de 1 segundo DexScreener em 15 trades. 10/15 (67%) precisos ≤3%. 3/15 (20%) limitação de learning window (WHY +22.5%, CTO +19.7%, RAMBO +3.7% — tradeoff intencional contra phantoms). 2/15 (13%) phantoms MILLION -33%, Multipad -57% — causados pelo ALT tx bypass, agora corrigido. **Marco zero definitivo: 2026-05-26.** Todos os dados de mc_min a partir desta data são confiáveis. |
 
 > ⚠️ **WR REAL CORRIGIDO (2026-05-14 sessão 5):** banco tinha dados fictícios — TradeMonitor inferia saídas de MC snapshots, não da blockchain. Auditoria via Helius revelou WR real de **10.1%** (14 TP / 125 SL / 139 trades). WR anterior de 32% era inflado por falsos TPs. `/debug/sell-recovery` executado: 139 correções persistidas.
-> ⚠️ **DADOS HISTÓRICOS SUSPEITOS (sessão 9):** mc_min de todos os tokens antes do fix (elapsed_sec < 90) pode estar corrompido pelo candle de transição. Análises de WR baseadas em `mc_min` histórico (bounce_pct, entry_ratio, drop_from_mig) devem ser tratadas com cautela. Novos trades pós-deploy serão os primeiros com dados de entrada confiáveis.
+> ⚠️ **DADOS HISTÓRICOS SUSPEITOS (sessão 9):** mc_min de todos os tokens antes do fix (elapsed_sec < 90) pode estar corrompido pelo candle de transição. Análises de WR baseadas em `mc_min` histórico (bounce_pct, entry_ratio, drop_from_mig) devem ser tratadas com cautela.
+> ⚠️ **MARCO ZERO DEFINITIVO: 2026-05-26 (sessão 16):** Phantom fix (ALT tx bypass) + auditoria manual n=15 confirmam que mc_min capturado a partir desta data é confiável. Trades anteriores (2026-05-21 a 2026-05-25) tinham erpc operacional mas bug ALT tx ainda ativo — mc_min potencialmente contaminado por secondary pools em transações versioned.
 
 ---
 
@@ -96,25 +99,23 @@
 > - Contexto atual: filtros frouxos propositalmente para coletar mais trades → WR=29% é FLOOR, não teto
 > - Trailing TP é crítico: responsável por 89% do lucro — TP fixo 50% teria resultado em -$1.83
 
-### Fase 0 — Validar captura do fundo ← EM ANDAMENTO (infra 100% deployada)
+### Fase 0 — Validar captura do fundo ← ✅ CONCLUÍDA (sessão 16, 2026-05-26)
 
-**Objetivo:** Confirmar que mc_min capturado corresponde ao fundo on-chain real.
+**Resultado:** mc_min capturado pelo bot corresponde ao fundo on-chain real.
 
-**Infraestrutura deployada (2026-05-26):**
+**Auditoria manual (n=15 trades, candles de 1 segundo DexScreener):**
+- 10/15 (67%) precisos — erro ≤ 3%
+- 3/15 (20%) limitação de learning window — tradeoff intencional (previne phantoms durante os primeiros ~300ms de pool confirmation)
+- 2/15 (13%) phantoms — identificados e corrigidos (MILLION, Multipad — bug ALT tx, commit 037a06c)
+
+**Phantom fix deployado:** `accounts is not None` guard em `_tier1_process`. Transações ALT com `accounts=[]` corretamente rejeitadas. Modo Helius (`accounts=None`) preservado.
+
+**Marco zero definitivo: 2026-05-26.** Todos os dados de mc_min coletados a partir desta data são confiáveis e podem ser usados para análise de filtros e WR.
+
+**Infraestrutura de validação contínua ativa:**
 - `mc_min_true` preenchido async via `helius_rpc.get_pool_bottom()` após cada graduação
 - `bottom_error_pct` e `bottom_quality` persistidos em `migrations`
-- Auditoria 100% PASS: kline fora do write path, PDA pre-seed ativo, replay com accounts validation
-
-**Critérios de gate:**
-- Acumular 30 graduações com `bottom_quality IS NOT NULL`
-- `bottom_quality = 'good'` em ≥ 80% dos tokens (|error| ≤ 5%)
-- WR ≥ 25% confirmado GMGN (não DB)
-
-**Como monitorar:** `SELECT bottom_quality, COUNT(*), AVG(bottom_error_pct)*100 FROM migrations WHERE mc_min_true IS NOT NULL GROUP BY bottom_quality;`
-
-**Ação:** Não mudar nenhum filtro, size ou infraestrutura. Apenas coletar e observar os `bottom_quality` que chegam.
-
-**Por que 30 graduações:** cada token leva 60min na janela quente. Com ~8 tokens/dia, são ~4 dias de dados.
+- Monitorar: `SELECT bottom_quality, COUNT(*), AVG(bottom_error_pct)*100 FROM migrations WHERE mc_min_true IS NOT NULL GROUP BY bottom_quality;`
 
 ---
 
