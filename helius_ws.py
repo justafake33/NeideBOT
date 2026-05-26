@@ -485,18 +485,18 @@ class HeliusWS:
 
         # Deriva PDA da pool primária em thread própria (não bloqueia o caller).
         # Ao confirmar o PDA, pre-seed _pool_account para que a validação de pool-account
-        # proteja imediatamente contra secondary pools — sem depender das 5 TXs de aprendizado.
+        # Deriva o PDA da pool primária para uso pelo helius_rpc (get_pool_bottom).
+        # NÃO seta _pool_account — a validação de pool account só é ativada após
+        # confirmação via intersecção de 5 TXs reais. Setar _pool_account aqui causaria
+        # rejeição de TODOS os eventos se o PDA não aparecer nos raw accounts da TX
+        # (ocorre quando a conta está em um Address Lookup Table — ALTs não são resolvidos).
         def _derive_async():
             pda = _derive_pool_pda(mint)
             if pda:
                 with self._lock:
                     self._pool_pda[mint] = pda
-                    # Pre-seed: define pool_account como o PDA antes de qualquer evento.
-                    # Substitui o learning window de 5 TXs — eventos de secondary pools
-                    # são rejeitados imediatamente (PDA não estará nos seus accounts).
-                    if mint not in self._pool_account:
-                        self._pool_account[mint] = pda
-                logger.info("HeliusWS: PDA %s... → %s... (pool pre-seeded)", mint[:8], pda[:8])
+                logger.info("HeliusWS: PDA %s... → %s... (pool pda known, learning window activo)",
+                            mint[:8], pda[:8])
             else:
                 logger.warning("HeliusWS: falha ao derivar PDA para %s", mint[:8])
         threading.Thread(target=_derive_async, daemon=True, name=f"pda-{mint[:8]}").start()
@@ -540,6 +540,17 @@ class HeliusWS:
         """Retorna o PDA confirmado da pool primária do token, ou None se não disponível."""
         with self._lock:
             return self._pool_pda.get(mint) or self._pool_account.get(mint)
+
+    def get_health(self) -> dict:
+        """Retorna diagnóstico do WebSocket para health check periódico."""
+        with self._lock:
+            n_active = len(self._mint_supply)
+        return {
+            "mode":       self._mode,
+            "connected":  self._connected,
+            "n_active":   n_active,
+            "tx_count":   self._erpc_tx_count,
+        }
 
     def stop(self):
         self._running = False
