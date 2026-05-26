@@ -178,7 +178,7 @@ class HotMonitor:
                         inner["time_min"] = elapsed_sec / 60
                         inner["ts_min"]   = datetime.fromtimestamp(candle_ts, tz=timezone.utc)
                         db.update_bottom(mint, mc_low, elapsed_sec / 60)
-                        logger.info("Fundo(kline1) %s: $%.0f em %.1fmin",
+                        logger.info("Fundo(kline1) %s: $%.2f em %.1fmin",
                                     state["symbol"], mc_low, elapsed_sec / 60)
         except Exception as e:
             logger.debug("_precise_bottom_single %s: %s", mint[:8], e)
@@ -248,7 +248,7 @@ class HotMonitor:
             state["ts_min"]   = ref_ts   # timestamp do evento real (não do processamento)
             db.update_bottom(mint, mc, elapsed_min)
             logger.info(
-                "Fundo(%s) %s: mint=%s mc_old=$%.0f mc_new=$%.0f "
+                "Fundo(%s) %s: mint=%s mc_old=$%.2f mc_new=$%.2f "
                 "event_ts=%.3f elapsed=%.1fmin",
                 source, state["symbol"], mint, mc_old, mc, ref_ts.timestamp(), elapsed_min,
             )
@@ -539,7 +539,7 @@ class HotMonitor:
         msg = (
             f"🔔 BOUNCE {symbol}\n"
             f"  Migração: ${mc_migration:,.0f}\n"
-            f"  Fundo:    ${mc_min:,.0f} (-{drop_from_mig:.0%})\n"
+            f"  Fundo:    ${mc_min:,.2f} (-{drop_from_mig:.0%})\n"
             f"  Agora:    ${mc:,.0f} (+{bounce_pct:.0%} do fundo)\n"
             f"  Tempo:    {elapsed_min:.1f}min\n"
             f"  Mint: {mint}"
@@ -549,7 +549,7 @@ class HotMonitor:
         except Exception as e:
             logger.warning("send_alert bounce %s: %s", mint[:8], e)
 
-        logger.info("BOUNCE %s: fundo=$%.0f drop=%.0f%% bounce=%.0f%% em %.1fmin",
+        logger.info("BOUNCE %s: fundo=$%.2f drop=%.0f%% bounce=%.0f%% em %.1fmin",
                     symbol, mc_min, drop_from_mig * 100, bounce_pct * 100, elapsed_min)
 
         if self._executor:

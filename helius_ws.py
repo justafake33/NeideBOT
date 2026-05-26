@@ -923,7 +923,7 @@ class HeliusWS:
                             if pool_acc in _replay_accs:
                                 logger.info(
                                     "HeliusWS erpc_replay %s: source=erpc_replay mint=%s "
-                                    "mc_new=$%.0f mc_old=inf event_ts=%.3f "
+                                    "mc_new=$%.2f mc_old=inf event_ts=%.3f "
                                     "reason=pool_confirmed_learning_window_flush",
                                     mint[:8], mint, _replay_mc, _replay_ts,
                                 )
@@ -931,7 +931,7 @@ class HeliusWS:
                                 self._on_price(mint, _replay_mc, event_ts=_event_dt)
                             else:
                                 logger.warning(
-                                    "HeliusWS replay_skip %s: mc_min=$%.0f descartado "
+                                    "HeliusWS replay_skip %s: mc_min=$%.2f descartado "
                                     "— pool %s... não estava na TX (phantom secondary pool)",
                                     mint[:8], _replay_mc, pool_acc[:8],
                                 )
@@ -1001,7 +1001,7 @@ class HeliusWS:
                 elif pre_mc < event["mc"]:
                     logger.info(
                         "HeliusWS erpc_replay %s: source=erpc_replay mint=%s "
-                        "mc_new=$%.0f mc_current=$%.0f event_ts=%.3f reason=lazy_flush",
+                        "mc_new=$%.2f mc_current=$%.2f event_ts=%.3f reason=lazy_flush",
                         mint[:8], mint, pre_mc, event["mc"], pre_ts,
                     )
                     _event_dt = datetime.fromtimestamp(pre_ts, tz=timezone.utc)
