@@ -921,6 +921,59 @@ class HotMonitor:
         else:
             logger.warning("Graduacao %s: todas as fontes falharam — 1h pulado", symbol)
 
+        # Validação assíncrona do mc_min via scan on-chain (não bloqueia o trade)
+        # Calcula bottom_error_pct = (mc_min_decision - mc_min_true) / mc_min_true
+        _mc_min_decision = state.get("mc_min", float("inf"))
+        _ts_mig_unix     = ts_mig_unix
+
+        def _run_bottom_truth():
+            try:
+                import helius_rpc
+                pool_pda = self._helius.get_pool_pda(mint) if self._helius else None
+                if not pool_pda:
+                    logger.debug("bottom_truth %s: pool_pda não disponível — skip", symbol)
+                    return
+                sol_usd_val = get_sol_usd()
+                truth = helius_rpc.get_pool_bottom(
+                    pool_pda,
+                    _ts_mig_unix,
+                    _ts_mig_unix + 3660,
+                    total_supply,
+                    sol_usd_val,
+                )
+                if not truth:
+                    logger.info("bottom_truth %s: scan on-chain retornou None (sem txs ou RPC indisponível)", symbol)
+                    return
+                mc_true = truth["mc_min_true"]
+                if mc_true > 0 and _mc_min_decision != float("inf"):
+                    err = (_mc_min_decision - mc_true) / mc_true
+                    quality = "good" if abs(err) <= 0.05 else ("ok" if abs(err) <= 0.15 else "bad")
+                else:
+                    err     = None
+                    quality = None
+                db.update_bottom_truth(
+                    mint,
+                    truth["mc_min_true"],
+                    truth["ts_min_true"],
+                    truth["txid_min_true"],
+                    truth["source_truth"],
+                    err,
+                    quality,
+                )
+                logger.info(
+                    "bottom_truth %s: decision=$%.0f true=$%.0f error=%s quality=%s txid=%s...",
+                    symbol,
+                    _mc_min_decision,
+                    mc_true,
+                    f"{err*100:+.1f}%" if err is not None else "N/A",
+                    quality or "N/A",
+                    truth["txid_min_true"][:16],
+                )
+            except Exception as _e:
+                logger.warning("bottom_truth %s: erro inesperado: %s", symbol, _e)
+
+        threading.Thread(target=_run_bottom_truth, daemon=True, name=f"btrue-{mint[:8]}").start()
+
         logger.info("%s saiu da janela quente (bottom=$%.0f em %.1fmin)",
                     symbol, state["mc_min"], state["time_min"])
 

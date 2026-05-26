@@ -536,6 +536,11 @@ class HeliusWS:
             })
         logger.info("HeliusWS: unsubscribe %s", mint[:8])
 
+    def get_pool_pda(self, mint: str) -> str | None:
+        """Retorna o PDA confirmado da pool primária do token, ou None se não disponível."""
+        with self._lock:
+            return self._pool_pda.get(mint) or self._pool_account.get(mint)
+
     def stop(self):
         self._running = False
         with self._ws_lock:
