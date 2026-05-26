@@ -1,7 +1,7 @@
 # NeideBOT — Roadmap
 
-**Atualizado:** 2026-05-24 (sessão 14)
-**Estado:** Bot ATIVO · erpc operacional · MIN_POOL_SOL=10 restaurado · branch ativo: `claude/gifted-newton-4oBcj`
+**Atualizado:** 2026-05-26 (sessão 15)
+**Estado:** Bot ATIVO · erpc operacional · mc_min_true com txid_proof ativo · branch ativo: `claude/gifted-newton-4oBcj`
 
 ---
 
@@ -75,6 +75,9 @@
 | **Pool-account learning por intersecção de 5 TXs** | 2026-05-21 | Seleção anterior (primeira TX, primeiro candidato) escolhia contas globais (vaults, fee accounts) antes do pool state PDA. Fix: acumular conjuntos de candidatos de 5 TXs diferentes e computar intersecção. ATAs de usuários são eliminados (variam por TX). Pool-specific accounts sobrevivem. Confirmado: `pool-account CONFIRMED GXyYU3xE: pool=CNa2muAa... (interseção de 5 TXs, 7 candidatos)` em ~300ms. Commit `70cd997`. |
 | **Log spam `skip não-pAMM` → debug level** | 2026-05-21 | WARNING aparecia a cada poucos segundos para transactions de aggregators que invocam múltiplos programas. Comportamento esperado — não é bug. Fix: `logger.warning` → `logger.debug`. Commit `70cd997`. |
 | **Primeiro token com dados limpos: JOB (DMircbtE)** | 2026-05-21 00:41 UTC | Marco zero da era de dados limpos. mc_migration=$35,412, smart=3. Todos os dados de mc_min coletados APÓS este timestamp são confiáveis (sem candle de transição, sem ts_migration bug, sem race condition). |
+| **Patch mc_min drift — 3 correções ortogonais** | 2026-05-26 | (1) kline removido do write path de mc_min — erpc é fonte única; (2) k-gate INCREASE REJECT → RESET quando pool não confirmada — secondary pool hijack reversível; (3) PDA pre-seed em `_derive_async` — pool account confirmada por criptografia, sem learning window. Commits `fc21240` + `837db0c`. Auditoria: 100% PASS nos 7 critérios. |
+| **mc_min_true com txid_proof** | 2026-05-26 | `helius_rpc.get_pool_bottom()`: `getSignaturesForAddress(pool_pda)` + parse Anchor dos logMessages de cada tx → mc_min com assinatura Solana como prova. Thread `_run_bottom_truth` disparada na graduação (async, não bloqueia trade). `helius_ws.get_pool_pda(mint)` expõe PDA confirmado. Commit `ae65a9c`. |
+| **bottom_error_pct + bottom_quality** | 2026-05-26 | `bottom_error_pct = (mc_min_decision - mc_min_true) / mc_min_true`. Positivo = bot viu fundo mais alto. `bottom_quality`: good (≤5%), ok (5-15%), bad (>15%). 6 novas colunas em `migrations`. Após primeiro ciclo de graduações (60min pós-deploy), banco terá métrica objetiva de confiança na captura de fundo. Commit `ae65a9c`. |
 
 > ⚠️ **WR REAL CORRIGIDO (2026-05-14 sessão 5):** banco tinha dados fictícios — TradeMonitor inferia saídas de MC snapshots, não da blockchain. Auditoria via Helius revelou WR real de **10.1%** (14 TP / 125 SL / 139 trades). WR anterior de 32% era inflado por falsos TPs. `/debug/sell-recovery` executado: 139 correções persistidas.
 > ⚠️ **DADOS HISTÓRICOS SUSPEITOS (sessão 9):** mc_min de todos os tokens antes do fix (elapsed_sec < 90) pode estar corrompido pelo candle de transição. Análises de WR baseadas em `mc_min` histórico (bounce_pct, entry_ratio, drop_from_mig) devem ser tratadas com cautela. Novos trades pós-deploy serão os primeiros com dados de entrada confiáveis.
@@ -93,18 +96,25 @@
 > - Contexto atual: filtros frouxos propositalmente para coletar mais trades → WR=29% é FLOOR, não teto
 > - Trailing TP é crítico: responsável por 89% do lucro — TP fixo 50% teria resultado em -$1.83
 
-### Fase 0 — Validar captura do fundo (AGORA) ← EM ANDAMENTO
+### Fase 0 — Validar captura do fundo ← EM ANDAMENTO (infra 100% deployada)
 
-**Objetivo:** Confirmar que MIN_POOL_SOL=10 eliminou phantoms e que mc_min capturado é confiável.
+**Objetivo:** Confirmar que mc_min capturado corresponde ao fundo on-chain real.
+
+**Infraestrutura deployada (2026-05-26):**
+- `mc_min_true` preenchido async via `helius_rpc.get_pool_bottom()` após cada graduação
+- `bottom_error_pct` e `bottom_quality` persistidos em `migrations`
+- Auditoria 100% PASS: kline fora do write path, PDA pre-seed ativo, replay com accounts validation
 
 **Critérios de gate:**
-- Acumular 30 trades com MIN_POOL_SOL=10 ativo (data de início: 2026-05-24)
-- `/debug/bottom-audit` phantom < 5% nos novos trades
+- Acumular 30 graduações com `bottom_quality IS NOT NULL`
+- `bottom_quality = 'good'` em ≥ 80% dos tokens (|error| ≤ 5%)
 - WR ≥ 25% confirmado GMGN (não DB)
 
-**Ação:** Não mudar nenhum filtro, size ou infraestrutura. Apenas coletar.
+**Como monitorar:** `SELECT bottom_quality, COUNT(*), AVG(bottom_error_pct)*100 FROM migrations WHERE mc_min_true IS NOT NULL GROUP BY bottom_quality;`
 
-**Por que 30 trades:** com 1 change at a time, precisamos de baseline limpa para cada decisão subsequente.
+**Ação:** Não mudar nenhum filtro, size ou infraestrutura. Apenas coletar e observar os `bottom_quality` que chegam.
+
+**Por que 30 graduações:** cada token leva 60min na janela quente. Com ~8 tokens/dia, são ~4 dias de dados.
 
 ---
 
