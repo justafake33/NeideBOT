@@ -36,6 +36,12 @@ def fmt_mc(v):
     if v >= 1_000:     return f"${v/1_000:.0f}K"
     return f"${v:.0f}"
 
+def fmt_mc_full(v):
+    """Full number with comma separator — for precision comparison (e.g. trades dashboard)."""
+    if v is None: return "—"
+    if v >= 1_000_000: return f"${v:,.0f}"
+    return f"${v:,.0f}"
+
 def fmt_pct(v):
     if v is None: return "—"
     return f"{v*100:+.1f}%"
@@ -5276,12 +5282,12 @@ _TRADES_HTML = """
   <td><b>{{ t.symbol or t.mint[:8] }}</b></td>
   <td><span class="badge b-{{ t.status }}">{{ t.status }}</span></td>
   <td>{{ t.ts_signal_brt or '—' }}</td>
-  <td>{{ fmt_mc(t.mc_bottom) }}</td>
+  <td>{{ fmt_mc_full(t.mc_bottom) }}</td>
   <td>
     {% if t.entry_mc_real %}
-      {{ fmt_mc(t.entry_mc_real) }}
+      {{ fmt_mc_full(t.entry_mc_real) }}
     {% else %}
-      <span class="est">{{ fmt_mc(t.entry_expected) }}*</span>
+      <span class="est">{{ fmt_mc_full(t.entry_expected) }}*</span>
     {% endif %}
   </td>
   <td>
@@ -5387,6 +5393,7 @@ def trades_dashboard():
         amount_usd=CALIBRATION_AMOUNT,
         calibration_max=CALIBRATION_MAX,
         fmt_mc=fmt_mc,
+        fmt_mc_full=fmt_mc_full,
     )
 
 
