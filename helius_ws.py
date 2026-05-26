@@ -938,12 +938,14 @@ class HeliusWS:
 
             # Pool account validation: após confirmação por intersecção, verifica que o
             # pool account está nos accounts desta transação.
-            if accounts:
-                with self._lock:
-                    known_pool = self._pool_account.get(mint)
-                if known_pool and known_pool not in accounts:
-                    logger.debug("HeliusWS pool-account skip %s: pool %s... não encontrado",
-                                 mint[:8], known_pool[:8])
+            # Se pool confirmada e accounts vazio (ALT tx não resolvida), rejeita por
+            # precaução — não conseguimos verificar se é pool primária ou secundária.
+            with self._lock:
+                known_pool = self._pool_account.get(mint)
+            if known_pool:
+                if not accounts or known_pool not in accounts:
+                    logger.debug("HeliusWS pool-account skip %s: pool %s... não verificada (accounts=%d)",
+                                 mint[:8], known_pool[:8], len(accounts) if accounts else 0)
                     return False
 
             # H22/H24/H25: acumula na rolling window
