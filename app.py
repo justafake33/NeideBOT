@@ -5234,6 +5234,7 @@ _TRADES_HTML = """
   .b-pending          { background: #3d3b00; color: #d29922; }
   .b-open             { background: #003d00; color: #3fb950; }
   .b-strategy_pending { background: #003d3d; color: #39d0d0; }
+  .b-tp               { background: #003d00; color: #3fb950; }
   .b-tp_hit           { background: #003d00; color: #3fb950; }
   .b-trailing_active  { background: #004d20; color: #56d364; }
   .b-sl_hit           { background: #3d0000; color: #f85149; }
@@ -5352,8 +5353,8 @@ def trades_dashboard():
         else:
             t["entry_divergence"] = None
 
-    # Métricas — statuses reais do TradeMonitor: "sl", "trailing_active", "expired"
-    TP_STATUSES = ("tp_hit", "trailing_active")
+    # Métricas — statuses reais do TradeMonitor: "tp", "sl", "trailing_active", "expired"
+    TP_STATUSES = ("tp", "tp_hit", "trailing_active")
     SL_STATUSES = ("sl_hit", "sl")
     OPEN_STATUSES = ("open", "pending", "strategy_pending")
     closed   = [t for t in trades_raw if t["status"] in TP_STATUSES + SL_STATUSES]
@@ -9380,7 +9381,7 @@ def _dip_entry_sim_inner():
     TP_PCT    = float(request.args.get("tp",   "0.75"))  # TP da nova entrada
     SL_PCT    = float(request.args.get("sl",   "0.15"))  # SL da nova entrada
 
-    TP_STATUSES = ("tp_hit", "trailing_active")
+    TP_STATUSES = ("tp", "tp_hit", "trailing_active")
     SL_STATUSES = ("sl_hit", "sl")
 
     with db._cursor() as cur:
@@ -9392,7 +9393,7 @@ def _dip_entry_sim_inner():
                 b.bounce_pct, b.drop_from_mig AS drop_pct, b.mc_min AS bottom_price
             FROM trades t
             LEFT JOIN bounce_signals b ON b.mint = t.mint
-            WHERE t.status IN ('tp_hit','trailing_active','sl_hit','sl','expired')
+            WHERE t.status IN ('tp','tp_hit','trailing_active','sl_hit','sl','expired')
               AND COALESCE(b.mc_at_signal, t.entry_expected) IS NOT NULL
             ORDER BY t.id ASC
         """)
