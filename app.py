@@ -15183,6 +15183,66 @@ pre.errbox{color:#f85149;background:#1a0000;padding:14px;border-radius:6px;
                 f"</tr></thead><tbody>{brows}</tbody></table></div>{PAD}"
             )
 
+            # ── 1b. Reclassifica SLs com P&L positivo (blockchain real) ───
+            # Estes foram gravados com exit_type='helius_sell_recovery' mas com
+            # new_status='sl' errado porque pnl < tp_pct*0.5 (lógica antiga).
+            # pnl_pct_real > 0 + status='sl' = trailing stop que saiu positivo.
+            if not dry_run:
+                with db._cursor() as cur:
+                    cur.execute("""
+                        UPDATE trades
+                        SET status = CASE
+                            WHEN pnl_pct_real >= COALESCE(tp_pct, 0.75) * 0.5 THEN 'tp'
+                            ELSE 'trailing_active'
+                        END
+                        WHERE status = 'sl'
+                          AND pnl_pct_real > 0
+                          AND exit_type = 'helius_sell_recovery'
+                        RETURNING id, symbol, pnl_pct_real,
+                            CASE WHEN pnl_pct_real >= COALESCE(tp_pct, 0.75) * 0.5 THEN 'tp'
+                                 ELSE 'trailing_active' END AS new_status
+                    """)
+                    reclassified = cur.fetchall()
+                if reclassified:
+                    rows_rcl = "".join(
+                        f"<tr><td>#{r['id']}</td><td>{r['symbol']}</td>"
+                        f"<td class='ok'>+{r['pnl_pct_real']*100:.1f}%</td>"
+                        f"<td>sl → <b>{r['new_status']}</b></td></tr>"
+                        for r in reclassified
+                    )
+                    yield (
+                        f"<h3>Correção: SLs com P&amp;L positivo ({len(reclassified)} trades)</h3>"
+                        f"<div class='section'><table>"
+                        f"<thead><tr><th>ID</th><th>Token</th><th>P&amp;L real</th><th>Mudança</th></tr></thead>"
+                        f"<tbody>{rows_rcl}</tbody></table></div>{PAD}"
+                    )
+                else:
+                    yield f"<p class='ok'>✅ Nenhum SL com P&amp;L positivo para reclassificar.</p>{PAD}"
+            else:
+                with db._cursor() as cur:
+                    cur.execute("""
+                        SELECT id, symbol, pnl_pct_real,
+                            CASE WHEN pnl_pct_real >= COALESCE(tp_pct, 0.75) * 0.5 THEN 'tp'
+                                 ELSE 'trailing_active' END AS would_be
+                        FROM trades
+                        WHERE status = 'sl' AND pnl_pct_real > 0
+                          AND exit_type = 'helius_sell_recovery'
+                    """)
+                    reclassified = cur.fetchall()
+                if reclassified:
+                    rows_rcl = "".join(
+                        f"<tr><td>#{r['id']}</td><td>{r['symbol']}</td>"
+                        f"<td class='ok'>+{r['pnl_pct_real']*100:.1f}%</td>"
+                        f"<td>sl → <b>{r['would_be']}</b> (dry run)</td></tr>"
+                        for r in reclassified
+                    )
+                    yield (
+                        f"<h3>[DRY RUN] SLs com P&amp;L positivo a reclassificar ({len(reclassified)})</h3>"
+                        f"<div class='section'><table>"
+                        f"<thead><tr><th>ID</th><th>Token</th><th>P&amp;L real</th><th>Mudança</th></tr></thead>"
+                        f"<tbody>{rows_rcl}</tbody></table></div>{PAD}"
+                    )
+
             # ── 2. Alvo: todos sem saída verificada on-chain ───────────────
             with db._cursor() as cur:
                 cur.execute("""
@@ -15383,7 +15443,12 @@ pre.errbox{color:#f85149;background:#1a0000;padding:14px;border-radius:6px;
                 sol_out    = sell["sol_received"]
                 pnl        = (sol_out - sol_in) / sol_in if sol_in else 0.0
                 tp_pct     = trade.get("tp_pct") or 0.75
-                new_status = "tp" if pnl >= tp_pct * 0.5 else "sl"
+                if pnl >= tp_pct * 0.5:
+                    new_status = "tp"
+                elif pnl > 0:
+                    new_status = "trailing_active"  # positive exit via trailing stop
+                else:
+                    new_status = "sl"
                 exit_ts_dt = _dt.datetime.fromtimestamp(sell["block_ts"], tz=_dt.timezone.utc)
                 old_pnl_pct = round(old_pnl * 100, 2) if old_pnl is not None else None
 
