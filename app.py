@@ -35897,6 +35897,452 @@ def analise_entrada_ticks():
     return h
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  /analise/hoje  — Todos os tokens do HotMonitor com features + simulação
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/analise/hoje")
+def analise_hoje():
+    """
+    Visão Big Player do dia:
+    - Todos os tokens que entraram no HotMonitor (migrations) na data escolhida
+    - Features completas de cada token (smart, rug, creator, cto, etc.)
+    - Resultado real: mc_bottom, mc_peak, pct_drop
+    - Simulação: se comprado no mc_bottom, qual seria o gain disponível?
+    - WR por faixa de cada feature
+    - Se disparamos bounce_signal e/ou executamos trade
+
+    ?date=2026-05-27  (default: hoje)
+    ?min_fee=0        (mínimo de total_fee_sol para excluir tokens mortos)
+    """
+    import datetime as _dt
+    date_str = request.args.get("date", _dt.date.today().isoformat())
+    min_fee  = float(request.args.get("min_fee", 0))
+
+    try:
+        day_start = _dt.datetime.strptime(date_str, "%Y-%m-%d").replace(
+            tzinfo=_dt.timezone.utc)
+        day_end   = day_start + _dt.timedelta(days=1)
+    except ValueError:
+        return f"<p>Data inválida: {date_str}</p>", 400
+
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                m.mint,
+                m.token_nome                AS symbol,
+                m.ts_migration,
+                m.mc_migration,
+                m.mc_bottom,
+                m.mc_peak,
+                m.mc_1h,
+                m.time_to_bottom,
+                m.time_to_peak,
+                m.pct_drop,
+                m.mc_migration_source,
+                m.exchange,
+                -- features
+                m.smart_wallets,
+                m.renowned_wallets,
+                m.sniper_wallets,
+                m.rug_ratio,
+                m.rat_trader_rate,
+                m.top10_holder_rate,
+                m.is_wash_trading,
+                m.creator_token_status,
+                m.creator_balance_rate,
+                m.suspected_insider_rate,
+                m.top70_sniper_hold_rate,
+                m.entrapment_ratio,
+                m.bot_degen_rate,
+                m.burn_status,
+                m.cto_flag,
+                m.has_social,
+                m.x_follower_count,
+                m.liq_migration,
+                m.total_fee_sol,
+                -- bottom quality (sessão 15)
+                m.mc_min_true,
+                m.bottom_error_pct,
+                m.bottom_quality,
+                -- bounce / trade
+                b.ts_signal         AS bounce_ts,
+                b.bounce_pct        AS bounce_pct,
+                b.elapsed_sec       AS bounce_elapsed,
+                b.mc_at_signal      AS bounce_mc,
+                b.drop_from_mig     AS bounce_drop,
+                t.id                AS trade_id,
+                t.status            AS trade_status,
+                t.pnl_pct_real      AS trade_pnl
+            FROM migrations m
+            LEFT JOIN bounce_signals b ON b.mint = m.mint
+            LEFT JOIN trades t         ON t.mint = m.mint
+            WHERE m.ts_migration >= %s
+              AND m.ts_migration <  %s
+              AND (%s = 0 OR COALESCE(m.total_fee_sol, 0) >= %s)
+            ORDER BY
+                CASE WHEN m.mc_bottom IS NOT NULL AND m.mc_peak IS NOT NULL
+                     THEN (m.mc_peak - m.mc_bottom) / NULLIF(m.mc_bottom, 0)
+                     ELSE -1 END DESC NULLS LAST
+        """, (day_start, day_end, min_fee, min_fee))
+        rows = [dict(r) for r in cur.fetchall()]
+
+    n_total    = len(rows)
+    n_with_bot = sum(1 for r in rows if r.get("mc_bottom") and r.get("mc_peak"))
+
+    # ── Simulação: compra no mc_bottom, vende no mc_peak ──────────────────
+    for r in rows:
+        bot = r.get("mc_bottom")
+        pk  = r.get("mc_peak")
+        if bot and pk and bot > 0:
+            r["sim_gain"] = (pk - bot) / bot
+        else:
+            r["sim_gain"] = None
+
+    sims     = [r["sim_gain"] for r in rows if r["sim_gain"] is not None]
+    n_sim    = len(sims)
+    avg_sim  = sum(sims) / n_sim if sims else 0
+    n_2x     = sum(1 for g in sims if g >= 1.0)
+    n_5x     = sum(1 for g in sims if g >= 4.0)
+    n_10x    = sum(1 for g in sims if g >= 9.0)
+    n_neg    = sum(1 for g in sims if g < 0.10)  # praticamente não subiu
+
+    # ── WR de feature por threshold ────────────────────────────────────────
+    # TP simulado = gain >= 75% do mc_bottom (trailing TP activation)
+    def _is_tp(r):
+        return r["sim_gain"] is not None and r["sim_gain"] >= 0.75
+
+    def _wr_cut(rows, key, threshold, above=True):
+        grp = [r for r in rows if r.get(key) is not None]
+        if above:
+            yes = [r for r in grp if r[key] >= threshold]
+            no  = [r for r in grp if r[key] <  threshold]
+        else:
+            yes = [r for r in grp if r[key] <= threshold]
+            no  = [r for r in grp if r[key] >  threshold]
+        wr_yes = sum(_is_tp(r) for r in yes) / len(yes) if yes else None
+        wr_no  = sum(_is_tp(r) for r in no)  / len(no)  if no  else None
+        return len(yes), wr_yes, len(no), wr_no
+
+    def _wr_bool(rows, key):
+        true_g  = [r for r in rows if r.get(key) is True]
+        false_g = [r for r in rows if r.get(key) is False]
+        wr_t = sum(_is_tp(r) for r in true_g)  / len(true_g)  if true_g  else None
+        wr_f = sum(_is_tp(r) for r in false_g) / len(false_g) if false_g else None
+        return len(true_g), wr_t, len(false_g), wr_f
+
+    features_analysis = []
+
+    def _add(label, n_yes, wr_yes, n_no, wr_no, yes_label, no_label):
+        delta = None
+        if wr_yes is not None and wr_no is not None:
+            delta = wr_yes - wr_no
+        features_analysis.append({
+            "label": label,
+            "n_yes": n_yes, "wr_yes": wr_yes, "yes_label": yes_label,
+            "n_no":  n_no,  "wr_no":  wr_no,  "no_label":  no_label,
+            "delta": delta,
+        })
+
+    # Smart wallets
+    n_y, wr_y, n_n, wr_n = _wr_cut(rows, "smart_wallets", 3)
+    _add("Smart wallets ≥3", n_y, wr_y, n_n, wr_n, "≥3", "<3")
+    n_y, wr_y, n_n, wr_n = _wr_cut(rows, "smart_wallets", 2)
+    _add("Smart wallets ≥2", n_y, wr_y, n_n, wr_n, "≥2", "<2")
+    n_y, wr_y, n_n, wr_n = _wr_cut(rows, "smart_wallets", 5)
+    _add("Smart wallets ≥5", n_y, wr_y, n_n, wr_n, "≥5", "<5")
+
+    # Rug ratio
+    n_y, wr_y, n_n, wr_n = _wr_cut(rows, "rug_ratio", 0.15, above=False)
+    _add("Rug ≤0.15", n_y, wr_y, n_n, wr_n, "≤0.15", ">0.15")
+    n_y, wr_y, n_n, wr_n = _wr_cut(rows, "rug_ratio", 0.10, above=False)
+    _add("Rug ≤0.10", n_y, wr_y, n_n, wr_n, "≤0.10", ">0.10")
+
+    # Top10 holder rate
+    n_y, wr_y, n_n, wr_n = _wr_cut(rows, "top10_holder_rate", 0.50, above=False)
+    _add("Top10 ≤50%", n_y, wr_y, n_n, wr_n, "≤50%", ">50%")
+    n_y, wr_y, n_n, wr_n = _wr_cut(rows, "top10_holder_rate", 0.70, above=False)
+    _add("Top10 ≤70%", n_y, wr_y, n_n, wr_n, "≤70%", ">70%")
+
+    # Rat trader rate
+    n_y, wr_y, n_n, wr_n = _wr_cut(rows, "rat_trader_rate", 0.10, above=False)
+    _add("Rat ≤10%", n_y, wr_y, n_n, wr_n, "≤10%", ">10%")
+    n_y, wr_y, n_n, wr_n = _wr_cut(rows, "rat_trader_rate", 0.20, above=False)
+    _add("Rat ≤20%", n_y, wr_y, n_n, wr_n, "≤20%", ">20%")
+
+    # Bot degen rate
+    n_y, wr_y, n_n, wr_n = _wr_cut(rows, "bot_degen_rate", 0.50, above=False)
+    _add("Bot ≤50%", n_y, wr_y, n_n, wr_n, "≤50%", ">50%")
+
+    # Entrapment ratio
+    n_y, wr_y, n_n, wr_n = _wr_cut(rows, "entrapment_ratio", 0.20, above=False)
+    _add("Entrapment ≤20%", n_y, wr_y, n_n, wr_n, "≤20%", ">20%")
+
+    # Suspected insider
+    n_y, wr_y, n_n, wr_n = _wr_cut(rows, "suspected_insider_rate", 0.15, above=False)
+    _add("Insider ≤15%", n_y, wr_y, n_n, wr_n, "≤15%", ">15%")
+
+    # Creator status
+    hold_g = [r for r in rows if r.get("creator_token_status") == "creator_hold"]
+    close_g= [r for r in rows if r.get("creator_token_status") == "creator_close"]
+    wr_h = sum(_is_tp(r) for r in hold_g)  / len(hold_g)  if hold_g  else None
+    wr_c = sum(_is_tp(r) for r in close_g) / len(close_g) if close_g else None
+    _add("Creator HOLD", len(hold_g), wr_h, len(close_g), wr_c, "hold", "close")
+
+    # CTO flag
+    n_y, wr_y, n_n, wr_n = _wr_bool(rows, "cto_flag")
+    _add("CTO flag", n_y, wr_y, n_n, wr_n, "CTO=true", "CTO=false")
+
+    # Wash trading
+    n_y, wr_y, n_n, wr_n = _wr_bool(rows, "is_wash_trading")
+    _add("Wash trading", n_y, wr_y, n_n, wr_n, "wash=true", "wash=false")
+
+    # Liq migration
+    n_y, wr_y, n_n, wr_n = _wr_cut(rows, "liq_migration", 20000)
+    _add("Liq ≥$20k", n_y, wr_y, n_n, wr_n, "≥$20k", "<$20k")
+    n_y, wr_y, n_n, wr_n = _wr_cut(rows, "liq_migration", 30000)
+    _add("Liq ≥$30k", n_y, wr_y, n_n, wr_n, "≥$30k", "<$30k")
+
+    # Fee (volume proxy)
+    n_y, wr_y, n_n, wr_n = _wr_cut(rows, "total_fee_sol", 2.0)
+    _add("Fee ≥2 SOL", n_y, wr_y, n_n, wr_n, "≥2 SOL", "<2 SOL")
+    n_y, wr_y, n_n, wr_n = _wr_cut(rows, "total_fee_sol", 3.0)
+    _add("Fee ≥3 SOL", n_y, wr_y, n_n, wr_n, "≥3 SOL", "<3 SOL")
+
+    # Tem social
+    n_y, wr_y, n_n, wr_n = _wr_bool(rows, "has_social")
+    _add("Tem social", n_y, wr_y, n_n, wr_n, "com social", "sem social")
+
+    # Sort by delta desc
+    features_analysis.sort(key=lambda x: (x["delta"] or -99), reverse=True)
+
+    # ── HTML ───────────────────────────────────────────────────────────────
+    CSS = """<style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;
+         font-size:12px;padding:16px}
+    h1{color:#58a6ff;font-size:16px;margin-bottom:4px}
+    .sub{color:#8b949e;font-size:11px;margin-bottom:14px}
+    h2{color:#e3b341;font-size:12px;margin:18px 0 6px;border-bottom:1px solid #30363d;
+       padding-bottom:3px}
+    .kv{display:flex;gap:20px;flex-wrap:wrap;background:#161b22;border:1px solid #30363d;
+        border-radius:6px;padding:10px 16px;margin-bottom:12px}
+    .kv div span{color:#8b949e;font-size:10px;display:block}
+    .kv div b{font-size:15px}
+    table{width:100%;border-collapse:collapse;font-size:11px;margin-bottom:12px}
+    th{background:#161b22;color:#8b949e;padding:4px 8px;text-align:right;
+       border-bottom:1px solid #30363d;font-size:10px;white-space:nowrap}
+    th:first-child,th:nth-child(2){text-align:left}
+    td{padding:3px 6px;border-bottom:1px solid #1c2128;text-align:right;white-space:nowrap}
+    td:first-child,td:nth-child(2){text-align:left}
+    tr:hover td{background:#161b22}
+    .green{color:#3fb950}.yellow{color:#d29922}.orange{color:#e3b341}
+    .red{color:#f85149}.dim{color:#484f58}.blue{color:#58a6ff}.purple{color:#bc8cff}
+    .pos{color:#3fb950}.neg{color:#f85149}
+    .badge-tp{background:#003d00;color:#3fb950;padding:1px 5px;border-radius:3px;font-size:10px}
+    .badge-sl{background:#3d0000;color:#f85149;padding:1px 5px;border-radius:3px;font-size:10px}
+    .badge-none{color:#484f58;font-size:10px}
+    .note{background:#1c2128;border:1px solid #30363d;border-radius:4px;
+          padding:8px 14px;margin:8px 0 14px;font-size:10px;color:#8b949e;line-height:1.6}
+    .feat-pos{color:#3fb950;font-weight:bold}
+    .feat-neg{color:#f85149;font-weight:bold}
+    .feat-neu{color:#8b949e}
+    .sticky-head th{position:sticky;top:0;z-index:10}
+    </style>"""
+
+    def _pct(v, d=0):
+        if v is None: return "<span class='dim'>—</span>"
+        sign = "+" if v > 0 else ""
+        return f"{sign}{v*100:.{d}f}%"
+    def _mc(v):
+        if not v: return "<span class='dim'>—</span>"
+        if v >= 1e6:   return f"${v/1e6:.2f}M"
+        if v >= 1000:  return f"${v/1000:.1f}K"
+        return f"${v:.0f}"
+    def _f(v, d=1):
+        if v is None: return "<span class='dim'>—</span>"
+        return f"{v:.{d}f}"
+    def _min(v):
+        if v is None: return "<span class='dim'>—</span>"
+        return f"{v:.1f}m"
+
+    # Gain color
+    def _gain_cls(g):
+        if g is None: return "dim"
+        if g >= 4.0:  return "purple"
+        if g >= 1.0:  return "green"
+        if g >= 0.30: return "yellow"
+        return "red"
+
+    # ── Estatísticas topo ──────────────────────────────────────────────────
+    wr_sim = n_2x / n_sim if n_sim else 0
+    n_bounced = sum(1 for r in rows if r.get("bounce_ts"))
+    n_traded  = sum(1 for r in rows if r.get("trade_id"))
+
+    h  = f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    h += f"<title>Análise Big Player — {date_str}</title>{CSS}</head><body>"
+    h += f"<h1>📊 Análise Big Player — {date_str}</h1>"
+    h += (f"<p class='sub'>Todos os tokens do HotMonitor · Simulação: comprado no mc_bottom, "
+          f"vendido no mc_peak · TP simulado = gain ≥75%</p>")
+
+    h += "<div class='kv'>"
+    h += f"<div><span>Tokens no HotMonitor</span><b class='blue'>{n_total}</b></div>"
+    h += f"<div><span>Com bottom+peak</span><b class='blue'>{n_sim}</b></div>"
+    h += f"<div><span>WR simulado (≥75%)</span><b class='{'green' if wr_sim>=0.30 else 'red'}'>{wr_sim:.0%}</b></div>"
+    h += f"<div><span>Gain médio (fundo→pico)</span><b class='yellow'>{avg_sim:.0%}</b></div>"
+    h += f"<div><span>≥2× (100%+)</span><b class='green'>{n_2x}</b></div>"
+    h += f"<div><span>≥5× (400%+)</span><b class='purple'>{n_5x}</b></div>"
+    h += f"<div><span>≥10× (900%+)</span><b class='purple'>{n_10x}</b></div>"
+    h += f"<div><span>Bounce disparado</span><b class='yellow'>{n_bounced}</b></div>"
+    h += f"<div><span>Trades executados</span><b class='blue'>{n_traded}</b></div>"
+    h += "</div>"
+
+    h += "<div class='note'>"
+    h += "<b>Como ler:</b> sim_gain = (mc_peak − mc_bottom) / mc_bottom. "
+    h += "Não inclui slippage, fee ou latência. É o potencial bruto se capturamos o fundo real. "
+    h += f"WR simulado usa threshold ≥75% (nosso trailing TP activation). "
+    h += "bottom_quality: good ≤5% erro, ok 5-15%, bad >15% (validado on-chain via Helius)."
+    h += "</div>"
+
+    # ── WR por feature ─────────────────────────────────────────────────────
+    h += "<h2>WR por Feature (TP simulado = gain ≥75%)</h2>"
+    h += "<div class='note'>Ordenado por delta de WR (melhor preditor no topo). "
+    h += "Apenas tokens com bottom+peak calculável entram na análise.</div>"
+    h += "<table>"
+    h += ("<tr><th>Feature</th><th>Grupo SIM</th><th>n</th><th>WR</th>"
+          "<th>Grupo NÃO</th><th>n</th><th>WR</th><th>Delta pp</th></tr>")
+    for fa in features_analysis:
+        delta = fa["delta"]
+        if delta is None:
+            dcls, dstr = "dim", "—"
+        elif delta > 0.10:
+            dcls, dstr = "feat-pos", f"+{delta*100:.1f}pp"
+        elif delta < -0.10:
+            dcls, dstr = "feat-neg", f"{delta*100:.1f}pp"
+        else:
+            dcls, dstr = "feat-neu", f"{delta*100:+.1f}pp"
+
+        def _wrfmt(wr, n):
+            if wr is None or n == 0: return "<span class='dim'>—</span>", "dim"
+            c = "green" if wr >= 0.40 else "yellow" if wr >= 0.25 else "red"
+            return f"{wr:.0%}", c
+
+        wr_y_s, wr_y_c = _wrfmt(fa["wr_yes"], fa["n_yes"])
+        wr_n_s, wr_n_c = _wrfmt(fa["wr_no"],  fa["n_no"])
+
+        h += (f"<tr>"
+              f"<td class='dim'>{fa['label']}</td>"
+              f"<td class='dim'>{fa['yes_label']}</td>"
+              f"<td class='dim'>{fa['n_yes']}</td>"
+              f"<td class='{wr_y_c}'>{wr_y_s}</td>"
+              f"<td class='dim'>{fa['no_label']}</td>"
+              f"<td class='dim'>{fa['n_no']}</td>"
+              f"<td class='{wr_n_c}'>{wr_n_s}</td>"
+              f"<td class='{dcls}'><b>{dstr}</b></td>"
+              f"</tr>")
+    h += "</table>"
+
+    # ── Tabela por token ───────────────────────────────────────────────────
+    h += "<h2>Tokens — Detalhe (ordenado por gain simulado desc)</h2>"
+    h += "<table class='sticky-head'>"
+    h += ("<tr>"
+          "<th>Token</th><th>Migração</th>"
+          "<th>mc_mig</th><th>mc_bot</th><th>mc_peak</th>"
+          "<th>Dump%</th><th>TTB</th><th>TTP</th>"
+          "<th title='sim_gain=(mc_peak-mc_bot)/mc_bot'>Sim gain</th>"
+          "<th title='bot quality'>Quality</th>"
+          "<th>Smart</th><th>Rug</th><th>Top10</th><th>Rat</th>"
+          "<th>Bot%</th><th>Creator</th><th>CTO</th><th>Wash</th>"
+          "<th>Liq</th><th>Fee SOL</th>"
+          "<th>Bounce</th><th>Trade</th>"
+          "</tr>")
+
+    for r in rows:
+        sym   = r.get("symbol") or r["mint"][:8]
+        ts_m  = r.get("ts_migration")
+        ts_str= ts_m.strftime("%H:%M") if ts_m else "—"
+        sg    = r["sim_gain"]
+        sg_str= f"{sg:.0%}" if sg is not None else "<span class='dim'>—</span>"
+        sg_cls= _gain_cls(sg)
+
+        dump   = r.get("pct_drop")
+        ttb    = r.get("time_to_bottom")
+        ttp    = r.get("time_to_peak")
+        smart  = r.get("smart_wallets")
+        rug    = r.get("rug_ratio")
+        top10  = r.get("top10_holder_rate")
+        rat    = r.get("rat_trader_rate")
+        bot    = r.get("bot_degen_rate")
+        creator= r.get("creator_token_status") or "—"
+        cto    = "✓" if r.get("cto_flag") else ""
+        wash   = "⚠" if r.get("is_wash_trading") else ""
+        liq    = r.get("liq_migration")
+        fee    = r.get("total_fee_sol")
+        bq     = r.get("bottom_quality") or "—"
+        bq_cls = {"good": "green", "ok": "yellow", "bad": "red"}.get(bq, "dim")
+
+        # creator color
+        cr_cls = "green" if creator == "creator_close" else ("yellow" if creator == "creator_hold" else "dim")
+        cr_lbl = "close" if creator == "creator_close" else ("hold" if creator == "creator_hold" else "—")
+
+        # bounce badge
+        if r.get("bounce_ts"):
+            bp  = r.get("bounce_pct")
+            bel = r.get("bounce_elapsed")
+            bp_s  = f"{bp:.0%}" if bp else "—"
+            bel_s = f"{bel/60:.0f}m" if bel else "—"
+            bounce_td = f"<span class='yellow'>🔔 {bp_s} @{bel_s}</span>"
+        else:
+            bounce_td = "<span class='dim'>—</span>"
+
+        # trade badge
+        if r.get("trade_id"):
+            ts = r.get("trade_status") or "?"
+            pnl = r.get("trade_pnl")
+            pnl_s = f"{pnl*100:+.1f}%" if pnl is not None else ""
+            if ts in ("tp", "tp_hit", "trailing_active"):
+                trade_td = f"<span class='badge-tp'>TP {pnl_s}</span>"
+            elif ts in ("sl", "sl_hit"):
+                trade_td = f"<span class='badge-sl'>SL {pnl_s}</span>"
+            else:
+                trade_td = f"<span class='dim'>{ts}</span>"
+        else:
+            trade_td = "<span class='badge-none'>—</span>"
+
+        # smart color
+        s_cls = "green" if (smart or 0) >= 3 else "yellow" if (smart or 0) >= 2 else "red"
+
+        h += (f"<tr>"
+              f"<td><b>{sym}</b></td>"
+              f"<td class='dim'>{ts_str}</td>"
+              f"<td>{_mc(r.get('mc_migration'))}</td>"
+              f"<td>{_mc(r.get('mc_bottom'))}</td>"
+              f"<td class='green'>{_mc(r.get('mc_peak'))}</td>"
+              f"<td class='red'>{_pct(dump)}</td>"
+              f"<td>{_min(ttb)}</td>"
+              f"<td>{_min(ttp)}</td>"
+              f"<td class='{sg_cls}'><b>{sg_str}</b></td>"
+              f"<td class='{bq_cls}'>{bq}</td>"
+              f"<td class='{s_cls}'>{smart if smart is not None else '<span class=dim>—</span>'}</td>"
+              f"<td class='{'red' if rug and rug>0.15 else 'green'}'>{_pct(rug)}</td>"
+              f"<td class='{'red' if top10 and top10>0.70 else 'yellow' if top10 and top10>0.50 else 'green'}'>{_pct(top10)}</td>"
+              f"<td class='{'red' if rat and rat>0.20 else 'green'}'>{_pct(rat)}</td>"
+              f"<td class='dim'>{_pct(bot)}</td>"
+              f"<td class='{cr_cls}'>{cr_lbl}</td>"
+              f"<td class='yellow'>{cto}</td>"
+              f"<td class='red'>{wash}</td>"
+              f"<td>{_mc(liq)}</td>"
+              f"<td class='dim'>{_f(fee)}</td>"
+              f"<td>{bounce_td}</td>"
+              f"<td>{trade_td}</td>"
+              f"</tr>")
+    h += "</table>"
+    h += (f"<p class='note'>?date=2026-05-26 para outro dia · "
+          f"?min_fee=1 para filtrar tokens mortos (fee≥1 SOL) · "
+          f"WR simulado assume compra exata no mc_bottom e venda exata no mc_peak — potencial máximo teórico.</p>")
+    h += "</body></html>"
+    return h
+
+
 @app.route("/debug/pipeline-audit")
 def debug_pipeline_audit():
     """
