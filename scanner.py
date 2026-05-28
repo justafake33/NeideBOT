@@ -442,6 +442,18 @@ class HotMonitor:
         if rise_bv > 0:
             buy_concentration = round(rise_lb / rise_bv, 4)
 
+        # C3 — Gate de pool depth: pool rasa = bounce é ruído de AMM, não demanda real.
+        # pool_quote < POOL_MIN_SOL_BOUNCE → um único sell de ~$300 move o preço 25%.
+        # get_pool_quote() lê _pool_quote_last[mint] sob lock — in-memory, zero latência.
+        # Só aplica quando helius está disponível E retornou algum dado para o mint.
+        POOL_MIN_SOL_BOUNCE = float(os.getenv("POOL_MIN_SOL_BOUNCE", "10"))
+        if POOL_MIN_SOL_BOUNCE > 0 and self._helius is not None:
+            pool_depth = self._helius.get_pool_quote(mint)
+            if pool_depth is not None and pool_depth < POOL_MIN_SOL_BOUNCE:
+                logger.info("BOUNCE skip %s — pool=%.1f SOL < min=%.0f SOL",
+                            state.get("symbol", mint[:8]), pool_depth, POOL_MIN_SOL_BOUNCE)
+                return
+
         # ── Atomic bounce_fired set: todos os filtros passaram, agora commita o sinal ────
         # Usar lock novamente para garantir que nenhuma outra thread setou bounce_fired
         # entre o snapshot inicial e aqui (improvável mas possível com timing muito específico).
