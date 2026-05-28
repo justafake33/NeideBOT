@@ -37233,5 +37233,394 @@ def debug_mint_trace():
                "<h1 class='red'>Erro</h1><pre>" + err + "</pre></body></html>", 500
 
 
+@app.route("/analise/bigplayer")
+def analise_bigplayer():
+    """
+    Big Player Entry Validation
+
+    Computa features de microestrutura derivadas do Codex sobre bounce_signals existentes
+    e correlaciona com outcomes via token_ticks (60min, entry=mc_at_signal, TP=+75%, SL=-25%).
+
+    Features calculadas em Python a partir de colunas existentes:
+      seller_exhaustion  = 1 - (rise_sell_vol / pre_sell_vol)   — sellers desaceleraram no RISE?
+      churn_ratio        = gross_rise / |net_rise|               — volume tóxico (wash?)
+      net_efficiency     = |net_rise| / gross_rise               — fração produtiva do capital
+      pool_norm_buy      = rise_buy_vol / pool_quote_at_signal   — pressão relativa ao pool
+      buy_concentration  = rise_lrg_buy / rise_buy_vol           — poucas carteiras grandes?
+    """
+    import psycopg2, psycopg2.extras, traceback as _tb
+    from db import DATABASE_URL
+
+    TP_MULT    = 1.75
+    SL_MULT    = 0.75
+    MIN_TICKS  = 3
+    SINCE      = "2026-05-26"   # marco zero dados limpos
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        cur.execute("""
+            WITH outcomes AS (
+                SELECT
+                    bs.mint,
+                    bs.ts_signal,
+                    bs.mc_at_signal                                     AS entry_mc,
+                    bs.bounce_pct,
+                    bs.elapsed_sec,
+                    -- PRÉ window (absorption = [ts_min-60s → ts_min])
+                    COALESCE(bs.absorption_buy_vol,  0)                 AS pre_buy,
+                    COALESCE(bs.absorption_sell_vol, 0)                 AS pre_sell,
+                    COALESCE(bs.absorption_events,   0)                 AS pre_events,
+                    -- RISE window
+                    COALESCE(bs.rise_buy_vol,  0)                       AS rise_buy,
+                    COALESCE(bs.rise_sell_vol, 0)                       AS rise_sell,
+                    COALESCE(bs.rise_events,   0)                       AS rise_events,
+                    bs.rise_lrg_buy,
+                    bs.rise_net_flow,
+                    -- Pool + meta
+                    bs.pool_quote_at_signal,
+                    bs.buy_concentration,
+                    bs.h23_window,
+                    bs.dump_seller_hhi,
+                    -- Token outcome via ticks (60min)
+                    MAX(COALESCE(tt.mc_high, tt.mc))                    AS max_mc,
+                    MIN(COALESCE(tt.mc_low,  tt.mc))                    AS min_mc,
+                    COUNT(tt.id)                                        AS tick_count
+                FROM bounce_signals bs
+                JOIN token_ticks tt
+                    ON  tt.mint    = bs.mint
+                    AND tt.tick_ts > bs.ts_signal
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
+                WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+                  AND bs.ts_signal   >= %(since)s
+                GROUP BY
+                    bs.mint, bs.ts_signal, bs.mc_at_signal, bs.bounce_pct, bs.elapsed_sec,
+                    bs.absorption_buy_vol, bs.absorption_sell_vol, bs.absorption_events,
+                    bs.rise_buy_vol, bs.rise_sell_vol, bs.rise_events,
+                    bs.rise_lrg_buy, bs.rise_net_flow,
+                    bs.pool_quote_at_signal, bs.buy_concentration,
+                    bs.h23_window, bs.dump_seller_hhi
+                HAVING COUNT(tt.id) >= %(min_ticks)s
+            )
+            SELECT *,
+                (max_mc >= entry_mc * %(tp)s)  AS tp_hit,
+                (min_mc <= entry_mc * %(sl)s)  AS sl_hit
+            FROM outcomes
+            ORDER BY ts_signal DESC
+        """, {"since": SINCE, "tp": TP_MULT, "sl": SL_MULT, "min_ticks": MIN_TICKS})
+        rows = cur.fetchall()
+        conn.close()
+    except Exception:
+        return f"<pre>{_tb.format_exc()}</pre>", 500
+
+    if not rows:
+        return (
+            "<p style='font-family:monospace;color:#c9d1d9;padding:20px'>"
+            f"Sem dados suficientes desde {SINCE} (bounces + ticks)."
+            "</p>"
+        )
+
+    # ── Compute derived features in Python ───────────────────────────────────
+    def feats(r):
+        pre_sell  = float(r["pre_sell"]  or 0)
+        pre_buy   = float(r["pre_buy"]   or 0)
+        rise_buy  = float(r["rise_buy"]  or 0)
+        rise_sell = float(r["rise_sell"] or 0)
+        pool      = float(r["pool_quote_at_signal"] or 0)
+        lrg       = float(r["rise_lrg_buy"] or 0)
+        gross     = rise_buy + rise_sell
+        net       = abs(rise_buy - rise_sell)
+
+        se = (1.0 - rise_sell / pre_sell) if pre_sell > 0 else None
+        cr = gross / net if net > 0.001 else None
+        ne = net / gross  if gross > 0   else None
+        pn = rise_buy / pool if pool > 0 else None
+        bc = lrg / rise_buy  if rise_buy > 0 else None
+
+        return {
+            "seller_exhaustion": se,
+            "churn_ratio":       cr,
+            "net_efficiency":    ne,
+            "pool_norm_buy":     pn,
+            "buy_conc":          bc,
+            "has_rise_data":     r["rise_events"] > 0,
+            "has_pre_data":      r["pre_events"] > 0,
+        }
+
+    enriched = [dict(r, **feats(r)) for r in rows]
+
+    # ── Baseline ──────────────────────────────────────────────────────────────
+    n_total  = len(enriched)
+    base_tp  = sum(1 for r in enriched if r["tp_hit"] and not r["sl_hit"])
+    BASE_WR  = round(base_tp / n_total * 100, 1) if n_total else 0
+
+    def agg(subset):
+        n = len(subset)
+        if n == 0:
+            return {"n": 0, "tp": 0, "sl": 0, "wr": None}
+        tp = sum(1 for r in subset if r["tp_hit"] and not r["sl_hit"])
+        sl = sum(1 for r in subset if r["sl_hit"])
+        return {"n": n, "tp": tp, "sl": sl, "wr": round(tp / n * 100, 1)}
+
+    def wr_col(wr):
+        if wr is None: return "—", "#8b949e"
+        c = "#3fb950" if wr >= BASE_WR + 8 else ("#f85149" if wr <= BASE_WR - 8 else "#e3b341")
+        return f"{wr:.1f}%", c
+
+    def delta(wr):
+        if wr is None: return "—"
+        d = wr - BASE_WR
+        c = "#3fb950" if d >= 5 else ("#f85149" if d <= -5 else "#8b949e")
+        return f"<span style='color:{c}'>{d:+.1f}pp</span>"
+
+    def tbl(title, note, bins, key_fn=None):
+        hdrs = ["Faixa", "n", "TP", "SL", "WR%", "Δ baseline"]
+        ths  = "".join(f"<th{'  style=text-align:right' if i else ''}>{h}</th>"
+                       for i, h in enumerate(hdrs))
+        body = ""
+        for label, fn in bins:
+            subset = [r for r in enriched if fn(r[key_fn] if key_fn else r)]
+            g = agg(subset)
+            ws, wc = wr_col(g["wr"])
+            body += (
+                f"<tr><td>{label}</td>"
+                f"<td style='text-align:right'>{g['n']}</td>"
+                f"<td style='text-align:right'>{g['tp']}</td>"
+                f"<td style='text-align:right'>{g['sl']}</td>"
+                f"<td style='text-align:right;color:{wc}'>{ws}</td>"
+                f"<td style='text-align:right'>{delta(g['wr'])}</td></tr>"
+            )
+        note_html = f"<p class='note'>{note}</p>" if note else ""
+        return f"<h2>{title}</h2>{note_html}<table><tr>{ths}</tr>{body}</table>"
+
+    # ── Feature bins ─────────────────────────────────────────────────────────
+
+    SE_BINS = [
+        ("≥0.7  (sellers desapareceram no RISE — exaustão forte)",
+            lambda r: r["seller_exhaustion"] is not None and r["seller_exhaustion"] >= 0.7),
+        ("0.4–0.7  (exaustão moderada)",
+            lambda r: r["seller_exhaustion"] is not None and 0.4 <= r["seller_exhaustion"] < 0.7),
+        ("0.0–0.4  (sellers ativos — exaustão fraca)",
+            lambda r: r["seller_exhaustion"] is not None and 0.0 <= r["seller_exhaustion"] < 0.4),
+        ("<0  (mais venda no RISE do que no PRÉ — sellers aceleraram)",
+            lambda r: r["seller_exhaustion"] is not None and r["seller_exhaustion"] < 0.0),
+        ("sem dados (pre_sell = 0 ou sem PRÉ)",
+            lambda r: r["seller_exhaustion"] is None),
+    ]
+
+    CR_BINS = [
+        ("<2×  (capital eficiente — poucas mãos, direção clara)",
+            lambda r: r["churn_ratio"] is not None and r["churn_ratio"] < 2.0),
+        ("2–5×  (algum wash, mas net positivo)",
+            lambda r: r["churn_ratio"] is not None and 2.0 <= r["churn_ratio"] < 5.0),
+        ("5–15×  (churn elevado — muito volume, pouco net)",
+            lambda r: r["churn_ratio"] is not None and 5.0 <= r["churn_ratio"] < 15.0),
+        ("≥15×  (wash trading / bots HFT — volume tóxico)",
+            lambda r: r["churn_ratio"] is not None and r["churn_ratio"] >= 15.0),
+        ("sem dados (rise net ≈ 0)",
+            lambda r: r["churn_ratio"] is None),
+    ]
+
+    NE_BINS = [
+        ("≥0.7  (eficiência alta — 70%+ do volume é direcional)",
+            lambda r: r["net_efficiency"] is not None and r["net_efficiency"] >= 0.7),
+        ("0.4–0.7  (eficiência moderada)",
+            lambda r: r["net_efficiency"] is not None and 0.4 <= r["net_efficiency"] < 0.7),
+        ("0.2–0.4  (eficiência baixa — muito tráfego bilateral)",
+            lambda r: r["net_efficiency"] is not None and 0.2 <= r["net_efficiency"] < 0.4),
+        ("<0.2  (quase tudo wash — sinal de entrada muito fraco)",
+            lambda r: r["net_efficiency"] is not None and r["net_efficiency"] < 0.2),
+        ("sem dados (rise_buy + rise_sell = 0)",
+            lambda r: r["net_efficiency"] is None),
+    ]
+
+    PN_BINS = [
+        ("≥0.2  (≥20% do pool comprado — pressão real)",
+            lambda r: r["pool_norm_buy"] is not None and r["pool_norm_buy"] >= 0.2),
+        ("0.1–0.2  (compra moderada relativa ao pool)",
+            lambda r: r["pool_norm_buy"] is not None and 0.1 <= r["pool_norm_buy"] < 0.2),
+        ("0.05–0.1  (compra leve)",
+            lambda r: r["pool_norm_buy"] is not None and 0.05 <= r["pool_norm_buy"] < 0.1),
+        ("<0.05  (compra negligível vs pool)",
+            lambda r: r["pool_norm_buy"] is not None and r["pool_norm_buy"] < 0.05),
+        ("sem dados (pool_quote = 0)",
+            lambda r: r["pool_norm_buy"] is None),
+    ]
+
+    BC_BINS = [
+        ("≥0.5  (1 carteira > 50% do volume — demanda concentrada)",
+            lambda r: r["buy_conc"] is not None and r["buy_conc"] >= 0.5),
+        ("0.25–0.5  (concentração moderada)",
+            lambda r: r["buy_conc"] is not None and 0.25 <= r["buy_conc"] < 0.5),
+        ("0.1–0.25  (distribuído — vários buyers)",
+            lambda r: r["buy_conc"] is not None and 0.1 <= r["buy_conc"] < 0.25),
+        ("<0.1  (muito fragmentado / micro-compras)",
+            lambda r: r["buy_conc"] is not None and r["buy_conc"] < 0.1),
+        ("sem dados (rise_buy = 0)",
+            lambda r: r["buy_conc"] is None),
+    ]
+
+    # ── Multi-feature intersections ───────────────────────────────────────────
+    def is_good_se(r):   return r["seller_exhaustion"] is not None and r["seller_exhaustion"] >= 0.4
+    def is_good_ne(r):   return r["net_efficiency"]    is not None and r["net_efficiency"]    >= 0.4
+    def is_good_pn(r):   return r["pool_norm_buy"]     is not None and r["pool_norm_buy"]     >= 0.1
+    def is_good_bc(r):   return r["buy_conc"]          is not None and r["buy_conc"]          >= 0.25
+    def is_clean_cr(r):  return r["churn_ratio"]       is not None and r["churn_ratio"]       <  5.0
+
+    MX_BINS = [
+        ("SE≥0.4 + NE≥0.4 + PN≥0.1 + CR<5  (setup A+: exaustão + eficiência + pressão + clean)",
+            lambda r: is_good_se(r) and is_good_ne(r) and is_good_pn(r) and is_clean_cr(r)),
+        ("SE≥0.4 + NE≥0.4  (exaustão + eficiência)",
+            lambda r: is_good_se(r) and is_good_ne(r)),
+        ("SE≥0.4 + PN≥0.1  (exaustão + pressão real)",
+            lambda r: is_good_se(r) and is_good_pn(r)),
+        ("NE≥0.4 + PN≥0.1  (eficiência + pressão — sem exaustão)",
+            lambda r: is_good_ne(r) and is_good_pn(r) and not is_good_se(r)),
+        ("Nenhuma condição (sem sinal microestrutura)",
+            lambda r: not is_good_se(r) and not is_good_ne(r) and not is_good_pn(r)),
+    ]
+
+    # ── Coverage stats ────────────────────────────────────────────────────────
+    n_rise = sum(1 for r in enriched if r["has_rise_data"])
+    n_pre  = sum(1 for r in enriched if r["has_pre_data"])
+    n_se   = sum(1 for r in enriched if r["seller_exhaustion"] is not None)
+    n_cr   = sum(1 for r in enriched if r["churn_ratio"] is not None)
+    n_ne   = sum(1 for r in enriched if r["net_efficiency"] is not None)
+    n_pn   = sum(1 for r in enriched if r["pool_norm_buy"] is not None)
+    n_bc   = sum(1 for r in enriched if r["buy_conc"] is not None)
+
+    # ── Sample: last 20 bounces with data ─────────────────────────────────────
+    sample = [r for r in enriched if r["has_rise_data"]][:20]
+    sample_rows = ""
+    for r in sample:
+        tp_mark  = "✓TP" if r["tp_hit"] and not r["sl_hit"] else ("✗SL" if r["sl_hit"] else "—")
+        tp_color = "#3fb950" if "✓" in tp_mark else ("#f85149" if "✗" in tp_mark else "#8b949e")
+        se_s = f"{r['seller_exhaustion']:+.2f}" if r["seller_exhaustion"] is not None else "—"
+        cr_s = f"{r['churn_ratio']:.1f}×" if r["churn_ratio"] is not None else "—"
+        ne_s = f"{r['net_efficiency']:.2f}" if r["net_efficiency"] is not None else "—"
+        pn_s = f"{r['pool_norm_buy']:.3f}" if r["pool_norm_buy"] is not None else "—"
+        bc_s = f"{r['buy_conc']:.2f}" if r["buy_conc"] is not None else "—"
+        bp_s = f"{(r['bounce_pct'] or 0)*100:.0f}%"
+        e_s  = f"{(r['elapsed_sec'] or 0)/60:.1f}m"
+        sample_rows += (
+            f"<tr><td style='color:{tp_color}'>{tp_mark}</td>"
+            f"<td>{bp_s}</td><td>{e_s}</td>"
+            f"<td style='text-align:right'>{se_s}</td>"
+            f"<td style='text-align:right'>{cr_s}</td>"
+            f"<td style='text-align:right'>{ne_s}</td>"
+            f"<td style='text-align:right'>{pn_s}</td>"
+            f"<td style='text-align:right'>{bc_s}</td>"
+            f"<td style='text-align:right'>{r['rise_events']}</td>"
+            f"<td style='text-align:right'>{r['pre_events']}</td></tr>"
+        )
+
+    se_tbl = tbl(
+        "Seller Exhaustion  [1 − (rise_sell / pre_sell)]",
+        "Mede se os vendedores desaceleraram no RISE vs PRÉ. "
+        "≥0.7 = sellers desapareceram. <0 = mais venda no bounce do que antes (aceleração — ruim).",
+        SE_BINS)
+
+    cr_tbl = tbl(
+        "Churn Ratio  [(rise_buy + rise_sell) / |rise_buy − rise_sell|]",
+        "Volume total / net flow. Alto = muito tráfego bilateral sem direção (wash ou bots). "
+        "<2× = poucas trocas, forte direção = real demand.",
+        CR_BINS)
+
+    ne_tbl = tbl(
+        "Net Efficiency  [|rise_buy − rise_sell| / (rise_buy + rise_sell)]",
+        "Fração do volume que é realmente direcional. ≥0.7 = 70% do volume tem direção clara. "
+        "<0.2 = quase tudo bilateral = sinal fraco.",
+        NE_BINS)
+
+    pn_tbl = tbl(
+        "Pool Normalized Buy  [rise_buy / pool_quote_at_signal]",
+        "Compra do RISE relativa ao tamanho do pool. ≥0.2 = compraram 20%+ do pool = pressão real. "
+        "<0.05 = compra negligível — o token subiu por vácuo, não por demanda.",
+        PN_BINS)
+
+    bc_tbl = tbl(
+        "Buy Concentration  [rise_lrg_buy / rise_buy]",
+        "Fração do volume de compra que veio de 1 carteira (maior trade). "
+        "≥0.5 = demanda concentrada = uma baleia absorveu. "
+        "<0.1 = micro-compras fragmentadas = possível bot farming.",
+        BC_BINS)
+
+    mx_tbl = tbl(
+        "Interseção de Features  (Setup A+, A, B, Nenhum)",
+        "Combinações de critérios. SE=seller_exhaustion≥0.4, NE=net_efficiency≥0.4, "
+        "PN=pool_norm_buy≥0.1, CR=churn_ratio<5.",
+        MX_BINS)
+
+    css = """
+    <style>
+      body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+      h1{color:#58a6ff}h2{color:#79c0ff;margin-top:28px}
+      table{border-collapse:collapse;width:100%;max-width:800px;margin-bottom:20px}
+      th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:left}
+      td{padding:5px 10px;border:1px solid #21262d;white-space:nowrap}
+      .note{color:#8b949e;font-size:12px;margin:4px 0 14px}
+      .box{background:#161b22;border:1px solid #30363d;padding:10px 14px;border-radius:4px;
+           margin:10px 0;font-size:12px}
+      .warn{color:#e3b341}.green{color:#3fb950}.red{color:#f85149}
+      a{color:#58a6ff;text-decoration:none}
+    </style>"""
+
+    html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+    <title>Big Player Analysis</title>{css}</head><body>
+    <h1>🎯 Big Player — Features de Microestrutura vs Outcome</h1>
+    <p class='note'>
+      Dados desde {SINCE} (marco zero phantom fix). Outcome: token_ticks 60min pós-sinal.<br>
+      Entry = mc_at_signal · TP = +75% (×{TP_MULT}) · SL = -25% (×{SL_MULT}) · mín {MIN_TICKS} ticks.
+    </p>
+    <div class='box'>
+      <b>Baseline:</b> {n_total} bounces com ticks &nbsp;|&nbsp;
+      <b>{base_tp} TP</b> / {n_total - base_tp} não-TP &nbsp;|&nbsp;
+      WR base = <b>{BASE_WR}%</b><br>
+      Cobertura RISE: {n_rise}/{n_total} ({round(n_rise/n_total*100) if n_total else 0}%) &nbsp;|&nbsp;
+      Cobertura PRÉ: {n_pre}/{n_total} ({round(n_pre/n_total*100) if n_total else 0}%) &nbsp;|&nbsp;
+      SE={n_se} · CR={n_cr} · NE={n_ne} · PN={n_pn} · BC={n_bc}
+    </div>
+
+    <p>
+      <a href='/analise/h22-h25-ticks'>H22-H25 Ticks</a> &nbsp;|&nbsp;
+      <a href='/analise/sinal-puro'>Sinal Puro</a> &nbsp;|&nbsp;
+      <a href='/analise/wr-breakdown'>WR Breakdown</a> &nbsp;|&nbsp;
+      <a href='/debug/flow-timeline'>Flow Timeline</a>
+    </p>
+
+    {se_tbl}
+    {cr_tbl}
+    {ne_tbl}
+    {pn_tbl}
+    {bc_tbl}
+    {mx_tbl}
+
+    <h2>Últimos bounces com dados RISE</h2>
+    <table>
+      <tr>
+        <th>Out</th><th>Bounce</th><th>Elapsed</th>
+        <th style='text-align:right'>SE</th>
+        <th style='text-align:right'>CR</th>
+        <th style='text-align:right'>NE</th>
+        <th style='text-align:right'>PN</th>
+        <th style='text-align:right'>BC</th>
+        <th style='text-align:right'>Rise ev</th>
+        <th style='text-align:right'>PRÉ ev</th>
+      </tr>
+      {sample_rows if sample_rows else "<tr><td colspan='10' style='color:#8b949e'>sem bounces com dados RISE desde " + SINCE + "</td></tr>"}
+    </table>
+
+    <p class='note'>
+      SE=seller_exhaustion · CR=churn_ratio · NE=net_efficiency ·
+      PN=pool_norm_buy · BC=buy_concentration<br>
+      Rise ev = eventos Helius na janela RISE (mc_min → mc_at_signal) ·
+      PRÉ ev = eventos 60s antes do fundo
+    </p>
+    </body></html>"""
+
+    return html
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
