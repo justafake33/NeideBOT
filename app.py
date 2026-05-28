@@ -36726,9 +36726,13 @@ def analise_bounce_universe():
     """
     Visão oracle do universo de bounces: TODOS os tokens migrados com token_ticks.
 
-    Entry  = fundo real (mc_min dos ticks, janela 90s–20min pós migração)
-    Outcome= 60 min completos a partir do fundo — sem teto artificial de bounce %
+    Entry  = fundo oracle (mc_min nos ticks, janela completa 90s–60min)
+    Outcome= do fundo até ts_migration+60min (tempo restante = o que o mercado oferece)
     Sem filtros do bot — perspectiva não-enviesada do que o universo entrega.
+
+    90s cutoff: elimina candle de transição bonding curve→pool (Bug 5).
+    Sem cap de 20min: o fundo pode acontecer quando quiser na janela de 60min.
+    Tokens com fundo tardio têm menos janela de recovery — isso é a realidade.
 
     Responde:
       - Qual % dos tokens naturalmente chega a +75% / +100% do fundo oracle?
@@ -36758,14 +36762,14 @@ def analise_bounce_universe():
                 WHERE ts_migration >= %(since)s
                   AND mc_migration IS NOT NULL AND mc_migration > 0
             ),
-            -- Menor preço real na janela 90s–20min (elimina transição bonding curve)
+            -- Menor preço real na janela 90s–60min (fundo oracle: sem cap de 20min)
             bottom_val AS (
                 SELECT tt.mint,
                     MIN(COALESCE(tt.mc_low, tt.mc)) AS mc_min
                 FROM token_ticks tt
                 JOIN mig m ON m.mint = tt.mint
                 WHERE tt.tick_ts > m.ts_migration + '90 seconds'::interval
-                  AND tt.tick_ts < m.ts_migration + '20 minutes'::interval
+                  AND tt.tick_ts < m.ts_migration + '60 minutes'::interval
                 GROUP BY tt.mint
                 HAVING COUNT(*) >= 2
             ),
@@ -36777,7 +36781,7 @@ def analise_bounce_universe():
                 JOIN mig          m  ON m.mint  = tt.mint
                 JOIN bottom_val   bv ON bv.mint = tt.mint
                 WHERE tt.tick_ts > m.ts_migration + '90 seconds'::interval
-                  AND tt.tick_ts < m.ts_migration + '20 minutes'::interval
+                  AND tt.tick_ts < m.ts_migration + '60 minutes'::interval
                   AND COALESCE(tt.mc_low, tt.mc) <= bv.mc_min * 1.005
                 ORDER BY tt.mint, tt.tick_ts ASC
             ),
@@ -36917,8 +36921,10 @@ def analise_bounce_universe():
             lambda r: 3  <= float(r["ttb_min"] or 99) < 8),
         ("8–15min",
             lambda r: 8  <= float(r["ttb_min"] or 99) < 15),
-        ("≥15min  (fundo tardio — venda gradual ou re-dump)",
-            lambda r: float(r["ttb_min"] or 99) >= 15),
+        ("15–25min  (fundo tardio)",
+            lambda r: 15 <= float(r["ttb_min"] or 99) < 25),
+        ("≥25min  (fundo muito tardio — descartado pelos nossos filtros)",
+            lambda r: float(r["ttb_min"] or 99) >= 25),
     ]
 
     SMART_BINS = [
@@ -36963,8 +36969,9 @@ def analise_bounce_universe():
         "Dump mais fundo entrega bounce maior ou maior probabilidade de não recovery?",
         DROP_BINS)
     ttb_tbl   = tbl(
-        "Time to Bottom — quando o fundo aparece (90s–20min)",
-        "Fundo em <3min = spike de venda concentrado (exaustão rápida). ≥15min = venda gradual ou re-dump.",
+        "Time to Bottom — quando o fundo aparece (janela completa 90s–60min)",
+        "Fundo em <3min = spike concentrado. ≥25min = fundo que nossos filtros (A.5) descartariam. "
+        "Essas duas faixas mostram o que estamos perdendo vs o que evitamos.",
         TTB_BINS)
     smart_tbl = tbl(
         "Smart Wallets no momento da migração",
@@ -36988,8 +36995,8 @@ def analise_bounce_universe():
     <title>Bounce Universe</title>{css}</head><body>
     <h1>🌌 Bounce Universe — Todos os Tokens (visão oracle)</h1>
     <p class='note'>
-      Entry = fundo oracle (mc_min dos ticks, 90s–20min pós migração) · SL = −25% do fundo.<br>
-      Outcome = max_mc nos <b>60min completos</b> a partir do fundo ·
+      Entry = fundo oracle (mc_min dos ticks, janela completa 90s–60min) · SL = −25% do fundo.<br>
+      Outcome = max_mc do fundo até ts_migration+60min (tempo restante da janela) ·
       <b>Sem filtros do bot</b> · Desde {SINCE}.
     </p>
     <div class='box'>
