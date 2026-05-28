@@ -571,7 +571,7 @@ MIGRATION_SOL_UNITS=410      # SOL teórico da bonding curve → mc_migration_bc
 BOUNCE_MIN_PCT=0.30          # bounce mínimo do fundo para disparar sinal — A.7 (era 0.15; 15-20% → 9.1% WR live, n=11)
 BOUNCE_DROP_MIN=0.30         # drop mínimo da migração para considerar (30%)
 BOUNCE_TIME_MAX=20.0         # A.5: janela máxima em minutos (100% TPs em ≤20min)
-BOTTOM_FRESHNESS_SEC=300     # A.6: máx 5min desde o último mc_min (bloqueia sinais tardios)
+BOTTOM_FRESHNESS_SEC=180     # A.6: máx 3min desde o último mc_min (bloqueia sinais tardios; reduzido de 300s em 2026-05-28)
 
 # Fase 6 — Execução de trades (configuráveis sem redeploy)
 TRADING_ENABLED=true         # true para ativar trades reais
@@ -805,6 +805,14 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 
 171. **`bottom_error_pct` e `bottom_quality` — métrica de confiança automática (sessão 15, 2026-05-26)**: `bottom_error_pct = (mc_min_decision - mc_min_true) / mc_min_true`. Positivo → bot viu fundo mais alto (perdeu o fundo real). Negativo → bot viu algo mais baixo (phantom ou secondary pool). `bottom_quality`: `"good"` (|error| ≤ 5%), `"ok"` (5-15%), `"bad"` (> 15%). 6 novas colunas em `migrations`: `mc_min_true`, `ts_min_true`, `txid_min_true`, `source_truth`, `bottom_error_pct`, `bottom_quality`. Função `db.update_bottom_truth()`. Log auditável: `bottom_truth SYMBOL: decision=$X true=$Y error=+Z% quality=good txid=abc123...`. Após o primeiro ciclo de graduações (~60min após deploy), o banco terá dados suficientes para quantificar objetivamente a qualidade da captura de fundo. Commit `ae65a9c`.
 
+175. **C1 — sl_ref usa mc_at_signal como fallback antes de entry_expected (sessão 16, 2026-05-28)**: `TradeMonitor._check_trade()` calculava `sl_ref = entry_mc_real or entry_mc` onde `entry_mc = entry_expected = mc_bottom × 1.15`. Para bounces altos (95%), `entry_expected` ficava 41% abaixo da entrada real → SL calculado abaixo do próprio fundo → threshold nunca atingido no TradeMonitor. Fix: `sl_ref = entry_mc_real or trade.get("mc_at_signal") or entry_mc`. `mc_at_signal` é o MC no momento do sinal de bounce — proxy muito mais próximo da entrada real. Commit `f962915`.
+
+176. **C2 — HeliusWS injetado no TradeExecutor (sessão 16, 2026-05-28)**: TradeExecutor não tinha acesso ao feed erpc em tempo real — apenas TradeMonitor tinha via `set_helius()`. Adicionado `self._helius = None` no `__init__` e método `set_helius()` ao TradeExecutor (mesmo padrão do TradeMonitor). Em `app.py`, linha após `monitor.set_helius(hot._helius)`: `executor.set_helius(hot._helius)`. Habilita C3 (leitura de pool_quote no bounce). Commit `f962915`.
+
+177. **C3 — Gate de pool depth antes do bounce_fired (sessão 16, 2026-05-28)**: pool rasa = bounce é ruído de AMM, não demanda real. Em pool de 10 SOL, uma única venda de ~$300 move o preço 25% — SL de 25% dispara por física, não por price action. Gate adicionado em `_check_bounce()` antes do bloco atômico `bounce_fired`: `pool_depth = self._helius.get_pool_quote(mint)` — leitura in-memory do `_pool_quote_last[mint]` sob lock, zero latência. Se `pool_depth < POOL_MIN_SOL_BOUNCE` → sinal rejeitado. Env var `POOL_MIN_SOL_BOUNCE=10` (mesmo threshold que A.9/MIN_POOL_SOL). Ajustar para 15-20 SOL antes de escalar para $10/trade. Commit `f962915`.
+
+178. **C4 — ALT tx aceita quando PDA confirmado por criptografia (sessão 16, 2026-05-28)**: melhoria do fix anterior (commit 037a06c). Antes: `accounts=[]` (transação ALT/versioned) → sempre rejeitado → bot perdia fundos reais que aconteciam em transações ALT (WHY +22.5%, CTO +19.7%, RAMBO +3.7% na auditoria n=15). Causa raiz: a pool primária já era conhecida via PDA derivado criptograficamente (`_pool_pda[mint]`), mas o código rejeitava o evento por não conseguir validar via lista de contas. Fix: quando `accounts=[]` E `_pool_pda[mint] == known_pool` → aceita o evento (PDA determinístico = matematicamente garantido). Quando `accounts=[]` E sem PDA confirmado → ainda rejeita (proteção mantida). `accounts=None` (modo Helius) → comportamento preservado sem validação. K-gate permanece como guard secundário. Com PDA pre-seed (`_derive_async`) ativo, a maioria dos mints já tem PDA confirmado antes dos primeiros eventos chegar. Commit `f962915`.
+
 172. **Resultado da auditoria final sessão 15 — 100% PASS**: todos os 7 critérios passaram com evidência de código. kline não escreve mc_min_decision (scanner.py:793–795). Gate 90s não existe em `_check_bounce` (scanner.py:304). Replay valida identidade de pool via `pool_acc in _replay_accs` (helius_ws.py:912). mc_min_true com txid persistido (helius_rpc.py:317–432 + db.py:612). bottom_error_pct e bottom_quality calculados e persistidos (scanner.py:947–953 + db.py:616). Monotonicidade: `if mc < state["mc_min"]` in-memory + `AND mc_bottom > %(mc)s` no DB. Logs com source/old/new: `"Fundo(%s) %s: mint=%s mc_old=$%.0f mc_new=$%.0f event_ts=%.3f elapsed=%.1fmin"` com source = `"erpc_live"` ou `"erpc_replay"`. Nenhum FAIL identificado. Este é o marco onde os dados começam a ser auditáveis por txid Solana.
 
 173. **Bug phantom via ALT tx corrigido (sessão 16, 2026-05-26)**: transações Solana versioned (v0) com Address Lookup Tables fazem com que `_parse_account_keys_from_tx()` retorne `[]` (lista vazia) — as account keys estão nas tabelas de lookup, não embutidas no wire format. O check antigo era `if accounts:` — lista vazia é falsy, logo o check era silenciosamente pulado → eventos de secondary pool em transações ALT passavam mesmo com pool confirmada → mc_min contaminado. Fix aplicado em dois commits: `16a512b` (correção inicial — rejeitava `accounts=[]`) e `037a06c` (fix da regressão crítica). A regressão: o fix intermediário usava `if not accounts or ...` — `not None` é True → modo Helius (que passa `accounts=None` por design) rejeitava TODOS os eventos após pool confirmada, tornando o bot completamente cego se erpc caísse. Fix final: `if known_pool and accounts is not None: if not accounts or known_pool not in accounts: return False`. Regra: validação de pool só aplica quando `accounts` é uma lista (erpc mode). `None` = modo Helius = sem dados de account = sem validação possível.
@@ -832,7 +840,7 @@ Branch `claude/gallant-ptolemy-HNNbz` ativo. erpc operacional, phantom fix deplo
 
 ### Pipeline ativo (branch `claude/gallant-ptolemy-HNNbz`)
 `TRADING_ENABLED=true` · `CALIBRATION_AMOUNT_USD=1.0` · `CALIBRATION_MAX_TRADES=999999`
-`TRADE_SL_PCT=0.25` · `FILTER_SMART_MIN=3` · `BOUNCE_MIN_PCT=0.30` · `BOUNCE_MAX_PCT=1.50`
+`TRADE_SL_PCT=0.25` · `FILTER_SMART_MIN=3` · `BOUNCE_MIN_PCT=0.30` · `BOUNCE_MAX_PCT=1.00`
 `MIN_POOL_SOL=10` (Railway + código default) · `ERPC_API_KEY` configurado · `HELIUS_RPC_URL` configurado
 
 **Portfolio:** ~$50 (após perdas com dados corrompidos históricos).
@@ -853,12 +861,17 @@ Branch `claude/gallant-ptolemy-HNNbz` ativo. erpc operacional, phantom fix deplo
 - ✅ **A.3 REMOVIDO**: entry ratio 50-65% baseada em dados corrompidos
 - ✅ **Phantom fix ALT tx (CRÍTICO)**: `accounts is not None` guard — erpc ALT txs (`accounts=[]`) rejeitadas corretamente; modo Helius (`accounts=None`) não afetado. Commits `16a512b` + `037a06c`
 - ✅ **Auditoria bottom capture (n=15)**: 67% precisos, 20% learning window, 13% phantoms corrigidos
+- ✅ **C1 — sl_ref fix (TradeMonitor)**: `sl_ref = entry_mc_real or mc_at_signal or entry_expected` — SL calculado com referência correta. Commit `f962915`
+- ✅ **C2 — HeliusWS injetado no TradeExecutor**: `set_helius()` adicionado ao executor, injection em `app.py`. Commit `f962915`
+- ✅ **C3 — Pool depth gate no bounce**: `POOL_MIN_SOL_BOUNCE=10` — rejeita bounce em pool rasa antes de `bounce_fired`. Commit `f962915`
+- ✅ **C4 — ALT PDA fallback**: `accounts=[]` + `_pool_pda[mint] == known_pool` → aceita (PDA criptograficamente garantido). Commit `f962915`
 
 **Filtros ativos (ordem de aplicação no _check_bounce):**
 - A.5: bloqueia elapsed > 20min (do ts_migration on-chain)
-- A.6: bloqueia fundo estagnado > 5min (BOTTOM_FRESHNESS_SEC=300)
+- A.6: bloqueia fundo estagnado > 3min (BOTTOM_FRESHNESS_SEC=180)
 - A.7: bloqueia bounce_pct < 30% (BOUNCE_MIN_PCT=0.30)
-- A.8: bloqueia bounce_pct > 150% (BOUNCE_MAX_PCT=1.50) — entradas tardias
+- A.8: bloqueia bounce_pct > 100% (BOUNCE_MAX_PCT=1.00) — entradas tardias
+- C3: bloqueia pool depth < 10 SOL (POOL_MIN_SOL_BOUNCE=10)
 - FILTER_PUMP_ONLY: garante cobertura H22
 
 **⚠️ WR histórico inválido.** Os primeiros dados REALMENTE confiáveis (phantom fix + auditoria n=15) são trades pós-2026-05-26 (sessão 16).
