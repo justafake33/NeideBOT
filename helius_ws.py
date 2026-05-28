@@ -938,17 +938,30 @@ class HeliusWS:
 
             # Pool account validation: após confirmação por intersecção, verifica que o
             # pool account está nos accounts desta transação.
-            # Só aplica quando accounts não é None — erpc passa lista de account keys;
-            # Helius (logsSubscribe) passa accounts=None por design, sem validação possível.
-            # Se pool confirmada e accounts=[] (ALT tx erpc não resolvida), rejeita por
-            # precaução — não conseguimos verificar se é pool primária ou secundária.
-            with self._lock:
-                known_pool = self._pool_account.get(mint)
-            if known_pool and accounts is not None:
-                if not accounts or known_pool not in accounts:
-                    logger.debug("HeliusWS pool-account skip %s: pool %s... não verificada (accounts=%d)",
-                                 mint[:8], known_pool[:8], len(accounts))
-                    return False
+            # accounts=None  → modo Helius (logsSubscribe) — sem dados de account, sem validação.
+            # accounts=[]    → transação ALT/versioned (accountKeys não parseáveis do wire format).
+            # accounts=[...] → lista normal, validação padrão.
+            if accounts is not None:
+                with self._lock:
+                    known_pool = self._pool_account.get(mint)
+                if known_pool:
+                    if not accounts:
+                        # ALT transaction — lista de contas vazia (não parseável do wire format).
+                        # Fallback: verificar se known_pool foi derivado como PDA (criptograficamente seguro).
+                        with self._lock:
+                            pool_pda = self._pool_pda.get(mint)
+                        if pool_pda and pool_pda == known_pool:
+                            # PDA confirmado por criptografia — k-gate é o guard secundário.
+                            pass
+                        else:
+                            # Pool ainda aprendida por intersecção e não confirmada por PDA — rejeitar ALT.
+                            logger.debug("HeliusWS ALT skip %s: pool %s... sem confirmação PDA",
+                                         mint[:8], known_pool[:8])
+                            return False
+                    elif known_pool not in accounts:
+                        logger.debug("HeliusWS pool-account skip %s: pool %s... não em accounts(%d)",
+                                     mint[:8], known_pool[:8], len(accounts))
+                        return False
 
             # H22/H24/H25: acumula na rolling window
             if event["side"] != "unknown":

@@ -71,8 +71,9 @@ class TradeExecutor:
     """
 
     def __init__(self, gmgn: GmgnClient):
-        self.gmgn  = gmgn
-        self._lock = threading.Lock()
+        self.gmgn    = gmgn
+        self._lock   = threading.Lock()
+        self._helius = None  # injetado via set_helius() antes de start()
         if TRADING_ENABLED:
             logger.info(
                 "TradeExecutor ativo — trailing(ativ=%.0f%% dd=%.0f%%) SL=%.0f%% amount=$%.2f max=%d",
@@ -81,6 +82,9 @@ class TradeExecutor:
             )
         else:
             logger.info("TradeExecutor em modo DRY-RUN (TRADING_ENABLED=false)")
+
+    def set_helius(self, helius):
+        self._helius = helius
 
     # ------------------------------------------------------------------
     # Entry point — chamado pelo HotMonitor._check_bounce()
@@ -687,7 +691,7 @@ class TradeMonitor:
         # entry_expected (mc_bottom × 1.15) está SEMPRE abaixo da entrada real —
         # para bounce 88%, entry_expected×1.75 = ×2.01 mas o bot comprou em ×1.88.
         # tp_mc ficaria abaixo do preço de entrada → marca trailing_active imediato no 1º tick.
-        sl_ref  = entry_mc_real or entry_mc
+        sl_ref  = entry_mc_real or trade.get("mc_at_signal") or entry_mc
         sl_mc   = sl_ref * (1 - sl_pct)
         mc_at_signal     = trade.get("mc_at_signal") or entry_mc  # melhor proxy que entry_expected
         tp_mc            = entry_mc_real * (1 + tp_pct) if entry_mc_real else mc_at_signal * (1 + tp_pct)

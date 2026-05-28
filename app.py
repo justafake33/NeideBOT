@@ -6307,7 +6307,8 @@ def _start_services():
     scheduler.start()
     hot.start()
     scanner.start()
-    monitor.set_helius(hot._helius)  # injeta helius para coleta de absorção durante holding
+    monitor.set_helius(hot._helius)   # injeta helius para coleta de absorção durante holding
+    executor.set_helius(hot._helius)  # injeta helius no executor (C3: gate de pool depth no bounce)
     monitor.start()
     logger.info("Todos os serviços iniciados")
 
