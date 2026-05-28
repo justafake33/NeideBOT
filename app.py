@@ -37233,6 +37233,318 @@ def debug_mint_trace():
                "<h1 class='red'>Erro</h1><pre>" + err + "</pre></body></html>", 500
 
 
+@app.route("/analise/bounce-universe")
+def analise_bounce_universe():
+    """
+    Visão oracle do universo de bounces: TODOS os tokens migrados com token_ticks.
+
+    Entry  = fundo oracle (mc_min nos ticks, janela completa 90s–60min)
+    Outcome= do fundo até ts_migration+60min (tempo restante = o que o mercado oferece)
+    Sem filtros do bot — perspectiva não-enviesada do que o universo entrega.
+
+    90s cutoff: elimina candle de transição bonding curve→pool (Bug 5).
+    Sem cap de 20min: o fundo pode acontecer quando quiser na janela de 60min.
+    Tokens com fundo tardio têm menos janela de recovery — isso é a realidade.
+
+    Responde:
+      - Qual % dos tokens naturalmente chega a +75% / +100% do fundo oracle?
+      - O bot captura os tokens certos ou perde os melhores?
+      - Quais atributos estáticos (drop, TTB, smart wallets) discriminam WR real?
+    """
+    import psycopg2, psycopg2.extras, traceback as _tb
+    from db import DATABASE_URL
+
+    TP75_MULT  = 1.75
+    TP100_MULT = 2.00
+    SL_MULT    = 0.75
+    MIN_POST   = 3
+    SINCE      = "2026-05-21"  # erpc operacional
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        cur.execute("""
+            WITH
+            mig AS (
+                SELECT mint, ts_migration, mc_migration,
+                       COALESCE(smart_wallets, 0) AS smart_wallets,
+                       rug_ratio, top10_holder_rate
+                FROM migrations
+                WHERE ts_migration >= %(since)s
+                  AND mc_migration IS NOT NULL AND mc_migration > 0
+            ),
+            -- Menor preço real na janela 90s–60min (fundo oracle: sem cap de 20min)
+            bottom_val AS (
+                SELECT tt.mint,
+                    MIN(COALESCE(tt.mc_low, tt.mc)) AS mc_min
+                FROM token_ticks tt
+                JOIN mig m ON m.mint = tt.mint
+                WHERE tt.tick_ts > m.ts_migration + '90 seconds'::interval
+                  AND tt.tick_ts < m.ts_migration + '60 minutes'::interval
+                GROUP BY tt.mint
+                HAVING COUNT(*) >= 2
+            ),
+            -- Timestamp do tick onde o fundo ocorreu (primeira ocorrência)
+            bottom_ts AS (
+                SELECT DISTINCT ON (tt.mint)
+                    tt.mint, tt.tick_ts AS ts_min
+                FROM token_ticks tt
+                JOIN mig          m  ON m.mint  = tt.mint
+                JOIN bottom_val   bv ON bv.mint = tt.mint
+                WHERE tt.tick_ts > m.ts_migration + '90 seconds'::interval
+                  AND tt.tick_ts < m.ts_migration + '60 minutes'::interval
+                  AND COALESCE(tt.mc_low, tt.mc) <= bv.mc_min * 1.005
+                ORDER BY tt.mint, tt.tick_ts ASC
+            ),
+            -- Janela pós-fundo: ts_min → ts_migration+60min
+            post_bottom AS (
+                SELECT tt.mint,
+                    MAX(COALESCE(tt.mc_high, tt.mc)) AS max_post,
+                    MIN(COALESCE(tt.mc_low,  tt.mc)) AS min_post,
+                    COUNT(*)                          AS post_ticks
+                FROM token_ticks tt
+                JOIN mig         m  ON m.mint  = tt.mint
+                JOIN bottom_ts   bt ON bt.mint = tt.mint
+                WHERE tt.tick_ts >= bt.ts_min
+                  AND tt.tick_ts <  m.ts_migration + '60 minutes'::interval
+                GROUP BY tt.mint
+                HAVING COUNT(*) >= %(min_post)s
+            ),
+            -- Bot sinalizou bounce neste token?
+            signaled AS (
+                SELECT DISTINCT mint FROM bounce_signals
+            )
+            SELECT
+                m.mint, m.mc_migration,
+                m.smart_wallets, m.rug_ratio, m.top10_holder_rate,
+                bv.mc_min,
+                EXTRACT(EPOCH FROM (bt.ts_min - m.ts_migration)) / 60.0   AS ttb_min,
+                pb.max_post, pb.min_post, pb.post_ticks,
+                (m.mc_migration - bv.mc_min) / m.mc_migration              AS drop_pct,
+                (pb.max_post    - bv.mc_min) / bv.mc_min                   AS max_gain_pct,
+                (pb.max_post >= bv.mc_min * %(tp75)s)                      AS tp75,
+                (pb.max_post >= bv.mc_min * %(tp100)s)                     AS tp100,
+                (pb.min_post <= bv.mc_min * %(sl)s)                        AS sl_hit,
+                (s.mint IS NOT NULL)                                        AS bot_signaled
+            FROM mig m
+            JOIN bottom_val  bv ON bv.mint = m.mint
+            JOIN bottom_ts   bt ON bt.mint = m.mint
+            JOIN post_bottom pb ON pb.mint = m.mint
+            LEFT JOIN signaled s ON s.mint  = m.mint
+        """, {
+            "since": SINCE,
+            "tp75": TP75_MULT, "tp100": TP100_MULT, "sl": SL_MULT,
+            "min_post": MIN_POST,
+        })
+        rows = cur.fetchall()
+        conn.close()
+    except Exception:
+        return f"<pre>{_tb.format_exc()}</pre>", 500
+
+    if not rows:
+        return (
+            "<p style='font-family:monospace;color:#c9d1d9;padding:20px'>"
+            f"Sem dados suficientes desde {SINCE}.</p>"
+        )
+
+    n_total    = len(rows)
+    base_tp75  = sum(1 for r in rows if r["tp75"])
+    base_tp100 = sum(1 for r in rows if r["tp100"])
+    BASE_WR    = round(base_tp75  / n_total * 100, 1) if n_total else 0
+    BASE_WR100 = round(base_tp100 / n_total * 100, 1) if n_total else 0
+
+    def agg(subset):
+        n = len(subset)
+        if n == 0:
+            return {"n": 0, "tp75": 0, "tp100": 0, "sl": 0, "wr": None, "wr100": None}
+        tp75  = sum(1 for r in subset if r["tp75"])
+        tp100 = sum(1 for r in subset if r["tp100"])
+        sl    = sum(1 for r in subset if r["sl_hit"])
+        return {
+            "n": n, "tp75": tp75, "tp100": tp100, "sl": sl,
+            "wr":    round(tp75  / n * 100, 1),
+            "wr100": round(tp100 / n * 100, 1),
+        }
+
+    def wr_col(wr):
+        if wr is None: return "—", "#8b949e"
+        c = "#3fb950" if wr >= BASE_WR + 8 else ("#f85149" if wr <= BASE_WR - 8 else "#e3b341")
+        return f"{wr:.1f}%", c
+
+    def delta(wr):
+        if wr is None: return "—"
+        d = wr - BASE_WR
+        c = "#3fb950" if d >= 5 else ("#f85149" if d <= -5 else "#8b949e")
+        return f"<span style='color:{c}'>{d:+.1f}pp</span>"
+
+    def tbl(title, note, bins):
+        hdrs = ["Faixa", "n", "TP+75%", "TP+100%", "SL−25%", "WR+75%", "WR+100%", "Δ base"]
+        _r   = " style='text-align:right'"
+        ths  = "".join(
+            f"<th{_r if i else ''}>{h}</th>"
+            for i, h in enumerate(hdrs)
+        )
+        body = ""
+        for label, fn in bins:
+            subset = [r for r in rows if fn(r)]
+            g = agg(subset)
+            ws,  wc  = wr_col(g["wr"])
+            w100 = f"{g['wr100']:.1f}%" if g["wr100"] is not None else "—"
+            body += (
+                f"<tr><td>{label}</td>"
+                f"<td style='text-align:right'>{g['n']}</td>"
+                f"<td style='text-align:right'>{g['tp75']}</td>"
+                f"<td style='text-align:right'>{g['tp100']}</td>"
+                f"<td style='text-align:right'>{g['sl']}</td>"
+                f"<td style='text-align:right;color:{wc}'>{ws}</td>"
+                f"<td style='text-align:right;color:#8b949e'>{w100}</td>"
+                f"<td style='text-align:right'>{delta(g['wr'])}</td></tr>"
+            )
+        note_html = f"<p class='note'>{note}</p>" if note else ""
+        return f"<h2>{title}</h2>{note_html}<table><tr>{ths}</tr>{body}</table>"
+
+    # ── Feature bins ──────────────────────────────────────────────────────────
+
+    SIGNAL_BINS = [
+        ("✓  Bot sinalizou (detectou bounce)",
+            lambda r: r["bot_signaled"]),
+        ("✗  Bot não sinalizou (potencial perdido ou filtrado)",
+            lambda r: not r["bot_signaled"]),
+    ]
+
+    DROP_BINS = [
+        ("≥70%  (dump brutal — bonding curve rekt)",
+            lambda r: float(r["drop_pct"] or 0) >= 0.70),
+        ("50–70%  (dump severo)",
+            lambda r: 0.50 <= float(r["drop_pct"] or 0) < 0.70),
+        ("30–50%  (dump moderado)",
+            lambda r: 0.30 <= float(r["drop_pct"] or 0) < 0.50),
+        ("10–30%  (dump leve)",
+            lambda r: 0.10 <= float(r["drop_pct"] or 0) < 0.30),
+        ("<10%  (sem dump real — migrou lateral)",
+            lambda r: float(r["drop_pct"] or 0) < 0.10),
+    ]
+
+    TTB_BINS = [
+        ("<3min  (fundo instantâneo — spike de venda concentrado)",
+            lambda r: float(r["ttb_min"] or 99) < 3),
+        ("3–8min",
+            lambda r: 3  <= float(r["ttb_min"] or 99) < 8),
+        ("8–15min",
+            lambda r: 8  <= float(r["ttb_min"] or 99) < 15),
+        ("15–25min  (fundo tardio)",
+            lambda r: 15 <= float(r["ttb_min"] or 99) < 25),
+        ("≥25min  (fundo muito tardio — descartado pelos nossos filtros)",
+            lambda r: float(r["ttb_min"] or 99) >= 25),
+    ]
+
+    SMART_BINS = [
+        ("≥5 smart wallets",       lambda r: int(r["smart_wallets"] or 0) >= 5),
+        ("3–4",                    lambda r: 3 <= int(r["smart_wallets"] or 0) < 5),
+        ("2",                      lambda r: int(r["smart_wallets"] or 0) == 2),
+        ("1",                      lambda r: int(r["smart_wallets"] or 0) == 1),
+        ("0",                      lambda r: int(r["smart_wallets"] or 0) == 0),
+    ]
+
+    # ── Gain distribution histogram ───────────────────────────────────────────
+    brackets = [(0,25),(25,50),(50,75),(75,100),(100,150),(150,200),(200,300),(300,500),(500,1000)]
+    gain_rows = ""
+    for lo, hi in brackets:
+        n = sum(1 for r in rows if lo <= float(r["max_gain_pct"] or 0) * 100 < hi)
+        pct = round(n / n_total * 100) if n_total else 0
+        bar = "█" * (pct // 2)
+        gain_rows += (
+            f"<tr><td>+{lo}% – +{hi}%</td>"
+            f"<td style='text-align:right'>{n}</td>"
+            f"<td style='color:#58a6ff'>{bar}&nbsp;{pct}%</td></tr>"
+        )
+    n_big  = sum(1 for r in rows if float(r["max_gain_pct"] or 0) * 100 >= 1000)
+    pct_big = round(n_big / n_total * 100) if n_total else 0
+    gain_rows += (
+        f"<tr><td>≥+1000%  (10×+)</td>"
+        f"<td style='text-align:right'>{n_big}</td>"
+        f"<td style='color:#58a6ff'>{'█'*(pct_big//2)}&nbsp;{pct_big}%</td></tr>"
+    )
+    # Tokens that went below -25% from the oracle bottom
+    n_sl = sum(1 for r in rows if r["sl_hit"])
+
+    n_signaled = sum(1 for r in rows if r["bot_signaled"])
+    n_missed   = n_total - n_signaled
+
+    signal_tbl = tbl(
+        "Bot sinalizou vs não sinalizou",
+        "Dos tokens com bounce real, quantos o bot capturou? WR dos não-capturados = potencial perdido.",
+        SIGNAL_BINS)
+    drop_tbl  = tbl(
+        "Profundidade do Dump (mc_migration → mc_min oracle)",
+        "Dump mais fundo entrega bounce maior ou maior probabilidade de não recovery?",
+        DROP_BINS)
+    ttb_tbl   = tbl(
+        "Time to Bottom — quando o fundo aparece (janela completa 90s–60min)",
+        "Fundo em <3min = spike concentrado. ≥25min = fundo que nossos filtros (A.5) descartariam. "
+        "Essas duas faixas mostram o que estamos perdendo vs o que evitamos.",
+        TTB_BINS)
+    smart_tbl = tbl(
+        "Smart Wallets no momento da migração",
+        "smart_degen_count do trenches. Discrimina WR oracle (independente dos filtros do bot)?",
+        SMART_BINS)
+
+    css = """<style>
+      body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+      h1{color:#58a6ff}h2{color:#79c0ff;margin-top:28px}
+      table{border-collapse:collapse;width:100%;max-width:860px;margin-bottom:20px}
+      th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:left}
+      td{padding:5px 10px;border:1px solid #21262d;white-space:nowrap}
+      .note{color:#8b949e;font-size:12px;margin:4px 0 14px}
+      .box{background:#161b22;border:1px solid #30363d;padding:10px 14px;border-radius:4px;
+           margin:10px 0;font-size:12px}
+      .warn{color:#e3b341}.green{color:#3fb950}.red{color:#f85149}
+      a{color:#58a6ff;text-decoration:none}
+    </style>"""
+
+    return f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+    <title>Bounce Universe</title>{css}</head><body>
+    <h1>🌌 Bounce Universe — Todos os Tokens (visão oracle)</h1>
+    <p class='note'>
+      Entry = fundo oracle (mc_min dos ticks, janela completa 90s–60min) · SL = −25% do fundo.<br>
+      Outcome = max_mc do fundo até ts_migration+60min (tempo restante da janela) ·
+      <b>Sem filtros do bot</b> · Desde {SINCE}.
+    </p>
+    <div class='box'>
+      Universo: <b>{n_total} tokens</b> com ≥{MIN_POST} ticks pós-fundo
+      &nbsp;|&nbsp; TP+75%: <b class='green'>{base_tp75} ({BASE_WR}%)</b>
+      &nbsp;|&nbsp; TP+100%: <b>{base_tp100} ({BASE_WR100}%)</b>
+      &nbsp;|&nbsp; SL−25%: <b class='red'>{n_sl} ({round(n_sl/n_total*100) if n_total else 0}%)</b><br>
+      Bot sinalizou: <b>{n_signaled}</b> ({round(n_signaled/n_total*100) if n_total else 0}%)
+      &nbsp;|&nbsp;
+      Bot não sinalizou: <b>{n_missed}</b> ({round(n_missed/n_total*100) if n_total else 0}%)
+    </div>
+    <p>
+      <a href='/analise/bigplayer'>← Big Player</a> &nbsp;|&nbsp;
+      <a href='/analise/sinal-puro'>Sinal Puro</a> &nbsp;|&nbsp;
+      <a href='/analise/token-outcome-clean'>Token Outcome Clean</a> &nbsp;|&nbsp;
+      <a href='/analise/h22-h25-ticks'>H22-H25 Ticks</a>
+    </p>
+
+    {signal_tbl}
+
+    <h2>Distribuição de Ganho Máximo do Fundo (60min oracle)</h2>
+    <p class='note'>
+      O que cada token entregou a partir do seu fundo real — sem threshold de sinal.
+      <span class='warn'>Atenção: mc_high dos ticks kline pode incluir spikes intra-candle.</span>
+    </p>
+    <table>
+      <tr><th>Faixa de ganho</th><th style='text-align:right'>n</th><th>Distribuição</th></tr>
+      {gain_rows}
+    </table>
+
+    {drop_tbl}
+    {ttb_tbl}
+    {smart_tbl}
+    </body></html>"""
+
+
 @app.route("/analise/bigplayer")
 def analise_bigplayer():
     """
