@@ -36789,7 +36789,6 @@ def analise_bounce_universe():
             post_bottom AS (
                 SELECT tt.mint,
                     MAX(COALESCE(tt.mc_high, tt.mc)) AS max_post,
-                    MIN(COALESCE(tt.mc_low,  tt.mc)) AS min_post,
                     COUNT(*)                          AS post_ticks
                 FROM token_ticks tt
                 JOIN mig         m  ON m.mint  = tt.mint
@@ -36808,12 +36807,11 @@ def analise_bounce_universe():
                 m.smart_wallets, m.rug_ratio, m.top10_holder_rate,
                 bv.mc_min,
                 EXTRACT(EPOCH FROM (bt.ts_min - m.ts_migration)) / 60.0   AS ttb_min,
-                pb.max_post, pb.min_post, pb.post_ticks,
+                pb.max_post, pb.post_ticks,
                 (m.mc_migration - bv.mc_min) / m.mc_migration              AS drop_pct,
                 (pb.max_post    - bv.mc_min) / bv.mc_min                   AS max_gain_pct,
                 (pb.max_post >= bv.mc_min * %(tp75)s)                      AS tp75,
                 (pb.max_post >= bv.mc_min * %(tp100)s)                     AS tp100,
-                (pb.min_post <= bv.mc_min * %(sl)s)                        AS sl_hit,
                 (s.mint IS NOT NULL)                                        AS bot_signaled
             FROM mig m
             JOIN bottom_val  bv ON bv.mint = m.mint
@@ -36822,7 +36820,7 @@ def analise_bounce_universe():
             LEFT JOIN signaled s ON s.mint  = m.mint
         """, {
             "since": SINCE,
-            "tp75": TP75_MULT, "tp100": TP100_MULT, "sl": SL_MULT,
+            "tp75": TP75_MULT, "tp100": TP100_MULT,
             "min_post": MIN_POST,
         })
         rows = cur.fetchall()
@@ -36839,20 +36837,24 @@ def analise_bounce_universe():
     n_total    = len(rows)
     base_tp75  = sum(1 for r in rows if r["tp75"])
     base_tp100 = sum(1 for r in rows if r["tp100"])
+    # "Dead" = price barely moved from oracle bottom (max gain < 25%)
+    base_dead  = sum(1 for r in rows if float(r["max_gain_pct"] or 0) < 0.25)
     BASE_WR    = round(base_tp75  / n_total * 100, 1) if n_total else 0
     BASE_WR100 = round(base_tp100 / n_total * 100, 1) if n_total else 0
 
     def agg(subset):
         n = len(subset)
         if n == 0:
-            return {"n": 0, "tp75": 0, "tp100": 0, "sl": 0, "wr": None, "wr100": None}
+            return {"n": 0, "tp75": 0, "tp100": 0, "dead": 0,
+                    "wr": None, "wr100": None, "dead_pct": None}
         tp75  = sum(1 for r in subset if r["tp75"])
         tp100 = sum(1 for r in subset if r["tp100"])
-        sl    = sum(1 for r in subset if r["sl_hit"])
+        dead  = sum(1 for r in subset if float(r["max_gain_pct"] or 0) < 0.25)
         return {
-            "n": n, "tp75": tp75, "tp100": tp100, "sl": sl,
-            "wr":    round(tp75  / n * 100, 1),
-            "wr100": round(tp100 / n * 100, 1),
+            "n": n, "tp75": tp75, "tp100": tp100, "dead": dead,
+            "wr":       round(tp75  / n * 100, 1),
+            "wr100":    round(tp100 / n * 100, 1),
+            "dead_pct": round(dead  / n * 100, 1),
         }
 
     def wr_col(wr):
@@ -36867,26 +36869,27 @@ def analise_bounce_universe():
         return f"<span style='color:{c}'>{d:+.1f}pp</span>"
 
     def tbl(title, note, bins):
-        hdrs = ["Faixa", "n", "TP+75%", "TP+100%", "SL−25%", "WR+75%", "WR+100%", "Δ base"]
+        # SL removido: com entry oracle no mc_min global, preço nunca vai abaixo do entry
+        # por definição. Dead = equivalente funcional: token ficou flat após o fundo.
+        hdrs = ["Faixa", "n", "TP+75%", "TP+100%", "Dead <25%", "WR+75%", "WR+100%", "Dead%", "Δ base"]
         _r   = " style='text-align:right'"
-        ths  = "".join(
-            f"<th{_r if i else ''}>{h}</th>"
-            for i, h in enumerate(hdrs)
-        )
+        ths  = "".join(f"<th{_r if i else ''}>{h}</th>" for i, h in enumerate(hdrs))
         body = ""
         for label, fn in bins:
             subset = [r for r in rows if fn(r)]
             g = agg(subset)
-            ws,  wc  = wr_col(g["wr"])
-            w100 = f"{g['wr100']:.1f}%" if g["wr100"] is not None else "—"
+            ws, wc = wr_col(g["wr"])
+            w100   = f"{g['wr100']:.1f}%" if g["wr100"]   is not None else "—"
+            wdead  = f"{g['dead_pct']:.1f}%" if g["dead_pct"] is not None else "—"
             body += (
                 f"<tr><td>{label}</td>"
                 f"<td style='text-align:right'>{g['n']}</td>"
                 f"<td style='text-align:right'>{g['tp75']}</td>"
                 f"<td style='text-align:right'>{g['tp100']}</td>"
-                f"<td style='text-align:right'>{g['sl']}</td>"
+                f"<td style='text-align:right;color:#e3b341'>{g['dead']}</td>"
                 f"<td style='text-align:right;color:{wc}'>{ws}</td>"
                 f"<td style='text-align:right;color:#8b949e'>{w100}</td>"
+                f"<td style='text-align:right;color:#e3b341'>{wdead}</td>"
                 f"<td style='text-align:right'>{delta(g['wr'])}</td></tr>"
             )
         note_html = f"<p class='note'>{note}</p>" if note else ""
@@ -36955,27 +36958,26 @@ def analise_bounce_universe():
         f"<td style='color:#58a6ff'>{'█'*(pct_big//2)}&nbsp;{pct_big}%</td></tr>"
     )
     # Tokens that went below -25% from the oracle bottom
-    n_sl = sum(1 for r in rows if r["sl_hit"])
+    # n_sl removed: SL meaningless with oracle entry at global mc_min
 
     n_signaled = sum(1 for r in rows if r["bot_signaled"])
     n_missed   = n_total - n_signaled
 
     signal_tbl = tbl(
         "Bot sinalizou vs não sinalizou",
-        "Dos tokens com bounce real, quantos o bot capturou? WR dos não-capturados = potencial perdido.",
+        "Dead% = token ficou flat após o fundo (max gain <25%) — equivalente funcional ao SL com entry oracle.",
         SIGNAL_BINS)
     drop_tbl  = tbl(
         "Profundidade do Dump (mc_migration → mc_min oracle)",
-        "Dump mais fundo entrega bounce maior ou maior probabilidade de não recovery?",
+        "Dump mais fundo entrega bounce maior ou maior probabilidade de token morto?",
         DROP_BINS)
     ttb_tbl   = tbl(
         "Time to Bottom — quando o fundo aparece (janela completa 90s–60min)",
-        "Fundo em <3min = spike concentrado. ≥25min = fundo que nossos filtros (A.5) descartariam. "
-        "Essas duas faixas mostram o que estamos perdendo vs o que evitamos.",
+        "Fundo em <3min = spike concentrado (exaustão rápida). ≥25min = fundo que nossos filtros (A.5) descartariam.",
         TTB_BINS)
     smart_tbl = tbl(
         "Smart Wallets no momento da migração",
-        "smart_degen_count do trenches. Discrimina WR oracle (independente dos filtros do bot)?",
+        "smart_degen_count do trenches. Discrimina WR oracle (sem viés dos filtros do bot)?",
         SMART_BINS)
 
     css = """<style>
@@ -36995,15 +36997,15 @@ def analise_bounce_universe():
     <title>Bounce Universe</title>{css}</head><body>
     <h1>🌌 Bounce Universe — Todos os Tokens (visão oracle)</h1>
     <p class='note'>
-      Entry = fundo oracle (mc_min dos ticks, janela completa 90s–60min) · SL = −25% do fundo.<br>
-      Outcome = max_mc do fundo até ts_migration+60min (tempo restante da janela) ·
-      <b>Sem filtros do bot</b> · Desde {SINCE}.
+      Entry = fundo oracle (mc_min dos ticks, janela completa 90s–60min).<br>
+      Outcome = max_mc do fundo até ts_migration+60min · Dead = max gain &lt;25% (token ficou flat).<br>
+      <b>Sem filtros do bot</b> · Desde {SINCE} · SL removido: com entry oracle no mínimo absoluto, por definição o preço não vai abaixo do entry.
     </p>
     <div class='box'>
       Universo: <b>{n_total} tokens</b> com ≥{MIN_POST} ticks pós-fundo
       &nbsp;|&nbsp; TP+75%: <b class='green'>{base_tp75} ({BASE_WR}%)</b>
       &nbsp;|&nbsp; TP+100%: <b>{base_tp100} ({BASE_WR100}%)</b>
-      &nbsp;|&nbsp; SL−25%: <b class='red'>{n_sl} ({round(n_sl/n_total*100) if n_total else 0}%)</b><br>
+      &nbsp;|&nbsp; Dead &lt;25%: <b class='warn'>{base_dead} ({round(base_dead/n_total*100) if n_total else 0}%)</b><br>
       Bot sinalizou: <b>{n_signaled}</b> ({round(n_signaled/n_total*100) if n_total else 0}%)
       &nbsp;|&nbsp;
       Bot não sinalizou: <b>{n_missed}</b> ({round(n_missed/n_total*100) if n_total else 0}%)
