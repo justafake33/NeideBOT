@@ -37987,7 +37987,7 @@ def analise_h22h24_lab():
     TP_MULT   = 1.0 + tp_pct
     SL_MULT   = 1.0 - sl_pct
     MIN_TICKS = 3
-    WINDOW_MIN = 20   # janela de outcome em minutos
+    WINDOW_MIN = 60   # janela de outcome em minutos (60min = janela completa do HotMonitor)
 
     # ── Query ───────────────────────────────────────────────────────────────────
     try:
@@ -38023,8 +38023,8 @@ def analise_h22h24_lab():
                     -- first SL tick
                     MIN(CASE WHEN tt.mc_low  <= bs.mc_at_signal * %(sl)s
                              THEN tt.tick_ts END)                        AS first_sl_ts,
-                    MAX(COALESCE(tt.mc_high, tt.mc))                     AS max_mc_20m,
-                    MIN(COALESCE(tt.mc_low,  tt.mc))                     AS min_mc_20m,
+                    MAX(COALESCE(tt.mc_high, tt.mc))                     AS max_mc_60m,
+                    MIN(COALESCE(tt.mc_low,  tt.mc))                     AS min_mc_60m,
                     COUNT(tt.id)                                         AS tick_count
                 FROM bounce_signals bs
                 JOIN token_ticks tt
@@ -38079,8 +38079,8 @@ def analise_h22h24_lab():
                 to2.tick_count,
                 to2.first_tp_ts,
                 to2.first_sl_ts,
-                to2.max_mc_20m,
-                to2.min_mc_20m,
+                to2.max_mc_60m,
+                to2.min_mc_60m,
                 CASE
                     WHEN to2.first_tp_ts IS NOT NULL AND (to2.first_sl_ts IS NULL OR to2.first_tp_ts <= to2.first_sl_ts)
                     THEN 'tp'
@@ -38088,10 +38088,10 @@ def analise_h22h24_lab():
                     THEN 'sl'
                     ELSE NULL
                 END                AS theoretical_outcome,
-                CASE WHEN bs.mc_at_signal > 0 AND to2.max_mc_20m IS NOT NULL
-                     THEN (to2.max_mc_20m - bs.mc_at_signal) / bs.mc_at_signal END AS max_gain_20m,
-                CASE WHEN bs.mc_at_signal > 0 AND to2.min_mc_20m IS NOT NULL
-                     THEN (to2.min_mc_20m - bs.mc_at_signal) / bs.mc_at_signal END AS min_drawdown_20m
+                CASE WHEN bs.mc_at_signal > 0 AND to2.max_mc_60m IS NOT NULL
+                     THEN (to2.max_mc_60m - bs.mc_at_signal) / bs.mc_at_signal END AS max_gain_60m,
+                CASE WHEN bs.mc_at_signal > 0 AND to2.min_mc_60m IS NOT NULL
+                     THEN (to2.min_mc_60m - bs.mc_at_signal) / bs.mc_at_signal END AS min_drawdown_60m
             FROM bounce_signals bs
             LEFT JOIN latest_trade lt   ON lt.mint = bs.mint
             LEFT JOIN tick_outcomes to2 ON to2.mint = bs.mint
@@ -38324,7 +38324,7 @@ def analise_h22h24_lab():
             "seller_exhaustion", "rise_churn_ratio", "rise_net_efficiency",
             "pool_normalized_flow", "buy_concentration",
             "dump_seller_hhi", "flow_efficiency",
-            "tick_count", "first_tp_ts", "first_sl_ts", "max_gain_20m", "min_drawdown_20m",
+            "tick_count", "first_tp_ts", "first_sl_ts", "max_gain_60m", "min_drawdown_60m",
             "theoretical_outcome", "real_status", "real_pnl",
         ]
         # deduplicate
@@ -38435,8 +38435,8 @@ def analise_h22h24_lab():
             f"<td>{_f2(r['pool_normalized_flow'], '.3f')}</td>"
             f"<td>{_f2(r['buy_concentration'])}</td>"
             f"<td>{_f2(r['dump_seller_hhi'])}</td>"
-            f"<td>{_pct(r['max_gain_20m'])}</td>"
-            f"<td>{_pct(r['min_drawdown_20m'])}</td>"
+            f"<td>{_pct(r['max_gain_60m'])}</td>"
+            f"<td>{_pct(r['min_drawdown_60m'])}</td>"
             f"</tr>"
         )
 
@@ -38453,7 +38453,7 @@ def analise_h22h24_lab():
       Th=outcome teórico (ticks {WINDOW_MIN}min) · Real=trade GMGN ·
       SE=seller_exhaustion · CR=churn_ratio · NE=net_efficiency ·
       PN=pool_norm_buy · BC=buy_concentration · HHI=dump_seller_hhi ·
-      MaxG/MinD = max gain / min drawdown 20min pós-sinal (% do mc_at_signal)
+      MaxG/MinD = max gain / min drawdown 60min pós-sinal (% do mc_at_signal)
     </p>"""
 
     se_tbl   = bucket_table("Seller Exhaustion  [1−(rise_sell/pre_sell)]",
