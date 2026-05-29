@@ -38860,6 +38860,7 @@ def debug_h22h24_live():
 def analise_invisible_demand_lab():
     import psycopg2
     from psycopg2.extras import RealDictCursor
+    from db import DATABASE_URL
     import io, csv as _csv
 
     days           = int(request.args.get("days", 30))
@@ -39290,12 +39291,12 @@ td:first-child{text-align:left}
 only_bottom={'sim' if only_bottom else 'não'} &nbsp;·&nbsp;
 TP={tp_pct*100:.0f}% / SL={sl_pct*100:.0f}%<br>
 Total bounce_signals: <b>{n_total}</b> &nbsp;·&nbsp;
-Com outcome calculado: <b>{n_outcome}</b> ({n_outcome/n_total*100:.0f}% de cobertura de ticks)<br>
+Com outcome calculado: <b>{n_outcome}</b> ({(n_outcome/n_total*100) if n_total else 0:.0f}% de cobertura de ticks)<br>
 TP: <b class='green'>{n_tp}</b> &nbsp;·&nbsp;
 SL: <b class='red'>{n_sl}</b> &nbsp;·&nbsp;
 Ambiguous: <b>{n_amb}</b> &nbsp;·&nbsp;
 WR baseline: <b>{base_wr:.1f}%</b><br>
-Com dados Helius (pre ou rise): <b>{n_helius}</b> ({n_helius/n_total*100:.0f}%)<br>
+Com dados Helius (pre ou rise): <b>{n_helius}</b> ({(n_helius/n_total*100) if n_total else 0:.0f}%)<br>
 InvisibleDemandBasic (IDB): <b>{n_idb}</b> &nbsp;·&nbsp;
 InvisibleDemandStrict (IDS): <b>{n_ids}</b><br>
 <span class='note'>Dados históricos proxy via bounce_signals. Eventos ERPC raw são in-memory e não persistidos —
