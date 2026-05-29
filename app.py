@@ -37802,6 +37802,58 @@ def analise_bigplayer():
             lambda r: not is_good_se(r) and not is_good_ne(r) and not is_good_pn(r)),
     ]
 
+    # ── Combinações candidatas v2 (A–I positivos, J–N rejeição) ──────────────
+    def _pre_ok(r):  return r["pre_net"] >= 0
+    def _rise_ok(r): return r["rise_net"] <= 1
+    def _bc_lt25(r): return r["buy_concentration"] is not None and r["buy_concentration"] < 0.25
+    def _bc_lt10(r): return r["buy_concentration"] is not None and r["buy_concentration"] < 0.1
+    def _hhi_ok(r):  return r["dump_seller_hhi"] is None or r["dump_seller_hhi"] < 0.4
+
+    COMBO_BINS_V2_POS = [
+        ("A  pre_net ≥ 0",
+            lambda r: _pre_ok(r)),
+        ("B  rise_net ≤ 1",
+            lambda r: _rise_ok(r)),
+        ("C  pre_net ≥ 0  AND  rise_net ≤ 1",
+            lambda r: _pre_ok(r) and _rise_ok(r)),
+        ("D  pre_net ≥ 0  AND  bc < 0.25",
+            lambda r: _pre_ok(r) and _bc_lt25(r)),
+        ("E  pre_net ≥ 0  AND  bc < 0.1",
+            lambda r: _pre_ok(r) and _bc_lt10(r)),
+        ("F  rise_net ≤ 1  AND  bc < 0.25",
+            lambda r: _rise_ok(r) and _bc_lt25(r)),
+        ("G  rise_net ≤ 1  AND  hhi < 0.4",
+            lambda r: _rise_ok(r) and _hhi_ok(r)),
+        ("H  pre_net ≥ 0  AND  rise_net ≤ 1  AND  hhi < 0.4",
+            lambda r: _pre_ok(r) and _rise_ok(r) and _hhi_ok(r)),
+        ("I  pre_net ≥ 0  AND  rise_net ≤ 1  AND  bc < 0.25  AND  hhi < 0.4",
+            lambda r: _pre_ok(r) and _rise_ok(r) and _bc_lt25(r) and _hhi_ok(r)),
+    ]
+
+    COMBO_BINS_V2_REJ = [
+        ("J  [rejeitado]  rise_net > 1",
+            lambda r: r["rise_net"] > 1),
+        ("K  [rejeitado]  rise_net > 3",
+            lambda r: r["rise_net"] > 3),
+        ("L  [rejeitado]  dump_seller_hhi ≥ 0.4",
+            lambda r: r["dump_seller_hhi"] is not None and r["dump_seller_hhi"] >= 0.4),
+        ("M  [rejeitado]  rise_net_efficiency ≥ 0.4",
+            lambda r: r["rise_net_efficiency"] is not None and r["rise_net_efficiency"] >= 0.4),
+        ("N  [rejeitado]  buy_concentration ≥ 0.5",
+            lambda r: r["buy_concentration"] is not None and r["buy_concentration"] >= 0.5),
+    ]
+
+    combo_tbl_v2 = (
+        bucket_table(
+            "Combinações Candidatas — gates positivos (A–I)",
+            "WR% do subconjunto que PASSA no filtro. Alto = filtro seleciona bem os TPs.",
+            COMBO_BINS_V2_POS)
+        + bucket_table(
+            "Filtros de Rejeição — gates negativos (J–N)",
+            "WR% do subconjunto REJEITADO. Baixo = filtro descarta corretamente os SLs.",
+            COMBO_BINS_V2_REJ)
+    )
+
     # ── Coverage stats ────────────────────────────────────────────────────────
     n_rise = sum(1 for r in enriched if r["has_rise_data"])
     n_pre  = sum(1 for r in enriched if r["has_pre_data"])
@@ -38072,6 +38124,8 @@ def analise_h22h24_lab():
                 -- H25/H26
                 bs.pool_quote_at_signal,
                 bs.buy_concentration,
+                -- rise_sec: duração do RISE [ts_min → ts_signal] via migrations.time_to_bottom
+                m.time_to_bottom   AS time_to_bottom_min,
                 -- Real trade outcome (GMGN ground truth)
                 lt.status          AS real_status,
                 lt.pnl_pct_real    AS real_pnl,
@@ -38095,6 +38149,7 @@ def analise_h22h24_lab():
             FROM bounce_signals bs
             LEFT JOIN latest_trade lt   ON lt.mint = bs.mint
             LEFT JOIN tick_outcomes to2 ON to2.mint = bs.mint
+            LEFT JOIN migrations m      ON m.mint   = bs.mint
             WHERE bs.ts_signal >= NOW() - INTERVAL '{days} days'
               AND bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
               {bottom_clause}
@@ -38125,9 +38180,19 @@ def analise_h22h24_lab():
         gross_rise = rise_buy + rise_sell
         abs_net_rise = abs(rise_net)
 
+        # rise_sec: tempo do RISE [ts_min → ts_signal] em segundos
+        elapsed_s      = float(r.get("elapsed_sec") or 0)
+        ttb_min        = r.get("time_to_bottom_min")
+        rise_sec       = (elapsed_s - float(ttb_min) * 60.0) if ttb_min is not None else None
+        if rise_sec is not None and rise_sec < 5:
+            rise_sec = None   # janela de rise degenerada, descartar
+
         pre_sell_rate  = pre_sell / 60.0 if pre_sell > 0 else None
+        rise_sell_rate = rise_sell / rise_sec if (rise_sec and rise_sec > 0 and rise_sell > 0) else None
         rise_buy_sell  = rise_buy / rise_sell if rise_sell > 0 else None
-        seller_exhaust = (1.0 - rise_sell / pre_sell) if pre_sell > 0 else None
+        # SE normalizado por taxa/s: compara sell_rate no RISE vs sell_rate no PRÉ (60s)
+        seller_exhaust = (1.0 - rise_sell_rate / pre_sell_rate
+                          ) if (rise_sell_rate is not None and pre_sell_rate and pre_sell_rate > 0) else None
         rise_churn     = gross_rise / abs_net_rise if abs_net_rise > 0.001 else None
         rise_net_eff   = abs_net_rise / gross_rise  if gross_rise  > 0     else None
         pool_norm_buy  = rise_buy / pool if pool > 0 else None
@@ -38238,7 +38303,7 @@ def analise_h22h24_lab():
         ("2–5×  algum wash",           lambda r: r["rise_churn_ratio"] is not None and 2.0 <= r["rise_churn_ratio"] < 5.0),
         ("5–15×  churn elevado",       lambda r: r["rise_churn_ratio"] is not None and 5.0 <= r["rise_churn_ratio"] < 15.0),
         ("≥15×  wash/HFT tóxico",      lambda r: r["rise_churn_ratio"] is not None and r["rise_churn_ratio"] >= 15.0),
-        ("sem dados (rise net≈0)",     lambda r: r["rise_churn_ratio"] is None),
+        ("net≈0 / bilateral balance",   lambda r: r["rise_churn_ratio"] is None),
     ]
 
     NE_BINS = [
@@ -38511,6 +38576,7 @@ def analise_h22h24_lab():
     {pf_tbl}
     {rf_tbl}
     {combo_tbl}
+    {combo_tbl_v2}
     {sample_tbl}
     </body></html>"""
 
