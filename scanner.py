@@ -13,6 +13,53 @@ from telegram_bot import send_alert
 
 logger = logging.getLogger(__name__)
 
+# ── Fase 1 V2 — Micro absorption helpers ────────────────────────────────────
+_MICRO_FLOW_EPS = 0.000001
+
+
+def _build_window_features(window_data: dict) -> dict:
+    """Deriva métricas padronizadas de get_absorption_window() para micro snapshots.
+
+    Apenas computação — sem efeitos colaterais, sem chamadas externas.
+    Retorna dict com: buy, sell, net, events, largest_buy, largest_sell,
+    buy_concentration, sell_concentration, zero_type.
+    """
+    if not window_data:
+        return {
+            "buy": None, "sell": None, "net": None, "events": None,
+            "largest_buy": None, "largest_sell": None,
+            "buy_concentration": None, "sell_concentration": None,
+            "zero_type": "missing",
+        }
+    buy      = window_data.get("buy_vol_sol",  0) or 0
+    sell     = window_data.get("sell_vol_sol", 0) or 0
+    events   = window_data.get("total_events", 0) or 0
+    lrg_buy  = window_data.get("largest_buy",  0) or 0
+    lrg_sell = window_data.get("largest_sell", 0) or 0
+    net      = buy - sell
+
+    if events == 0:
+        zero_type = "zero_no_events"
+    elif abs(net) < _MICRO_FLOW_EPS:
+        zero_type = "zero_balanced_flow"
+    elif net > _MICRO_FLOW_EPS:
+        zero_type = "positive"
+    else:
+        zero_type = "negative"
+
+    return {
+        "buy":               buy,
+        "sell":              sell,
+        "net":               round(net, 6),
+        "events":            events,
+        "largest_buy":       lrg_buy,
+        "largest_sell":      lrg_sell,
+        "buy_concentration":  round(lrg_buy  / buy,  4) if buy  > 0 else None,
+        "sell_concentration": round(lrg_sell / sell, 4) if sell > 0 else None,
+        "zero_type":         zero_type,
+    }
+
+
 POLL_INTERVAL      = int(os.getenv("POLL_INTERVAL_SEC",    "5"))
 HOT_INTERVAL       = 30
 HOT_PRECISE_SEC    = int(os.getenv("HOT_PRECISE_SEC",      "5"))    # alinhado com trenches poll — mc_min sempre fresco na detecção
@@ -262,6 +309,10 @@ class HotMonitor:
                         (mc / state["mc_migration"] - 1) * 100)
 
         self._check_bounce(mint, state, mc, elapsed_sec)
+
+        # Fase 1 V2 — micro absorption snapshot (research-only, nunca afeta trading)
+        if self._helius and state.get("ts_min") is not None:
+            self._maybe_record_micro_snapshot(mint, state, mc, ref_ts)
 
     # ------------------------------------------------------------------
     # Bounce detector
@@ -581,6 +632,156 @@ class HotMonitor:
                 )
             except Exception as e:
                 logger.error("executor.on_bounce %s: %s", symbol, e)
+
+    # ------------------------------------------------------------------
+    # Fase 1 V2 — Micro absorption snapshot (research-only)
+    # Nunca altera lógica de compra, _check_bounce, executor ou gmgn_client.
+    # ------------------------------------------------------------------
+
+    _MICRO_SNAP_WINDOW_SEC = 60   # grava até 60s após o fundo
+    _MICRO_SNAP_RATE_SEC   = 2.0  # no máximo 1 snapshot a cada 2s por token
+
+    def _maybe_record_micro_snapshot(self, mint: str, state: dict,
+                                     mc: float, ref_ts: datetime) -> None:
+        """Rate-limiter: checa se é hora de gravar um novo snapshot e lança thread."""
+        now_ts      = ref_ts.timestamp()
+        ts_min      = state.get("ts_min")
+        if ts_min is None:
+            return
+        ts_min_ts   = ts_min.timestamp()
+        bottom_age  = now_ts - ts_min_ts
+
+        if bottom_age < 0 or bottom_age > self._MICRO_SNAP_WINDOW_SEC:
+            return
+
+        last = state.get("last_micro_snapshot_ts", 0)
+        if now_ts - last < self._MICRO_SNAP_RATE_SEC:
+            return
+
+        # Atualiza rate limiter imediatamente (evita burst)
+        state["last_micro_snapshot_ts"] = now_ts
+
+        # Executa em thread daemon — push_mc não pode bloquear
+        threading.Thread(
+            target=self._record_micro_absorption_snapshot,
+            args=(mint, dict(state), mc, now_ts, ts_min_ts, round(bottom_age, 2)),
+            daemon=True,
+            name=f"micro-{mint[:6]}",
+        ).start()
+
+    def _record_micro_absorption_snapshot(
+        self, mint: str, state: dict, mc_current: float,
+        now_ts: float, ts_min_ts: float, bottom_age_sec: float,
+    ) -> None:
+        """Coleta e persiste microdados de absorção ao redor do fundo.
+
+        Research-only: nunca chama executor, nunca altera trading logic.
+        Falha silenciosa para nunca quebrar o scanner.
+        """
+        try:
+            ts_migration = state.get("ts_migration")
+            ts_mig_ts    = ts_migration.timestamp() if ts_migration else None
+            mc_migration = state.get("mc_migration") or 0
+            mc_min       = state.get("mc_min") or 0
+
+            elapsed_sec   = int(now_ts - ts_mig_ts) if ts_mig_ts else None
+            drop_from_mig = (mc_migration - mc_min) / mc_migration if mc_migration > 0 else None
+            bounce_pct_now = (mc_current - mc_min) / mc_min if mc_min > 0 else None
+
+            pool_quote = self._helius.get_pool_quote(mint)
+
+            def _w(sec: int, end_ts: float) -> dict:
+                return self._helius.get_absorption_window(
+                    mint, window_sec=max(1, sec), window_end_ts=end_ts
+                )
+
+            def _wf(sec: int, end_ts: float) -> dict:
+                return _build_window_features(_w(sec, end_ts))
+
+            # PRE: [ts_min - Xs, ts_min]
+            pre_5  = _wf(5,  ts_min_ts)
+            pre_10 = _wf(10, ts_min_ts)
+            pre_15 = _wf(15, ts_min_ts)
+            pre_30 = _wf(30, ts_min_ts)
+
+            # RISE: [ts_min, ts_min + Xs] (janelas fixas desde o fundo)
+            rise_1  = _wf(1,  ts_min_ts + 1)
+            rise_3  = _wf(3,  ts_min_ts + 3)
+            rise_5  = _wf(5,  ts_min_ts + 5)
+            rise_10 = _wf(10, ts_min_ts + 10)
+            rise_now = _wf(max(1, int(now_ts - ts_min_ts)), now_ts)
+
+            # LIVE: [now - Xs, now]
+            live_5  = _wf(5,  now_ts)
+            live_10 = _wf(10, now_ts)
+
+            def _wp(feat: dict, prefix: str) -> dict:
+                return {
+                    f"{prefix}_buy":          feat.get("buy"),
+                    f"{prefix}_sell":         feat.get("sell"),
+                    f"{prefix}_net":          feat.get("net"),
+                    f"{prefix}_events":       feat.get("events"),
+                    f"{prefix}_largest_buy":  feat.get("largest_buy"),
+                    f"{prefix}_largest_sell": feat.get("largest_sell"),
+                    f"{prefix}_zero_type":    feat.get("zero_type"),
+                }
+
+            pre_net  = pre_30.get("net") or 0
+            rise_net = rise_now.get("net") or 0
+            rise_ev  = rise_now.get("events") or 0
+            pre_ev   = pre_30.get("events") or 0
+
+            flags = {
+                "idb_like_live":      pre_net >= 0 and rise_net <= 1,
+                "idb2_like_live":     pre_net > 0 and rise_net <= 0,
+                "silent_bottom_like": pre_ev == 0 and rise_net <= 1,
+                "rise_hot_risk":      rise_net > 3,
+                "hhi_missing":        True,   # H24 não calculado no micro path (custoso)
+                "data_missing":       pre_ev == 0 and rise_ev == 0,
+            }
+
+            data = {
+                "mint":           mint,
+                "symbol":         state.get("symbol"),
+                "ts_snapshot":    datetime.fromtimestamp(now_ts, tz=timezone.utc),
+                "ts_migration":   ts_migration,
+                "ts_min":         datetime.fromtimestamp(ts_min_ts, tz=timezone.utc),
+                "mc_migration":   mc_migration,
+                "mc_min":         mc_min,
+                "mc_current":     mc_current,
+                "elapsed_sec":    elapsed_sec,
+                "bottom_age_sec": bottom_age_sec,
+                "bounce_pct_now": round(bounce_pct_now, 4) if bounce_pct_now is not None else None,
+                "drop_from_mig":  round(drop_from_mig, 4) if drop_from_mig is not None else None,
+                "pool_quote":     pool_quote,
+                **_wp(pre_5,  "pre_5s"),
+                **_wp(pre_10, "pre_10s"),
+                **_wp(pre_15, "pre_15s"),
+                **_wp(pre_30, "pre_30s"),
+                **_wp(rise_1,  "rise_1s"),
+                **_wp(rise_3,  "rise_3s"),
+                **_wp(rise_5,  "rise_5s"),
+                **_wp(rise_10, "rise_10s"),
+                **_wp(rise_now, "rise_now"),
+                "live_5s_buy":    live_5.get("buy"),
+                "live_5s_sell":   live_5.get("sell"),
+                "live_5s_net":    live_5.get("net"),
+                "live_5s_events": live_5.get("events"),
+                "live_10s_buy":    live_10.get("buy"),
+                "live_10s_sell":   live_10.get("sell"),
+                "live_10s_net":    live_10.get("net"),
+                "live_10s_events": live_10.get("events"),
+                "buy_concentration_5s":   pre_5.get("buy_concentration"),
+                "buy_concentration_10s":  pre_10.get("buy_concentration"),
+                "sell_concentration_5s":  pre_5.get("sell_concentration"),
+                "sell_concentration_10s": pre_10.get("sell_concentration"),
+                "candidate_flags": flags,
+            }
+
+            db.insert_micro_absorption_snapshot(data)
+
+        except Exception as e:
+            logger.debug("micro_snapshot %s: %s", mint[:8], e)
 
     def _backfill_slope_ticks(self, mint: str, state: dict):
         """
