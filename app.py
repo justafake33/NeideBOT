@@ -37952,5 +37952,843 @@ def analise_bigplayer():
     return html
 
 
+@app.route("/analise/h22-h24-lab")
+def analise_h22h24_lab():
+    """
+    H22/H23/H24 Laboratory — análise histórica de features de microestrutura.
+
+    Pergunta central: quais features derivadas de H22/H23/H24 reduzem SL
+    sem eliminar TPs?
+
+    Query params:
+      days        int   (default 30)  janela de lookback em dias
+      from_id     int   (optional)    só bounces com id >= from_id
+      only_bottom bool  (default 1)   filtrar h23_window='bottom'
+      quality     str   (default all) 'good'/'ok'/'bad'/'all'
+      tp_pct      float (default 0.75) nível de TP
+      sl_pct      float (default 0.25) nível de SL
+      format      str   (default html) 'html'/'json'/'csv'
+    """
+    import psycopg2, psycopg2.extras, traceback as _tb, csv, io, json as _json
+    from db import DATABASE_URL
+
+    # ── Params ──────────────────────────────────────────────────────────────────
+    try:
+        days        = int(request.args.get("days", 30))
+        from_id     = int(request.args.get("from_id")) if request.args.get("from_id") else None
+        only_bottom = request.args.get("only_bottom", "1") not in ("0", "false", "no")
+        quality_f   = request.args.get("quality", "all").lower()
+        tp_pct      = float(request.args.get("tp_pct", 0.75))
+        sl_pct      = float(request.args.get("sl_pct", 0.25))
+        fmt         = request.args.get("format", "html").lower()
+    except ValueError as e:
+        return f"<pre>Parâmetro inválido: {e}</pre>", 400
+
+    TP_MULT   = 1.0 + tp_pct
+    SL_MULT   = 1.0 - sl_pct
+    MIN_TICKS = 3
+    WINDOW_MIN = 20   # janela de outcome em minutos
+
+    # ── Query ───────────────────────────────────────────────────────────────────
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        quality_clause = ""
+        if quality_f in ("good", "ok", "bad"):
+            quality_clause = f"AND bs.data_quality = '{quality_f}'"
+
+        bottom_clause = "AND bs.h23_window = 'bottom'" if only_bottom else ""
+        fromid_clause = f"AND bs.id >= {from_id}" if from_id else ""
+
+        cur.execute(f"""
+            WITH latest_trade AS (
+                SELECT DISTINCT ON (mint)
+                    mint,
+                    status,
+                    pnl_pct_real,
+                    mc_at_signal   AS trade_entry_mc,
+                    tp_pct         AS trade_tp_pct,
+                    sl_pct         AS trade_sl_pct
+                FROM trades
+                ORDER BY mint, created_at DESC
+            ),
+            tick_outcomes AS (
+                SELECT
+                    bs.mint,
+                    bs.mc_at_signal                                      AS entry_mc,
+                    -- first TP tick
+                    MIN(CASE WHEN tt.mc_high >= bs.mc_at_signal * %(tp)s
+                             THEN tt.tick_ts END)                        AS first_tp_ts,
+                    -- first SL tick
+                    MIN(CASE WHEN tt.mc_low  <= bs.mc_at_signal * %(sl)s
+                             THEN tt.tick_ts END)                        AS first_sl_ts,
+                    MAX(COALESCE(tt.mc_high, tt.mc))                     AS max_mc_20m,
+                    MIN(COALESCE(tt.mc_low,  tt.mc))                     AS min_mc_20m,
+                    COUNT(tt.id)                                         AS tick_count
+                FROM bounce_signals bs
+                JOIN token_ticks tt
+                    ON  tt.mint    = bs.mint
+                    AND tt.tick_ts > bs.ts_signal
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '{WINDOW_MIN} minutes'
+                WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+                GROUP BY bs.mint, bs.mc_at_signal
+                HAVING COUNT(tt.id) >= {MIN_TICKS}
+            )
+            SELECT
+                bs.id,
+                bs.mint,
+                bs.symbol,
+                bs.exchange,
+                bs.ts_signal,
+                bs.elapsed_sec,
+                bs.mc_migration,
+                bs.mc_min,
+                bs.mc_at_signal,
+                bs.drop_from_mig,
+                bs.bounce_pct,
+                bs.h23_window,
+                bs.data_quality,
+                -- PRÉ window [ts_min-60s, ts_min]
+                COALESCE(bs.absorption_buy_vol,  0) AS pre_buy,
+                COALESCE(bs.absorption_sell_vol, 0) AS pre_sell,
+                COALESCE(bs.absorption_events,   0) AS pre_events,
+                COALESCE(bs.absorption_lrg_buy,  0) AS pre_lrg_buy,
+                -- RISE window [ts_min, ts_signal]
+                COALESCE(bs.rise_buy_vol,   0)      AS rise_buy,
+                COALESCE(bs.rise_sell_vol,  0)      AS rise_sell,
+                COALESCE(bs.rise_net_flow,  0)      AS rise_net,
+                COALESCE(bs.rise_events,    0)      AS rise_events,
+                COALESCE(bs.rise_lrg_buy,   0)      AS rise_lrg_buy,
+                -- POST bounce snapshots
+                bs.p30s_buy_vol,
+                bs.p30s_sell_vol,
+                bs.p60s_buy_vol,
+                bs.p60s_sell_vol,
+                -- H24 dump seller concentration
+                bs.dump_seller_count,
+                bs.dump_seller_hhi,
+                bs.dump_top_seller_frac,
+                -- H25/H26
+                bs.pool_quote_at_signal,
+                bs.buy_concentration,
+                -- Real trade outcome (GMGN ground truth)
+                lt.status          AS real_status,
+                lt.pnl_pct_real    AS real_pnl,
+                -- Theoretical outcome via token_ticks
+                to2.tick_count,
+                to2.first_tp_ts,
+                to2.first_sl_ts,
+                to2.max_mc_20m,
+                to2.min_mc_20m,
+                CASE
+                    WHEN to2.first_tp_ts IS NOT NULL AND (to2.first_sl_ts IS NULL OR to2.first_tp_ts <= to2.first_sl_ts)
+                    THEN 'tp'
+                    WHEN to2.first_sl_ts IS NOT NULL
+                    THEN 'sl'
+                    ELSE NULL
+                END                AS theoretical_outcome,
+                CASE WHEN bs.mc_at_signal > 0 AND to2.max_mc_20m IS NOT NULL
+                     THEN (to2.max_mc_20m - bs.mc_at_signal) / bs.mc_at_signal END AS max_gain_20m,
+                CASE WHEN bs.mc_at_signal > 0 AND to2.min_mc_20m IS NOT NULL
+                     THEN (to2.min_mc_20m - bs.mc_at_signal) / bs.mc_at_signal END AS min_drawdown_20m
+            FROM bounce_signals bs
+            LEFT JOIN latest_trade lt   ON lt.mint = bs.mint
+            LEFT JOIN tick_outcomes to2 ON to2.mint = bs.mint
+            WHERE bs.ts_signal >= NOW() - INTERVAL '{days} days'
+              AND bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+              {bottom_clause}
+              {quality_clause}
+              {fromid_clause}
+            ORDER BY bs.ts_signal DESC
+        """, {"tp": TP_MULT, "sl": SL_MULT})
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    except Exception:
+        return f"<pre>{_tb.format_exc()}</pre>", 500
+
+    # ── Derived features ─────────────────────────────────────────────────────
+    def compute_feats(r):
+        pre_buy   = float(r["pre_buy"]   or 0)
+        pre_sell  = float(r["pre_sell"]  or 0)
+        rise_buy  = float(r["rise_buy"]  or 0)
+        rise_sell = float(r["rise_sell"] or 0)
+        pool      = float(r["pool_quote_at_signal"] or 0)
+        rise_lrg  = float(r["rise_lrg_buy"] or 0)
+        p60_buy   = float(r["p60s_buy_vol"]  or 0) if r["p60s_buy_vol"]  is not None else 0.0
+        p60_sell  = float(r["p60s_sell_vol"] or 0) if r["p60s_sell_vol"] is not None else 0.0
+
+        pre_net   = pre_buy  - pre_sell
+        rise_net  = rise_buy - rise_sell
+        post60_net = p60_buy - p60_sell
+
+        gross_rise = rise_buy + rise_sell
+        abs_net_rise = abs(rise_net)
+
+        pre_sell_rate  = pre_sell / 60.0 if pre_sell > 0 else None
+        rise_buy_sell  = rise_buy / rise_sell if rise_sell > 0 else None
+        seller_exhaust = (1.0 - rise_sell / pre_sell) if pre_sell > 0 else None
+        rise_churn     = gross_rise / abs_net_rise if abs_net_rise > 0.001 else None
+        rise_net_eff   = abs_net_rise / gross_rise  if gross_rise  > 0     else None
+        pool_norm_buy  = rise_buy / pool if pool > 0 else None
+        buy_conc_calc  = rise_lrg / rise_buy if rise_buy > 0 else None
+        flow_eff       = rise_net / gross_rise if gross_rise > 0 else None
+
+        hhi = r["dump_seller_hhi"]
+        top_frac = r["dump_top_seller_frac"]
+        dump_count = r["dump_seller_count"]
+
+        return {
+            "pre_net":           pre_net,
+            "rise_net":          rise_net,
+            "post60_net":        post60_net,
+            "pre_sell_rate":     pre_sell_rate,
+            "rise_buy_sell_ratio": rise_buy_sell,
+            "seller_exhaustion": seller_exhaust,
+            "rise_churn_ratio":  rise_churn,
+            "rise_net_efficiency": rise_net_eff,
+            "pool_normalized_flow": pool_norm_buy,
+            "buy_concentration": buy_conc_calc if buy_conc_calc is not None else (
+                float(r["buy_concentration"]) if r["buy_concentration"] is not None else None
+            ),
+            "dump_seller_hhi":   hhi,
+            "dump_top_seller_frac": top_frac,
+            "flow_efficiency":   flow_eff,
+            "has_pre_data":      r["pre_events"] > 0,
+            "has_rise_data":     r["rise_events"] > 0,
+        }
+
+    enriched = [dict(r, **compute_feats(r)) for r in rows]
+
+    # ── Coverage ─────────────────────────────────────────────────────────────
+    n_total         = len(enriched)
+    n_with_ticks    = sum(1 for r in enriched if r["tick_count"] is not None)
+    n_with_outcome  = sum(1 for r in enriched if r["theoretical_outcome"] is not None)
+    n_with_helius   = sum(1 for r in enriched if r["pre_events"] > 0)
+    n_with_rise     = sum(1 for r in enriched if r["rise_events"] > 0)
+    n_with_trade    = sum(1 for r in enriched if r["real_status"] is not None)
+    n_bottom_window = sum(1 for r in enriched if r["h23_window"] == "bottom")
+    n_good_quality  = sum(1 for r in enriched if r["data_quality"] == "good")
+    n_h24_data      = sum(1 for r in enriched if r["dump_seller_hhi"] is not None)
+
+    # ── Outcome subsets ───────────────────────────────────────────────────────
+    with_outcome = [r for r in enriched if r["theoretical_outcome"] is not None]
+    n_th_tp = sum(1 for r in with_outcome if r["theoretical_outcome"] == "tp")
+    n_th_sl = sum(1 for r in with_outcome if r["theoretical_outcome"] == "sl")
+    BASE_WR  = round(n_th_tp / n_with_outcome * 100, 1) if n_with_outcome else 0.0
+
+    def agg_subset(subset):
+        n = len(subset)
+        if n == 0:
+            return {"n": 0, "tp": 0, "sl": 0, "wr": None, "tps_pct": None}
+        tp = sum(1 for r in subset if r["theoretical_outcome"] == "tp")
+        sl = sum(1 for r in subset if r["theoretical_outcome"] == "sl")
+        wr = round(tp / n * 100, 1)
+        return {"n": n, "tp": tp, "sl": sl, "wr": wr, "tps_pct": round(tp / max(n_th_tp, 1) * 100, 0)}
+
+    def wr_color(wr):
+        if wr is None: return "#8b949e"
+        return "#3fb950" if wr >= BASE_WR + 8 else ("#f85149" if wr <= BASE_WR - 8 else "#e3b341")
+
+    def delta_str(wr):
+        if wr is None: return "—"
+        d = wr - BASE_WR
+        c = "#3fb950" if d >= 5 else ("#f85149" if d <= -5 else "#8b949e")
+        return f"<span style='color:{c}'>{d:+.1f}pp</span>"
+
+    def tps_lost_str(tps_pct):
+        if tps_pct is None: return "—"
+        c = "#3fb950" if tps_pct >= 80 else ("#e3b341" if tps_pct >= 50 else "#f85149")
+        return f"<span style='color:{c}'>{tps_pct:.0f}%</span>"
+
+    def bucket_table(title, note, bins):
+        hdrs = ["Faixa", "n", "TP", "SL", "WR%", "Δbaseline", "TPs retidos%"]
+        ths  = "".join(f"<th style='text-align:{'left' if i==0 else 'right'}'>{h}</th>"
+                       for i, h in enumerate(hdrs))
+        body = ""
+        for label, fn in bins:
+            subset = [r for r in with_outcome if fn(r)]
+            g = agg_subset(subset)
+            wc = wr_color(g["wr"])
+            wr_s = f"{g['wr']:.1f}%" if g["wr"] is not None else "—"
+            body += (
+                f"<tr><td>{label}</td>"
+                f"<td style='text-align:right'>{g['n']}</td>"
+                f"<td style='text-align:right'>{g['tp']}</td>"
+                f"<td style='text-align:right'>{g['sl']}</td>"
+                f"<td style='text-align:right;color:{wc}'>{wr_s}</td>"
+                f"<td style='text-align:right'>{delta_str(g['wr'])}</td>"
+                f"<td style='text-align:right'>{tps_lost_str(g['tps_pct'])}</td></tr>"
+            )
+        note_html = f"<p class='note'>{note}</p>" if note else ""
+        return f"<h2>{title}</h2>{note_html}<table><tr>{ths}</tr>{body}</table>"
+
+    # ── Feature buckets ───────────────────────────────────────────────────────
+
+    SE_BINS = [
+        ("≥0.7  exaustão forte (sellers desapareceram)", lambda r: r["seller_exhaustion"] is not None and r["seller_exhaustion"] >= 0.7),
+        ("0.4–0.7  exaustão moderada",                   lambda r: r["seller_exhaustion"] is not None and 0.4 <= r["seller_exhaustion"] < 0.7),
+        ("0.0–0.4  exaustão fraca",                      lambda r: r["seller_exhaustion"] is not None and 0.0 <= r["seller_exhaustion"] < 0.4),
+        ("<0  sellers aceleraram no bounce",              lambda r: r["seller_exhaustion"] is not None and r["seller_exhaustion"] < 0.0),
+        ("sem dados (pre_sell=0)",                        lambda r: r["seller_exhaustion"] is None),
+    ]
+
+    CR_BINS = [
+        ("<2×  capital eficiente",     lambda r: r["rise_churn_ratio"] is not None and r["rise_churn_ratio"] < 2.0),
+        ("2–5×  algum wash",           lambda r: r["rise_churn_ratio"] is not None and 2.0 <= r["rise_churn_ratio"] < 5.0),
+        ("5–15×  churn elevado",       lambda r: r["rise_churn_ratio"] is not None and 5.0 <= r["rise_churn_ratio"] < 15.0),
+        ("≥15×  wash/HFT tóxico",      lambda r: r["rise_churn_ratio"] is not None and r["rise_churn_ratio"] >= 15.0),
+        ("sem dados (rise net≈0)",     lambda r: r["rise_churn_ratio"] is None),
+    ]
+
+    NE_BINS = [
+        ("≥0.7  eficiência alta",      lambda r: r["rise_net_efficiency"] is not None and r["rise_net_efficiency"] >= 0.7),
+        ("0.4–0.7  eficiência mod.",   lambda r: r["rise_net_efficiency"] is not None and 0.4 <= r["rise_net_efficiency"] < 0.7),
+        ("0.2–0.4  eficiência baixa",  lambda r: r["rise_net_efficiency"] is not None and 0.2 <= r["rise_net_efficiency"] < 0.4),
+        ("<0.2  quase tudo wash",      lambda r: r["rise_net_efficiency"] is not None and r["rise_net_efficiency"] < 0.2),
+        ("sem dados",                  lambda r: r["rise_net_efficiency"] is None),
+    ]
+
+    PN_BINS = [
+        ("≥0.2  pressão real (≥20% pool)",  lambda r: r["pool_normalized_flow"] is not None and r["pool_normalized_flow"] >= 0.2),
+        ("0.1–0.2  pressão moderada",       lambda r: r["pool_normalized_flow"] is not None and 0.1 <= r["pool_normalized_flow"] < 0.2),
+        ("0.05–0.1  pressão leve",          lambda r: r["pool_normalized_flow"] is not None and 0.05 <= r["pool_normalized_flow"] < 0.1),
+        ("<0.05  compra negligível",         lambda r: r["pool_normalized_flow"] is not None and r["pool_normalized_flow"] < 0.05),
+        ("sem dados (pool=0)",              lambda r: r["pool_normalized_flow"] is None),
+    ]
+
+    BC_BINS = [
+        ("≥0.5  demanda concentrada (1 baleia)",  lambda r: r["buy_concentration"] is not None and r["buy_concentration"] >= 0.5),
+        ("0.25–0.5  concentração moderada",       lambda r: r["buy_concentration"] is not None and 0.25 <= r["buy_concentration"] < 0.5),
+        ("0.1–0.25  distribuído",                 lambda r: r["buy_concentration"] is not None and 0.1 <= r["buy_concentration"] < 0.25),
+        ("<0.1  micro-compras / bots",            lambda r: r["buy_concentration"] is not None and r["buy_concentration"] < 0.1),
+        ("sem dados (rise_buy=0)",               lambda r: r["buy_concentration"] is None),
+    ]
+
+    HHI_BINS = [
+        ("≥0.4  dump concentrado (1-2 sellers dominam)",  lambda r: r["dump_seller_hhi"] is not None and r["dump_seller_hhi"] >= 0.4),
+        ("0.2–0.4  dump semi-concentrado",                lambda r: r["dump_seller_hhi"] is not None and 0.2 <= r["dump_seller_hhi"] < 0.4),
+        ("0.1–0.2  dump distribuído",                     lambda r: r["dump_seller_hhi"] is not None and 0.1 <= r["dump_seller_hhi"] < 0.2),
+        ("<0.1  muitos sellers pequenos",                  lambda r: r["dump_seller_hhi"] is not None and r["dump_seller_hhi"] < 0.1),
+        ("sem dados H24",                                  lambda r: r["dump_seller_hhi"] is None),
+    ]
+
+    PREFLOW_BINS = [
+        (">1 SOL  capital entrando antes do fundo",  lambda r: r["pre_net"] > 1.0),
+        ("0–1 SOL  pequena entrada",                 lambda r: 0 <= r["pre_net"] <= 1.0),
+        ("<0  saída líquida antes do fundo",         lambda r: r["pre_net"] < 0.0),
+    ]
+
+    RISEFLOW_BINS = [
+        (">3 SOL  forte entrada no bounce",   lambda r: r["rise_net"] > 3.0),
+        ("1–3 SOL  entrada moderada",         lambda r: 1.0 <= r["rise_net"] <= 3.0),
+        ("0–1 SOL  entrada fraca",            lambda r: 0 <= r["rise_net"] < 1.0),
+        ("<0  saída líquida no bounce",       lambda r: r["rise_net"] < 0.0),
+    ]
+
+    # ── Multi-feature combinations ────────────────────────────────────────────
+    def good_se(r):  return r["seller_exhaustion"] is not None and r["seller_exhaustion"] >= 0.4
+    def good_ne(r):  return r["rise_net_efficiency"] is not None and r["rise_net_efficiency"] >= 0.4
+    def good_pn(r):  return r["pool_normalized_flow"] is not None and r["pool_normalized_flow"] >= 0.1
+    def good_bc(r):  return r["buy_concentration"] is not None and r["buy_concentration"] >= 0.25
+    def clean_cr(r): return r["rise_churn_ratio"] is not None and r["rise_churn_ratio"] < 5.0
+    def hhi_hi(r):   return r["dump_seller_hhi"] is not None and r["dump_seller_hhi"] >= 0.3
+
+    COMBO_BINS = [
+        ("SE≥0.4 + NE≥0.4 + PN≥0.1 + CR<5  Setup A+",         lambda r: good_se(r) and good_ne(r) and good_pn(r) and clean_cr(r)),
+        ("SE≥0.4 + NE≥0.4  exaustão+eficiência",               lambda r: good_se(r) and good_ne(r)),
+        ("SE≥0.4 + PN≥0.1  exaustão+pressão",                  lambda r: good_se(r) and good_pn(r)),
+        ("HHI≥0.3 + SE≥0.4  dump concentrado+exaustão",        lambda r: hhi_hi(r) and good_se(r)),
+        ("HHI≥0.3 + NE≥0.4  dump concentrado+eficiência",      lambda r: hhi_hi(r) and good_ne(r)),
+        ("NE≥0.4 + PN≥0.1 (sem exaustão)",                     lambda r: good_ne(r) and good_pn(r) and not good_se(r)),
+        ("Nenhum critério (sem microestrutura)",                 lambda r: not good_se(r) and not good_ne(r) and not good_pn(r)),
+    ]
+
+    # ── False positive table (SL hits by feature) ─────────────────────────────
+    sl_rows_se  = [(r, r["seller_exhaustion"])  for r in with_outcome if r["theoretical_outcome"] == "sl" and r["seller_exhaustion"] is not None]
+    sl_rows_ne  = [(r, r["rise_net_efficiency"]) for r in with_outcome if r["theoretical_outcome"] == "sl" and r["rise_net_efficiency"] is not None]
+    sl_rows_hhi = [(r, r["dump_seller_hhi"])    for r in with_outcome if r["theoretical_outcome"] == "sl" and r["dump_seller_hhi"] is not None]
+
+    # ── JSON / CSV output ──────────────────────────────────────────────────────
+    if fmt in ("json", "csv"):
+        export_fields = [
+            "id", "mint", "symbol", "exchange", "ts_signal", "elapsed_sec",
+            "mc_migration", "mc_min", "mc_at_signal", "bounce_pct", "drop_from_mig",
+            "h23_window", "data_quality",
+            "pre_buy", "pre_sell", "pre_events",
+            "rise_buy", "rise_sell", "rise_net", "rise_events",
+            "p60s_buy_vol", "p60s_sell_vol",
+            "pool_quote_at_signal", "dump_seller_hhi", "dump_top_seller_frac", "dump_seller_count",
+            "pre_net", "rise_net", "post60_net",
+            "pre_sell_rate", "rise_buy_sell_ratio",
+            "seller_exhaustion", "rise_churn_ratio", "rise_net_efficiency",
+            "pool_normalized_flow", "buy_concentration",
+            "dump_seller_hhi", "flow_efficiency",
+            "tick_count", "first_tp_ts", "first_sl_ts", "max_gain_20m", "min_drawdown_20m",
+            "theoretical_outcome", "real_status", "real_pnl",
+        ]
+        # deduplicate
+        seen = set()
+        export_fields = [f for f in export_fields if f not in seen and not seen.add(f)]
+        export_data = []
+        for r in enriched:
+            row_out = {}
+            for f in export_fields:
+                v = r.get(f)
+                if hasattr(v, "isoformat"):
+                    v = v.isoformat()
+                row_out[f] = v
+            export_data.append(row_out)
+
+        if fmt == "json":
+            return app.response_class(
+                _json.dumps({"params": {"days": days, "tp_pct": tp_pct, "sl_pct": sl_pct,
+                                        "only_bottom": only_bottom, "quality": quality_f},
+                             "coverage": {"total": n_total, "with_ticks": n_with_ticks,
+                                          "with_outcome": n_with_outcome, "with_helius": n_with_helius},
+                             "baseline_wr": BASE_WR,
+                             "rows": export_data}, default=str, indent=2),
+                mimetype="application/json"
+            )
+        else:
+            buf = io.StringIO()
+            w = csv.DictWriter(buf, fieldnames=export_fields, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(export_data)
+            return app.response_class(buf.getvalue(), mimetype="text/csv",
+                                      headers={"Content-Disposition": "attachment; filename=h22h24lab.csv"})
+
+    # ── HTML ───────────────────────────────────────────────────────────────────
+    CSS = """<style>
+      body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+      h1{color:#58a6ff}h2{color:#79c0ff;margin-top:28px;font-size:14px}
+      table{border-collapse:collapse;width:100%;max-width:860px;margin-bottom:20px}
+      th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d}
+      td{padding:5px 10px;border:1px solid #21262d;white-space:nowrap}
+      .note{color:#8b949e;font-size:12px;margin:4px 0 12px}
+      .box{background:#161b22;border:1px solid #30363d;padding:10px 14px;border-radius:4px;margin:10px 0}
+      .green{color:#3fb950}.red{color:#f85149}.yellow{color:#e3b341}
+      a{color:#58a6ff;text-decoration:none}
+      .param-form{background:#161b22;border:1px solid #30363d;padding:12px 16px;border-radius:4px;margin-bottom:20px}
+      .param-form label{color:#8b949e;font-size:12px;margin-right:8px}
+      .param-form input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;padding:3px 6px;font-family:monospace}
+      .param-form button{background:#238636;color:#fff;border:none;padding:5px 14px;cursor:pointer;border-radius:3px;font-family:monospace}
+    </style>"""
+
+    current_params = (f"?days={days}&tp_pct={tp_pct}&sl_pct={sl_pct}"
+                      f"&only_bottom={'1' if only_bottom else '0'}&quality={quality_f}")
+
+    param_form = f"""
+    <div class='param-form'>
+      <form method='get'>
+        <label>days</label><input name='days' value='{days}' size='4'>
+        <label>tp_pct</label><input name='tp_pct' value='{tp_pct}' size='5'>
+        <label>sl_pct</label><input name='sl_pct' value='{sl_pct}' size='5'>
+        <label>only_bottom</label><input name='only_bottom' value='{"1" if only_bottom else "0"}' size='2'>
+        <label>quality</label><input name='quality' value='{quality_f}' size='6'>
+        <label>from_id</label><input name='from_id' value='{from_id or ""}' size='8'>
+        &nbsp;<button type='submit'>Atualizar</button>
+        &nbsp; <a href='{current_params}&format=json'>JSON</a>
+        &nbsp; <a href='{current_params}&format=csv'>CSV</a>
+      </form>
+    </div>"""
+
+    cov_box = f"""<div class='box'>
+      <b>Cobertura</b> — {days}d | {'h23=bottom' if only_bottom else 'todas janelas'} | quality={quality_f}<br>
+      Total bounces: <b>{n_total}</b> &nbsp;·&nbsp;
+      Com ticks: <b>{n_with_ticks}</b> ({round(n_with_ticks/n_total*100) if n_total else 0}%) &nbsp;·&nbsp;
+      Com outcome calculado: <b class='yellow'>{n_with_outcome}</b> &nbsp;·&nbsp;
+      Com trade real: <b>{n_with_trade}</b><br>
+      Helius PRÉ: {n_with_helius} ({round(n_with_helius/n_total*100) if n_total else 0}%) &nbsp;·&nbsp;
+      Helius RISE: {n_with_rise} ({round(n_with_rise/n_total*100) if n_total else 0}%) &nbsp;·&nbsp;
+      H24 (HHI): {n_h24_data} ({round(n_h24_data/n_total*100) if n_total else 0}%) &nbsp;·&nbsp;
+      h23=bottom: {n_bottom_window} &nbsp;·&nbsp;
+      data_quality=good: {n_good_quality}<br>
+      <b>Baseline WR ({WINDOW_MIN}min, entry=mc_at_signal, TP=+{tp_pct*100:.0f}%, SL=-{sl_pct*100:.0f}%):
+      <span class='yellow'>{BASE_WR}%</span></b>
+      &nbsp;({n_th_tp} TP / {n_th_sl} SL / {n_with_outcome} com outcome)
+    </div>"""
+
+    # ── Sample table (last 30 with rise data) ─────────────────────────────────
+    sample = [r for r in enriched if r["has_rise_data"]][:30]
+    sample_rows_html = ""
+    for r in sample:
+        out = r["theoretical_outcome"]
+        real_out = r["real_status"]
+        out_label = ("✓TP" if out == "tp" else ("✗SL" if out == "sl" else "?"))
+        out_color = "#3fb950" if out == "tp" else ("#f85149" if out == "sl" else "#8b949e")
+        real_label = f"R:{real_out[:2].upper()}" if real_out and real_out not in ("open","pending","error") else ""
+        real_color = "#3fb950" if real_out in ("tp",) else ("#f85149" if real_out in ("sl",) else "#8b949e")
+
+        def _f2(v, fmt_s=".2f"): return f"{v:{fmt_s}}" if v is not None else "—"
+        def _pct(v): return f"{v*100:.0f}%" if v is not None else "—"
+
+        sample_rows_html += (
+            f"<tr>"
+            f"<td style='color:{out_color}'>{out_label}</td>"
+            f"<td style='color:{real_color}'>{real_label}</td>"
+            f"<td>{r['symbol'] or r['mint'][:6]}</td>"
+            f"<td>{_pct(r['bounce_pct'])}</td>"
+            f"<td>{_f2(r['seller_exhaustion'])}</td>"
+            f"<td>{_f2(r['rise_churn_ratio'], '.1f') if r['rise_churn_ratio'] else '—'}×</td>"
+            f"<td>{_f2(r['rise_net_efficiency'])}</td>"
+            f"<td>{_f2(r['pool_normalized_flow'], '.3f')}</td>"
+            f"<td>{_f2(r['buy_concentration'])}</td>"
+            f"<td>{_f2(r['dump_seller_hhi'])}</td>"
+            f"<td>{_pct(r['max_gain_20m'])}</td>"
+            f"<td>{_pct(r['min_drawdown_20m'])}</td>"
+            f"</tr>"
+        )
+
+    sample_tbl = f"""<h2>Últimos bounces com dados RISE (max 30)</h2>
+    <table>
+      <tr>
+        <th>Th</th><th>Real</th><th>Token</th><th>B%</th>
+        <th>SE</th><th>CR</th><th>NE</th><th>PN</th><th>BC</th><th>HHI</th>
+        <th>MaxG%</th><th>MinD%</th>
+      </tr>
+      {sample_rows_html or "<tr><td colspan='12' style='color:#8b949e'>sem bounces com dados RISE neste período</td></tr>"}
+    </table>
+    <p class='note'>
+      Th=outcome teórico (ticks {WINDOW_MIN}min) · Real=trade GMGN ·
+      SE=seller_exhaustion · CR=churn_ratio · NE=net_efficiency ·
+      PN=pool_norm_buy · BC=buy_concentration · HHI=dump_seller_hhi ·
+      MaxG/MinD = max gain / min drawdown 20min pós-sinal (% do mc_at_signal)
+    </p>"""
+
+    se_tbl   = bucket_table("Seller Exhaustion  [1−(rise_sell/pre_sell)]",
+                             "≥0.7 = sellers desapareceram no bounce vs janela do fundo. <0 = sellers aceleraram (ruim).",
+                             SE_BINS)
+    cr_tbl   = bucket_table("Rise Churn Ratio  [(buy+sell)/|net|]",
+                             "<2× = capital eficiente, direcional. ≥15× = wash/HFT. Alto = ruído, não demanda.",
+                             CR_BINS)
+    ne_tbl   = bucket_table("Rise Net Efficiency  [|net|/(buy+sell)]",
+                             "≥0.7 = 70%+ do volume tem direção. <0.2 = quase tudo bilateral.",
+                             NE_BINS)
+    pn_tbl   = bucket_table("Pool Normalized Buy  [rise_buy/pool_quote]",
+                             "≥0.2 = compraram 20%+ do pool. <0.05 = bounce por vácuo, sem demanda real.",
+                             PN_BINS)
+    bc_tbl   = bucket_table("Buy Concentration  [rise_lrg_buy/rise_buy]",
+                             "≥0.5 = 1 baleia dominou a compra. <0.1 = micro-compras fragmentadas.",
+                             BC_BINS)
+    hhi_tbl  = bucket_table("Dump Seller HHI (H24)  [concentração dos vendors durante o dump]",
+                             "≥0.4 = 1-2 sellers dominam. Dump finito. <0.1 = muitos sellers → dump estrutural.",
+                             HHI_BINS)
+    pf_tbl   = bucket_table("Pre-Flow (net SOL 60s antes do fundo)",
+                             "Capital líquido entrando/saindo nos 60s que antecedem o fundo.",
+                             PREFLOW_BINS)
+    rf_tbl   = bucket_table("Rise-Flow (net SOL durante o bounce)",
+                             "Capital líquido no RISE [ts_min→ts_signal].",
+                             RISEFLOW_BINS)
+    combo_tbl = bucket_table("Combinações de Features  (Setup A+, A, B, Nenhum)",
+                              "SE=seller_exhaustion≥0.4 · NE=net_efficiency≥0.4 · PN=pool_norm≥0.1 · CR<5 · HHI≥0.3.",
+                              COMBO_BINS)
+
+    nav = ("<p><a href='/analise/bigplayer'>BigPlayer</a> · "
+           "<a href='/analise/h22-h25-ticks'>H22-H25 Ticks</a> · "
+           "<a href='/analise/sinal-puro'>Sinal Puro</a> · "
+           "<a href='/debug/h22-h24-live'>H22-H24 Live</a> · "
+           "<a href='/analise/wr-breakdown'>WR Breakdown</a></p>")
+
+    html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+    <title>H22/H24 Lab</title>{CSS}</head><body>
+    <h1>🔬 H22/H24 Lab — Laboratório de Microestrutura</h1>
+    <p class='note'>
+      Pergunta: quais features de microestrutura reduzem SL sem eliminar TPs?<br>
+      Outcome teórico: token_ticks {WINDOW_MIN}min · entry=mc_at_signal ·
+      TP=+{tp_pct*100:.0f}% (×{TP_MULT}) · SL=-{sl_pct*100:.0f}% (×{SL_MULT})<br>
+      Outcome real: latest trade GMGN por mint (ground truth).
+    </p>
+    {param_form}
+    {nav}
+    {cov_box}
+    {se_tbl}
+    {cr_tbl}
+    {ne_tbl}
+    {pn_tbl}
+    {bc_tbl}
+    {hhi_tbl}
+    {pf_tbl}
+    {rf_tbl}
+    {combo_tbl}
+    {sample_tbl}
+    </body></html>"""
+
+    return html
+
+
+@app.route("/debug/h22-h24-live")
+def debug_h22h24_live():
+    """
+    H22/H24 Live — features de microestrutura ao vivo para tokens no HotMonitor.
+
+    Leitura 100% passiva: não chama executor, não altera estado, não faz rede/API externa.
+    """
+    import traceback as _tb
+
+    CSS = """<style>
+      body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+      h1{color:#58a6ff}h2{color:#79c0ff;margin-top:24px}
+      table{border-collapse:collapse;width:100%;margin-bottom:16px}
+      th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d}
+      td{padding:5px 10px;border:1px solid #21262d;white-space:nowrap;font-size:12px}
+      .note{color:#8b949e;font-size:11px;margin:4px 0 12px}
+      .box{background:#161b22;border:1px solid #30363d;padding:10px 14px;border-radius:4px;margin:10px 0}
+      .green{color:#3fb950}.red{color:#f85149}.yellow{color:#e3b341}.dim{color:#484f58}
+      a{color:#58a6ff;text-decoration:none}
+    </style>"""
+
+    # ── Check scanner availability ────────────────────────────────────────────
+    try:
+        hot_monitor = scanner.hot if hasattr(scanner, "hot") else None
+    except Exception:
+        hot_monitor = None
+
+    helius_available = False
+    try:
+        if hot_monitor is not None and hasattr(hot_monitor, "_helius") and hot_monitor._helius is not None:
+            helius_available = True
+    except Exception:
+        pass
+
+    if not hot_monitor or not helius_available:
+        reason = "HotMonitor indisponível" if not hot_monitor else "Helius/erpc indisponível"
+        return f"""<!DOCTYPE html><html><head><meta charset='utf-8'><title>H22-H24 Live</title>{CSS}</head>
+        <body><h1>H22/H24 Live</h1>
+        <div class='box red'>{reason} — live analysis disabled</div>
+        <p><a href='/analise/h22-h24-lab'>Lab histórico</a></p>
+        </body></html>"""
+
+    # ── Collect live state ────────────────────────────────────────────────────
+    import time as _time
+
+    now_ts = _time.time()
+
+    try:
+        # Read state snapshot under lock
+        with hot_monitor._lock:
+            tokens_snapshot = {
+                mint: dict(state)
+                for mint, state in hot_monitor._tokens.items()
+            }
+    except Exception as e:
+        return f"""<!DOCTYPE html><html><head><meta charset='utf-8'><title>H22-H24 Live</title>{CSS}</head>
+        <body><h1>H22/H24 Live</h1>
+        <div class='box red'>Erro ao ler HotMonitor state: {e}</div>
+        </body></html>"""
+
+    # ── Compute live features per token ───────────────────────────────────────
+    def get_window(mint, start_ts, end_ts):
+        try:
+            return hot_monitor._helius.get_absorption_window(
+                mint, window_sec=int(end_ts - start_ts), window_end_ts=end_ts
+            )
+        except Exception:
+            return None
+
+    def derive_feats(pre, rise):
+        if not pre or not rise:
+            return {}
+        pre_buy   = float(pre.get("buy_vol_sol",  0) or 0)
+        pre_sell  = float(pre.get("sell_vol_sol", 0) or 0)
+        rise_buy  = float(rise.get("buy_vol_sol",  0) or 0)
+        rise_sell = float(rise.get("sell_vol_sol", 0) or 0)
+        rise_lrg  = float(rise.get("largest_buy", 0) or 0)
+        gross     = rise_buy + rise_sell
+        net       = abs(rise_buy - rise_sell)
+        return {
+            "pre_net":             pre_buy - pre_sell,
+            "rise_net":            rise_buy - rise_sell,
+            "seller_exhaustion":   (1 - rise_sell / pre_sell) if pre_sell > 0 else None,
+            "rise_churn_ratio":    gross / net if net > 0.001 else None,
+            "rise_net_efficiency": net / gross if gross > 0 else None,
+            "rise_buy_sell_ratio": rise_buy / rise_sell if rise_sell > 0 else None,
+        }
+
+    rows = []
+    for mint, state in tokens_snapshot.items():
+        try:
+            ts_mig     = state.get("ts_mig_unix") or 0
+            ts_min_obj = state.get("ts_min")
+            ts_min_ts  = ts_min_obj.timestamp() if hasattr(ts_min_obj, "timestamp") else (ts_mig + 60)
+
+            mc_migration = float(state.get("mc_migration") or 0)
+            mc_min       = float(state.get("mc_min") or 0)
+            mc_last      = float(state.get("mc_last") or mc_min)
+            elapsed_s    = now_ts - ts_mig if ts_mig > 0 else 0
+            bounce_pct   = (mc_last - mc_min) / mc_min if mc_min > 0 else 0
+            drop_pct     = (mc_migration - mc_min) / mc_migration if mc_migration > 0 else 0
+
+            # Windows
+            pre_win  = get_window(mint, ts_min_ts - 60, ts_min_ts)
+            rise_win = get_window(mint, ts_min_ts, now_ts)
+            live10s  = get_window(mint, now_ts - 10,  now_ts)
+            live30s  = get_window(mint, now_ts - 30,  now_ts)
+            live60s  = get_window(mint, now_ts - 60,  now_ts)
+            h24_win  = get_window(mint, ts_mig,        ts_min_ts)
+
+            pool_quote = None
+            try:
+                pool_quote = hot_monitor._helius.get_pool_quote(mint)
+            except Exception:
+                pass
+
+            feats = derive_feats(pre_win, rise_win)
+
+            # Pool-normalized flow
+            pn = None
+            if pool_quote and pool_quote > 0 and rise_win:
+                rb = float(rise_win.get("buy_vol_sol", 0) or 0)
+                pn = rb / pool_quote
+
+            bc = None
+            if rise_win:
+                rb = float(rise_win.get("buy_vol_sol", 0) or 0)
+                rl = float(rise_win.get("largest_buy", 0) or 0)
+                bc = rl / rb if rb > 0 else None
+
+            feats["pool_normalized_flow"] = pn
+            feats["buy_concentration"]    = bc
+
+            # H24 dump seller concentration
+            h24_hhi  = None
+            h24_frac = None
+            h24_cnt  = None
+            if h24_win and hasattr(hot_monitor._helius, "get_dump_seller_concentration"):
+                try:
+                    h24_cnt, h24_hhi, h24_frac = hot_monitor._helius.get_dump_seller_concentration(
+                        mint, ts_mig, ts_min_ts
+                    )
+                except Exception:
+                    pass
+            feats["dump_seller_hhi"]      = h24_hhi
+            feats["dump_top_seller_frac"] = h24_frac
+            feats["dump_seller_count"]    = h24_cnt
+
+            # Candidate stage + risk flags
+            se = feats.get("seller_exhaustion")
+            ne = feats.get("rise_net_efficiency")
+            pn_val = feats.get("pool_normalized_flow")
+            cr = feats.get("rise_churn_ratio")
+
+            flags = []
+            if mc_last > mc_migration * 0.80:  flags.append("LATE_ENTRY")
+            if elapsed_s > 1200:               flags.append("A5_OOB")
+            if bounce_pct > 1.0:               flags.append("BOUNCE_TOO_HIGH")
+            if cr is not None and cr >= 15:    flags.append("WASH_SUSPECT")
+            if ne is not None and ne < 0.2:    flags.append("BILATERAL_NOISE")
+            if se is not None and se < 0:      flags.append("SELLERS_ACCEL")
+
+            a_plus = (se is not None and se >= 0.4
+                      and ne is not None and ne >= 0.4
+                      and pn_val is not None and pn_val >= 0.1
+                      and cr is not None and cr < 5.0)
+            a_ok = (se is not None and se >= 0.4) or (ne is not None and ne >= 0.4 and pn_val is not None and pn_val >= 0.1)
+
+            stage = "A+" if a_plus else ("A" if a_ok else "B")
+
+            rows.append({
+                "mint":           mint,
+                "symbol":         state.get("symbol", mint[:8]),
+                "elapsed_min":    elapsed_s / 60,
+                "mc_migration":   mc_migration,
+                "mc_min":         mc_min,
+                "mc_last":        mc_last,
+                "bounce_pct":     bounce_pct,
+                "drop_pct":       drop_pct,
+                "pool_quote":     pool_quote,
+                "pre_events":     (pre_win or {}).get("total_events", 0),
+                "rise_events":    (rise_win or {}).get("total_events", 0),
+                "live10s_events": (live10s or {}).get("total_events", 0),
+                "live30s_net":    ((live30s or {}).get("buy_vol_sol", 0) or 0) - ((live30s or {}).get("sell_vol_sol", 0) or 0),
+                "live60s_net":    ((live60s or {}).get("buy_vol_sol", 0) or 0) - ((live60s or {}).get("sell_vol_sol", 0) or 0),
+                **feats,
+                "stage":          stage,
+                "risk_flags":     flags,
+            })
+        except Exception as exc:
+            rows.append({"mint": mint, "symbol": state.get("symbol", "?"), "error": str(exc)})
+
+    # ── Render ────────────────────────────────────────────────────────────────
+    def _f(v, fmt=".2f"):
+        if v is None: return "<span style='color:#484f58'>—</span>"
+        try:
+            return f"{v:{fmt}}"
+        except Exception:
+            return str(v)
+
+    def _pct(v):
+        if v is None: return "<span style='color:#484f58'>—</span>"
+        c = "#3fb950" if v >= 0 else "#f85149"
+        return f"<span style='color:{c}'>{v*100:+.0f}%</span>"
+
+    table_rows = ""
+    for r in sorted(rows, key=lambda x: x.get("elapsed_min", 999)):
+        if "error" in r:
+            table_rows += f"<tr><td colspan='16' style='color:#f85149'>ERR {r['symbol']}: {r['error']}</td></tr>"
+            continue
+        stage_color = "#3fb950" if r["stage"] == "A+" else ("#58a6ff" if r["stage"] == "A" else "#8b949e")
+        flags_str = " ".join(f"<span style='color:#f85149'>{f}</span>" for f in r["risk_flags"]) or "—"
+        table_rows += (
+            f"<tr>"
+            f"<td><a href='/debug/mint-trace?mint={r['mint']}'>{r['symbol']}</a></td>"
+            f"<td>{r['elapsed_min']:.1f}m</td>"
+            f"<td>{_pct(r['bounce_pct'])}</td>"
+            f"<td>{_pct(r['drop_pct'])}</td>"
+            f"<td>{_f(r['pool_quote'], '.1f')}</td>"
+            f"<td style='color:{stage_color}'>{r['stage']}</td>"
+            f"<td>{_f(r.get('seller_exhaustion'))}</td>"
+            f"<td>{_f(r.get('rise_churn_ratio'), '.1f')}×</td>"
+            f"<td>{_f(r.get('rise_net_efficiency'))}</td>"
+            f"<td>{_f(r.get('pool_normalized_flow'), '.3f')}</td>"
+            f"<td>{_f(r.get('buy_concentration'))}</td>"
+            f"<td>{_pct(r.get('live30s_net'))}</td>"
+            f"<td>{r['pre_events']}/{r['rise_events']}</td>"
+            f"<td>{r['live10s_events']}</td>"
+            f"<td>{_f(r.get('dump_seller_hhi'))}</td>"
+            f"<td>{flags_str}</td>"
+            f"</tr>"
+        )
+
+    n_tokens = len([r for r in rows if "error" not in r])
+
+    html = f"""<!DOCTYPE html><html><head>
+    <meta charset='utf-8'><meta http-equiv='refresh' content='10'>
+    <title>H22-H24 Live</title>{CSS}</head><body>
+    <h1>📡 H22/H24 Live — Features de Microestrutura ao Vivo</h1>
+    <p class='note'>
+      Leitura passiva. Sem chamadas de rede, sem trading. Auto-refresh 10s.<br>
+      PRÉ=[ts_min−60s,ts_min] · RISE=[ts_min,now] · LIVE=janelas 10s/30s/60s ·
+      H24=[ts_migration,ts_min].
+    </p>
+    <div class='box'>
+      <b>HotMonitor:</b> {n_tokens} tokens ativos &nbsp;·&nbsp;
+      <b>Helius/erpc:</b> <span class='green'>OK</span> &nbsp;·&nbsp;
+      Timestamp: {__import__('datetime').datetime.utcnow().strftime('%H:%M:%S')} UTC
+    </div>
+    <p><a href='/analise/h22-h24-lab'>Lab Histórico</a> · <a href='/analise/bigplayer'>BigPlayer</a></p>
+
+    <table>
+      <tr>
+        <th>Token</th><th>Elapsed</th><th>Bounce%</th><th>Drop%</th>
+        <th>Pool SOL</th><th>Stage</th>
+        <th>SE</th><th>CR</th><th>NE</th><th>PN</th><th>BC</th>
+        <th>L30s net</th><th>Ev P/R</th><th>L10s ev</th>
+        <th>HHI</th><th>Flags</th>
+      </tr>
+      {table_rows or "<tr><td colspan='16' style='color:#8b949e'>Nenhum token ativo no HotMonitor</td></tr>"}
+    </table>
+
+    <p class='note'>
+      SE=seller_exhaustion · CR=churn_ratio · NE=net_efficiency ·
+      PN=pool_norm_buy · BC=buy_concentration · HHI=dump_seller_hhi ·
+      L30s net=net SOL flow últimos 30s · Ev P/R=eventos PRÉ/RISE ·
+      L10s ev=eventos últimos 10s · Stage=A+/A/B candidato
+    </p>
+    </body></html>"""
+
+    return html
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
