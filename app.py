@@ -38856,5 +38856,644 @@ def debug_h22h24_live():
     return html
 
 
+@app.route("/analise/invisible-demand-lab")
+def analise_invisible_demand_lab():
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    import io, csv as _csv
+
+    days           = int(request.args.get("days", 30))
+    tp_pct         = float(request.args.get("tp_pct", 0.75))
+    sl_pct         = float(request.args.get("sl_pct", 0.25))
+    only_bottom    = request.args.get("only_bottom", "1") not in ("0", "false", "")
+    min_pool       = float(request.args.get("min_pool", 0))
+    max_bounce_pct = request.args.get("max_bounce_pct")
+    min_bounce_pct = request.args.get("min_bounce_pct")
+    fmt            = request.args.get("format", "html")
+
+    bottom_clause     = "AND bs.h23_window = 'bottom'" if only_bottom else ""
+    pool_clause       = f"AND bs.pool_quote_at_signal >= {min_pool}" if min_pool > 0 else ""
+    bounce_max_clause = f"AND bs.bounce_pct <= {float(max_bounce_pct)}" if max_bounce_pct else ""
+    bounce_min_clause = f"AND bs.bounce_pct >= {float(min_bounce_pct)}" if min_bounce_pct else ""
+
+    TP_MULT = 1.0 + tp_pct
+    SL_MULT = 1.0 - sl_pct
+
+    sql = f"""
+    WITH latest_trade AS (
+        SELECT DISTINCT ON (mint)
+            mint, status, exit_type, pnl_pct_real, mc_at_signal AS trade_entry_mc, created_at
+        FROM trades ORDER BY mint, created_at DESC
+    ),
+    tick_outcomes AS (
+        SELECT
+            bs.mint,
+            bs.mc_at_signal AS entry_mc,
+            MIN(CASE WHEN COALESCE(tt.mc_high,tt.mc) >= bs.mc_at_signal * %(tp)s THEN tt.tick_ts END) AS first_tp_ts,
+            MIN(CASE WHEN COALESCE(tt.mc_low, tt.mc) <= bs.mc_at_signal * %(sl)s THEN tt.tick_ts END) AS first_sl_ts,
+            MAX(CASE WHEN tt.tick_ts <= bs.ts_signal + INTERVAL '5 minutes'  THEN COALESCE(tt.mc_high,tt.mc) END) AS max_mc_5m,
+            MAX(CASE WHEN tt.tick_ts <= bs.ts_signal + INTERVAL '10 minutes' THEN COALESCE(tt.mc_high,tt.mc) END) AS max_mc_10m,
+            MAX(CASE WHEN tt.tick_ts <= bs.ts_signal + INTERVAL '20 minutes' THEN COALESCE(tt.mc_high,tt.mc) END) AS max_mc_20m,
+            MAX(COALESCE(tt.mc_high,tt.mc)) AS max_mc_60m,
+            MIN(CASE WHEN tt.tick_ts <= bs.ts_signal + INTERVAL '5 minutes'  THEN COALESCE(tt.mc_low,tt.mc) END) AS min_mc_5m,
+            MIN(CASE WHEN tt.tick_ts <= bs.ts_signal + INTERVAL '10 minutes' THEN COALESCE(tt.mc_low,tt.mc) END) AS min_mc_10m,
+            MIN(CASE WHEN tt.tick_ts <= bs.ts_signal + INTERVAL '20 minutes' THEN COALESCE(tt.mc_low,tt.mc) END) AS min_mc_20m,
+            MIN(COALESCE(tt.mc_low,tt.mc)) AS min_mc_60m,
+            COUNT(tt.id) AS tick_count
+        FROM bounce_signals bs
+        JOIN token_ticks tt
+            ON tt.mint = bs.mint
+            AND tt.tick_ts > bs.ts_signal
+            AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
+        WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+        GROUP BY bs.mint, bs.mc_at_signal
+        HAVING COUNT(tt.id) >= 3
+    )
+    SELECT
+        bs.mint, bs.symbol, bs.exchange, bs.ts_signal, bs.elapsed_sec,
+        bs.mc_migration, bs.mc_min, bs.mc_at_signal, bs.drop_from_mig, bs.bounce_pct,
+        bs.h23_window, bs.data_quality,
+        COALESCE(bs.absorption_buy_vol,  0) AS pre_buy,
+        COALESCE(bs.absorption_sell_vol, 0) AS pre_sell,
+        COALESCE(bs.absorption_events,   0) AS pre_events,
+        COALESCE(bs.absorption_lrg_buy,  0) AS pre_lrg_buy,
+        COALESCE(bs.rise_buy_vol,  0)       AS rise_buy,
+        COALESCE(bs.rise_sell_vol, 0)       AS rise_sell,
+        COALESCE(bs.rise_events,   0)       AS rise_events,
+        COALESCE(bs.rise_lrg_buy,  0)       AS rise_lrg_buy,
+        bs.net_sol_flow, bs.rise_net_flow,
+        bs.pool_quote_at_signal, bs.buy_concentration,
+        bs.dump_seller_hhi, bs.dump_seller_count, bs.dump_top_seller_frac,
+        m.time_to_bottom AS time_to_bottom_min,
+        lt.status AS real_status, lt.pnl_pct_real AS real_pnl, lt.exit_type AS real_exit_type,
+        to2.tick_count, to2.first_tp_ts, to2.first_sl_ts,
+        to2.max_mc_5m, to2.max_mc_10m, to2.max_mc_20m, to2.max_mc_60m,
+        to2.min_mc_5m, to2.min_mc_10m, to2.min_mc_20m, to2.min_mc_60m
+    FROM bounce_signals bs
+    LEFT JOIN latest_trade  lt  ON lt.mint  = bs.mint
+    LEFT JOIN tick_outcomes to2 ON to2.mint = bs.mint
+    LEFT JOIN migrations    m   ON m.mint   = bs.mint
+    WHERE bs.ts_signal >= NOW() - INTERVAL '{days} days'
+      AND bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+      {bottom_clause} {pool_clause} {bounce_min_clause} {bounce_max_clause}
+    ORDER BY bs.ts_signal DESC
+    """
+
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, {"tp": TP_MULT, "sl": SL_MULT})
+            raw_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    def compute_feats(r):
+        pre_buy   = float(r["pre_buy"]  or 0)
+        pre_sell  = float(r["pre_sell"] or 0)
+        rise_buy  = float(r["rise_buy"]  or 0)
+        rise_sell = float(r["rise_sell"] or 0)
+        rise_lrg_buy = float(r["rise_lrg_buy"] or 0)
+
+        pre_net  = float(r["net_sol_flow"]  if r["net_sol_flow"]  is not None else (pre_buy  - pre_sell))
+        rise_net = float(r["rise_net_flow"] if r["rise_net_flow"] is not None else (rise_buy - rise_sell))
+
+        rise_gross = rise_buy + rise_sell
+        abs_net    = abs(rise_net)
+
+        elapsed_s = float(r["elapsed_sec"] or 0)
+        ttb_min   = r["time_to_bottom_min"]
+        rise_sec  = (elapsed_s - float(ttb_min) * 60.0) if ttb_min is not None else None
+        if rise_sec is not None and rise_sec < 5:
+            rise_sec = None
+
+        ne = abs_net / rise_gross if rise_gross > 0 else None
+        cr = rise_gross / abs_net if abs_net > 0.001 else None
+
+        pq  = r["pool_quote_at_signal"]
+        pn  = rise_buy / float(pq) if pq else None
+
+        bc_stored = r["buy_concentration"]
+        bc_calc   = rise_lrg_buy / rise_buy if (rise_buy > 0 and rise_lrg_buy > 0) else None
+        bc        = bc_calc if bc_calc is not None else (float(bc_stored) if bc_stored is not None else None)
+
+        hhi = float(r["dump_seller_hhi"]) if r["dump_seller_hhi"] is not None else None
+
+        ftp = r["first_tp_ts"]
+        fsl = r["first_sl_ts"]
+        if ftp and fsl:
+            if ftp == fsl:
+                outcome = "ambiguous"
+            elif ftp < fsl:
+                outcome = "tp"
+            else:
+                outcome = "sl"
+        elif ftp:
+            outcome = "tp"
+        elif fsl:
+            outcome = "sl"
+        else:
+            outcome = "none"
+
+        entry_mc = float(r["mc_at_signal"] or 0)
+        def pct(raw_val):
+            if raw_val is None or entry_mc <= 0:
+                return None
+            return (float(raw_val) - entry_mc) / entry_mc
+
+        # Invisible demand flags
+        flags = []
+        if pre_net >= 0:
+            flags.append("PA")          # PreAbsorption
+        if rise_net <= 1:
+            flags.append("SR")          # SoftRise
+        if rise_net <= 1 and (ne is None or ne < 0.4):
+            flags.append("AF")          # AntiFomo
+        if bc is not None and bc < 0.25:
+            flags.append("MD")          # MicroDistributed
+        if bc is not None and bc < 0.5:
+            flags.append("NW")          # NoWhale
+        if hhi is None or hhi < 0.4:
+            flags.append("NH")          # NoToxicHHI
+        if pre_net >= 0 and rise_net <= 1:
+            flags.append("IDB")         # InvisibleDemandBasic
+        if pre_net >= 0 and rise_net <= 1 and (bc is not None and bc < 0.25) and (hhi is None or hhi < 0.4):
+            flags.append("IDS")         # InvisibleDemandStrict
+        if "IDS" in flags and float(r["bounce_pct"] or 999) <= 0.50:
+            flags.append("IDN")         # InvisibleDemandNearBottom
+
+        return {
+            "pre_net": pre_net, "rise_net": rise_net, "rise_gross": rise_gross,
+            "ne": ne, "cr": cr, "pn": pn, "bc": bc, "hhi": hhi,
+            "rise_sec": rise_sec,
+            "theoretical_outcome": outcome,
+            "max_gain_5m":      pct(r["max_mc_5m"]),
+            "max_gain_10m":     pct(r["max_mc_10m"]),
+            "max_gain_20m":     pct(r["max_mc_20m"]),
+            "max_gain_60m":     pct(r["max_mc_60m"]),
+            "min_drawdown_5m":  pct(r["min_mc_5m"]),
+            "min_drawdown_10m": pct(r["min_mc_10m"]),
+            "min_drawdown_20m": pct(r["min_mc_20m"]),
+            "min_drawdown_60m": pct(r["min_mc_60m"]),
+            "time_to_tp_sec": (ftp - r["ts_signal"]).total_seconds() if (ftp and r["ts_signal"]) else None,
+            "time_to_sl_sec": (fsl - r["ts_signal"]).total_seconds() if (fsl and r["ts_signal"]) else None,
+            "invisible_demand_flags": flags,
+        }
+
+    rows = []
+    for r in raw_rows:
+        feats = compute_feats(r)
+        rows.append({**dict(r), **feats})
+
+    # ── Coverage stats ──────────────────────────────────────────────────
+    n_total     = len(rows)
+    n_outcome   = sum(1 for r in rows if r["theoretical_outcome"] in ("tp","sl","ambiguous"))
+    n_tp        = sum(1 for r in rows if r["theoretical_outcome"] == "tp")
+    n_sl        = sum(1 for r in rows if r["theoretical_outcome"] == "sl")
+    n_amb       = sum(1 for r in rows if r["theoretical_outcome"] == "ambiguous")
+    n_helius    = sum(1 for r in rows if float(r["pre_events"] or 0) > 0 or float(r["rise_events"] or 0) > 0)
+    base_wr     = n_tp / n_outcome * 100 if n_outcome > 0 else 0
+
+    if fmt == "json":
+        import json as _json
+        return _json.dumps({
+            "coverage": {"n_total": n_total, "n_outcome": n_outcome, "n_tp": n_tp, "n_sl": n_sl, "base_wr": round(base_wr,2)},
+            "rows": [{k: (str(v) if hasattr(v,"isoformat") else v) for k,v in r.items()} for r in rows]
+        }, default=str)
+
+    if fmt == "csv":
+        buf = io.StringIO()
+        if rows:
+            writer = _csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            for r in rows:
+                writer.writerow({k: (str(v) if hasattr(v,"isoformat") else v) for k,v in r.items()})
+        return buf.getvalue(), 200, {"Content-Type": "text/csv", "Content-Disposition": "attachment; filename=invisible_demand_lab.csv"}
+
+    # ── Helper tables ────────────────────────────────────────────────────
+    def _fmt_pct(v, decimals=1):
+        if v is None: return "—"
+        return f"{v*100:+.{decimals}f}%"
+
+    def demand_table(title, note, bins, is_reject=False):
+        rows_out = [f"<h3>{title}</h3>"]
+        if note:
+            rows_out.append(f"<p class='note'>{note}</p>")
+        rows_out.append("""<table>
+<tr><th>Faixa</th><th>n</th><th>TP</th><th>SL</th><th>WR%</th>
+    <th>Δbaseline</th><th>TPs%</th><th>SLs rem%</th><th>AvgG20m</th><th>AvgG60m</th></tr>""")
+        # baseline row
+        rows_out.append(f"<tr style='color:#8b949e'><td>Baseline (todos)</td><td>{n_outcome}</td>"
+                        f"<td>{n_tp}</td><td>{n_sl}</td><td>{base_wr:.1f}%</td>"
+                        f"<td>—</td><td>100%</td><td>0%</td>"
+                        f"<td>{'—'}</td><td>{'—'}</td></tr>")
+        for label, fn in bins:
+            subset  = [r for r in rows if fn(r)]
+            sub_out = [r for r in subset if r["theoretical_outcome"] in ("tp","sl","ambiguous")]
+            s_tp    = sum(1 for r in sub_out if r["theoretical_outcome"] == "tp")
+            s_sl    = sum(1 for r in sub_out if r["theoretical_outcome"] == "sl")
+            s_n     = len(sub_out)
+            wr      = s_tp / s_n * 100 if s_n > 0 else None
+            delta   = (wr - base_wr) if wr is not None else None
+            tps_pct = s_tp / n_tp * 100 if n_tp > 0 else 0
+            sls_rem = (n_sl - s_sl) / n_sl * 100 if n_sl > 0 else 0
+            g20_vals= [r["max_gain_20m"] for r in subset if r["max_gain_20m"] is not None]
+            g60_vals= [r["max_gain_60m"] for r in subset if r["max_gain_60m"] is not None]
+            avg20   = sum(g20_vals)/len(g20_vals) if g20_vals else None
+            avg60   = sum(g60_vals)/len(g60_vals) if g60_vals else None
+
+            wr_str  = f"{wr:.1f}%" if wr is not None else "—"
+            if delta is not None:
+                color = "#3fb950" if (delta > 3 and not is_reject) or (delta < -3 and is_reject) else ("#f85149" if (delta < -3 and not is_reject) or (delta > 3 and is_reject) else "#c9d1d9")
+                delta_str = f"<span style='color:{color}'>{delta:+.1f}pp</span>"
+            else:
+                delta_str = "—"
+            rows_out.append(f"<tr><td>{label}</td><td>{len(subset)}</td><td>{s_tp}</td><td>{s_sl}</td>"
+                            f"<td>{wr_str}</td><td>{delta_str}</td>"
+                            f"<td>{tps_pct:.0f}%</td><td>{sls_rem:.0f}%</td>"
+                            f"<td>{_fmt_pct(avg20)}</td><td>{_fmt_pct(avg60)}</td></tr>")
+        rows_out.append("</table>")
+        return "\n".join(rows_out)
+
+    # ── Definition bins A-M ──────────────────────────────────────────────
+    DEFS = [
+        ("A  PreAbsorption    pre_net ≥ 0",              lambda r: r["pre_net"] >= 0),
+        ("B  SoftRise         rise_net ≤ 1",             lambda r: r["rise_net"] <= 1),
+        ("C  AntiFomo         rise_net ≤ 1 AND ne < 0.4",lambda r: r["rise_net"] <= 1 and (r["ne"] is None or r["ne"] < 0.4)),
+        ("D  MicroDistributed bc < 0.25",                lambda r: r["bc"] is not None and r["bc"] < 0.25),
+        ("E  NoWhale          bc < 0.5",                 lambda r: r["bc"] is not None and r["bc"] < 0.5),
+        ("F  NoToxicHHI       hhi < 0.4 or null",        lambda r: r["hhi"] is None or r["hhi"] < 0.4),
+        ("G  InvisibleDemandBasic   pre≥0 AND rise≤1",   lambda r: r["pre_net"] >= 0 and r["rise_net"] <= 1),
+        ("H  InvisibleDemandStrict  G AND bc<0.25 AND hhi<0.4",
+             lambda r: r["pre_net"] >= 0 and r["rise_net"] <= 1 and r["bc"] is not None and r["bc"] < 0.25 and (r["hhi"] is None or r["hhi"] < 0.4)),
+        ("I  InvisibleDemandNearBottom  H AND bounce≤50%",
+             lambda r: r["pre_net"] >= 0 and r["rise_net"] <= 1 and r["bc"] is not None and r["bc"] < 0.25 and (r["hhi"] is None or r["hhi"] < 0.4) and float(r["bounce_pct"] or 999) <= 0.50),
+        ("J  [REJECT]  rise_net > 1",                    lambda r: r["rise_net"] > 1),
+        ("K  [REJECT]  rise_net > 3",                    lambda r: r["rise_net"] > 3),
+        ("L  [REJECT]  bc ≥ 0.5",                        lambda r: r["bc"] is not None and r["bc"] >= 0.5),
+        ("M  [REJECT]  hhi ≥ 0.4",                       lambda r: r["hhi"] is not None and r["hhi"] >= 0.4),
+    ]
+
+    defs_pos  = DEFS[:9]
+    defs_rej  = DEFS[9:]
+    table_defs = demand_table("Definições A–I (candidatos)", "", defs_pos, is_reject=False)
+    table_rej  = demand_table("Definições J–M (filtros de rejeição)", "WR baixo = bom filtro", defs_rej, is_reject=True)
+
+    # ── Combination matrix ───────────────────────────────────────────────
+    COMBO = [
+        ("pre_net ≥ 0",                       lambda r: r["pre_net"] >= 0),
+        ("rise_net ≤ 1",                      lambda r: r["rise_net"] <= 1),
+        ("rise_net ≤ 0",                      lambda r: r["rise_net"] <= 0),
+        ("rise_net < 0 (strictly)",           lambda r: r["rise_net"] < 0),
+        ("bc < 0.25",                         lambda r: r["bc"] is not None and r["bc"] < 0.25),
+        ("bc < 0.10",                         lambda r: r["bc"] is not None and r["bc"] < 0.10),
+        ("hhi < 0.4 (or null)",               lambda r: r["hhi"] is None or r["hhi"] < 0.4),
+        ("bounce_pct ≤ 0.50",                 lambda r: float(r["bounce_pct"] or 999) <= 0.50),
+        ("bounce_pct ≤ 0.75",                 lambda r: float(r["bounce_pct"] or 999) <= 0.75),
+        ("pool_quote ≥ 10 SOL",               lambda r: r["pool_quote_at_signal"] is not None and float(r["pool_quote_at_signal"]) >= 10),
+        ("elapsed ≤ 180s",                    lambda r: float(r["elapsed_sec"] or 999) <= 180),
+        ("elapsed ≤ 300s",                    lambda r: float(r["elapsed_sec"] or 999) <= 300),
+        ("─── combinações ─────────────────", lambda r: False),
+        ("pre≥0 AND rise≤1",                  lambda r: r["pre_net"] >= 0 and r["rise_net"] <= 1),
+        ("pre≥0 AND rise<0",                  lambda r: r["pre_net"] >= 0 and r["rise_net"] < 0),
+        ("pre≥0 AND rise≤1 AND bc<0.25",      lambda r: r["pre_net"] >= 0 and r["rise_net"] <= 1 and r["bc"] is not None and r["bc"] < 0.25),
+        ("pre≥0 AND rise≤1 AND hhi<0.4",      lambda r: r["pre_net"] >= 0 and r["rise_net"] <= 1 and (r["hhi"] is None or r["hhi"] < 0.4)),
+        ("pre≥0 AND rise≤1 AND bc<0.25 AND hhi<0.4",
+             lambda r: r["pre_net"] >= 0 and r["rise_net"] <= 1 and r["bc"] is not None and r["bc"] < 0.25 and (r["hhi"] is None or r["hhi"] < 0.4)),
+        ("pre≥0 AND rise≤1 AND bounce≤50%",   lambda r: r["pre_net"] >= 0 and r["rise_net"] <= 1 and float(r["bounce_pct"] or 999) <= 0.50),
+        ("pre≥0 AND rise≤1 AND bounce≤50% AND bc<0.25",
+             lambda r: r["pre_net"] >= 0 and r["rise_net"] <= 1 and float(r["bounce_pct"] or 999) <= 0.50 and r["bc"] is not None and r["bc"] < 0.25),
+        ("─── rejeições ───────────────────", lambda r: False),
+        ("[REJECT] rise > 1",                 lambda r: r["rise_net"] > 1),
+        ("[REJECT] rise > 3",                 lambda r: r["rise_net"] > 3),
+        ("[REJECT] hhi ≥ 0.4",               lambda r: r["hhi"] is not None and r["hhi"] >= 0.4),
+        ("[REJECT] bc ≥ 0.5",                lambda r: r["bc"] is not None and r["bc"] >= 0.5),
+    ]
+    table_combo = demand_table("Matriz de Combinações", "", COMBO)
+
+    # ── Token ranking (last 50) ──────────────────────────────────────────
+    def flag_abbr(flags):
+        return " ".join(flags) if flags else "—"
+
+    def fmt_sol(v):
+        if v is None: return "—"
+        return f"{float(v):+.2f}"
+
+    def fmt_f(v, fmt=".2f"):
+        if v is None: return "—"
+        return f"{float(v):{fmt}}"
+
+    ranking_rows = ""
+    for r in rows[:50]:
+        outcome = r["theoretical_outcome"]
+        real    = r["real_status"] or "—"
+        bp      = float(r["bounce_pct"] or 0) * 100
+        el      = float(r["elapsed_sec"] or 0)
+        oc_color = {"tp": "#3fb950", "sl": "#f85149", "ambiguous": "#d29922"}.get(outcome, "#8b949e")
+        ranking_rows += (
+            f"<tr>"
+            f"<td>{r['symbol'] or r['mint'][:8]}</td>"
+            f"<td>{bp:.0f}%</td>"
+            f"<td>{el:.0f}s</td>"
+            f"<td>{fmt_sol(r['pre_net'])}</td>"
+            f"<td>{fmt_sol(r['rise_net'])}</td>"
+            f"<td>{fmt_f(r['ne'])}</td>"
+            f"<td>{fmt_f(r['bc'])}</td>"
+            f"<td>{fmt_f(r['hhi'])}</td>"
+            f"<td>{fmt_f(r['pool_quote_at_signal'],'.1f')}</td>"
+            f"<td style='font-size:10px'>{flag_abbr(r['invisible_demand_flags'])}</td>"
+            f"<td style='color:{oc_color}'>{outcome}</td>"
+            f"<td>{real}</td>"
+            f"<td>{_fmt_pct(r['max_gain_20m'])}</td>"
+            f"<td>{_fmt_pct(r['min_drawdown_20m'])}</td>"
+            f"</tr>"
+        )
+
+    # ── False positives (IDS=TRUE, outcome=sl) ───────────────────────────
+    fps = [r for r in rows if "IDS" in r["invisible_demand_flags"] and r["theoretical_outcome"] == "sl"]
+    fp_rows = ""
+    for r in fps:
+        if r["rise_net"] > 0.5:
+            reason = "rise tinha compradores (não é truly invisible)"
+        elif r["bc"] is not None and r["bc"] >= 0.2:
+            reason = "atividade whale moderada"
+        elif r["hhi"] is not None and r["hhi"] >= 0.3:
+            reason = "concentração de vendedores"
+        elif r["max_gain_20m"] is not None and r["max_gain_20m"] > 0:
+            reason = "atingiu ganho parcial antes do SL"
+        else:
+            reason = "dump estrutural — sem bounce"
+        fp_rows += (
+            f"<tr><td>{r['symbol'] or r['mint'][:8]}</td>"
+            f"<td>{float(r['bounce_pct'] or 0)*100:.0f}%</td>"
+            f"<td>{fmt_sol(r['pre_net'])}</td>"
+            f"<td>{fmt_sol(r['rise_net'])}</td>"
+            f"<td>{fmt_f(r['bc'])}</td>"
+            f"<td>{fmt_f(r['hhi'])}</td>"
+            f"<td>{_fmt_pct(r['max_gain_20m'])}</td>"
+            f"<td>{_fmt_pct(r['min_drawdown_20m'])}</td>"
+            f"<td>{reason}</td></tr>"
+        )
+    table_fp = f"""
+<h3>Falsos Positivos — IDS=TRUE mas outcome=SL (n={len(fps)})</h3>
+<table>
+<tr><th>Símbolo</th><th>Bounce%</th><th>PreNet</th><th>RiseNet</th>
+    <th>BC</th><th>HHI</th><th>MaxG20m</th><th>MinD20m</th><th>Diagnóstico</th></tr>
+{fp_rows or "<tr><td colspan='9' style='color:#8b949e'>Nenhum falso positivo</td></tr>"}
+</table>"""
+
+    # ── False negatives (outcome=tp, IDS NOT in flags) ───────────────────
+    fns = [r for r in rows if r["theoretical_outcome"] == "tp" and "IDS" not in r["invisible_demand_flags"]]
+    fn_rows = ""
+    for r in fns:
+        reasons = []
+        if r["pre_net"] < 0:       reasons.append("pre_net negativo")
+        if r["rise_net"] > 1:      reasons.append("rise_net alto")
+        if r["bc"] is not None and r["bc"] >= 0.25: reasons.append("BC alto")
+        if r["hhi"] is not None and r["hhi"] >= 0.4: reasons.append("HHI alto")
+        if r["bc"] is None and r["hhi"] is None: reasons.append("dados ausentes")
+        fn_rows += (
+            f"<tr><td>{r['symbol'] or r['mint'][:8]}</td>"
+            f"<td>{float(r['bounce_pct'] or 0)*100:.0f}%</td>"
+            f"<td>{fmt_sol(r['pre_net'])}</td>"
+            f"<td>{fmt_sol(r['rise_net'])}</td>"
+            f"<td>{fmt_f(r['bc'])}</td>"
+            f"<td>{fmt_f(r['hhi'])}</td>"
+            f"<td>{_fmt_pct(r['max_gain_20m'])}</td>"
+            f"<td>{', '.join(reasons) or '—'}</td></tr>"
+        )
+    table_fn = f"""
+<h3>Falsos Negativos — outcome=TP mas IDS=FALSE (n={len(fns)})</h3>
+<table>
+<tr><th>Símbolo</th><th>Bounce%</th><th>PreNet</th><th>RiseNet</th>
+    <th>BC</th><th>HHI</th><th>MaxG20m</th><th>Motivo da perda</th></tr>
+{fn_rows or "<tr><td colspan='8' style='color:#8b949e'>Nenhum falso negativo</td></tr>"}
+</table>"""
+
+    # ── HTML ─────────────────────────────────────────────────────────────
+    css = """<style>
+body{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:16px}
+h2{color:#58a6ff}h3{color:#79c0ff;margin-top:24px}
+table{border-collapse:collapse;width:100%;margin:8px 0}
+th,td{border:1px solid #30363d;padding:4px 8px;font-size:12px;text-align:right}
+th{background:#161b22;text-align:center;color:#8b949e}
+td:first-child{text-align:left}
+.green{color:#3fb950}.red{color:#f85149}.note{color:#8b949e;font-size:11px}
+.box{background:#161b22;border:1px solid #30363d;padding:12px;margin:8px 0;border-radius:6px}
+</style>"""
+
+    n_ids = sum(1 for r in rows if "IDS" in r["invisible_demand_flags"])
+    n_idb = sum(1 for r in rows if "IDB" in r["invisible_demand_flags"])
+
+    coverage_box = f"""
+<div class='box'>
+<b>Coverage</b> &nbsp;·&nbsp; Período: {days} dias &nbsp;·&nbsp;
+only_bottom={'sim' if only_bottom else 'não'} &nbsp;·&nbsp;
+TP={tp_pct*100:.0f}% / SL={sl_pct*100:.0f}%<br>
+Total bounce_signals: <b>{n_total}</b> &nbsp;·&nbsp;
+Com outcome calculado: <b>{n_outcome}</b> ({n_outcome/n_total*100:.0f}% de cobertura de ticks)<br>
+TP: <b class='green'>{n_tp}</b> &nbsp;·&nbsp;
+SL: <b class='red'>{n_sl}</b> &nbsp;·&nbsp;
+Ambiguous: <b>{n_amb}</b> &nbsp;·&nbsp;
+WR baseline: <b>{base_wr:.1f}%</b><br>
+Com dados Helius (pre ou rise): <b>{n_helius}</b> ({n_helius/n_total*100:.0f}%)<br>
+InvisibleDemandBasic (IDB): <b>{n_idb}</b> &nbsp;·&nbsp;
+InvisibleDemandStrict (IDS): <b>{n_ids}</b><br>
+<span class='note'>Dados históricos proxy via bounce_signals. Eventos ERPC raw são in-memory e não persistidos —
+micro-análise de tokens sem bounce_signal exige persistência futura.</span>
+</div>"""
+
+    html = f"""<!DOCTYPE html><html><head><title>Invisible Demand Lab</title>{css}</head><body>
+<h2>Invisible Demand Lab</h2>
+<p><a href='?days={days}&only_bottom=0'>Todos</a> |
+   <a href='?days={days}&only_bottom=1'>h23_window=bottom</a> |
+   <a href='?days={days}&format=json'>JSON</a> |
+   <a href='?days={days}&format=csv'>CSV</a> |
+   <a href='/debug/invisible-demand-live'>Live →</a></p>
+
+{coverage_box}
+
+{table_defs}
+
+{table_rej}
+
+{table_combo}
+
+<h3>Token Ranking — últimos {min(50, n_total)} tokens</h3>
+<table>
+<tr>
+  <th>Símbolo</th><th>Bounce%</th><th>Elapsed</th>
+  <th>PreNet SOL</th><th>RiseNet SOL</th><th>NE</th><th>BC</th><th>HHI</th>
+  <th>Pool SOL</th><th>Flags</th><th>Th</th><th>Real</th><th>MaxG20m</th><th>MinD20m</th>
+</tr>
+{ranking_rows or "<tr><td colspan='14' style='color:#8b949e'>Sem dados</td></tr>"}
+</table>
+
+{table_fp}
+
+{table_fn}
+
+</body></html>"""
+
+    return html
+
+
+@app.route("/debug/invisible-demand-live")
+def debug_invisible_demand_live():
+    import time as _time
+
+    css = """<style>
+body{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:16px}
+h2{color:#58a6ff}h3{color:#79c0ff}
+table{border-collapse:collapse;width:100%;margin:8px 0}
+th,td{border:1px solid #30363d;padding:4px 8px;font-size:12px;text-align:right}
+th{background:#161b22;text-align:center;color:#8b949e}
+td:first-child{text-align:left}
+.green{color:#3fb950}.red{color:#f85149}.note{color:#8b949e;font-size:11px}
+.box{background:#161b22;border:1px solid #30363d;padding:12px;margin:8px 0;border-radius:6px}
+.INVISIBLE_DEMAND_CANDIDATE{color:#3fb950;font-weight:bold}
+.EXIT_LIQUIDITY_RISK{color:#f85149;font-weight:bold}
+.CHASED_TOO_FAR{color:#d29922}
+.BOTTOM_CANDIDATE{color:#79c0ff}
+.DUMPING{color:#8b949e}
+.DATA_MISSING{color:#484f58}
+.NEUTRAL{color:#8b949e}
+</style>
+<meta http-equiv='refresh' content='15'>"""
+
+    # Graceful degradation
+    try:
+        hot = scanner.hot
+    except Exception:
+        return f"""<!DOCTYPE html><html><head>{css}</head><body>
+<h2>Invisible Demand Live</h2>
+<p class='note'>Scanner indisponível.</p></body></html>"""
+
+    helius = getattr(hot, "_helius", None)
+    if helius is None:
+        return f"""<!DOCTYPE html><html><head>{css}</head><body>
+<h2>Invisible Demand Live</h2>
+<p class='note'>Helius/erpc indisponível — live analysis disabled.</p></body></html>"""
+
+    now = _time.time()
+
+    with hot._lock:
+        tokens_snapshot = {mint: dict(state) for mint, state in hot._tokens.items()}
+
+    table_rows = ""
+    for mint, state in tokens_snapshot.items():
+        try:
+            symbol       = state.get("symbol", mint[:8])
+            mc_migration = float(state.get("mc_migration") or 0)
+            mc_min       = float(state.get("mc_min") or 0)
+            mc_last      = float(state.get("mc_last") or mc_min)
+            ts_mig_unix  = float(state.get("ts_mig_unix") or 0)
+            ts_min_dt    = state.get("ts_min")
+            elapsed_min  = float(state.get("elapsed") or 0)
+
+            ts_min_ts = ts_min_dt.timestamp() if ts_min_dt else None
+            bottom_age_sec = (now - ts_min_ts) if ts_min_ts else None
+
+            bounce_now = (mc_last - mc_min) / mc_min if mc_min > 0 else 0
+            drop_pct   = (mc_migration - mc_min) / mc_migration if mc_migration > 0 else 0
+
+            def _get_win(sec, end_ts):
+                try:
+                    return helius.get_absorption_window(mint, sec, end_ts)
+                except Exception:
+                    return {"buy_vol_sol": 0, "sell_vol_sol": 0, "buy_count": 0, "sell_count": 0, "largest_buy": 0, "total_events": 0}
+
+            pre30 = _get_win(30, ts_min_ts) if ts_min_ts else None
+            pre15 = _get_win(15, ts_min_ts) if ts_min_ts else None
+            pre5  = _get_win(5,  ts_min_ts) if ts_min_ts else None
+
+            rise_sec_dur = max(1, int(now - ts_min_ts)) if ts_min_ts and now > ts_min_ts else 0
+            rise_now = _get_win(rise_sec_dur, now) if rise_sec_dur > 1 else None
+
+            live10 = _get_win(10, now)
+            live5  = _get_win(5,  now)
+
+            try:
+                pool_q = helius.get_pool_quote(mint)
+            except Exception:
+                pool_q = None
+
+            pre_net_30 = (pre30["buy_vol_sol"] - pre30["sell_vol_sol"]) if pre30 else None
+            pre_net_15 = (pre15["buy_vol_sol"] - pre15["sell_vol_sol"]) if pre15 else None
+            rise_net   = (rise_now["buy_vol_sol"] - rise_now["sell_vol_sol"]) if rise_now else None
+            live_net10 = live10["buy_vol_sol"] - live10["sell_vol_sol"]
+
+            # candidate_stage
+            if pre_net_30 is None and rise_net is None:
+                stage = "DATA_MISSING"
+            elif mc_last < mc_min * 1.05:
+                stage = "DUMPING"
+            elif pre_net_30 is not None and pre_net_30 >= 0 and rise_net is not None and rise_net < 0:
+                stage = "BOTTOM_CANDIDATE"
+            elif pre_net_30 is not None and pre_net_30 >= 0 and rise_net is not None and rise_net <= 1:
+                stage = "INVISIBLE_DEMAND_CANDIDATE"
+            elif rise_net is not None and rise_net > 3:
+                stage = "EXIT_LIQUIDITY_RISK"
+            elif bounce_now > 1.0:
+                stage = "CHASED_TOO_FAR"
+            else:
+                stage = "NEUTRAL"
+
+            def fs(v):
+                if v is None: return "—"
+                return f"{v:+.2f}"
+
+            def fp(v):
+                if v is None: return "—"
+                return f"{v*100:+.0f}%"
+
+            ev_pre  = pre30["total_events"] if pre30 else 0
+            ev_rise = rise_now["total_events"] if rise_now else 0
+
+            table_rows += (
+                f"<tr>"
+                f"<td>{symbol}</td>"
+                f"<td>{elapsed_min:.1f}min</td>"
+                f"<td>{bounce_now*100:+.0f}%</td>"
+                f"<td>{drop_pct*100:.0f}%</td>"
+                f"<td>{fs(pre_net_30)} / {fs(pre_net_15)}</td>"
+                f"<td>{fs(rise_net)}</td>"
+                f"<td>{fs(live_net10)}</td>"
+                f"<td>{(f'{pool_q:.1f}' if pool_q else '—')}</td>"
+                f"<td class='{stage}'>{stage}</td>"
+                f"<td>{ev_pre}/{ev_rise}</td>"
+                f"</tr>"
+            )
+        except Exception as ex:
+            table_rows += f"<tr><td colspan='10' style='color:#484f58'>{mint[:8]} — erro: {ex}</td></tr>"
+
+    n_tokens = len(tokens_snapshot)
+    html = f"""<!DOCTYPE html><html><head><title>Invisible Demand Live</title>{css}</head><body>
+<h2>Invisible Demand Live</h2>
+<div class='box'>
+<b>HotMonitor:</b> {n_tokens} tokens ativos &nbsp;·&nbsp;
+<b>Helius/erpc:</b> <span class='green'>OK</span> &nbsp;·&nbsp;
+Timestamp: {__import__('datetime').datetime.utcnow().strftime('%H:%M:%S')} UTC
+</div>
+<p><a href='/analise/invisible-demand-lab'>Lab Histórico</a> · <a href='/analise/h22-h24-lab'>H22–H24 Lab</a></p>
+
+<table>
+  <tr>
+    <th>Token</th><th>Elapsed</th><th>Bounce%</th><th>Drop%</th>
+    <th>Pre30s/15s net</th><th>Rise net</th><th>L10s net</th>
+    <th>Pool SOL</th><th>Stage</th><th>Ev Pre/Rise</th>
+  </tr>
+  {table_rows or "<tr><td colspan='10' style='color:#8b949e'>Nenhum token ativo no HotMonitor</td></tr>"}
+</table>
+
+<p class='note'>
+  Pre=janela 30s/15s antes do fundo · Rise=fundo→agora ·
+  Stage: INVISIBLE_DEMAND_CANDIDATE = pre≥0 e rise≤1 · BOTTOM_CANDIDATE = pre≥0 e rise&lt;0<br>
+  Ev Pre/Rise = contagem de eventos Helius nas janelas. Auto-refresh: 15s
+</p>
+</body></html>"""
+
+    return html
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
