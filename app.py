@@ -38017,11 +38017,11 @@ def analise_h22h24_lab():
                 SELECT
                     bs.mint,
                     bs.mc_at_signal                                      AS entry_mc,
-                    -- first TP tick
-                    MIN(CASE WHEN tt.mc_high >= bs.mc_at_signal * %(tp)s
+                    -- first TP tick — COALESCE: trenches ticks têm mc_high=NULL, usar mc
+                    MIN(CASE WHEN COALESCE(tt.mc_high, tt.mc) >= bs.mc_at_signal * %(tp)s
                              THEN tt.tick_ts END)                        AS first_tp_ts,
-                    -- first SL tick
-                    MIN(CASE WHEN tt.mc_low  <= bs.mc_at_signal * %(sl)s
+                    -- first SL tick — COALESCE: trenches ticks têm mc_low=NULL, usar mc
+                    MIN(CASE WHEN COALESCE(tt.mc_low,  tt.mc) <= bs.mc_at_signal * %(sl)s
                              THEN tt.tick_ts END)                        AS first_sl_ts,
                     MAX(COALESCE(tt.mc_high, tt.mc))                     AS max_mc_60m,
                     MIN(COALESCE(tt.mc_low,  tt.mc))                     AS min_mc_60m,
