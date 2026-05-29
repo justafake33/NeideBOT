@@ -37802,58 +37802,6 @@ def analise_bigplayer():
             lambda r: not is_good_se(r) and not is_good_ne(r) and not is_good_pn(r)),
     ]
 
-    # ── Combinações candidatas v2 (A–I positivos, J–N rejeição) ──────────────
-    def _pre_ok(r):  return r["pre_net"] >= 0
-    def _rise_ok(r): return r["rise_net"] <= 1
-    def _bc_lt25(r): return r["buy_concentration"] is not None and r["buy_concentration"] < 0.25
-    def _bc_lt10(r): return r["buy_concentration"] is not None and r["buy_concentration"] < 0.1
-    def _hhi_ok(r):  return r["dump_seller_hhi"] is None or r["dump_seller_hhi"] < 0.4
-
-    COMBO_BINS_V2_POS = [
-        ("A  pre_net ≥ 0",
-            lambda r: _pre_ok(r)),
-        ("B  rise_net ≤ 1",
-            lambda r: _rise_ok(r)),
-        ("C  pre_net ≥ 0  AND  rise_net ≤ 1",
-            lambda r: _pre_ok(r) and _rise_ok(r)),
-        ("D  pre_net ≥ 0  AND  bc < 0.25",
-            lambda r: _pre_ok(r) and _bc_lt25(r)),
-        ("E  pre_net ≥ 0  AND  bc < 0.1",
-            lambda r: _pre_ok(r) and _bc_lt10(r)),
-        ("F  rise_net ≤ 1  AND  bc < 0.25",
-            lambda r: _rise_ok(r) and _bc_lt25(r)),
-        ("G  rise_net ≤ 1  AND  hhi < 0.4",
-            lambda r: _rise_ok(r) and _hhi_ok(r)),
-        ("H  pre_net ≥ 0  AND  rise_net ≤ 1  AND  hhi < 0.4",
-            lambda r: _pre_ok(r) and _rise_ok(r) and _hhi_ok(r)),
-        ("I  pre_net ≥ 0  AND  rise_net ≤ 1  AND  bc < 0.25  AND  hhi < 0.4",
-            lambda r: _pre_ok(r) and _rise_ok(r) and _bc_lt25(r) and _hhi_ok(r)),
-    ]
-
-    COMBO_BINS_V2_REJ = [
-        ("J  [rejeitado]  rise_net > 1",
-            lambda r: r["rise_net"] > 1),
-        ("K  [rejeitado]  rise_net > 3",
-            lambda r: r["rise_net"] > 3),
-        ("L  [rejeitado]  dump_seller_hhi ≥ 0.4",
-            lambda r: r["dump_seller_hhi"] is not None and r["dump_seller_hhi"] >= 0.4),
-        ("M  [rejeitado]  rise_net_efficiency ≥ 0.4",
-            lambda r: r["rise_net_efficiency"] is not None and r["rise_net_efficiency"] >= 0.4),
-        ("N  [rejeitado]  buy_concentration ≥ 0.5",
-            lambda r: r["buy_concentration"] is not None and r["buy_concentration"] >= 0.5),
-    ]
-
-    combo_tbl_v2 = (
-        bucket_table(
-            "Combinações Candidatas — gates positivos (A–I)",
-            "WR% do subconjunto que PASSA no filtro. Alto = filtro seleciona bem os TPs.",
-            COMBO_BINS_V2_POS)
-        + bucket_table(
-            "Filtros de Rejeição — gates negativos (J–N)",
-            "WR% do subconjunto REJEITADO. Baixo = filtro descarta corretamente os SLs.",
-            COMBO_BINS_V2_REJ)
-    )
-
     # ── Coverage stats ────────────────────────────────────────────────────────
     n_rise = sum(1 for r in enriched if r["has_rise_data"])
     n_pre  = sum(1 for r in enriched if r["has_pre_data"])
@@ -38370,6 +38318,58 @@ def analise_h22h24_lab():
     ]
 
     # ── False positive table (SL hits by feature) ─────────────────────────────
+    # ── Combinações candidatas v2 (A–I positivos, J–N rejeição) ──────────────
+    def _pre_ok(r):  return r["pre_net"] >= 0
+    def _rise_ok(r): return r["rise_net"] <= 1
+    def _bc_lt25(r): return r["buy_concentration"] is not None and r["buy_concentration"] < 0.25
+    def _bc_lt10(r): return r["buy_concentration"] is not None and r["buy_concentration"] < 0.1
+    def _hhi_ok(r):  return r["dump_seller_hhi"] is None or r["dump_seller_hhi"] < 0.4
+
+    COMBO_BINS_V2_POS = [
+        ("A  pre_net ≥ 0",
+            lambda r: _pre_ok(r)),
+        ("B  rise_net ≤ 1",
+            lambda r: _rise_ok(r)),
+        ("C  pre_net ≥ 0  AND  rise_net ≤ 1",
+            lambda r: _pre_ok(r) and _rise_ok(r)),
+        ("D  pre_net ≥ 0  AND  bc < 0.25",
+            lambda r: _pre_ok(r) and _bc_lt25(r)),
+        ("E  pre_net ≥ 0  AND  bc < 0.1",
+            lambda r: _pre_ok(r) and _bc_lt10(r)),
+        ("F  rise_net ≤ 1  AND  bc < 0.25",
+            lambda r: _rise_ok(r) and _bc_lt25(r)),
+        ("G  rise_net ≤ 1  AND  hhi < 0.4",
+            lambda r: _rise_ok(r) and _hhi_ok(r)),
+        ("H  pre_net ≥ 0  AND  rise_net ≤ 1  AND  hhi < 0.4",
+            lambda r: _pre_ok(r) and _rise_ok(r) and _hhi_ok(r)),
+        ("I  pre_net ≥ 0  AND  rise_net ≤ 1  AND  bc < 0.25  AND  hhi < 0.4",
+            lambda r: _pre_ok(r) and _rise_ok(r) and _bc_lt25(r) and _hhi_ok(r)),
+    ]
+
+    COMBO_BINS_V2_REJ = [
+        ("J  [rejeitado]  rise_net > 1",
+            lambda r: r["rise_net"] > 1),
+        ("K  [rejeitado]  rise_net > 3",
+            lambda r: r["rise_net"] > 3),
+        ("L  [rejeitado]  dump_seller_hhi ≥ 0.4",
+            lambda r: r["dump_seller_hhi"] is not None and r["dump_seller_hhi"] >= 0.4),
+        ("M  [rejeitado]  rise_net_efficiency ≥ 0.4",
+            lambda r: r["rise_net_efficiency"] is not None and r["rise_net_efficiency"] >= 0.4),
+        ("N  [rejeitado]  buy_concentration ≥ 0.5",
+            lambda r: r["buy_concentration"] is not None and r["buy_concentration"] >= 0.5),
+    ]
+
+    combo_tbl_v2 = (
+        bucket_table(
+            "Combinações Candidatas — gates positivos (A–I)",
+            "WR% do subconjunto que PASSA no filtro. Alto = filtro seleciona bem os TPs.",
+            COMBO_BINS_V2_POS)
+        + bucket_table(
+            "Filtros de Rejeição — gates negativos (J–N)",
+            "WR% do subconjunto REJEITADO. Baixo = filtro descarta corretamente os SLs.",
+            COMBO_BINS_V2_REJ)
+    )
+
     sl_rows_se  = [(r, r["seller_exhaustion"])  for r in with_outcome if r["theoretical_outcome"] == "sl" and r["seller_exhaustion"] is not None]
     sl_rows_ne  = [(r, r["rise_net_efficiency"]) for r in with_outcome if r["theoretical_outcome"] == "sl" and r["rise_net_efficiency"] is not None]
     sl_rows_hhi = [(r, r["dump_seller_hhi"])    for r in with_outcome if r["theoretical_outcome"] == "sl" and r["dump_seller_hhi"] is not None]
