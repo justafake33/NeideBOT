@@ -39949,5 +39949,170 @@ Auto-refresh: 15s
     return html
 
 
+@app.route("/debug/micro-absorption-snapshots")
+def debug_micro_absorption_snapshots():  # noqa: C901
+    """Fase 1 V2 — inspeção de micro snapshots de absorção (research-only).
+
+    Params: days=1, mint=, limit=200, format=html|json|csv
+    """
+    import csv
+    import io
+    import json as _json
+
+    days_raw  = request.args.get("days",   "1")
+    mint_raw  = request.args.get("mint",   "").strip() or None
+    limit_raw = request.args.get("limit",  "200")
+    fmt       = request.args.get("format", "html").lower()
+
+    try:
+        days  = max(1, int(days_raw))
+    except ValueError:
+        days = 1
+    try:
+        limit = max(1, min(2000, int(limit_raw)))
+    except ValueError:
+        limit = 200
+
+    rows = db.get_micro_absorption_snapshots(days=days, mint=mint_raw, limit=limit)
+
+    # ── JSON ─────────────────────────────────────────────────────────────────
+    if fmt == "json":
+        def _serial(obj):
+            if hasattr(obj, "isoformat"):
+                return obj.isoformat()
+            return str(obj)
+        return app.response_class(
+            response=_json.dumps(rows, default=_serial, ensure_ascii=False),
+            status=200,
+            mimetype="application/json",
+        )
+
+    # ── CSV ──────────────────────────────────────────────────────────────────
+    if fmt == "csv":
+        if not rows:
+            return app.response_class("", status=200, mimetype="text/csv")
+        out = io.StringIO()
+        writer = csv.DictWriter(out, fieldnames=rows[0].keys(), extrasaction="ignore")
+        writer.writeheader()
+        for r in rows:
+            safe = {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in r.items()}
+            writer.writerow(safe)
+        return app.response_class(out.getvalue(), status=200, mimetype="text/csv",
+                                   headers={"Content-Disposition":
+                                            "attachment; filename=micro_absorption.csv"})
+
+    # ── HTML ─────────────────────────────────────────────────────────────────
+    def _fmt(v, d=4):
+        if v is None:
+            return "<span style='color:#888'>—</span>"
+        if isinstance(v, float):
+            return f"{v:+.{d}f}"
+        return str(v)
+
+    def _net_cell(v):
+        if v is None:
+            return "<td>—</td>"
+        color = "#2ecc71" if v > 0 else ("#e74c3c" if v < 0 else "#888")
+        return f"<td style='color:{color};font-weight:bold'>{v:+.4f}</td>"
+
+    def _flags_cell(flags):
+        if not flags:
+            return "<td>—</td>"
+        if isinstance(flags, str):
+            try:
+                flags = _json.loads(flags)
+            except Exception:
+                return f"<td>{flags}</td>"
+        items = []
+        colors = {
+            "idb_like_live":      ("#2ecc71", True),
+            "idb2_like_live":     ("#27ae60", True),
+            "silent_bottom_like": ("#3498db", True),
+            "rise_hot_risk":      ("#e74c3c", True),
+            "data_missing":       ("#888",    True),
+            "hhi_missing":        ("#aaa",    False),
+        }
+        for k, v in flags.items():
+            if not v:
+                continue
+            color, show = colors.get(k, ("#ccc", True))
+            if show:
+                items.append(f"<span style='color:{color};font-size:11px'>{k}</span>")
+        return "<td>" + " ".join(items) + "</td>"
+
+    rows_html = ""
+    for r in rows:
+        ts   = r.get("ts_snapshot")
+        ts_s = ts.strftime("%H:%M:%S") if ts else "—"
+        sym  = r.get("symbol") or "—"
+        mint = r.get("mint") or "—"
+        age  = _fmt(r.get("bottom_age_sec"), 1)
+        bpct = _fmt(r.get("bounce_pct_now"), 3)
+
+        rows_html += f"""<tr>
+            <td style='font-size:11px'>{ts_s}</td>
+            <td>{sym}</td>
+            <td style='font-size:10px;color:#888'>{mint[:12]}…</td>
+            <td>{age}</td>
+            <td>{bpct}</td>
+            {_net_cell(r.get("pre_5s_net"))}
+            {_net_cell(r.get("pre_10s_net"))}
+            {_net_cell(r.get("pre_15s_net"))}
+            {_net_cell(r.get("pre_30s_net"))}
+            {_net_cell(r.get("rise_1s_net"))}
+            {_net_cell(r.get("rise_3s_net"))}
+            {_net_cell(r.get("rise_5s_net"))}
+            {_net_cell(r.get("rise_10s_net"))}
+            {_net_cell(r.get("rise_now_net"))}
+            {_net_cell(r.get("live_5s_net"))}
+            {_net_cell(r.get("live_10s_net"))}
+            <td style='font-size:11px'>{_fmt(r.get("pool_quote"), 1)} SOL</td>
+            {_flags_cell(r.get("candidate_flags"))}
+        </tr>"""
+
+    filter_note = f"mint={mint_raw}" if mint_raw else f"últimas {days}d"
+    html = f"""<!DOCTYPE html><html><head>
+<title>Micro Absorption Snapshots</title>
+<meta charset='utf-8'>
+<style>
+  body {{ font-family: monospace; font-size: 12px; background: #111; color: #eee; padding: 12px; }}
+  h2 {{ color: #f0a; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  th, td {{ border: 1px solid #333; padding: 4px 6px; text-align: right; }}
+  th {{ background: #222; color: #9af; position: sticky; top: 0; }}
+  tr:hover {{ background: #1a1a2e; }}
+  .note {{ color: #888; font-size: 11px; }}
+  a {{ color: #9af; }}
+</style>
+</head><body>
+<h2>Micro Absorption Snapshots — Fase 1 V2</h2>
+<p class='note'>
+  Mostrando {len(rows)} de {limit} registros ({filter_note}).
+  Dados research-only — não afetam trading.
+  Formatos: <a href='?days={days}&format=json&limit={limit}{"&mint="+mint_raw if mint_raw else ""}'>JSON</a>
+           | <a href='?days={days}&format=csv&limit={limit}{"&mint="+mint_raw if mint_raw else ""}'>CSV</a>
+</p>
+<table>
+<thead><tr>
+  <th>TS</th><th>Token</th><th>Mint</th>
+  <th>BottomAge</th><th>Bounce%</th>
+  <th>pre5s</th><th>pre10s</th><th>pre15s</th><th>pre30s</th>
+  <th>rise1s</th><th>rise3s</th><th>rise5s</th><th>rise10s</th><th>riseNow</th>
+  <th>live5s</th><th>live10s</th>
+  <th>Pool</th><th>Flags</th>
+</tr></thead>
+<tbody>
+{rows_html or "<tr><td colspan='18' style='text-align:center;color:#888'>Nenhum snapshot ainda — bot ativo?</td></tr>"}
+</tbody>
+</table>
+<p class='note'>
+  pre*: net SOL flow antes do fundo · rise*: desde o fundo até N segundos ·
+  live*: últimos N segundos · + verde = compradores dominam · − vermelho = vendedores dominam
+</p>
+</body></html>"""
+
+    return html
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)

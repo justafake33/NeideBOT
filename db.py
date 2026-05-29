@@ -373,6 +373,120 @@ def init_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_tat_trade ON trade_absorption_ticks (trade_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_tat_mint  ON trade_absorption_ticks (mint)")
 
+        # ── Fase 1 V2 — Micro absorption snapshots (research-only) ──────────
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS micro_absorption_snapshots (
+                id                   BIGSERIAL PRIMARY KEY,
+                mint                 TEXT NOT NULL,
+                symbol               TEXT,
+                ts_snapshot          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                ts_migration         TIMESTAMPTZ,
+                ts_min               TIMESTAMPTZ,
+                mc_migration         FLOAT,
+                mc_min               FLOAT,
+                mc_current           FLOAT,
+                elapsed_sec          INT,
+                bottom_age_sec       FLOAT,
+                bounce_pct_now       FLOAT,
+                drop_from_mig        FLOAT,
+                pool_quote           FLOAT,
+                -- PRE windows (centradas no fundo: [ts_min - Xs, ts_min])
+                pre_5s_buy           FLOAT,
+                pre_5s_sell          FLOAT,
+                pre_5s_net           FLOAT,
+                pre_5s_events        INT,
+                pre_5s_largest_buy   FLOAT,
+                pre_5s_largest_sell  FLOAT,
+                pre_5s_zero_type     TEXT,
+                pre_10s_buy          FLOAT,
+                pre_10s_sell         FLOAT,
+                pre_10s_net          FLOAT,
+                pre_10s_events       INT,
+                pre_10s_largest_buy  FLOAT,
+                pre_10s_largest_sell FLOAT,
+                pre_10s_zero_type    TEXT,
+                pre_15s_buy          FLOAT,
+                pre_15s_sell         FLOAT,
+                pre_15s_net          FLOAT,
+                pre_15s_events       INT,
+                pre_15s_largest_buy  FLOAT,
+                pre_15s_largest_sell FLOAT,
+                pre_15s_zero_type    TEXT,
+                pre_30s_buy          FLOAT,
+                pre_30s_sell         FLOAT,
+                pre_30s_net          FLOAT,
+                pre_30s_events       INT,
+                pre_30s_largest_buy  FLOAT,
+                pre_30s_largest_sell FLOAT,
+                pre_30s_zero_type    TEXT,
+                -- RISE windows (desde ts_min até N segundos depois)
+                rise_1s_buy           FLOAT,
+                rise_1s_sell          FLOAT,
+                rise_1s_net           FLOAT,
+                rise_1s_events        INT,
+                rise_1s_largest_buy   FLOAT,
+                rise_1s_largest_sell  FLOAT,
+                rise_1s_zero_type     TEXT,
+                rise_3s_buy           FLOAT,
+                rise_3s_sell          FLOAT,
+                rise_3s_net           FLOAT,
+                rise_3s_events        INT,
+                rise_3s_largest_buy   FLOAT,
+                rise_3s_largest_sell  FLOAT,
+                rise_3s_zero_type     TEXT,
+                rise_5s_buy           FLOAT,
+                rise_5s_sell          FLOAT,
+                rise_5s_net           FLOAT,
+                rise_5s_events        INT,
+                rise_5s_largest_buy   FLOAT,
+                rise_5s_largest_sell  FLOAT,
+                rise_5s_zero_type     TEXT,
+                rise_10s_buy          FLOAT,
+                rise_10s_sell         FLOAT,
+                rise_10s_net          FLOAT,
+                rise_10s_events       INT,
+                rise_10s_largest_buy  FLOAT,
+                rise_10s_largest_sell FLOAT,
+                rise_10s_zero_type    TEXT,
+                rise_now_buy          FLOAT,
+                rise_now_sell         FLOAT,
+                rise_now_net          FLOAT,
+                rise_now_events       INT,
+                rise_now_largest_buy  FLOAT,
+                rise_now_largest_sell FLOAT,
+                rise_now_zero_type    TEXT,
+                -- LIVE windows (últimos Xs antes de agora)
+                live_5s_buy           FLOAT,
+                live_5s_sell          FLOAT,
+                live_5s_net           FLOAT,
+                live_5s_events        INT,
+                live_10s_buy          FLOAT,
+                live_10s_sell         FLOAT,
+                live_10s_net          FLOAT,
+                live_10s_events       INT,
+                -- Concentrations
+                buy_concentration_5s   FLOAT,
+                buy_concentration_10s  FLOAT,
+                sell_concentration_5s  FLOAT,
+                sell_concentration_10s FLOAT,
+                -- Research flags
+                candidate_flags JSONB,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_micro_abs_snap_mint_ts "
+            "ON micro_absorption_snapshots (mint, ts_snapshot DESC)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_micro_abs_snap_ts "
+            "ON micro_absorption_snapshots (ts_snapshot DESC)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_micro_abs_snap_flags "
+            "ON micro_absorption_snapshots USING gin(candidate_flags)"
+        )
+
     logger.info("DB inicializado")
 
 
@@ -906,6 +1020,102 @@ def update_bounce_snapshots(mint: str, window_label: str, buy_vol: float, sell_v
             f"UPDATE bounce_signals SET {cols} WHERE mint = %(mint)s",
             {"bv": buy_vol, "sv": sell_vol, "ev": events, "mint": mint},
         )
+
+
+def insert_micro_absorption_snapshot(data: dict) -> None:
+    """Insere snapshot de micro-absorção (research-only).
+    Insert-only — nunca atualiza trades, bounce_signals ou token_ticks.
+    Falha silenciosa para não quebrar o scanner.
+    """
+    import json as _json
+    flags = data.get("candidate_flags")
+    flags_json = _json.dumps(flags) if isinstance(flags, dict) else None
+
+    with _cursor() as cur:
+        cur.execute("""
+            INSERT INTO micro_absorption_snapshots (
+                mint, symbol, ts_snapshot, ts_migration, ts_min,
+                mc_migration, mc_min, mc_current,
+                elapsed_sec, bottom_age_sec, bounce_pct_now, drop_from_mig,
+                pool_quote,
+                pre_5s_buy,  pre_5s_sell,  pre_5s_net,  pre_5s_events,
+                pre_5s_largest_buy, pre_5s_largest_sell, pre_5s_zero_type,
+                pre_10s_buy, pre_10s_sell, pre_10s_net, pre_10s_events,
+                pre_10s_largest_buy, pre_10s_largest_sell, pre_10s_zero_type,
+                pre_15s_buy, pre_15s_sell, pre_15s_net, pre_15s_events,
+                pre_15s_largest_buy, pre_15s_largest_sell, pre_15s_zero_type,
+                pre_30s_buy, pre_30s_sell, pre_30s_net, pre_30s_events,
+                pre_30s_largest_buy, pre_30s_largest_sell, pre_30s_zero_type,
+                rise_1s_buy,  rise_1s_sell,  rise_1s_net,  rise_1s_events,
+                rise_1s_largest_buy, rise_1s_largest_sell, rise_1s_zero_type,
+                rise_3s_buy,  rise_3s_sell,  rise_3s_net,  rise_3s_events,
+                rise_3s_largest_buy, rise_3s_largest_sell, rise_3s_zero_type,
+                rise_5s_buy,  rise_5s_sell,  rise_5s_net,  rise_5s_events,
+                rise_5s_largest_buy, rise_5s_largest_sell, rise_5s_zero_type,
+                rise_10s_buy, rise_10s_sell, rise_10s_net, rise_10s_events,
+                rise_10s_largest_buy, rise_10s_largest_sell, rise_10s_zero_type,
+                rise_now_buy, rise_now_sell, rise_now_net, rise_now_events,
+                rise_now_largest_buy, rise_now_largest_sell, rise_now_zero_type,
+                live_5s_buy,  live_5s_sell,  live_5s_net,  live_5s_events,
+                live_10s_buy, live_10s_sell, live_10s_net, live_10s_events,
+                buy_concentration_5s,  buy_concentration_10s,
+                sell_concentration_5s, sell_concentration_10s,
+                candidate_flags
+            ) VALUES (
+                %(mint)s, %(symbol)s, %(ts_snapshot)s, %(ts_migration)s, %(ts_min)s,
+                %(mc_migration)s, %(mc_min)s, %(mc_current)s,
+                %(elapsed_sec)s, %(bottom_age_sec)s, %(bounce_pct_now)s, %(drop_from_mig)s,
+                %(pool_quote)s,
+                %(pre_5s_buy)s,  %(pre_5s_sell)s,  %(pre_5s_net)s,  %(pre_5s_events)s,
+                %(pre_5s_largest_buy)s, %(pre_5s_largest_sell)s, %(pre_5s_zero_type)s,
+                %(pre_10s_buy)s, %(pre_10s_sell)s, %(pre_10s_net)s, %(pre_10s_events)s,
+                %(pre_10s_largest_buy)s, %(pre_10s_largest_sell)s, %(pre_10s_zero_type)s,
+                %(pre_15s_buy)s, %(pre_15s_sell)s, %(pre_15s_net)s, %(pre_15s_events)s,
+                %(pre_15s_largest_buy)s, %(pre_15s_largest_sell)s, %(pre_15s_zero_type)s,
+                %(pre_30s_buy)s, %(pre_30s_sell)s, %(pre_30s_net)s, %(pre_30s_events)s,
+                %(pre_30s_largest_buy)s, %(pre_30s_largest_sell)s, %(pre_30s_zero_type)s,
+                %(rise_1s_buy)s,  %(rise_1s_sell)s,  %(rise_1s_net)s,  %(rise_1s_events)s,
+                %(rise_1s_largest_buy)s, %(rise_1s_largest_sell)s, %(rise_1s_zero_type)s,
+                %(rise_3s_buy)s,  %(rise_3s_sell)s,  %(rise_3s_net)s,  %(rise_3s_events)s,
+                %(rise_3s_largest_buy)s, %(rise_3s_largest_sell)s, %(rise_3s_zero_type)s,
+                %(rise_5s_buy)s,  %(rise_5s_sell)s,  %(rise_5s_net)s,  %(rise_5s_events)s,
+                %(rise_5s_largest_buy)s, %(rise_5s_largest_sell)s, %(rise_5s_zero_type)s,
+                %(rise_10s_buy)s, %(rise_10s_sell)s, %(rise_10s_net)s, %(rise_10s_events)s,
+                %(rise_10s_largest_buy)s, %(rise_10s_largest_sell)s, %(rise_10s_zero_type)s,
+                %(rise_now_buy)s, %(rise_now_sell)s, %(rise_now_net)s, %(rise_now_events)s,
+                %(rise_now_largest_buy)s, %(rise_now_largest_sell)s, %(rise_now_zero_type)s,
+                %(live_5s_buy)s,  %(live_5s_sell)s,  %(live_5s_net)s,  %(live_5s_events)s,
+                %(live_10s_buy)s, %(live_10s_sell)s, %(live_10s_net)s, %(live_10s_events)s,
+                %(buy_concentration_5s)s,  %(buy_concentration_10s)s,
+                %(sell_concentration_5s)s, %(sell_concentration_10s)s,
+                %(candidate_flags)s::jsonb
+            )
+        """, {**data, "candidate_flags": flags_json})
+
+
+def get_micro_absorption_snapshots(
+    days: int = 1,
+    mint: Optional[str] = None,
+    limit: int = 200,
+) -> list:
+    """Retorna micro snapshots recentes para inspeção de pesquisa."""
+    from datetime import timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    params: dict = {"limit": limit, "cutoff": cutoff}
+    mint_clause = ""
+    if mint:
+        mint_clause = "AND mint = %(mint)s"
+        params["mint"] = mint
+    with _cursor() as cur:
+        cur.execute(f"""
+            SELECT *
+            FROM micro_absorption_snapshots
+            WHERE ts_snapshot >= %(cutoff)s
+              {mint_clause}
+            ORDER BY ts_snapshot DESC
+            LIMIT %(limit)s
+        """, params)
+        return [dict(row) for row in cur.fetchall()]
 
 
 def insert_ticks_batch(ticks: list):
