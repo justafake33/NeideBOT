@@ -1,7 +1,7 @@
 import os
 import logging
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import psycopg2
@@ -1119,7 +1119,6 @@ def get_micro_absorption_snapshots(
     limit: int = 200,
 ) -> list:
     """Retorna micro snapshots recentes para inspeção de pesquisa."""
-    from datetime import timedelta
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     params: dict = {"limit": limit, "cutoff": cutoff}
     mint_clause = ""
