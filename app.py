@@ -40015,6 +40015,12 @@ def debug_micro_absorption_snapshots():  # noqa: C901
         color = "#2ecc71" if v > 0 else ("#e74c3c" if v < 0 else "#888")
         return f"<td style='color:{color};font-weight:bold'>{v:+.4f}</td>"
 
+    def _rise_net_cell(v, zero_type):
+        """Célula de net para janelas RISE — mostra ⏳ se incompleta."""
+        if zero_type == "incomplete":
+            return "<td style='color:#444;font-style:italic' title='janela ainda não fechou'>⏳</td>"
+        return _net_cell(v)
+
     def _flags_cell(flags):
         if not flags:
             return "<td>—</td>"
@@ -40059,10 +40065,10 @@ def debug_micro_absorption_snapshots():  # noqa: C901
             {_net_cell(r.get("pre_10s_net"))}
             {_net_cell(r.get("pre_15s_net"))}
             {_net_cell(r.get("pre_30s_net"))}
-            {_net_cell(r.get("rise_1s_net"))}
-            {_net_cell(r.get("rise_3s_net"))}
-            {_net_cell(r.get("rise_5s_net"))}
-            {_net_cell(r.get("rise_10s_net"))}
+            {_rise_net_cell(r.get("rise_1s_net"),  r.get("rise_1s_zero_type"))}
+            {_rise_net_cell(r.get("rise_3s_net"),  r.get("rise_3s_zero_type"))}
+            {_rise_net_cell(r.get("rise_5s_net"),  r.get("rise_5s_zero_type"))}
+            {_rise_net_cell(r.get("rise_10s_net"), r.get("rise_10s_zero_type"))}
             {_net_cell(r.get("rise_now_net"))}
             {_net_cell(r.get("live_5s_net"))}
             {_net_cell(r.get("live_10s_net"))}

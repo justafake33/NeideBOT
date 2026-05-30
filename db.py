@@ -486,6 +486,16 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_micro_abs_snap_flags "
             "ON micro_absorption_snapshots USING gin(candidate_flags)"
         )
+        # Concentrações nomeadas por janela (adicionadas no ajuste pós-Fase1)
+        for col in [
+            "ADD COLUMN IF NOT EXISTS pre_5s_buy_concentration   FLOAT",
+            "ADD COLUMN IF NOT EXISTS pre_10s_buy_concentration  FLOAT",
+            "ADD COLUMN IF NOT EXISTS rise_5s_buy_concentration  FLOAT",
+            "ADD COLUMN IF NOT EXISTS rise_10s_buy_concentration FLOAT",
+            "ADD COLUMN IF NOT EXISTS live_5s_buy_concentration  FLOAT",
+            "ADD COLUMN IF NOT EXISTS live_10s_buy_concentration FLOAT",
+        ]:
+            cur.execute(f"ALTER TABLE micro_absorption_snapshots {col}")
 
     logger.info("DB inicializado")
 
@@ -1025,72 +1035,82 @@ def update_bounce_snapshots(mint: str, window_label: str, buy_vol: float, sell_v
 def insert_micro_absorption_snapshot(data: dict) -> None:
     """Insere snapshot de micro-absorção (research-only).
     Insert-only — nunca atualiza trades, bounce_signals ou token_ticks.
-    Falha silenciosa para não quebrar o scanner.
+    Exceções são capturadas aqui e logadas como DEBUG; o scanner não quebra.
     """
     import json as _json
-    flags = data.get("candidate_flags")
-    flags_json = _json.dumps(flags) if isinstance(flags, dict) else None
+    try:
+        flags = data.get("candidate_flags")
+        flags_json = _json.dumps(flags) if isinstance(flags, dict) else None
 
-    with _cursor() as cur:
-        cur.execute("""
-            INSERT INTO micro_absorption_snapshots (
-                mint, symbol, ts_snapshot, ts_migration, ts_min,
-                mc_migration, mc_min, mc_current,
-                elapsed_sec, bottom_age_sec, bounce_pct_now, drop_from_mig,
-                pool_quote,
-                pre_5s_buy,  pre_5s_sell,  pre_5s_net,  pre_5s_events,
-                pre_5s_largest_buy, pre_5s_largest_sell, pre_5s_zero_type,
-                pre_10s_buy, pre_10s_sell, pre_10s_net, pre_10s_events,
-                pre_10s_largest_buy, pre_10s_largest_sell, pre_10s_zero_type,
-                pre_15s_buy, pre_15s_sell, pre_15s_net, pre_15s_events,
-                pre_15s_largest_buy, pre_15s_largest_sell, pre_15s_zero_type,
-                pre_30s_buy, pre_30s_sell, pre_30s_net, pre_30s_events,
-                pre_30s_largest_buy, pre_30s_largest_sell, pre_30s_zero_type,
-                rise_1s_buy,  rise_1s_sell,  rise_1s_net,  rise_1s_events,
-                rise_1s_largest_buy, rise_1s_largest_sell, rise_1s_zero_type,
-                rise_3s_buy,  rise_3s_sell,  rise_3s_net,  rise_3s_events,
-                rise_3s_largest_buy, rise_3s_largest_sell, rise_3s_zero_type,
-                rise_5s_buy,  rise_5s_sell,  rise_5s_net,  rise_5s_events,
-                rise_5s_largest_buy, rise_5s_largest_sell, rise_5s_zero_type,
-                rise_10s_buy, rise_10s_sell, rise_10s_net, rise_10s_events,
-                rise_10s_largest_buy, rise_10s_largest_sell, rise_10s_zero_type,
-                rise_now_buy, rise_now_sell, rise_now_net, rise_now_events,
-                rise_now_largest_buy, rise_now_largest_sell, rise_now_zero_type,
-                live_5s_buy,  live_5s_sell,  live_5s_net,  live_5s_events,
-                live_10s_buy, live_10s_sell, live_10s_net, live_10s_events,
-                buy_concentration_5s,  buy_concentration_10s,
-                sell_concentration_5s, sell_concentration_10s,
-                candidate_flags
-            ) VALUES (
-                %(mint)s, %(symbol)s, %(ts_snapshot)s, %(ts_migration)s, %(ts_min)s,
-                %(mc_migration)s, %(mc_min)s, %(mc_current)s,
-                %(elapsed_sec)s, %(bottom_age_sec)s, %(bounce_pct_now)s, %(drop_from_mig)s,
-                %(pool_quote)s,
-                %(pre_5s_buy)s,  %(pre_5s_sell)s,  %(pre_5s_net)s,  %(pre_5s_events)s,
-                %(pre_5s_largest_buy)s, %(pre_5s_largest_sell)s, %(pre_5s_zero_type)s,
-                %(pre_10s_buy)s, %(pre_10s_sell)s, %(pre_10s_net)s, %(pre_10s_events)s,
-                %(pre_10s_largest_buy)s, %(pre_10s_largest_sell)s, %(pre_10s_zero_type)s,
-                %(pre_15s_buy)s, %(pre_15s_sell)s, %(pre_15s_net)s, %(pre_15s_events)s,
-                %(pre_15s_largest_buy)s, %(pre_15s_largest_sell)s, %(pre_15s_zero_type)s,
-                %(pre_30s_buy)s, %(pre_30s_sell)s, %(pre_30s_net)s, %(pre_30s_events)s,
-                %(pre_30s_largest_buy)s, %(pre_30s_largest_sell)s, %(pre_30s_zero_type)s,
-                %(rise_1s_buy)s,  %(rise_1s_sell)s,  %(rise_1s_net)s,  %(rise_1s_events)s,
-                %(rise_1s_largest_buy)s, %(rise_1s_largest_sell)s, %(rise_1s_zero_type)s,
-                %(rise_3s_buy)s,  %(rise_3s_sell)s,  %(rise_3s_net)s,  %(rise_3s_events)s,
-                %(rise_3s_largest_buy)s, %(rise_3s_largest_sell)s, %(rise_3s_zero_type)s,
-                %(rise_5s_buy)s,  %(rise_5s_sell)s,  %(rise_5s_net)s,  %(rise_5s_events)s,
-                %(rise_5s_largest_buy)s, %(rise_5s_largest_sell)s, %(rise_5s_zero_type)s,
-                %(rise_10s_buy)s, %(rise_10s_sell)s, %(rise_10s_net)s, %(rise_10s_events)s,
-                %(rise_10s_largest_buy)s, %(rise_10s_largest_sell)s, %(rise_10s_zero_type)s,
-                %(rise_now_buy)s, %(rise_now_sell)s, %(rise_now_net)s, %(rise_now_events)s,
-                %(rise_now_largest_buy)s, %(rise_now_largest_sell)s, %(rise_now_zero_type)s,
-                %(live_5s_buy)s,  %(live_5s_sell)s,  %(live_5s_net)s,  %(live_5s_events)s,
-                %(live_10s_buy)s, %(live_10s_sell)s, %(live_10s_net)s, %(live_10s_events)s,
-                %(buy_concentration_5s)s,  %(buy_concentration_10s)s,
-                %(sell_concentration_5s)s, %(sell_concentration_10s)s,
-                %(candidate_flags)s::jsonb
-            )
-        """, {**data, "candidate_flags": flags_json})
+        with _cursor() as cur:
+            cur.execute("""
+                INSERT INTO micro_absorption_snapshots (
+                    mint, symbol, ts_snapshot, ts_migration, ts_min,
+                    mc_migration, mc_min, mc_current,
+                    elapsed_sec, bottom_age_sec, bounce_pct_now, drop_from_mig,
+                    pool_quote,
+                    pre_5s_buy,  pre_5s_sell,  pre_5s_net,  pre_5s_events,
+                    pre_5s_largest_buy, pre_5s_largest_sell, pre_5s_zero_type,
+                    pre_10s_buy, pre_10s_sell, pre_10s_net, pre_10s_events,
+                    pre_10s_largest_buy, pre_10s_largest_sell, pre_10s_zero_type,
+                    pre_15s_buy, pre_15s_sell, pre_15s_net, pre_15s_events,
+                    pre_15s_largest_buy, pre_15s_largest_sell, pre_15s_zero_type,
+                    pre_30s_buy, pre_30s_sell, pre_30s_net, pre_30s_events,
+                    pre_30s_largest_buy, pre_30s_largest_sell, pre_30s_zero_type,
+                    rise_1s_buy,  rise_1s_sell,  rise_1s_net,  rise_1s_events,
+                    rise_1s_largest_buy, rise_1s_largest_sell, rise_1s_zero_type,
+                    rise_3s_buy,  rise_3s_sell,  rise_3s_net,  rise_3s_events,
+                    rise_3s_largest_buy, rise_3s_largest_sell, rise_3s_zero_type,
+                    rise_5s_buy,  rise_5s_sell,  rise_5s_net,  rise_5s_events,
+                    rise_5s_largest_buy, rise_5s_largest_sell, rise_5s_zero_type,
+                    rise_10s_buy, rise_10s_sell, rise_10s_net, rise_10s_events,
+                    rise_10s_largest_buy, rise_10s_largest_sell, rise_10s_zero_type,
+                    rise_now_buy, rise_now_sell, rise_now_net, rise_now_events,
+                    rise_now_largest_buy, rise_now_largest_sell, rise_now_zero_type,
+                    live_5s_buy,  live_5s_sell,  live_5s_net,  live_5s_events,
+                    live_10s_buy, live_10s_sell, live_10s_net, live_10s_events,
+                    buy_concentration_5s,  buy_concentration_10s,
+                    sell_concentration_5s, sell_concentration_10s,
+                    pre_5s_buy_concentration,  pre_10s_buy_concentration,
+                    rise_5s_buy_concentration, rise_10s_buy_concentration,
+                    live_5s_buy_concentration, live_10s_buy_concentration,
+                    candidate_flags
+                ) VALUES (
+                    %(mint)s, %(symbol)s, %(ts_snapshot)s, %(ts_migration)s, %(ts_min)s,
+                    %(mc_migration)s, %(mc_min)s, %(mc_current)s,
+                    %(elapsed_sec)s, %(bottom_age_sec)s, %(bounce_pct_now)s, %(drop_from_mig)s,
+                    %(pool_quote)s,
+                    %(pre_5s_buy)s,  %(pre_5s_sell)s,  %(pre_5s_net)s,  %(pre_5s_events)s,
+                    %(pre_5s_largest_buy)s, %(pre_5s_largest_sell)s, %(pre_5s_zero_type)s,
+                    %(pre_10s_buy)s, %(pre_10s_sell)s, %(pre_10s_net)s, %(pre_10s_events)s,
+                    %(pre_10s_largest_buy)s, %(pre_10s_largest_sell)s, %(pre_10s_zero_type)s,
+                    %(pre_15s_buy)s, %(pre_15s_sell)s, %(pre_15s_net)s, %(pre_15s_events)s,
+                    %(pre_15s_largest_buy)s, %(pre_15s_largest_sell)s, %(pre_15s_zero_type)s,
+                    %(pre_30s_buy)s, %(pre_30s_sell)s, %(pre_30s_net)s, %(pre_30s_events)s,
+                    %(pre_30s_largest_buy)s, %(pre_30s_largest_sell)s, %(pre_30s_zero_type)s,
+                    %(rise_1s_buy)s,  %(rise_1s_sell)s,  %(rise_1s_net)s,  %(rise_1s_events)s,
+                    %(rise_1s_largest_buy)s, %(rise_1s_largest_sell)s, %(rise_1s_zero_type)s,
+                    %(rise_3s_buy)s,  %(rise_3s_sell)s,  %(rise_3s_net)s,  %(rise_3s_events)s,
+                    %(rise_3s_largest_buy)s, %(rise_3s_largest_sell)s, %(rise_3s_zero_type)s,
+                    %(rise_5s_buy)s,  %(rise_5s_sell)s,  %(rise_5s_net)s,  %(rise_5s_events)s,
+                    %(rise_5s_largest_buy)s, %(rise_5s_largest_sell)s, %(rise_5s_zero_type)s,
+                    %(rise_10s_buy)s, %(rise_10s_sell)s, %(rise_10s_net)s, %(rise_10s_events)s,
+                    %(rise_10s_largest_buy)s, %(rise_10s_largest_sell)s, %(rise_10s_zero_type)s,
+                    %(rise_now_buy)s, %(rise_now_sell)s, %(rise_now_net)s, %(rise_now_events)s,
+                    %(rise_now_largest_buy)s, %(rise_now_largest_sell)s, %(rise_now_zero_type)s,
+                    %(live_5s_buy)s,  %(live_5s_sell)s,  %(live_5s_net)s,  %(live_5s_events)s,
+                    %(live_10s_buy)s, %(live_10s_sell)s, %(live_10s_net)s, %(live_10s_events)s,
+                    %(buy_concentration_5s)s,  %(buy_concentration_10s)s,
+                    %(sell_concentration_5s)s, %(sell_concentration_10s)s,
+                    %(pre_5s_buy_concentration)s,  %(pre_10s_buy_concentration)s,
+                    %(rise_5s_buy_concentration)s, %(rise_10s_buy_concentration)s,
+                    %(live_5s_buy_concentration)s, %(live_10s_buy_concentration)s,
+                    %(candidate_flags)s::jsonb
+                )
+            """, {**data, "candidate_flags": flags_json})
+    except Exception as e:
+        logger.debug("insert_micro_absorption_snapshot %s: %s",
+                     str(data.get("mint", ""))[:8], e)
 
 
 def get_micro_absorption_snapshots(
