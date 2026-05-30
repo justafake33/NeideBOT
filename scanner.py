@@ -17,13 +17,23 @@ logger = logging.getLogger(__name__)
 _MICRO_FLOW_EPS = 0.000001
 
 
-def _build_window_features(window_data: dict) -> dict:
+def _build_window_features(window_data: dict, complete: bool = True) -> dict:
     """Deriva métricas padronizadas de get_absorption_window() para micro snapshots.
+
+    complete=False → janela ainda não fechou (ex: rise_5s com bottom_age_sec < 5).
+    Retorna todos os campos NULL e zero_type='incomplete' para não poluir análises.
 
     Apenas computação — sem efeitos colaterais, sem chamadas externas.
     Retorna dict com: buy, sell, net, events, largest_buy, largest_sell,
     buy_concentration, sell_concentration, zero_type.
     """
+    if not complete:
+        return {
+            "buy": None, "sell": None, "net": None, "events": None,
+            "largest_buy": None, "largest_sell": None,
+            "buy_concentration": None, "sell_concentration": None,
+            "zero_type": "incomplete",
+        }
     if not window_data:
         return {
             "buy": None, "sell": None, "net": None, "events": None,
@@ -695,23 +705,25 @@ class HotMonitor:
                     mint, window_sec=max(1, sec), window_end_ts=end_ts
                 )
 
-            def _wf(sec: int, end_ts: float) -> dict:
-                return _build_window_features(_w(sec, end_ts))
+            def _wf(sec: int, end_ts: float, complete: bool = True) -> dict:
+                return _build_window_features(_w(sec, end_ts), complete=complete)
 
-            # PRE: [ts_min - Xs, ts_min]
+            # PRE: [ts_min - Xs, ts_min] — sempre completas (fundo já ocorreu)
             pre_5  = _wf(5,  ts_min_ts)
             pre_10 = _wf(10, ts_min_ts)
             pre_15 = _wf(15, ts_min_ts)
             pre_30 = _wf(30, ts_min_ts)
 
-            # RISE: [ts_min, ts_min + Xs] (janelas fixas desde o fundo)
-            rise_1  = _wf(1,  ts_min_ts + 1)
-            rise_3  = _wf(3,  ts_min_ts + 3)
-            rise_5  = _wf(5,  ts_min_ts + 5)
-            rise_10 = _wf(10, ts_min_ts + 10)
+            # RISE: [ts_min, ts_min + Xs] — só preencher quando a janela tiver fechado.
+            # Se bottom_age_sec < X, a janela ainda não encerrou → NULL + zero_type='incomplete'.
+            rise_1  = _wf(1,  ts_min_ts + 1,  complete=(bottom_age_sec >= 1))
+            rise_3  = _wf(3,  ts_min_ts + 3,  complete=(bottom_age_sec >= 3))
+            rise_5  = _wf(5,  ts_min_ts + 5,  complete=(bottom_age_sec >= 5))
+            rise_10 = _wf(10, ts_min_ts + 10, complete=(bottom_age_sec >= 10))
+            # rise_now usa o elapsed real — sempre completo por definição
             rise_now = _wf(max(1, int(now_ts - ts_min_ts)), now_ts)
 
-            # LIVE: [now - Xs, now]
+            # LIVE: [now - Xs, now] — sempre completas
             live_5  = _wf(5,  now_ts)
             live_10 = _wf(10, now_ts)
 
@@ -771,10 +783,18 @@ class HotMonitor:
                 "live_10s_sell":   live_10.get("sell"),
                 "live_10s_net":    live_10.get("net"),
                 "live_10s_events": live_10.get("events"),
+                # Concentrações legacy (mantidas para retrocompat — mapeiam pre_5s/pre_10s)
                 "buy_concentration_5s":   pre_5.get("buy_concentration"),
                 "buy_concentration_10s":  pre_10.get("buy_concentration"),
                 "sell_concentration_5s":  pre_5.get("sell_concentration"),
                 "sell_concentration_10s": pre_10.get("sell_concentration"),
+                # Concentrações nomeadas por janela (sem ambiguidade)
+                "pre_5s_buy_concentration":   pre_5.get("buy_concentration"),
+                "pre_10s_buy_concentration":  pre_10.get("buy_concentration"),
+                "rise_5s_buy_concentration":  rise_5.get("buy_concentration"),   # NULL se incompleta
+                "rise_10s_buy_concentration": rise_10.get("buy_concentration"),  # NULL se incompleta
+                "live_5s_buy_concentration":  live_5.get("buy_concentration"),
+                "live_10s_buy_concentration": live_10.get("buy_concentration"),
                 "candidate_flags": flags,
             }
 
