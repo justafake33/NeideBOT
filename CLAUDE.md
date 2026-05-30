@@ -223,6 +223,17 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO 2026-05-04)
 
 ## 🔍 ESTADO ATUAL
 
+> ### 🛑 BOT PARADO — CAPTAÇÃO DE MICRODADOS (2026-05-30)
+>
+> **`TRADING_ENABLED=false`** — Bot parado intencionalmente para acumulação de dados na tabela `micro_absorption_snapshots` (V2 Fase 1).
+>
+> **Objetivo:** coletar microdados de fluxo de ordens (PRE/RISE/LIVE) ao redor do fundo de cada token durante os próximos dias/semanas para validar H22, H23, H24 e derivadas (H26, pool depth, seller exhaustion) com n≥30 bounces com outcomes GMGN confirmados.
+>
+> **Branch ativo:** `claude/nifty-hamilton-tQORb` (V2 Fase 1)
+> **Fases V2 pendentes (em standby):** Fase 2 (Micro Absorption Lab) → Fase 3 (Shadow Entry Signals) → Fase 4 (EntryEngineV2) → Fase 5 (Dry-run) → Fase 6 (ExecutionEngineV2 Real Scout)
+>
+> **Reativar trading:** setar `TRADING_ENABLED=true` no Railway + aguardar n≥30 snapshots com outcomes.
+
 > ### ⚠️ LEITURA OBRIGATÓRIA ANTES DE ANALISAR QUALQUER NÚMERO DESTA SEÇÃO
 >
 > **Todos os WR, recovery rates, n=, e análises de filtros registrados aqui ANTES de 2026-05-20 não têm comprovação na blockchain e devem ser lidos como contexto histórico, não como verdades operacionais.**
@@ -517,6 +528,7 @@ get_sol_usd() [gmgn_client.py]
 | `bounce_signals` | **Fase 2** — um registro por token quando bounce detector dispara (UNIQUE mint). Tem 8 colunas H22: `absorption_buy_vol`, `sell_vol`, `buy_cnt`, `sell_cnt`, `lrg_buy`, `events`, `score=NULL`, `grade=NULL`. |
 | `trades` | **Fase 6** — log completo de cada trade live. Coluna `fill_source TEXT` rastreia origem do fill data (`gmgn`/`helius`/`helius_recovery`/`gmgn_recovery`). |
 | `trade_absorption_ticks` | Snapshots contínuos de absorção Helius (+30s/+60s pós-bounce) por trade em monitoramento. |
+| `micro_absorption_snapshots` | **V2 Fase 1 (2026-05-30)** — série temporal de microdados de fluxo por token, capturados a cada 2s durante os 60s após o fundo. ~97 colunas: janelas PRE (5/10/15/30s antes do fundo), RISE (1/3/5/10s após fundo, com guard de completude), LIVE (5/10s antes do snapshot), concentrações nomeadas por janela, `candidate_flags` JSONB. Research-only — nunca afeta trading. |
 
 ### HeapScheduler
 - Thread única com heap de eventos futuros
@@ -624,6 +636,7 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 | `/analise/post-sl-recovery` | **Post-SL Recovery** — para cada SL, max MC nos ticks pós-exit. 12% atingiriam TP (8/64). 88% continuaram dumpando. Confirma H21 estruturalmente. |
 | `/analise/h22-correlation` | **H22 Correlation** — correlação entre absorção pós-fundo (Helius) e outcome TP/SL. Tabelas por bucket: absorption_events (0/1-2/3-5/6-10/≥11), buy/sell ratio (∞/≥3×/1.5-3×/etc.), concentração (largest_buy/buy_vol). Instrumento pronto antes dos dados chegarem — n=? cresce com o bot ativo. Gate: n≥30 com Helius. |
 | `/debug/open-trades` | **Diagnóstico de trades abertos** — por trade `open`/`trailing_active`: entry_expected, entry_mc_real, sl_mc, tp_mc, contagem de ticks, min_low, max_high, flags sl_hit/tp_hit, resposta ao vivo do GMGN `query_order` com raw JSON. Identifica trades presos + por que TradeMonitor não detectou saída. |
+| `/debug/micro-absorption-snapshots` | **V2 Fase 1** — visualiza `micro_absorption_snapshots`. Suporta `?days=1&mint=&limit=200&format=html\|json\|csv`. HTML com células PRE/RISE/LIVE coloridas (verde/vermelho para net positivo/negativo). RISE incompleto mostra ⏳ com tooltip. Indicadores de completude por janela. |
 
 ---
 
