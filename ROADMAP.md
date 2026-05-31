@@ -1,7 +1,7 @@
 # NeideBOT — Roadmap
 
-**Atualizado:** 2026-05-28 (sessão 17)
-**Estado:** Bot ATIVO · erpc operacional · phantom fix ativo · mc_min auditado (n=15, 67% precisos) · C1-C4 deployados · branch ativo: `claude/gallant-ptolemy-HNNbz`
+**Atualizado:** 2026-05-30 (sessão 18)
+**Estado:** Bot PARADO para captação de microdados (V2 Fase 1) · `TRADING_ENABLED=false` · branch ativo: `claude/nifty-hamilton-tQORb`
 
 ---
 
@@ -84,10 +84,132 @@
 | **C2 — HeliusWS injetado no TradeExecutor** | 2026-05-28 | TradeExecutor não tinha acesso ao feed erpc em tempo real. Adicionado `self._helius = None` no `__init__` + método `set_helius()` (mesmo padrão do TradeMonitor). Em `app.py`: `executor.set_helius(hot._helius)` após a injeção no monitor. Habilita leitura de pool_quote em tempo real no momento do bounce (C3). Commit `f962915`. |
 | **C3 — Pool depth gate no bounce** | 2026-05-28 | Pool rasa = bounce é ruído de AMM, não demanda real. Em pool de 10 SOL, uma única venda de ~$300 move o preço 25% — SL de 25% dispara por física, não por price action. Gate adicionado em `_check_bounce()` antes do bloco atômico `bounce_fired`: lê `_pool_quote_last[mint]` in-memory via `get_pool_quote(mint)` (zero latência). Se `pool_depth < POOL_MIN_SOL_BOUNCE` → sinal rejeitado. Env var `POOL_MIN_SOL_BOUNCE=10`. Commit `f962915`. |
 | **C4 — ALT PDA fallback** | 2026-05-28 | Melhoria do phantom fix (commit 037a06c). Transações ALT (`accounts=[]`) eram sempre rejeitadas — bot perdia fundos reais que aconteciam em transações versioned (WHY +22.5%, CTO +19.7%, RAMBO +3.7% na auditoria n=15). Fix: quando `accounts=[]` E `_pool_pda[mint] == known_pool` → aceita (PDA é matematicamente garantido por `sha256(seeds + program_id)`). Sem PDA → ainda rejeita. Helius mode (`accounts=None`) → preservado sem validação. Commit `f962915`. |
+| **V2 Fase 1 — micro_absorption_snapshots** | 2026-05-30 | Sistema de captação de microdados de fluxo de ordens ao redor do fundo. Tabela `micro_absorption_snapshots` (~97 colunas) com snapshots a cada 2s durante os 60s pós-fundo. Janelas PRE (5/10/15/30s), RISE (1/3/5/10s, com guard de completude), LIVE (5/10s). Concentrações nomeadas por janela (`pre_5s_buy_concentration` etc.). `candidate_flags` JSONB. `_build_window_features()` como utilitário puro sem I/O. `_maybe_record_micro_snapshot()` com rate limit 2s/token. Endpoint `/debug/micro-absorption-snapshots`. Bot parado (`TRADING_ENABLED=false`) para acumulação. Branch `claude/nifty-hamilton-tQORb`. Commits `d368b40` + `c9ae4d7` + `c42ba75`. |
 
 > ⚠️ **WR REAL CORRIGIDO (2026-05-14 sessão 5):** banco tinha dados fictícios — TradeMonitor inferia saídas de MC snapshots, não da blockchain. Auditoria via Helius revelou WR real de **10.1%** (14 TP / 125 SL / 139 trades). WR anterior de 32% era inflado por falsos TPs. `/debug/sell-recovery` executado: 139 correções persistidas.
 > ⚠️ **DADOS HISTÓRICOS SUSPEITOS (sessão 9):** mc_min de todos os tokens antes do fix (elapsed_sec < 90) pode estar corrompido pelo candle de transição. Análises de WR baseadas em `mc_min` histórico (bounce_pct, entry_ratio, drop_from_mig) devem ser tratadas com cautela.
 > ⚠️ **MARCO ZERO DEFINITIVO: 2026-05-26 (sessão 16):** Phantom fix (ALT tx bypass) + auditoria manual n=15 confirmam que mc_min capturado a partir desta data é confiável. Trades anteriores (2026-05-21 a 2026-05-25) tinham erpc operacional mas bug ALT tx ainda ativo — mc_min potencialmente contaminado por secondary pools em transações versioned.
+
+---
+
+## 🔬 V2 — Reestruturação de Microestrutura
+
+### Estado atual (2026-05-30)
+
+**Bot PARADO** · `TRADING_ENABLED=false` · Branch: `claude/nifty-hamilton-tQORb`
+
+O sistema de trading foi pausado para acumulação de dados de microestrutura. A ideia central é que filtros estáticos (smart count, bounce_pct, elapsed, creator_status) entregam no máximo +7pp de WR. O edge real está em **quem comprou o fundo e com que força** — e só conseguimos responder isso com dados de fluxo de ordens em granularidade de segundos.
+
+### Fase 1 — Micro Absorption Snapshots ✅ CONCLUÍDA (2026-05-30)
+
+**O que foi implementado:**
+- Tabela `micro_absorption_snapshots` (~97 colunas) — série temporal a cada 2s por token durante os 60s após o fundo
+- Janelas PRE (5/10/15/30s antes do fundo), RISE (1/3/5/10s após o fundo), LIVE (5/10s recentes)
+- Guard de completude: janelas RISE com `bottom_age_sec < X` retornam `NULL` com `zero_type='incomplete'`
+- Concentrações nomeadas por janela: `pre_5s_buy_concentration`, `rise_10s_buy_concentration`, etc.
+- `candidate_flags` JSONB para flags arbitrárias (seller exhaustion, pool depth, etc.)
+- `_build_window_features()` — utilitário puro sem I/O, facilita testes e reutilização
+- Rate limiter: máx 1 snapshot por 2s por token, apenas dentro dos 60s pós-fundo
+- Thread-safe: `last_micro_snapshot_ts` setado ANTES do dispatch para evitar burst concorrente
+- Endpoint `/debug/micro-absorption-snapshots` — view HTML com células coloridas, ⏳ para RISE incompleto, suporte a `?format=json|csv`
+- Falha silenciosa: try/except em `_record_micro_absorption_snapshot` e `insert_micro_absorption_snapshot` — qualquer erro de coleta não atinge o scanner
+
+**Commits:** `d368b40` (foundation) · `c9ae4d7` (rise guards + named concentrations + silent insert) · `c42ba75` (fix NameError timezone)
+
+**Travas de segurança (NUNCA violar em fases futuras):**
+- Lógica de trading (`_check_bounce`, executor, swap, TP/SL, trailing) → intocável
+- Tabelas existentes (`migrations`, `bounce_signals`, `trades`, `token_ticks`, `token_signals`) → sem DELETE/ALTER destrutivo
+- Env vars de trading (`TRADING_ENABLED`, `BOUNCE_MIN_PCT`, `TRADE_SL_PCT`, etc.) → sem alteração por código de research
+- Falha de coleta → log silencioso, nunca exceção propagada
+
+---
+
+### Fase 2 — Micro Absorption Lab ⏳ STANDBY
+
+**O que fazer quando n≥30 snapshots com outcomes GMGN confirmados:**
+1. Abrir `/debug/micro-absorption-snapshots` + `/analise/h22-correlation` — ver padrões emergentes
+2. Calcular WR por combinação PRE/RISE/LIVE (positivo vs negativo vs nulo)
+3. Identificar qual janela discrimina mais TP vs SL
+4. Calcular correlações: `net_pre_5s × net_rise_5s`, `buy_concentration_pre × rise_events`, etc.
+5. Documentar achados em CLAUDE.md antes de qualquer código novo
+
+**Gate:** n≥30 bounces com `micro_absorption_snapshots` + outcomes GMGN (confirmados via `/debug/sell-recovery`)
+
+---
+
+### Fase 3 — Shadow Entry Signals ⏳ STANDBY
+
+**O que fazer após Fase 2 identificar ≥1 janela discriminatória:**
+- Implementar `shadow_entry_signals` — log de todos os sinais que passariam pelo filtro de absorção, sem executar
+- Comparar WR hipotético do shadow vs WR real da execução atual
+- Validar que o filtro não elimina mais de 40% dos bounces válidos (preserva frequência mínima)
+
+**Gate:** Fase 2 com ≥1 métrica mostrando ≥15pp de discriminação (WR maior com absorção vs sem)
+
+---
+
+### Fase 4 — EntryEngineV2 ⏳ STANDBY
+
+**O que fazer após Shadow mostrar melhora robusta:**
+- Adicionar gate de absorção em `_check_bounce()` (condição adicional, não substitui filtros existentes)
+- `ABSORPTION_GATE_ENABLED` env var — desligável sem redeploy
+- Começar com o filtro mais conservador identificado na Fase 2
+
+**Gate:** Shadow Entry com n≥50 e WR hipotético ≥25pp melhor que baseline, com ≤40% de bounces bloqueados
+
+---
+
+### Fase 5 — ExecutionEngineV2 Dry-run ⏳ STANDBY
+
+**O que fazer após Fase 4 estabilizar:**
+- `TRADING_ENABLED=true` com `CALIBRATION_AMOUNT_USD=1.0`
+- n=30 trades reais com novos filtros
+- Comparar WR com período pré-V2 (ajustado por regime de mercado)
+
+**Gate:** Fase 4 ativa e estável por ≥7 dias
+
+---
+
+### Fase 6 — ExecutionEngineV2 Real Scout ⏳ STANDBY
+
+**O que fazer após Fase 5 confirmar WR ≥25% em ≥30 trades:**
+- Escalar para $10/trade
+- Implementar ENTRY_MAX_BOUNCE_PCT (cancela trade se preço já subiu muito desde o sinal)
+- Avaliar migração GMGN → Jupiter quando WR ≥30%
+
+**Gate:** Fase 5 com WR ≥25% confirmado GMGN em ≥30 trades
+
+---
+
+## 🔮 Visão Futura do Projeto
+
+### Próxima grande alavanca de código: seller exhaustion (H24)
+
+A hipótese central não testada: **90% dos SLs são tokens onde os sellers NÃO tinham terminado quando entramos.** O fundo detectado não era o fundo real — havia pressão de venda residual não visível nos snapshots de 5s.
+
+Com `micro_absorption_snapshots`, podemos medir diretamente:
+- `pre_30s_sell` — quanta pressão de venda chegou nos 30s antes do fundo
+- `rise_5s_buy_concentration` — bounce concentrado (poucos buyers grandes) vs disperso (muitos pequenos)
+- `pre_5s_net` vs `rise_5s_net` — mudança de regime entre dump e bounce
+
+Se `pre_30s_sell > threshold` e `rise_5s_buy_concentration < 0.3` → muitos sellers, pouca concentração de demanda → provavelmente não é o fundo real.
+
+### Jupiter + Helius (quando WR ≥30% confirmado)
+
+Migrar execução para Jupiter elimina a friction mais significativa:
+- GMGN platform fee: 1%+1% = 2% → Jupiter LP fee: ~0.25%+0.25% = 0.5%
+- ATA rent por SL: ~$0.20/SL → Jupiter fecha ATA no sell automaticamente
+- Break-even a $10/trade: GMGN ~12% WR → Jupiter ~9% WR
+
+Implementar DEPOIS de WR confirmado ≥30% em ≥30 trades a $10. Não antes.
+
+### Re-entry em tokens com TP histórico
+
+Tokens que fizeram bounce uma vez têm maior probabilidade de fazer de novo (comunidade estabelecida, liquidez comprovada). Implementar re-entry flag em `_check_bounce()` — `bounce_fired` não bloqueia re-entry se token tem TP anterior no DB.
+
+### Score de confluência (longo prazo, n≥200 trades GMGN limpos)
+
+Só faz sentido com dados suficientes por bucket. Com n<200, qualquer tier tem <50 amostras — ruído, não sinal. Prioridade: acumular dados, não modelar prematuramente.
 
 ---
 
