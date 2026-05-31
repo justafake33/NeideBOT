@@ -1117,24 +1117,50 @@ def get_micro_absorption_snapshots(
     days: int = 1,
     mint: Optional[str] = None,
     limit: int = 200,
+    summary: bool = False,
 ) -> list:
-    """Retorna micro snapshots recentes para inspeção de pesquisa."""
+    """Retorna micro snapshots recentes para inspeção de pesquisa.
+
+    summary=True → uma linha por bounce (mint + ts_min), o snapshot com
+    bottom_age_sec máximo (mais próximo dos 60s finais).
+    summary=False → todas as linhas individualmente (série temporal).
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     params: dict = {"limit": limit, "cutoff": cutoff}
     mint_clause = ""
     if mint:
         mint_clause = "AND mint = %(mint)s"
         params["mint"] = mint
-    with _cursor() as cur:
-        cur.execute(f"""
+
+    if summary:
+        # Um row por bounce: o snapshot com maior bottom_age_sec no evento
+        query = f"""
+            SELECT DISTINCT ON (mint, ts_min) *
+            FROM micro_absorption_snapshots
+            WHERE ts_snapshot >= %(cutoff)s
+              {mint_clause}
+            ORDER BY mint, ts_min DESC, bottom_age_sec DESC
+            LIMIT %(limit)s
+        """
+    else:
+        query = f"""
             SELECT *
             FROM micro_absorption_snapshots
             WHERE ts_snapshot >= %(cutoff)s
               {mint_clause}
             ORDER BY ts_snapshot DESC
             LIMIT %(limit)s
-        """, params)
-        return [dict(row) for row in cur.fetchall()]
+        """
+
+    with _cursor() as cur:
+        cur.execute(query, params)
+        rows = [dict(row) for row in cur.fetchall()]
+
+    if summary:
+        # Re-ordena por ts_min DESC após o DISTINCT ON
+        rows.sort(key=lambda r: r.get("ts_min") or r.get("ts_snapshot"), reverse=True)
+
+    return rows
 
 
 def insert_ticks_batch(ticks: list):
