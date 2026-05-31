@@ -40120,5 +40120,64 @@ def debug_micro_absorption_snapshots():  # noqa: C901
     return html
 
 
+@app.route("/debug/micro-diag")
+def debug_micro_diag():
+    """Diagnóstico temporário — identifica por que /debug/micro-absorption-snapshots retorna 404."""
+    import traceback
+    import json as _json
+
+    results = {}
+
+    # 1. Rota está registrada no URL map?
+    registered = [str(r) for r in app.url_map.iter_rules()
+                  if "micro" in str(r)]
+    results["routes_with_micro"] = registered
+
+    # 2. db.get_micro_absorption_snapshots existe?
+    results["db_func_exists"] = hasattr(db, "get_micro_absorption_snapshots")
+
+    # 3. Tabela existe no banco?
+    try:
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_name = 'micro_absorption_snapshots'
+                )
+            """)
+            results["table_exists"] = cur.fetchone()["exists"]
+    except Exception as e:
+        results["table_check_error"] = str(e)
+
+    # 4. Tenta chamar db.get_micro_absorption_snapshots
+    try:
+        rows = db.get_micro_absorption_snapshots(days=1, mint=None, limit=5)
+        results["db_call_ok"] = True
+        results["rows_returned"] = len(rows)
+    except Exception as e:
+        results["db_call_ok"] = False
+        results["db_call_error"] = str(e)
+        results["db_call_traceback"] = traceback.format_exc()
+
+    # 5. Colunas da tabela (se existir)
+    if results.get("table_exists"):
+        try:
+            with db._cursor() as cur:
+                cur.execute("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_name = 'micro_absorption_snapshots'
+                    ORDER BY ordinal_position
+                """)
+                results["columns"] = [r["column_name"] for r in cur.fetchall()]
+        except Exception as e:
+            results["columns_error"] = str(e)
+
+    return app.response_class(
+        response=_json.dumps(results, indent=2, default=str),
+        status=200,
+        mimetype="application/json",
+    )
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
