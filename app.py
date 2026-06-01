@@ -41973,5 +41973,270 @@ th{{background:#eee}}
     return render_template_string(html)
 
 
+@app.route("/debug/pool-deep-tokens")
+def debug_pool_deep_tokens():
+    """Tokens com pool_quote > threshold: fundo capturado + outcome simulado + links."""
+    from collections import defaultdict
+    from datetime import timedelta, timezone
+
+    days       = int(request.args.get("days", 14))
+    pool_min   = float(request.args.get("pool_min", 90))
+    entry_pct  = float(request.args.get("entry_pct", 0.10))
+    tp_pct     = float(request.args.get("tp_pct", 0.75))
+    sl_pct     = float(request.args.get("sl_pct", 0.25))
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    import psycopg2, psycopg2.extras
+    conn = psycopg2.connect(db.DATABASE_URL)
+    conn.autocommit = True
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    # ── 1. Melhor snapshot por (mint, ts_min) com pool_quote >= threshold ──────
+    cur.execute("""
+        SELECT DISTINCT ON (mint, ts_min)
+            mint, symbol, ts_min, ts_migration,
+            mc_min, mc_migration, bounce_pct_now, drop_from_mig,
+            elapsed_sec, pool_quote,
+            pre_10s_net, pre_30s_net,
+            rise_5s_net, rise_10s_net,
+            bottom_age_sec
+        FROM micro_absorption_snapshots
+        WHERE ts_snapshot >= %(cutoff)s
+          AND pool_quote >= %(pool_min)s
+          AND mc_min IS NOT NULL
+          AND ts_min IS NOT NULL
+        ORDER BY mint, ts_min, bottom_age_sec DESC
+    """, {"cutoff": cutoff, "pool_min": pool_min})
+    bottoms = [dict(r) for r in cur.fetchall()]
+
+    rows = []
+    if bottoms:
+        mints = list({b["mint"] for b in bottoms})
+        ts_floor = min(b["ts_min"] for b in bottoms)
+        ts_ceil  = max(b["ts_min"] for b in bottoms) + timedelta(hours=1, minutes=5)
+
+        cur.execute("""
+            SELECT mint, tick_ts, mc, mc_open, mc_high, mc_low, source
+            FROM token_ticks
+            WHERE mint = ANY(%(mints)s)
+              AND tick_ts >  %(ts_floor)s
+              AND tick_ts <= %(ts_ceil)s
+            ORDER BY mint, tick_ts
+        """, {"mints": mints, "ts_floor": ts_floor, "ts_ceil": ts_ceil})
+        ticks_by_mint = defaultdict(list)
+        for t in cur.fetchall():
+            ticks_by_mint[t["mint"]].append(dict(t))
+
+        # ── 2. Simula TP/SL para cada bottom ────────────────────────────────
+        entry_mult = 1.0 + entry_pct
+        tp_mult    = 1.0 + tp_pct
+        sl_mult    = 1.0 - sl_pct
+
+        for b in bottoms:
+            mc_min_v   = b["mc_min"] or 0
+            ts_min_v   = b["ts_min"]
+            ts_end     = ts_min_v + timedelta(minutes=60)
+            entry_mc   = mc_min_v * entry_mult
+            tp_mc      = entry_mc * tp_mult
+            sl_mc      = entry_mc * sl_mult
+
+            window = [t for t in ticks_by_mint[b["mint"]]
+                      if t["tick_ts"] > ts_min_v and t["tick_ts"] <= ts_end]
+
+            ts_tp = ts_sl = None
+            max_mc = entry_mc
+            for t in window:
+                if t["source"] == "kline":
+                    hi = t["mc_high"] or t["mc"] or 0
+                    lo = t["mc_low"]  or t["mc"] or 0
+                else:
+                    hi = lo = t["mc"] or 0
+                if hi > max_mc:
+                    max_mc = hi
+                tp_hit = hi >= tp_mc
+                sl_hit = lo <= sl_mc
+                if tp_hit and sl_hit:
+                    mc_open  = t.get("mc_open") or t["mc"] or 0
+                    midpoint = (tp_mc + sl_mc) / 2
+                    if mc_open >= midpoint:
+                        if ts_tp is None: ts_tp = t["tick_ts"]
+                    else:
+                        if ts_sl is None: ts_sl = t["tick_ts"]
+                elif tp_hit and ts_tp is None:
+                    ts_tp = t["tick_ts"]
+                elif sl_hit and ts_sl is None:
+                    ts_sl = t["tick_ts"]
+                if ts_tp and ts_sl:
+                    break
+
+            if ts_tp and ts_sl:
+                outcome = "tp" if ts_tp <= ts_sl else "sl"
+            elif ts_tp:
+                outcome = "tp"
+            elif ts_sl:
+                outcome = "sl"
+            else:
+                outcome = "no_exit"
+
+            exit_ts = ts_tp if outcome == "tp" else (ts_sl if outcome == "sl" else None)
+            min_exit = round((exit_ts - ts_min_v).total_seconds() / 60, 1) if exit_ts else None
+            max_gain = round((max_mc / entry_mc - 1) * 100, 1) if entry_mc > 0 else None
+
+            rows.append({
+                **b,
+                "entry_mc":   entry_mc,
+                "tp_mc":      tp_mc,
+                "sl_mc":      sl_mc,
+                "outcome":    outcome,
+                "n_ticks":    len(window),
+                "min_exit":   min_exit,
+                "max_gain":   max_gain,
+            })
+
+    cur.close()
+    conn.close()
+
+    # Sort by ts_min DESC
+    rows.sort(key=lambda r: r["ts_min"], reverse=True)
+
+    # ── Sumário ────────────────────────────────────────────────────────────────
+    n_tp  = sum(1 for r in rows if r["outcome"] == "tp")
+    n_sl  = sum(1 for r in rows if r["outcome"] == "sl")
+    n_ne  = sum(1 for r in rows if r["outcome"] == "no_exit")
+    n_tot = len(rows)
+    wr    = n_tp / (n_tp + n_sl) * 100 if (n_tp + n_sl) > 0 else 0
+    ev    = (n_tp * tp_pct - (n_sl + n_ne) * sl_pct) / n_tot * 100 if n_tot > 0 else 0
+
+    def _fmt(v, prefix="$", decimals=0):
+        if v is None: return "—"
+        if decimals == 0: return f"{prefix}{v:,.0f}"
+        return f"{prefix}{v:,.{decimals}f}"
+
+    def _pct(v):
+        if v is None: return "—"
+        return f"{v:+.1f}%"
+
+    def _outcome_cell(o):
+        if o == "tp":
+            return '<td style="background:#c8f7c5;font-weight:bold;text-align:center">✅ TP</td>'
+        if o == "sl":
+            return '<td style="background:#fdc7c7;font-weight:bold;text-align:center">❌ SL</td>'
+        return '<td style="background:#fff3cd;text-align:center">⏳ no_exit</td>'
+
+    def _flow(v):
+        if v is None: return "—"
+        color = "#1a7f37" if v > 0 else ("#cc0000" if v < 0 else "#888")
+        return f'<span style="color:{color}">{v:+.2f}</span>'
+
+    # Build rows HTML
+    rows_html = ""
+    for r in rows:
+        mint = r["mint"] or ""
+        sym  = r["symbol"] or mint[:8]
+        ts   = r["ts_min"].strftime("%m/%d %H:%M") if r["ts_min"] else "—"
+        pool = f"{r['pool_quote']:.0f}" if r.get("pool_quote") else "—"
+        mc_m = _fmt(r.get("mc_migration"))
+        mc_b = _fmt(r.get("mc_min"))
+        drop = _pct(r.get("drop_from_mig") and r["drop_from_mig"] * 100)
+        bpct = _pct(r.get("bounce_pct_now") and r["bounce_pct_now"] * 100)
+        ela  = f"{r['elapsed_sec']:.0f}s" if r.get("elapsed_sec") else "—"
+        ent  = _fmt(r.get("entry_mc"))
+        tp_v = _fmt(r.get("tp_mc"))
+        sl_v = _fmt(r.get("sl_mc"))
+        ntk  = r.get("n_ticks", 0)
+        mex  = f"{r['min_exit']}m" if r.get("min_exit") else "—"
+        mg   = _pct(r.get("max_gain"))
+        p10  = _flow(r.get("pre_10s_net"))
+        r5   = _flow(r.get("rise_5s_net"))
+        age  = f"{r.get('bottom_age_sec','?')}s"
+        gmgn = f'<a href="https://gmgn.ai/sol/token/{mint}" target="_blank">GMGN</a>'
+        dex  = f'<a href="https://dexscreener.com/solana/{mint}" target="_blank">DS</a>'
+
+        rows_html += f"""<tr>
+  <td>{ts}</td>
+  <td><b>{sym}</b></td>
+  <td style="font-size:10px">{mint[:12]}…</td>
+  <td style="text-align:right"><b>{pool}</b></td>
+  <td style="text-align:right">{mc_m}</td>
+  <td style="text-align:right">{mc_b}</td>
+  <td style="text-align:right">{drop}</td>
+  <td style="text-align:right">{ela}</td>
+  <td style="text-align:right">{ent}</td>
+  <td style="text-align:right">{tp_v}</td>
+  <td style="text-align:right">{sl_v}</td>
+  <td style="text-align:center">{ntk}</td>
+  {_outcome_cell(r["outcome"])}
+  <td style="text-align:center">{mex}</td>
+  <td style="text-align:right">{mg}</td>
+  <td style="text-align:right">{p10}</td>
+  <td style="text-align:right">{r5}</td>
+  <td style="text-align:center">{age}</td>
+  <td>{gmgn} {dex}</td>
+</tr>"""
+
+    wr_color = "#1a7f37" if wr >= 40 else ("#cc0000" if wr < 25 else "#856404")
+    ev_color = "#1a7f37" if ev > 0 else "#cc0000"
+
+    html = f"""<!DOCTYPE html><html><head><title>Pool Deep Tokens</title>
+<meta http-equiv="refresh" content="60">
+<style>
+body{{font-family:monospace;font-size:12px;padding:16px;background:#fafafa}}
+h2{{margin-bottom:6px}}
+table{{border-collapse:collapse;width:100%}}
+td,th{{padding:3px 6px;border:1px solid #ccc;white-space:nowrap}}
+th{{background:#eee;text-align:left}}
+.card{{display:inline-block;margin:3px;padding:5px 10px;background:#fff;
+       border:1px solid #ddd;border-radius:4px;text-align:center;min-width:90px}}
+.card b{{display:block;font-size:15px}}
+.card small{{color:#888;font-size:10px}}
+a{{color:#0060df}}
+</style></head><body>
+<h2>🏊 Tokens com Pool &gt; {pool_min:.0f} SOL — últimos {days} dias</h2>
+<p style="color:#666;font-size:11px">
+  Simulação: entry +{entry_pct:.0%} do fundo | TP +{tp_pct:.0%} | SL -{sl_pct:.0%} |
+  Parâmetros: <a href="?days={days}&pool_min={pool_min}&entry_pct={entry_pct}&tp_pct={tp_pct}&sl_pct={sl_pct}">atual</a> |
+  Pool: <a href="?days={days}&pool_min=50">50+</a>
+  <a href="?days={days}&pool_min=70">70+</a>
+  <a href="?days={days}&pool_min=90">90+</a>
+  <a href="?days={days}&pool_min=120">120+</a> |
+  Dias: <a href="?days=7&pool_min={pool_min:.0f}">7d</a>
+  <a href="?days=14&pool_min={pool_min:.0f}">14d</a>
+  <a href="?days=30&pool_min={pool_min:.0f}">30d</a>
+</p>
+
+<div style="margin-bottom:10px">
+  <div class="card"><b>{n_tot}</b><small>eventos</small></div>
+  <div class="card"><b style="color:{wr_color}">{wr:.1f}%</b><small>WR (TP/TP+SL)</small></div>
+  <div class="card"><b style="color:{ev_color}">{ev:+.1f}%</b><small>EV/trade</small></div>
+  <div class="card"><b style="color:#1a7f37">{n_tp}</b><small>TP</small></div>
+  <div class="card"><b style="color:#cc0000">{n_sl}</b><small>SL</small></div>
+  <div class="card"><b style="color:#856404">{n_ne}</b><small>no_exit</small></div>
+</div>
+
+<table>
+<thead><tr>
+  <th>Hora</th><th>Token</th><th>Mint</th>
+  <th>Pool SOL</th><th>MC Mig.</th><th>MC Fundo</th>
+  <th>Drop%</th><th>t→fundo</th>
+  <th>Entry</th><th>TP alvo</th><th>SL alvo</th>
+  <th>Ticks</th><th>Outcome</th><th>Saída</th><th>Max Gain</th>
+  <th>Pre10</th><th>Rise5</th><th>Snap age</th><th>Links</th>
+</tr></thead>
+<tbody>
+{rows_html if rows_html else '<tr><td colspan="19" style="text-align:center;color:#888">Nenhum evento encontrado com pool ≥ ' + str(pool_min) + ' SOL nos últimos ' + str(days) + ' dias</td></tr>'}
+</tbody>
+</table>
+
+<p style="color:#888;font-size:10px;margin-top:10px">
+  Auto-refresh 60s | Drop% = queda da migração ao fundo | t→fundo = elapsed desde migração |
+  Pre10 / Rise5 = fluxo líquido SOL (verde=compra, vermelho=venda) |
+  Snap age = antiguidade do snapshot no momento da captura |
+  Outcome simulado a partir do mc_min capturado pelo erpc, SEM execução real
+</p>
+</body></html>"""
+    return render_template_string(html)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
