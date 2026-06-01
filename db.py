@@ -1304,7 +1304,8 @@ def get_micro_outcomes(
         ]
 
         ts_tp = ts_sl = None
-        max_mc_seen = entry_mc
+        entry_hit = False
+        max_mc_seen = 0
 
         for t in window_ticks:  # já vem ordenado por tick_ts
             if t["source"] == "kline":
@@ -1313,7 +1314,13 @@ def get_micro_outcomes(
             else:
                 high = low = t["mc"] or 0
 
-            if high > max_mc_seen:
+            # Rastreia quando atinge entry_mc — só contar max APÓS isso
+            if not entry_hit and high >= entry_mc:
+                entry_hit = True
+                max_mc_seen = high
+
+            # Atualiza max_mc apenas após atingir entry
+            if entry_hit and high > max_mc_seen:
                 max_mc_seen = high
 
             tp_hit = high >= tp_mc
@@ -1346,6 +1353,11 @@ def get_micro_outcomes(
 
         exit_ts = ts_tp if outcome == "tp" else (ts_sl if outcome == "sl" else None)
         elapsed_exit = (exit_ts - ts_min).total_seconds() / 60 if exit_ts else None
+
+        # Fallback: se nunca atingiu entry, max_mc = entry_mc (não pode ganhar sem entrar)
+        if not entry_hit:
+            max_mc_seen = entry_mc
+
         max_gain_pct = (max_mc_seen / entry_mc - 1) * 100 if entry_mc > 0 else None
 
         results.append({
