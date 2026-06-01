@@ -1118,12 +1118,14 @@ def get_micro_absorption_snapshots(
     mint: Optional[str] = None,
     limit: int = 200,
     summary: bool = False,
+    min_age: Optional[float] = None,
 ) -> list:
     """Retorna micro snapshots recentes para inspeção de pesquisa.
 
     summary=True → uma linha por bounce (mint + ts_min), o snapshot com
     bottom_age_sec máximo (mais próximo dos 60s finais).
     summary=False → todas as linhas individualmente (série temporal).
+    min_age → filtra eventos com bottom_age_sec >= min_age (só eventos completos).
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     params: dict = {"limit": limit, "cutoff": cutoff}
@@ -1132,22 +1134,46 @@ def get_micro_absorption_snapshots(
         mint_clause = "AND mint = %(mint)s"
         params["mint"] = mint
 
+    age_having = ""
+    if min_age is not None:
+        age_having = "AND MAX(bottom_age_sec) >= %(min_age)s"
+        params["min_age"] = min_age
+
     if summary:
-        # Um row por bounce: o snapshot com maior bottom_age_sec no evento
-        query = f"""
-            SELECT DISTINCT ON (mint, ts_min) *
-            FROM micro_absorption_snapshots
-            WHERE ts_snapshot >= %(cutoff)s
-              {mint_clause}
-            ORDER BY mint, ts_min DESC, bottom_age_sec DESC
-            LIMIT %(limit)s
-        """
+        if min_age is not None:
+            # Filtra pares (mint, ts_min) cujo snapshot máximo passa do threshold,
+            # depois seleciona o snapshot mais completo de cada par.
+            query = f"""
+                WITH eligible AS (
+                    SELECT mint, ts_min
+                    FROM micro_absorption_snapshots
+                    WHERE ts_snapshot >= %(cutoff)s {mint_clause}
+                    GROUP BY mint, ts_min
+                    {age_having}
+                )
+                SELECT DISTINCT ON (s.mint, s.ts_min) s.*
+                FROM micro_absorption_snapshots s
+                JOIN eligible e ON s.mint = e.mint AND s.ts_min = e.ts_min
+                ORDER BY s.mint, s.ts_min DESC, s.bottom_age_sec DESC
+                LIMIT %(limit)s
+            """
+        else:
+            query = f"""
+                SELECT DISTINCT ON (mint, ts_min) *
+                FROM micro_absorption_snapshots
+                WHERE ts_snapshot >= %(cutoff)s
+                  {mint_clause}
+                ORDER BY mint, ts_min DESC, bottom_age_sec DESC
+                LIMIT %(limit)s
+            """
     else:
+        age_clause = "AND bottom_age_sec >= %(min_age)s" if min_age is not None else ""
         query = f"""
             SELECT *
             FROM micro_absorption_snapshots
             WHERE ts_snapshot >= %(cutoff)s
               {mint_clause}
+              {age_clause}
             ORDER BY ts_snapshot DESC
             LIMIT %(limit)s
         """
@@ -1157,10 +1183,36 @@ def get_micro_absorption_snapshots(
         rows = [dict(row) for row in cur.fetchall()]
 
     if summary:
-        # Re-ordena por ts_min DESC após o DISTINCT ON
         rows.sort(key=lambda r: r.get("ts_min") or r.get("ts_snapshot"), reverse=True)
 
     return rows
+
+
+def get_micro_absorption_stats(days: int = 1, mint: Optional[str] = None) -> dict:
+    """Conta totais de snapshots, bounce events e tokens no período."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    params: dict = {"cutoff": cutoff}
+    mint_clause = ""
+    if mint:
+        mint_clause = "AND mint = %(mint)s"
+        params["mint"] = mint
+
+    query = f"""
+        SELECT
+            COUNT(*)                                          AS total_snapshots,
+            COUNT(DISTINCT (mint, ts_min))                   AS total_bounces,
+            COUNT(DISTINCT mint)                             AS total_tokens,
+            COUNT(DISTINCT (mint, ts_min))
+              FILTER (WHERE bottom_age_sec >= 50)            AS complete_bounces,
+            MIN(ts_snapshot)                                 AS first_ts,
+            MAX(ts_snapshot)                                 AS last_ts
+        FROM micro_absorption_snapshots
+        WHERE ts_snapshot >= %(cutoff)s {mint_clause}
+    """
+    with _cursor() as cur:
+        cur.execute(query, params)
+        row = cur.fetchone()
+    return dict(row) if row else {}
 
 
 def insert_ticks_batch(ticks: list):

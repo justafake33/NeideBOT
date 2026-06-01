@@ -39959,11 +39959,12 @@ def debug_micro_absorption_snapshots():  # noqa: C901
     import io
     import json as _json
 
-    days_raw  = request.args.get("days",   "1")
-    mint_raw  = request.args.get("mint",   "").strip() or None
-    limit_raw = request.args.get("limit",  "200")
-    fmt       = request.args.get("format", "html").lower()
-    mode      = request.args.get("mode",   "summary").lower()  # summary | full
+    days_raw    = request.args.get("days",    "1")
+    mint_raw    = request.args.get("mint",    "").strip() or None
+    limit_raw   = request.args.get("limit",   "200")
+    fmt         = request.args.get("format",  "html").lower()
+    mode        = request.args.get("mode",    "summary").lower()  # summary | full
+    min_age_raw = request.args.get("min_age", "").strip()         # e.g. 50
 
     try:
         days  = max(1, int(days_raw))
@@ -39973,10 +39974,15 @@ def debug_micro_absorption_snapshots():  # noqa: C901
         limit = max(1, min(5000, int(limit_raw)))
     except ValueError:
         limit = 200
+    try:
+        min_age = float(min_age_raw) if min_age_raw else None  # type: ignore[assignment]
+    except ValueError:
+        min_age = None
 
     summary = (mode != "full")
+    stats = db.get_micro_absorption_stats(days=days, mint=mint_raw)
     rows = db.get_micro_absorption_snapshots(days=days, mint=mint_raw, limit=limit,
-                                              summary=summary)
+                                              summary=summary, min_age=min_age)
 
     # ── JSON ─────────────────────────────────────────────────────────────────
     if fmt == "json":
@@ -40083,6 +40089,14 @@ def debug_micro_absorption_snapshots():  # noqa: C901
     mode_label  = "sumário (1 linha/bounce)" if summary else "completo (série temporal)"
     base_args   = f"days={days}&limit={limit}" + (f"&mint={mint_raw}" if mint_raw else "")
     toggle_mode = "full" if summary else "summary"
+    age_arg     = f"&min_age={int(min_age)}" if min_age is not None else ""
+
+    total_snaps    = stats.get("total_snapshots") or 0
+    total_bounces  = stats.get("total_bounces") or 0
+    total_tokens   = stats.get("total_tokens") or 0
+    complete_ev    = stats.get("complete_bounces") or 0
+    age_note       = f" · filtrando bottom_age ≥ {int(min_age)}s" if min_age is not None else ""
+
     html = f"""<!DOCTYPE html><html><head>
 <title>Micro Absorption Snapshots</title>
 <meta charset='utf-8'>
@@ -40095,20 +40109,33 @@ def debug_micro_absorption_snapshots():  # noqa: C901
   th {{ background: #222; color: #9af; position: sticky; top: 0; }}
   tr:hover {{ background: #1a1a2e; }}
   .note {{ color: #888; font-size: 11px; }}
+  .stat {{ display:inline-block; background:#1a1a2e; border:1px solid #333;
+           padding:4px 10px; margin:2px 4px 6px 0; border-radius:4px; }}
+  .stat b {{ color:#fff; }}
+  .stat span {{ color:#888; font-size:10px; }}
   a {{ color: #9af; }}
 </style>
 </head><body>
 <h2>Micro Absorption Snapshots — Fase 1 V2</h2>
+<div>
+  <div class='stat'><b>{total_tokens}</b> <span>tokens únicos</span></div>
+  <div class='stat'><b>{total_bounces}</b> <span>bounce events (mint+ts_min)</span></div>
+  <div class='stat'><b>{complete_ev}</b> <span>completos (age≥50s)</span></div>
+  <div class='stat'><b>{total_snaps}</b> <span>snapshots brutos</span></div>
+</div>
 <p class='note'>
-  Mostrando <b>{len(rows)}</b> registros · modo: <b>{mode_label}</b> · {filter_note}<br>
-  Modo: <a href='?{base_args}&mode={toggle_mode}'>{"ver série temporal completa" if summary else "ver sumário (1/bounce)"}</a>
+  Mostrando <b>{len(rows)}</b> registros · modo: <b>{mode_label}</b> · {filter_note}{age_note}<br>
+  Modo: <a href='?{base_args}&mode={toggle_mode}{age_arg}'>{"ver série temporal completa" if summary else "ver sumário (1/bounce)"}</a>
   &nbsp;|&nbsp;
-  Dias: <a href='?{base_args}&mode={mode}&days=1'>1d</a>
-        <a href='?{base_args}&mode={mode}&days=3'>3d</a>
-        <a href='?{base_args}&mode={mode}&days=7'>7d</a>
+  Dias: <a href='?{base_args}&mode={mode}{age_arg}&days=1'>1d</a>
+        <a href='?{base_args}&mode={mode}{age_arg}&days=3'>3d</a>
+        <a href='?{base_args}&mode={mode}{age_arg}&days=7'>7d</a>
   &nbsp;|&nbsp;
-  Formatos: <a href='?{base_args}&mode={mode}&format=json'>JSON</a>
-           | <a href='?{base_args}&mode={mode}&format=csv'>CSV</a>
+  Filtro: <a href='?{base_args}&mode={mode}&days={days}'>todos</a>
+          <a href='?{base_args}&mode={mode}&days={days}&min_age=50'>só completos (≥50s)</a>
+  &nbsp;|&nbsp;
+  Formatos: <a href='?{base_args}&mode={mode}{age_arg}&format=json'>JSON</a>
+           | <a href='?{base_args}&mode={mode}{age_arg}&format=csv'>CSV</a>
 </p>
 <table>
 <thead><tr>
