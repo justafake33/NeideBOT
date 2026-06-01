@@ -42048,12 +42048,21 @@ def debug_pool_deep_tokens():
 
             ts_tp = ts_sl = None
             max_mc = entry_mc
+            first_kline = True  # primeira vela kline após ts_min: mc_high pertence à descida
             for t in window:
                 if t["source"] == "kline":
-                    hi = t["mc_high"] or t["mc"] or 0
-                    lo = t["mc_low"]  or t["mc"] or 0
+                    # Na primeira vela kline, mc_high foi atingido ANTES do fundo (na descida).
+                    # Usar apenas mc_close para TP nessa vela — evita falso TP.
+                    if first_kline:
+                        hi = t["mc"] or 0          # mc_close da vela do fundo
+                        lo = t["mc_low"] or t["mc"] or 0
+                        first_kline = False
+                    else:
+                        hi = t["mc_high"] or t["mc"] or 0
+                        lo = t["mc_low"]  or t["mc"] or 0
                 else:
                     hi = lo = t["mc"] or 0
+                    first_kline = False  # trenches tick conta como separador
                 if hi > max_mc:
                     max_mc = hi
                 tp_hit = hi >= tp_mc
