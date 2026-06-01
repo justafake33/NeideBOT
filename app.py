@@ -39949,6 +39949,284 @@ Auto-refresh: 15s
     return html
 
 
+@app.route("/analise/micro-outcomes")
+def analise_micro_outcomes():  # noqa: C901
+    """Fase 2 V2 — correlaciona features de microestrutura (PRE/RISE) com outcome TP/SL.
+
+    Params: days=7, min_age=50, entry=0.15, tp=0.75, sl=0.25
+    Entry simulado: mc_min * (1+entry). TP/SL caminhados via token_ticks 60min.
+    """
+    import statistics
+
+    days_raw  = request.args.get("days",  "7")
+    entry_raw = request.args.get("entry", "0.15")
+    tp_raw    = request.args.get("tp",    "0.75")
+    sl_raw    = request.args.get("sl",    "0.25")
+    try:    days      = max(1, min(30, int(days_raw)))
+    except: days      = 7
+    try:    entry_pct = max(0.0, min(1.0, float(entry_raw)))
+    except: entry_pct = 0.15
+    try:    tp_pct    = max(0.1, min(5.0, float(tp_raw)))
+    except: tp_pct    = 0.75
+    try:    sl_pct    = max(0.05, min(0.9, float(sl_raw)))
+    except: sl_pct    = 0.25
+
+    rows = db.get_micro_outcomes(days=days, entry_pct=entry_pct, tp_pct=tp_pct, sl_pct=sl_pct)
+
+    # ── Partições ────────────────────────────────────────────────────────────
+    with_ticks  = [r for r in rows if r["tick_count"] > 0]
+    no_ticks    = [r for r in rows if r["tick_count"] == 0]
+    tp_rows     = [r for r in with_ticks if r["outcome"] == "tp"]
+    sl_rows     = [r for r in with_ticks if r["outcome"] == "sl"]
+    noexit_rows = [r for r in with_ticks if r["outcome"] == "no_exit"]
+
+    n_total   = len(rows)
+    n_ticks   = len(with_ticks)
+    n_tp      = len(tp_rows)
+    n_sl      = len(sl_rows)
+    n_noexit  = len(noexit_rows)
+    wr        = n_tp / n_ticks * 100 if n_ticks > 0 else 0
+
+    def _avg(lst, key):
+        vals = [r[key] for r in lst if r.get(key) is not None]
+        return statistics.mean(vals) if vals else None
+
+    def _fmtv(v, d=2):
+        if v is None: return "—"
+        return f"{v:+.{d}f}"
+
+    def _fmtp(v):
+        if v is None: return "—"
+        return f"{v:.1f}%"
+
+    # ── Tabela de correlação de features ─────────────────────────────────────
+    FEATURES = [
+        # (col_name, label, decimals)
+        ("pre_30s_net",          "PRE-30s net SOL",        2),
+        ("pre_10s_net",          "PRE-10s net SOL",        2),
+        ("pre_5s_net",           "PRE-5s net SOL",         2),
+        ("pre_15s_net",          "PRE-15s net SOL",        2),
+        ("pre_30s_buy",          "PRE-30s buy vol",        2),
+        ("pre_30s_sell",         "PRE-30s sell vol",       2),
+        ("pre_10s_buy",          "PRE-10s buy vol",        2),
+        ("pre_10s_sell",         "PRE-10s sell vol",       2),
+        ("pre_5s_largest_buy",   "PRE-5s largest buy",     2),
+        ("pre_30s_largest_buy",  "PRE-30s largest buy",    2),
+        ("buy_concentration_5s", "Buy concentration 5s",   3),
+        ("buy_concentration_10s","Buy concentration 10s",  3),
+        ("rise_1s_net",          "RISE-1s net SOL",        2),
+        ("rise_3s_net",          "RISE-3s net SOL",        2),
+        ("rise_5s_net",          "RISE-5s net SOL",        2),
+        ("rise_10s_net",         "RISE-10s net SOL",       2),
+        ("rise_now_net",         "RISE-now net SOL",       2),
+        ("live_5s_net",          "LIVE-5s net SOL",        2),
+        ("live_10s_net",         "LIVE-10s net SOL",       2),
+        ("pool_quote",           "Pool depth (SOL)",       1),
+        ("bounce_pct_now",       "Bounce% (60s janela)",   3),
+        ("drop_from_mig",        "Drop from migration",    3),
+        ("elapsed_sec",          "Elapsed (s) mig→fundo",  0),
+    ]
+
+    feat_rows = []
+    for col, label, dec in FEATURES:
+        avg_tp  = _avg(tp_rows, col)
+        avg_sl  = _avg(sl_rows, col)
+        avg_all = _avg(with_ticks, col)
+        n_col   = sum(1 for r in with_ticks if r.get(col) is not None)
+        delta   = (avg_tp - avg_sl) if avg_tp is not None and avg_sl is not None else None
+        feat_rows.append((col, label, dec, avg_tp, avg_sl, avg_all, delta, n_col))
+
+    feat_rows.sort(key=lambda x: abs(x[6]) if x[6] is not None else 0, reverse=True)
+
+    feat_html = ""
+    for col, label, dec, avg_tp, avg_sl, avg_all, delta, n_col in feat_rows:
+        if delta is None:
+            continue
+        d_color = "#2ecc71" if delta > 0 else "#e74c3c"
+        feat_html += f"""<tr>
+            <td style='text-align:left'>{label}</td>
+            <td>{_fmtv(avg_tp, dec)}</td>
+            <td>{_fmtv(avg_sl, dec)}</td>
+            <td>{_fmtv(avg_all, dec)}</td>
+            <td style='color:{d_color};font-weight:bold'>{_fmtv(delta, dec)}</td>
+            <td style='color:#888'>{n_col}</td>
+        </tr>"""
+
+    # ── Bucket analysis para pre_30s_net ─────────────────────────────────────
+    BUCKETS_30S = [
+        ("< -10 SOL",  lambda v: v < -10),
+        ("-10 a -5",   lambda v: -10 <= v < -5),
+        ("-5 a 0",     lambda v: -5 <= v < 0),
+        ("0 a +5",     lambda v: 0 <= v < 5),
+        ("+5 a +10",   lambda v: 5 <= v < 10),
+        ("> +10 SOL",  lambda v: v >= 10),
+    ]
+
+    def _bucket_row(label, subset):
+        n = len(subset)
+        if n == 0: return None
+        n_tp_ = sum(1 for r in subset if r["outcome"] == "tp")
+        n_sl_ = sum(1 for r in subset if r["outcome"] == "sl")
+        wr_   = n_tp_ / n * 100
+        avg_exit = _avg([r for r in subset if r["outcome"] != "no_exit"], "elapsed_exit_min")
+        avg_gain = _avg(subset, "max_gain_pct")
+        return (label, n, n_tp_, n_sl_, n - n_tp_ - n_sl_, wr_, avg_exit, avg_gain)
+
+    bucket_html = ""
+    for label, fn in BUCKETS_30S:
+        subset = [r for r in with_ticks if r.get("pre_30s_net") is not None and fn(r["pre_30s_net"])]
+        row = _bucket_row(label, subset)
+        if not row: continue
+        lbl, n, ntp, nsl, nne, wr_, aex, agn = row
+        wr_color = "#2ecc71" if wr_ >= wr else ("#e74c3c" if wr_ < wr * 0.5 else "#f39c12")
+        bucket_html += f"""<tr>
+            <td style='text-align:left'>{lbl}</td>
+            <td>{n}</td>
+            <td style='color:#2ecc71'>{ntp}</td>
+            <td style='color:#e74c3c'>{nsl}</td>
+            <td style='color:#888'>{nne}</td>
+            <td style='color:{wr_color};font-weight:bold'>{wr_:.1f}%</td>
+            <td>{_fmtv(aex, 1) if aex else "—"} min</td>
+            <td>{_fmtv(agn, 1) if agn else "—"}%</td>
+        </tr>"""
+
+    # ── Pool depth buckets ────────────────────────────────────────────────────
+    POOL_BUCKETS = [
+        ("10-30 SOL",  lambda v: 10 <= v < 30),
+        ("30-60 SOL",  lambda v: 30 <= v < 60),
+        ("60-90 SOL",  lambda v: 60 <= v < 90),
+        ("> 90 SOL",   lambda v: v >= 90),
+    ]
+    pool_html = ""
+    for label, fn in POOL_BUCKETS:
+        subset = [r for r in with_ticks if r.get("pool_quote") and fn(r["pool_quote"])]
+        row = _bucket_row(label, subset)
+        if not row: continue
+        lbl, n, ntp, nsl, nne, wr_, aex, agn = row
+        wr_color = "#2ecc71" if wr_ >= wr else ("#e74c3c" if wr_ < wr * 0.5 else "#f39c12")
+        pool_html += f"""<tr>
+            <td style='text-align:left'>{lbl}</td>
+            <td>{n}</td>
+            <td style='color:#2ecc71'>{ntp}</td>
+            <td style='color:#e74c3c'>{nsl}</td>
+            <td style='color:#888'>{nne}</td>
+            <td style='color:{wr_color};font-weight:bold'>{wr_:.1f}%</td>
+        </tr>"""
+
+    # ── HTML ─────────────────────────────────────────────────────────────────
+    base = f"days={days}&entry={entry_pct}&tp={tp_pct}&sl={sl_pct}"
+    avg_tp_exit  = _avg(tp_rows, "elapsed_exit_min")
+    avg_sl_exit  = _avg(sl_rows, "elapsed_exit_min")
+    avg_max_gain = _avg(with_ticks, "max_gain_pct")
+
+    html = f"""<!DOCTYPE html><html><head>
+<title>Micro Outcomes — Fase 2 V2</title>
+<meta charset='utf-8'>
+<style>
+  body  {{ font-family: monospace; font-size:12px; background:#111; color:#eee; padding:16px; }}
+  h2    {{ color:#f0a; margin-bottom:4px; }}
+  h3    {{ color:#9af; margin:18px 0 6px; border-bottom:1px solid #333; padding-bottom:4px; }}
+  table {{ border-collapse:collapse; margin-bottom:18px; }}
+  th,td {{ border:1px solid #333; padding:4px 8px; text-align:right; }}
+  th    {{ background:#1a1a2e; color:#9af; }}
+  tr:hover {{ background:#1a1a2e; }}
+  .stat {{ display:inline-block; background:#1a1a2e; border:1px solid #444; padding:6px 14px;
+           margin:3px 5px 8px 0; border-radius:4px; }}
+  .stat b {{ color:#fff; font-size:14px; }}
+  .stat span {{ color:#888; font-size:10px; }}
+  .cfg  {{ background:#1a1a2e; border:1px solid #333; padding:8px 12px; margin-bottom:14px;
+           border-radius:4px; font-size:11px; color:#aaa; }}
+  a {{ color:#9af; }}
+  .warn {{ color:#f39c12; }}
+</style></head><body>
+<h2>Micro Outcomes — Fase 2 V2</h2>
+
+<div class='cfg'>
+  <b>Config:</b>
+  entry +{entry_pct*100:.0f}% do fundo &nbsp;|&nbsp;
+  TP +{tp_pct*100:.0f}% da entrada &nbsp;|&nbsp;
+  SL -{sl_pct*100:.0f}% da entrada &nbsp;|&nbsp;
+  janela 60min token_ticks &nbsp;|&nbsp;
+  últimos {days}d
+  <br>
+  Ajustar:
+  <a href='?{base}&entry=0.10'>entry +10%</a>
+  <a href='?{base}&entry=0.15'>+15%</a>
+  <a href='?{base}&entry=0.20'>+20%</a>
+  <a href='?{base}&entry=0.30'>+30%</a>
+  &nbsp;|&nbsp;
+  <a href='?days=1&entry={entry_pct}&tp={tp_pct}&sl={sl_pct}'>1d</a>
+  <a href='?days=3&entry={entry_pct}&tp={tp_pct}&sl={sl_pct}'>3d</a>
+  <a href='?days=7&entry={entry_pct}&tp={tp_pct}&sl={sl_pct}'>7d</a>
+  <a href='?days=14&entry={entry_pct}&tp={tp_pct}&sl={sl_pct}'>14d</a>
+  &nbsp;|&nbsp;
+  <a href='?{base}&tp=0.50'>TP 50%</a>
+  <a href='?{base}&tp=0.75'>75%</a>
+  <a href='?{base}&tp=1.00'>100%</a>
+  &nbsp;|&nbsp;
+  <a href='?{base}&sl=0.15'>SL 15%</a>
+  <a href='?{base}&sl=0.25'>25%</a>
+</div>
+
+<div>
+  <div class='stat'><b>{n_total}</b> <span>bottom events (age≥50s)</span></div>
+  <div class='stat'><b>{n_ticks}</b> <span>com token_ticks</span></div>
+  <div class='stat'><b style='color:#e74c3c'>{n_total - n_ticks}</b> <span>sem ticks (excluídos)</span></div>
+  <div class='stat'><b style='color:#2ecc71'>{n_tp}</b> <span>TP (+{tp_pct*100:.0f}%)</span></div>
+  <div class='stat'><b style='color:#e74c3c'>{n_sl}</b> <span>SL (-{sl_pct*100:.0f}%)</span></div>
+  <div class='stat'><b style='color:#888'>{n_noexit}</b> <span>no exit (60min)</span></div>
+  <div class='stat'><b style='color:{"#2ecc71" if wr >= 20 else "#f39c12"}'>{wr:.1f}%</b> <span>Win Rate</span></div>
+  <div class='stat'><b>{_fmtv(avg_tp_exit,1) if avg_tp_exit else "—"} min</b> <span>avg tempo TP</span></div>
+  <div class='stat'><b>{_fmtv(avg_sl_exit,1) if avg_sl_exit else "—"} min</b> <span>avg tempo SL</span></div>
+  <div class='stat'><b>{_fmtv(avg_max_gain,1) if avg_max_gain else "—"}%</b> <span>avg max gain (vs entry)</span></div>
+</div>
+
+{"<p class='warn'>⚠️ n_ticks < 30 — dados insuficientes para conclusões.</p>" if n_ticks < 30 else ""}
+
+<h3>Correlação de Features — média por outcome (TP vs SL)</h3>
+<p style='color:#888;font-size:11px'>Ordenado por |Δ(TP−SL)| — features com maior poder discriminatório primeiro.</p>
+<table>
+<thead><tr>
+  <th style='text-align:left'>Feature</th>
+  <th>avg TP<br>(n={n_tp})</th>
+  <th>avg SL<br>(n={n_sl})</th>
+  <th>avg ALL<br>(n={n_ticks})</th>
+  <th>Δ (TP−SL)</th>
+  <th>n</th>
+</tr></thead>
+<tbody>{feat_html or "<tr><td colspan='6' style='text-align:center;color:#888'>sem dados</td></tr>"}</tbody>
+</table>
+
+<h3>Bucket Analysis — PRE-30s net SOL</h3>
+<p style='color:#888;font-size:11px'>Quem estava comprando nos 30s antes do fundo? Sinal de absorção vs capitulação pura.</p>
+<table>
+<thead><tr>
+  <th style='text-align:left'>PRE-30s net</th><th>n</th>
+  <th>TP</th><th>SL</th><th>no_exit</th><th>WR</th>
+  <th>avg exit</th><th>avg max gain</th>
+</tr></thead>
+<tbody>{bucket_html or "<tr><td colspan='8' style='text-align:center;color:#888'>sem dados</td></tr>"}</tbody>
+</table>
+
+<h3>Bucket Analysis — Pool Depth</h3>
+<p style='color:#888;font-size:11px'>Pool rasa = bounce é ruído de AMM. Pool funda = compras reais movem o preço.</p>
+<table>
+<thead><tr>
+  <th style='text-align:left'>Pool</th><th>n</th>
+  <th>TP</th><th>SL</th><th>no_exit</th><th>WR</th>
+</tr></thead>
+<tbody>{pool_html or "<tr><td colspan='6' style='text-align:center;color:#888'>sem dados</td></tr>"}</tbody>
+</table>
+
+<p style='color:#555;font-size:10px;margin-top:20px'>
+  Fonte: micro_absorption_snapshots (PRE/RISE features) × token_ticks (outcome simulado 60min).
+  Entry = mc_min × {entry_mult:.2f} | TP = entry × {1+tp_pct:.2f} | SL = entry × {1-sl_pct:.2f}
+</p>
+</body></html>"""
+
+    return html
+
+
 @app.route("/debug/micro-absorption-snapshots")
 def debug_micro_absorption_snapshots():  # noqa: C901
     """Fase 1 V2 — inspeção de micro snapshots de absorção (research-only).
