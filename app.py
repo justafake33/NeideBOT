@@ -41993,7 +41993,7 @@ def debug_pool_deep_tokens():
     conn.autocommit = True
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    # ── 1. Melhor snapshot por (mint, ts_min) com pool_quote >= threshold ──────
+    # ── 1. Melhor snapshot por (mint, ts_min) ────────────────────────────────
     cur.execute("""
         SELECT DISTINCT ON (mint, ts_min)
             mint, symbol, ts_min, ts_migration,
@@ -42014,10 +42014,27 @@ def debug_pool_deep_tokens():
 
     rows = []
     if bottoms:
-        mints = list({b["mint"] for b in bottoms})
-        ts_floor = min(b["ts_min"] for b in bottoms)
-        ts_ceil  = max(b["ts_min"] for b in bottoms) + timedelta(hours=1, minutes=5)
+        mints     = list({b["mint"] for b in bottoms})
+        ts_floor  = min(b["ts_min"] for b in bottoms)
+        ts_ceil   = max(b["ts_min"] for b in bottoms) + timedelta(hours=1, minutes=5)
 
+        # ── 2. Snapshots erpc por (mint, ts_min): preço real pós-fundo (2s..60s) ──
+        # Usados ANTES dos token_ticks para evitar artefato da vela do fundo.
+        cur.execute("""
+            SELECT mint, ts_min, ts_snapshot, bottom_age_sec, mc_current
+            FROM micro_absorption_snapshots
+            WHERE mint = ANY(%(mints)s)
+              AND ts_snapshot >= %(ts_floor)s
+              AND mc_current IS NOT NULL
+            ORDER BY mint, ts_min, bottom_age_sec
+        """, {"mints": mints, "ts_floor": ts_floor})
+        # erpc_by_key[(mint, ts_min)] = lista ordenada de {ts_snapshot, mc_current}
+        erpc_by_key = defaultdict(list)
+        for r in cur.fetchall():
+            key = (r["mint"], r["ts_min"])
+            erpc_by_key[key].append({"ts": r["ts_snapshot"], "mc": float(r["mc_current"] or 0)})
+
+        # ── 3. Token ticks para a janela de 60min (pós primeiro minuto) ──────────
         cur.execute("""
             SELECT mint, tick_ts, mc, mc_open, mc_high, mc_low, source
             FROM token_ticks
@@ -42030,7 +42047,7 @@ def debug_pool_deep_tokens():
         for t in cur.fetchall():
             ticks_by_mint[t["mint"]].append(dict(t))
 
-        # ── 2. Simula TP/SL para cada bottom ────────────────────────────────
+        # ── 4. Simula TP/SL para cada bottom ─────────────────────────────────────
         entry_mult = 1.0 + entry_pct
         tp_mult    = 1.0 + tp_pct
         sl_mult    = 1.0 - sl_pct
@@ -42043,26 +42060,40 @@ def debug_pool_deep_tokens():
             tp_mc      = entry_mc * tp_mult
             sl_mc      = entry_mc * sl_mult
 
-            window = [t for t in ticks_by_mint[b["mint"]]
-                      if t["tick_ts"] > ts_min_v and t["tick_ts"] <= ts_end]
+            # Fase 1: snapshots erpc (ts_min + 2s .. ts_min + 60s)
+            # Preço real post-fundo capturado pelo HeliusWS — sem artefato de OHLC.
+            erpc_snaps = erpc_by_key.get((b["mint"], ts_min_v), [])
 
             ts_tp = ts_sl = None
             max_mc = entry_mc
-            first_kline = True  # primeira vela kline após ts_min: mc_high pertence à descida
+
+            for s in erpc_snaps:
+                if s["ts"] <= ts_min_v:
+                    continue  # snap é do fundo ou antes — pula
+                mc_v = s["mc"]
+                if mc_v > max_mc:
+                    max_mc = mc_v
+                if mc_v >= tp_mc and ts_tp is None:
+                    ts_tp = s["ts"]
+                if mc_v <= sl_mc and ts_sl is None:
+                    ts_sl = s["ts"]
+                if ts_tp and ts_sl:
+                    break
+
+            # Fase 2: token_ticks — apenas candles INTEIRAMENTE após o fundo (60s gap)
+            # Ignora o primeiro candle kline que CONTÉM ts_min (mc_high é da descida).
+            ts_post_fundo = ts_min_v + timedelta(seconds=60)
+            window = [t for t in ticks_by_mint[b["mint"]]
+                      if t["tick_ts"] > ts_post_fundo and t["tick_ts"] <= ts_end]
+
             for t in window:
+                if ts_tp and ts_sl:
+                    break
                 if t["source"] == "kline":
-                    # Na primeira vela kline, mc_high foi atingido ANTES do fundo (na descida).
-                    # Usar apenas mc_close para TP nessa vela — evita falso TP.
-                    if first_kline:
-                        hi = t["mc"] or 0          # mc_close da vela do fundo
-                        lo = t["mc_low"] or t["mc"] or 0
-                        first_kline = False
-                    else:
-                        hi = t["mc_high"] or t["mc"] or 0
-                        lo = t["mc_low"]  or t["mc"] or 0
+                    hi = t["mc_high"] or t["mc"] or 0
+                    lo = t["mc_low"]  or t["mc"] or 0
                 else:
                     hi = lo = t["mc"] or 0
-                    first_kline = False  # trenches tick conta como separador
                 if hi > max_mc:
                     max_mc = hi
                 tp_hit = hi >= tp_mc
@@ -42078,8 +42109,6 @@ def debug_pool_deep_tokens():
                     ts_tp = t["tick_ts"]
                 elif sl_hit and ts_sl is None:
                     ts_sl = t["tick_ts"]
-                if ts_tp and ts_sl:
-                    break
 
             if ts_tp and ts_sl:
                 outcome = "tp" if ts_tp <= ts_sl else "sl"
