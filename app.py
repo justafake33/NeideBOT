@@ -39971,6 +39971,7 @@ def analise_micro_outcomes():  # noqa: C901
     try:    sl_pct    = max(0.05, min(0.9, float(sl_raw)))
     except: sl_pct    = 0.25
 
+    entry_mult = 1 + entry_pct
     rows = db.get_micro_outcomes(days=days, entry_pct=entry_pct, tp_pct=tp_pct, sl_pct=sl_pct)
 
     # ── Partições ────────────────────────────────────────────────────────────
