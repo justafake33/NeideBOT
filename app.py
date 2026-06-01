@@ -41112,5 +41112,866 @@ th{{background:#eee}}
     return render_template_string(html)
 
 
+@app.route("/analise/micro-outcomes-v2-2")
+def analise_micro_outcomes_v22():  # noqa: C901
+    """V2.2 — separação causal: ts_min / decision_ts / entry_ts por entry_mode."""
+    import json as _json
+
+    # ── Params ──────────────────────────────────────────────────────────────────
+    days         = int(request.args.get("days", 7))
+    decision_age = int(request.args.get("decision_age", 5))
+    entry_pct    = float(request.args.get("entry", 0.15))
+    tp_pct       = float(request.args.get("tp", 0.75))
+    sl_pct       = float(request.args.get("sl", 0.25))
+    entry_mode   = request.args.get("entry_mode", "decision_entry")
+    pullback_pct = float(request.args.get("pullback_pct", 0.0))
+    none_policy  = request.args.get("none_policy", "loss")
+    sc_pol       = request.args.get("same_candle_policy", "conservative_sl_first")
+    comp_sample  = request.args.get("comparison_sample", "available_by_age")
+    apply_locks  = request.args.get("apply_live_locks", "0") == "1"
+    min_n        = int(request.args.get("min_n", 20))
+    fmt          = request.args.get("format", "html")
+
+    _MODES = {"limit_from_bottom", "decision_entry", "pullback_after_decision"}
+    if entry_mode not in _MODES:
+        entry_mode = "decision_entry"
+    _AGES = [1, 3, 5, 10, 15, 30, 50]
+
+    # ── Helpers ─────────────────────────────────────────────────────────────────
+    def _s(v, d=None):
+        return v if v is not None else d
+
+    def _ts(dt):
+        try:
+            return dt.timestamp() if dt is not None else None
+        except Exception:
+            return None
+
+    def _get_snap(snaps, age):
+        for s in snaps:
+            if _s(s.get("bottom_age_sec"), -1) >= age:
+                return s
+        return None
+
+    # ── Core simulation ─────────────────────────────────────────────────────────
+    def _simulate(ticks, ts_min_ts, dec_ts, mc_min, mc_cur, em,
+                  epct, tpct, spct, pbpct, scp):
+        """Returns dict with all simulation fields."""
+        R = {
+            "entry_mc": None, "entry_search_start_ts": None,
+            "entry_hit_any_after_ts_min": False, "entry_hit_after_decision": False,
+            "entry_hit_valid_for_mode": False, "entry_before_decision": False,
+            "missed_pre_decision_entry": False,
+            "entry_ts_ts": None, "entry_latency_sec": None,
+            "tp_mc": None, "sl_mc": None,
+            "tp_ts_ts": None, "sl_ts_ts": None,
+            "same_candle_tp_sl_conflict": False,
+            "outcome": "no_ticks" if not ticks else "no_exit",
+            "max_gain_after_decision": None, "max_drawdown_after_decision": None,
+            "max_gain_after_entry": None, "max_drawdown_after_entry": None,
+            "tick_count_after_decision": 0, "tick_count_after_entry": 0,
+            "tick_coverage_ok": False,
+        }
+        if not ticks or not mc_min or mc_min <= 0 or ts_min_ts is None or dec_ts is None:
+            return R
+
+        # Determine entry target and search window
+        if em == "limit_from_bottom":
+            ent_mc = mc_min * (1.0 + epct)
+            ent_start = ts_min_ts
+        elif em == "decision_entry":
+            if not mc_cur or mc_cur <= 0:
+                R["outcome"] = "entry_not_hit"
+                return R
+            ent_mc = mc_cur
+            ent_start = dec_ts
+        else:  # pullback_after_decision
+            if pbpct > 0 and mc_cur and mc_cur > 0:
+                ent_mc = mc_cur * (1.0 - pbpct)
+            else:
+                ent_mc = mc_min * (1.0 + epct)
+            ent_start = dec_ts
+
+        R["entry_mc"] = ent_mc
+        R["entry_search_start_ts"] = ent_start
+        tp_mc_v = ent_mc * (1.0 + tpct)
+        sl_mc_v = ent_mc * (1.0 - spct)
+        R["tp_mc"] = tp_mc_v
+        R["sl_mc"] = sl_mc_v
+
+        # Pre-decision missed check (pullback mode only)
+        if em == "pullback_after_decision":
+            was_above = False
+            for t in ticks:
+                tts = _ts(t.get("tick_ts"))
+                if tts is None or tts <= ts_min_ts:
+                    continue
+                if tts >= dec_ts:
+                    break
+                src = t.get("source", "trenches")
+                hi = (t.get("mc_high") or t.get("mc") or 0) if src == "kline" else (t.get("mc") or 0)
+                lo = (t.get("mc_low") or t.get("mc") or 0) if src == "kline" else (t.get("mc") or 0)
+                if hi > ent_mc:
+                    was_above = True
+                if was_above and lo <= ent_mc:
+                    R["missed_pre_decision_entry"] = True
+                    break
+
+        # Main tick walk
+        entry_hit = False
+        entry_ts_v = None
+        any_hit = False
+        adec_hit = False
+        mx_dec = mn_dec = mx_ent = mn_ent = None
+        tad = tae = 0
+        resolved = False
+
+        for t in ticks:
+            tts = _ts(t.get("tick_ts"))
+            if tts is None or tts <= ts_min_ts:
+                continue
+            src = t.get("source", "trenches")
+            if src == "kline":
+                hi  = t.get("mc_high") or t.get("mc") or 0
+                lo  = t.get("mc_low")  or t.get("mc") or 0
+                mid = t.get("mc") or ((hi + lo) / 2 if hi and lo else 0)
+                op  = t.get("mc_open") or mid
+            else:
+                hi = lo = mid = op = t.get("mc") or 0
+            if not mid:
+                continue
+
+            if tts >= dec_ts:
+                tad += 1
+                mx_dec = max(mx_dec, hi) if mx_dec is not None else hi
+                mn_dec = min(mn_dec, lo) if mn_dec is not None else lo
+
+            # Entry detection phase
+            if not entry_hit:
+                fired = False
+                if em == "limit_from_bottom":
+                    if hi >= ent_mc:
+                        any_hit = True
+                        if tts >= dec_ts:
+                            adec_hit = True
+                        fired = True
+                        R["entry_before_decision"] = (tts < dec_ts)
+                elif em == "decision_entry":
+                    if tts >= dec_ts:
+                        any_hit = adec_hit = fired = True
+                else:  # pullback
+                    if tts >= dec_ts and lo <= ent_mc:
+                        any_hit = adec_hit = fired = True
+
+                if fired:
+                    entry_hit = True
+                    entry_ts_v = tts
+                    tae += 1
+                    mx_ent = hi
+                    mn_ent = lo
+                    if not resolved:
+                        tp_ec = hi >= tp_mc_v
+                        sl_ec = lo <= sl_mc_v
+                        if tp_ec and sl_ec:
+                            R["same_candle_tp_sl_conflict"] = True
+                            if scp == "conservative_sl_first":
+                                R["outcome"] = "sl"; R["sl_ts_ts"] = tts; resolved = True
+                            elif scp == "optimistic_tp_first":
+                                R["outcome"] = "tp"; R["tp_ts_ts"] = tts; resolved = True
+                            else:
+                                midpt = (tp_mc_v + sl_mc_v) / 2.0
+                                if op >= midpt:
+                                    R["outcome"] = "tp"; R["tp_ts_ts"] = tts
+                                else:
+                                    R["outcome"] = "sl"; R["sl_ts_ts"] = tts
+                                resolved = True
+                        elif tp_ec:
+                            R["outcome"] = "tp"; R["tp_ts_ts"] = tts; resolved = True
+                        elif sl_ec:
+                            R["outcome"] = "sl"; R["sl_ts_ts"] = tts; resolved = True
+                continue
+
+            # Post-entry TP/SL
+            tae += 1
+            mx_ent = max(mx_ent, hi) if mx_ent is not None else hi
+            mn_ent = min(mn_ent, lo) if mn_ent is not None else lo
+            if resolved:
+                continue
+            tp_hit = hi >= tp_mc_v
+            sl_hit = lo <= sl_mc_v
+            if tp_hit and sl_hit:
+                R["same_candle_tp_sl_conflict"] = True
+                if scp == "conservative_sl_first":
+                    tp_hit, sl_hit = False, True
+                elif scp == "optimistic_tp_first":
+                    tp_hit, sl_hit = True, False
+                else:
+                    if op >= (tp_mc_v + sl_mc_v) / 2.0:
+                        tp_hit, sl_hit = True, False
+                    else:
+                        tp_hit, sl_hit = False, True
+            if tp_hit:
+                R["outcome"] = "tp"; R["tp_ts_ts"] = tts; resolved = True
+            elif sl_hit:
+                R["outcome"] = "sl"; R["sl_ts_ts"] = tts; resolved = True
+
+        # Summarise
+        R["entry_hit_any_after_ts_min"] = any_hit
+        R["entry_hit_after_decision"] = adec_hit
+        R["entry_hit_valid_for_mode"] = any_hit if em == "limit_from_bottom" else adec_hit
+        if not entry_hit:
+            R["outcome"] = "entry_not_hit"
+        R["entry_ts_ts"] = entry_ts_v
+        if entry_ts_v is not None and ent_start is not None:
+            R["entry_latency_sec"] = entry_ts_v - ent_start
+        R["tick_count_after_decision"] = tad
+        R["tick_count_after_entry"] = tae
+        R["tick_coverage_ok"] = tad >= 5
+        if mx_dec is not None and ent_mc:
+            R["max_gain_after_decision"]    = (mx_dec - ent_mc) / ent_mc
+            R["max_drawdown_after_decision"] = (mn_dec - ent_mc) / ent_mc if mn_dec is not None else None
+        if mx_ent is not None and ent_mc:
+            R["max_gain_after_entry"]    = (mx_ent - ent_mc) / ent_mc
+            R["max_drawdown_after_entry"] = (mn_ent - ent_mc) / ent_mc if mn_ent is not None else None
+        return R
+
+    # ── Rules ───────────────────────────────────────────────────────────────────
+    _RULES = [
+        ("PoolStrong",   "pool_quote > 90",                0,  lambda s: _s(s.get("pool_quote"), 0) > 90),
+        ("Pre10_Pos",    "pre_10s_net > 0",               0,  lambda s: _s(s.get("pre_10s_net"), 0) > 0),
+        ("Pre10_Mod",    "1 < pre_10s_net ≤ 5",          0,  lambda s: 1 < _s(s.get("pre_10s_net"), 0) <= 5),
+        ("Pre10_NoDp",   "pre_10s_net > -5",              0,  lambda s: _s(s.get("pre_10s_net"), 0) > -5),
+        ("Pre30_Sell",   "pre_30s_sell > 3",              0,  lambda s: _s(s.get("pre_30s_sell"), 0) > 3),
+        ("Pre30_Btl",    "buy>3 AND sell>3 (30s)",        0,  lambda s: _s(s.get("pre_30s_buy"), 0) > 3 and _s(s.get("pre_30s_sell"), 0) > 3),
+        ("NoChase",      "30% ≤ bounce < 60%",            0,  lambda s: 0.30 <= _s(s.get("bounce_pct_now"), 0) < 0.60),
+        ("ChaseRisk",    "bounce > 100%",                 0,  lambda s: _s(s.get("bounce_pct_now"), 0) > 1.00),
+        ("Rise3_Neg",    "rise_3s_net < 0",               3,  lambda s: _s(s.get("rise_3s_net"), 0) < 0),
+        ("Rise5_Neg",    "rise_5s_net < 0",               5,  lambda s: _s(s.get("rise_5s_net"), 0) < 0),
+        ("Rise5_Deep",   "rise_5s_net < -1",              5,  lambda s: _s(s.get("rise_5s_net"), 0) < -1),
+        ("Rise5_Hot",    "rise_5s_net > 3",               5,  lambda s: _s(s.get("rise_5s_net"), 0) > 3),
+        ("Rise10_Hot",   "rise_10s_net > 10",             10, lambda s: _s(s.get("rise_10s_net"), 0) > 10),
+        ("PS_R5N",       "pool>90 AND rise5<0",           5,  lambda s: _s(s.get("pool_quote"), 0) > 90 and _s(s.get("rise_5s_net"), 0) < 0),
+        ("PS_R5D",       "pool>90 AND rise5<-1",          5,  lambda s: _s(s.get("pool_quote"), 0) > 90 and _s(s.get("rise_5s_net"), 0) < -1),
+        ("PS_P10M",      "pool>90 AND 1<pre10≤5",        0,  lambda s: _s(s.get("pool_quote"), 0) > 90 and 1 < _s(s.get("pre_10s_net"), 0) <= 5),
+        ("PS_P10M_R5N",  "pool>90 AND 1<pre10≤5 AND r5<0", 5, lambda s: _s(s.get("pool_quote"), 0) > 90 and 1 < _s(s.get("pre_10s_net"), 0) <= 5 and _s(s.get("rise_5s_net"), 0) < 0),
+    ]
+
+    # ── Load data ────────────────────────────────────────────────────────────────
+    events_dict, ticks_dict = db.get_micro_outcomes_v2_data(days=days)
+
+    if not events_dict:
+        msg = f"Sem dados para os últimos {days} dias."
+        if fmt == "json":
+            return app.response_class(response=_json.dumps({"error": msg}), mimetype="application/json")
+        return render_template_string(
+            "<html><body style='font-family:monospace;padding:20px'>"
+            "<h2>micro-outcomes-v2-2</h2><p>{{ msg }}</p>"
+            "<a href='?days=30'>Tentar 30 dias</a></body></html>", msg=msg)
+
+    # ── Common events (intersection across all ages) ──────────────────────────
+    common_keys = None
+    if comp_sample == "common_events":
+        common_keys = {k for k, ss in events_dict.items()
+                       if all(_get_snap(ss, a) is not None for a in _AGES)}
+
+    def _keys_for_age(age):
+        if comp_sample == "common_events":
+            return common_keys or set()
+        return {k for k, ss in events_dict.items() if _get_snap(ss, age) is not None}
+
+    # ── Process one event at given age ────────────────────────────────────────
+    def _proc(key, snaps, age, em_use=None):
+        em_u = em_use or entry_mode
+        mint = snaps[0]["mint"]
+        mc_min_v = _s(snaps[0].get("mc_min"), 0)
+        ts_min_raw = snaps[0].get("ts_min")
+        if not mc_min_v or ts_min_raw is None:
+            return None
+        snap = _get_snap(snaps, age)
+        if snap is None:
+            return None
+        ts_min_ts_v = _ts(ts_min_raw)
+        ts_snap = snap.get("ts_snapshot")
+        dec_ts_v = _ts(ts_snap)
+        mc_cur = _s(snap.get("mc_current"), mc_min_v)
+        if ts_min_ts_v is None or dec_ts_v is None:
+            return None
+
+        sim = _simulate(
+            ticks_dict.get(mint, []),
+            ts_min_ts_v, dec_ts_v, mc_min_v, mc_cur,
+            em_u, entry_pct, tp_pct, sl_pct, pullback_pct, sc_pol,
+        )
+
+        elig = True
+        lock_rsn = "none"
+        if apply_locks:
+            if _s(snap.get("pool_quote"), 0) < 10:
+                elig = False; lock_rsn = "pool_too_shallow"
+
+        rules_ev = {}
+        for rid, _rl, rmin, rfn in _RULES:
+            if age >= rmin:
+                try:
+                    rules_ev[rid] = rfn(snap)
+                except Exception:
+                    rules_ev[rid] = None
+            else:
+                rules_ev[rid] = None
+
+        return {
+            "key": key, "mint": mint,
+            "symbol": snap.get("symbol", "?"),
+            "ts_min": ts_min_raw, "decision_ts": ts_snap, "snap_ts": ts_snap,
+            "bottom_age_actual": _s(snap.get("bottom_age_sec"), 0),
+            "mc_min": mc_min_v, "mc_current_at_decision": mc_cur,
+            "mc_migration": _s(snap.get("mc_migration"), 0),
+            "pool_quote": _s(snap.get("pool_quote"), 0),
+            "bounce_pct_now": _s(snap.get("bounce_pct_now"), 0),
+            "drop_from_mig": _s(snap.get("drop_from_mig"), 0),
+            "elapsed_sec": _s(snap.get("elapsed_sec"), 0),
+            "pre_10s_net": _s(snap.get("pre_10s_net"), 0),
+            "pre_30s_net": _s(snap.get("pre_30s_net"), 0),
+            "pre_30s_sell": _s(snap.get("pre_30s_sell"), 0),
+            "pre_30s_buy": _s(snap.get("pre_30s_buy"), 0),
+            "pre_10s_sell": _s(snap.get("pre_10s_sell"), 0),
+            "pre_10s_buy": _s(snap.get("pre_10s_buy"), 0),
+            "rise_3s_net": _s(snap.get("rise_3s_net"), None) if age >= 3 else None,
+            "rise_5s_net": _s(snap.get("rise_5s_net"), None) if age >= 5 else None,
+            "rise_10s_net": _s(snap.get("rise_10s_net"), None) if age >= 10 else None,
+            **{f"sim_{k}": v for k, v in sim.items()},
+            **{f"r_{k}": v for k, v in rules_ev.items()},
+            "eligible_under_live_rules": elig, "lock_reason": lock_rsn,
+            "rules_matched": [rid for rid, rv in rules_ev.items() if rv is True],
+        }
+
+    # ── Stats ────────────────────────────────────────────────────────────────────
+    def _stats(rows):
+        n = len(rows)
+        if n == 0:
+            return {"n": 0, "entry_hit": 0, "tp": 0, "sl": 0, "no_exit": 0,
+                    "entry_not_hit": 0, "no_ticks": 0,
+                    "wr_resolved": None, "wr_trade": None, "wr_all": None,
+                    "ev_resolved": None, "ev_zero": None, "ev_loss": None,
+                    "entry_hit_rate": None, "entry_before_dec_rate": None,
+                    "med_lat": None, "p90_lat": None, "avg_gain": None, "avg_draw": None}
+        eh  = sum(1 for r in rows if r.get("sim_entry_hit_valid_for_mode"))
+        tp  = sum(1 for r in rows if r.get("sim_outcome") == "tp")
+        sl  = sum(1 for r in rows if r.get("sim_outcome") == "sl")
+        ne  = sum(1 for r in rows if r.get("sim_outcome") == "no_exit")
+        enh = sum(1 for r in rows if r.get("sim_outcome") == "entry_not_hit")
+        nt  = sum(1 for r in rows if r.get("sim_outcome") == "no_ticks")
+        ebd = sum(1 for r in rows if r.get("sim_entry_before_decision"))
+        res = tp + sl
+        wr_res = tp / res if res else None
+        wr_trd = tp / eh  if eh  else None
+        ev_res = (tp * tp_pct - sl * sl_pct) / res if res else None
+        ev_zer = (tp * tp_pct - sl * sl_pct) / n
+        pen = ne + enh + nt
+        ev_los = (tp * tp_pct - sl * sl_pct - pen * sl_pct) / n
+        lats = sorted([r["sim_entry_latency_sec"] for r in rows
+                       if r.get("sim_entry_latency_sec") is not None])
+        med_l = lats[len(lats) // 2] if lats else None
+        p90_l = lats[int(len(lats) * .9)] if lats else None
+        gains = [r["sim_max_gain_after_entry"] for r in rows
+                 if r.get("sim_max_gain_after_entry") is not None]
+        draws = [r["sim_max_drawdown_after_entry"] for r in rows
+                 if r.get("sim_max_drawdown_after_entry") is not None]
+        return {
+            "n": n, "entry_hit": eh, "tp": tp, "sl": sl,
+            "no_exit": ne, "entry_not_hit": enh, "no_ticks": nt,
+            "wr_resolved": wr_res, "wr_trade": wr_trd, "wr_all": tp / n,
+            "ev_resolved": ev_res, "ev_zero": ev_zer, "ev_loss": ev_los,
+            "entry_hit_rate": eh / n if n else None,
+            "entry_before_dec_rate": ebd / n if n else None,
+            "med_lat": med_l, "p90_lat": p90_l,
+            "avg_gain": sum(gains) / len(gains) if gains else None,
+            "avg_draw": sum(draws) / len(draws) if draws else None,
+        }
+
+    # ── Main results ─────────────────────────────────────────────────────────────
+    eligible_keys = _keys_for_age(decision_age)
+    results = []
+    for key, snaps in events_dict.items():
+        if key not in eligible_keys:
+            continue
+        row = _proc(key, snaps, decision_age)
+        if row:
+            results.append(row)
+
+    base = _stats(results)
+
+    # Warn if many entries fired before decision (limit_from_bottom mode)
+    ebd_count = sum(1 for r in results if r.get("sim_entry_before_decision"))
+    ebd_warn = entry_mode == "limit_from_bottom" and base["n"] > 0 and ebd_count / base["n"] > 0.3
+
+    # ── Decision Age Comparison ──────────────────────────────────────────────────
+    age_comp = []
+    for age in _AGES:
+        akeys = _keys_for_age(age)
+        age_rows = []
+        for key in akeys:
+            ss = events_dict.get(key)
+            if not ss:
+                continue
+            row = _proc(key, ss, age)
+            if row:
+                age_rows.append(row)
+        st = _stats(age_rows)
+        age_comp.append({
+            "age": age, **st,
+            "coverage_pct": len(age_rows) / max(len(events_dict), 1),
+        })
+
+    # ── Rule Scoreboard ──────────────────────────────────────────────────────────
+    rule_scores = []
+    for rid, rlbl, rmin, _ in _RULES:
+        elig = decision_age >= rmin
+        col = f"r_{rid}"
+        yes_rows = [r for r in results if r.get(col) is True] if elig else []
+        no_rows  = [r for r in results if r.get(col) is False] if elig else []
+        sy  = _stats(yes_rows)
+        sno = _stats(no_rows)
+        dwr = ((sy["wr_resolved"] or 0) - (sno["wr_resolved"] or 0)) \
+              if sy["wr_resolved"] is not None and sno["wr_resolved"] is not None else None
+        dev = ((sy["ev_loss"] or 0) - (sno["ev_loss"] or 0)) \
+              if sy["ev_loss"] is not None and sno["ev_loss"] is not None else None
+        warn = sy["n"] < min_n or sno["n"] < min_n
+        rule_scores.append({
+            "id": rid, "label": rlbl, "eligible": elig, "min_age": rmin,
+            "n_yes": sy["n"], "n_no": sno["n"],
+            "tp_yes": sy["tp"], "sl_yes": sy["sl"],
+            "ne_yes": sy["no_exit"], "enh_yes": sy["entry_not_hit"],
+            "wr_yes": sy["wr_resolved"], "wr_no": sno["wr_resolved"],
+            "ev_yes": sy["ev_loss"], "ev_no": sno["ev_loss"],
+            "delta_wr": dwr, "delta_ev": dev,
+            "eh_rate_yes": sy["entry_hit_rate"],
+            "med_lat_yes": sy["med_lat"],
+            "avg_gain_yes": sy["avg_gain"],
+            "avg_draw_yes": sy["avg_draw"],
+            "sample_warning": warn,
+        })
+    rule_scores.sort(key=lambda x: -(x["delta_ev"] or -999))
+
+    # ── Bucket tables ────────────────────────────────────────────────────────────
+    def _bkt(rows, kfn, ranges):
+        out = {}
+        for lbl, lo, hi in ranges:
+            brows = [r for r in rows
+                     if kfn(r) is not None and lo <= kfn(r) < hi]
+            out[lbl] = _stats(brows)
+        return out
+
+    pool_bkt = _bkt(results, lambda r: r["pool_quote"],
+        [("<20", 0, 20), ("20-50", 20, 50), ("50-90", 50, 90), (">90", 90, 1e9)])
+    pre10_bkt = _bkt(results, lambda r: r["pre_10s_net"],
+        [("< -5", -1e9, -5), ("-5 a -1", -5, -1), ("-1 a +1", -1, 1), ("+1 a +5", 1, 5), ("> +5", 5, 1e9)])
+    bounce_bkt = _bkt(results, lambda r: r.get("bounce_pct_now", 0) * 100,
+        [("<5%", 0, 5), ("5-10%", 5, 10), ("10-15%", 10, 15), ("15-30%", 15, 30),
+         ("30-60%", 30, 60), ("60-100%", 60, 100), (">100%", 100, 1e9)])
+    lat_bkt = _bkt(results, lambda r: r.get("sim_entry_latency_sec"),
+        [("0-1s", 0, 1), ("1-3s", 1, 3), ("3-10s", 3, 10), ("10-30s", 10, 30), (">30s", 30, 1e9)])
+    rise_bkt = None
+    rise_bkt_lbl = None
+    if decision_age >= 5:
+        rise_bkt = _bkt(results, lambda r: r.get("rise_5s_net"),
+            [("< -10", -1e9, -10), ("-10 a -3", -10, -3), ("-3 a -1", -3, -1),
+             ("-1 a 0", -1, 0), ("0 a +1", 0, 1), ("+1 a +3", 1, 3), ("+3 a +10", 3, 10), (">+10", 10, 1e9)])
+        rise_bkt_lbl = "Rise 5s Net"
+    elif decision_age >= 3:
+        rise_bkt = _bkt(results, lambda r: r.get("rise_3s_net"),
+            [("< -10", -1e9, -10), ("-10 a -3", -10, -3), ("-3 a -1", -3, -1),
+             ("-1 a 0", -1, 0), ("0 a +1", 0, 1), ("+1 a +3", 1, 3), ("+3 a +10", 3, 10), (">+10", 10, 1e9)])
+        rise_bkt_lbl = "Rise 3s Net"
+
+    # ── FP/FN for best rule ──────────────────────────────────────────────────────
+    best_rule = next((r for r in rule_scores if r["eligible"] and r["n_yes"] >= min_n), None)
+    fpfn = None
+    fp_details = []
+    if best_rule:
+        col = f"r_{best_rule['id']}"
+        yes_tp  = [r for r in results if r.get(col) is True  and r.get("sim_outcome") == "tp"]
+        yes_sl  = [r for r in results if r.get(col) is True  and r.get("sim_outcome") == "sl"]
+        yes_ne  = [r for r in results if r.get(col) is True  and r.get("sim_outcome") == "no_exit"]
+        yes_enh = [r for r in results if r.get(col) is True  and r.get("sim_outcome") == "entry_not_hit"]
+        no_tp   = [r for r in results if r.get(col) is False and r.get("sim_outcome") == "tp"]
+        no_sl   = [r for r in results if r.get(col) is False and r.get("sim_outcome") == "sl"]
+        no_ne   = [r for r in results if r.get(col) is False and r.get("sim_outcome") == "no_exit"]
+        no_enh  = [r for r in results if r.get(col) is False and r.get("sim_outcome") == "entry_not_hit"]
+        tot_tp  = len(yes_tp) + len(no_tp)
+        fpfn = {
+            "rule_id": best_rule["id"], "rule_label": best_rule["label"],
+            "tp_yes": len(yes_tp), "sl_yes": len(yes_sl), "ne_yes": len(yes_ne), "enh_yes": len(yes_enh),
+            "tp_no":  len(no_tp),  "sl_no":  len(no_sl),  "ne_no":  len(no_ne),  "enh_no":  len(no_enh),
+            "fp_rate": len(yes_sl) / max(len(yes_sl) + len(yes_tp), 1),
+            "fn_rate": len(no_tp)  / max(tot_tp, 1),
+        }
+        for r in yes_sl:
+            diag = []
+            if r.get("pool_quote", 0) < 90:
+                diag.append("pool_not_strong")
+            if r.get("rise_5s_net") is not None and r.get("rise_5s_net", 0) > 3:
+                diag.append("rise_hot")
+            if r.get("pre_10s_net", 0) < -5:
+                diag.append("pre_deep_negative")
+            if r.get("bounce_pct_now", 0) > 1.0:
+                diag.append("chase_over_100")
+            if r.get("sim_entry_before_decision"):
+                diag.append("entry_before_decision")
+            if r.get("sim_same_candle_tp_sl_conflict"):
+                diag.append("same_candle_conflict")
+            if not diag:
+                diag.append("no_follow_through")
+            fp_details.append({
+                "symbol": r.get("symbol", "?"), "mint": r.get("mint", ""),
+                "ts_min": str(r.get("ts_min", ""))[:19],
+                "pool_quote": round(r.get("pool_quote", 0), 1),
+                "bounce_pct": f"{r.get('bounce_pct_now', 0)*100:.0f}%",
+                "pre_10s_net": round(r.get("pre_10s_net", 0), 2),
+                "rise_5s_net": (round(r.get("rise_5s_net", 0), 2)
+                                if r.get("rise_5s_net") is not None else "—"),
+                "entry_hit": r.get("sim_entry_hit_valid_for_mode"),
+                "entry_before_dec": r.get("sim_entry_before_decision"),
+                "lat_s": (round(r.get("sim_entry_latency_sec", 0), 1)
+                          if r.get("sim_entry_latency_sec") is not None else "—"),
+                "outcome": r.get("sim_outcome", "?"),
+                "max_gain": (f"{r.get('sim_max_gain_after_entry', 0)*100:.0f}%"
+                             if r.get("sim_max_gain_after_entry") is not None else "—"),
+                "drawdown": (f"{r.get('sim_max_drawdown_after_entry', 0)*100:.0f}%"
+                             if r.get("sim_max_drawdown_after_entry") is not None else "—"),
+                "diagnostic": ", ".join(diag),
+            })
+
+    # ── Exports ──────────────────────────────────────────────────────────────────
+    if fmt == "json":
+        export = {
+            "params": {"days": days, "decision_age": decision_age, "entry_pct": entry_pct,
+                       "tp_pct": tp_pct, "sl_pct": sl_pct, "entry_mode": entry_mode,
+                       "pullback_pct": pullback_pct, "none_policy": none_policy,
+                       "same_candle_policy": sc_pol, "comparison_sample": comp_sample,
+                       "apply_live_locks": apply_locks, "min_n": min_n},
+            "summary": base, "decision_age_comparison": age_comp,
+            "rule_scoreboard": rule_scores,
+            "pool_buckets": pool_bkt, "pre10_buckets": pre10_bkt,
+            "bounce_buckets": bounce_bkt, "entry_latency_buckets": lat_bkt,
+            "rise_buckets": rise_bkt, "fp_fn": fpfn, "false_positives": fp_details,
+            "rows": [{k: (str(v) if hasattr(v, "isoformat") else v)
+                      for k, v in r.items() if not k.startswith("r_")}
+                     for r in results],
+        }
+        return app.response_class(
+            response=_json.dumps(export, indent=2, default=str),
+            mimetype="application/json")
+
+    if fmt == "csv":
+        _CCOLS = [
+            "symbol", "mint", "ts_min", "decision_ts", "snap_ts", "bottom_age_actual",
+            "sim_entry_mode", "sim_entry_search_start_ts", "mc_min",
+            "mc_current_at_decision", "sim_entry_mc",
+            "sim_entry_hit_any_after_ts_min", "sim_entry_hit_after_decision",
+            "sim_entry_hit_valid_for_mode", "sim_entry_before_decision",
+            "sim_missed_pre_decision_entry", "sim_entry_ts_ts", "sim_entry_latency_sec",
+            "sim_tp_mc", "sim_sl_mc", "sim_outcome", "sim_tp_ts_ts", "sim_sl_ts_ts",
+            "sim_same_candle_tp_sl_conflict",
+            "pool_quote", "bounce_pct_now", "drop_from_mig",
+            "pre_10s_net", "pre_30s_sell", "rise_3s_net", "rise_5s_net", "rise_10s_net",
+            "eligible_under_live_rules", "lock_reason", "rules_matched",
+        ]
+        buf = io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=_CCOLS, extrasaction="ignore")
+        w.writeheader()
+        for r in results:
+            w.writerow({k: (str(v) if not isinstance(v, (int, float, str, bool, type(None))) else v)
+                        for k, v in r.items()})
+        return Response(buf.getvalue(), mimetype="text/csv",
+                        headers={"Content-Disposition": "attachment; filename=micro_v22.csv"})
+
+    # ── HTML ─────────────────────────────────────────────────────────────────────
+    def _pc(v, dec=1):
+        return f"{v*100:+.{dec}f}%" if v is not None else "—"
+
+    def _fc(v, dec=1):
+        return f"{v:.{dec}f}" if v is not None else "—"
+
+    def _wrc(v):
+        if v is None: return ""
+        return "color:green;font-weight:bold" if v >= 0.35 else ("color:red" if v < 0.20 else "color:orange")
+
+    def _evc(v):
+        if v is None: return ""
+        return "color:green;font-weight:bold" if v > 0 else ("color:red" if v < 0 else "")
+
+    def _dc(v):
+        if v is None: return ""
+        return "color:green" if v > 0.02 else ("color:red" if v < -0.02 else "")
+
+    age_nav = " | ".join(
+        f'<a href="?days={days}&entry={entry_pct}&tp={tp_pct}&sl={sl_pct}'
+        f'&decision_age={a}&entry_mode={entry_mode}&comparison_sample={comp_sample}'
+        f'&same_candle_policy={sc_pol}&min_n={min_n}"'
+        f' style="{"font-weight:bold;text-decoration:underline" if a == decision_age else ""}">{a}s</a>'
+        for a in _AGES
+    )
+    mode_nav = " | ".join(
+        f'<a href="?days={days}&entry={entry_pct}&tp={tp_pct}&sl={sl_pct}'
+        f'&decision_age={decision_age}&entry_mode={m}&comparison_sample={comp_sample}'
+        f'&same_candle_policy={sc_pol}&min_n={min_n}"'
+        f' style="{"font-weight:bold;text-decoration:underline" if m == entry_mode else ""}">{m}</a>'
+        for m in ["limit_from_bottom", "decision_entry", "pullback_after_decision"]
+    )
+
+    _MODE_DESCS = {
+        "limit_from_bottom": (
+            "🔵 <b>limit_from_bottom</b> — Ordem passiva desde o fundo.",
+            "entry_mc = mc_min × (1+entry%). Busca entrada desde ts_min. "
+            "⚠️ Pode preencher antes do decision_age — isso é reportado como entry_before_decision.",
+        ),
+        "decision_entry": (
+            "🟢 <b>decision_entry</b> — Compra no preço atual da decisão.",
+            "entry_mc = mc_current no snapshot. É o modo mais próximo de uma futura EntryEngine. "
+            "TP/SL medidos a partir de decision_ts.",
+        ),
+        "pullback_after_decision": (
+            "🟡 <b>pullback_after_decision</b> — Aguarda pullback após a decisão.",
+            f"entry_mc = mc_min × (1+entry%) ou mc_current × (1-{pullback_pct:.0%}) se pullback_pct>0. "
+            "Só conta entrada após decision_ts. missed_pre_decision_entry=true se oportunidade passou antes.",
+        ),
+    }
+    mode_title, mode_desc = _MODE_DESCS.get(entry_mode, ("", ""))
+
+    ebd_warn_html = ""
+    if ebd_warn:
+        ebd_warn_html = (
+            f'<div style="background:#fff3cd;border:1px solid #ffc107;padding:8px;margin:8px 0;border-radius:4px">'
+            f'⚠️ <b>{ebd_count}/{base["n"]} eventos ({ebd_count/base["n"]*100:.0f}%) tiveram fill antes do decision_ts.</b> '
+            f'Esses resultados não são executáveis com decision_age={decision_age}s. '
+            f'Considere usar <code>decision_entry</code> ou um decision_age menor.</div>'
+        )
+
+    def _bkt_rows(bkt):
+        h = ""
+        for lbl, st in bkt.items():
+            if st["n"] == 0:
+                continue
+            wr = f"{st['wr_resolved']*100:.1f}%" if st["wr_resolved"] is not None else "—"
+            ev = f"{st['ev_loss']*100:+.1f}%" if st["ev_loss"] is not None else "—"
+            mg = f"{st['avg_gain']*100:.0f}%" if st["avg_gain"] is not None else "—"
+            h += (f'<tr><td>{lbl}</td><td>{st["n"]}</td><td>{st["entry_hit"]}</td>'
+                  f'<td>{st["tp"]}</td><td>{st["sl"]}</td><td>{st["no_exit"]}</td><td>{st["entry_not_hit"]}</td>'
+                  f'<td style="{_wrc(st["wr_resolved"])}">{wr}</td>'
+                  f'<td style="{_evc(st["ev_loss"])}">{ev}</td>'
+                  f'<td>{mg}</td></tr>\n')
+        return h
+
+    def _bkt_table(title, bkt):
+        if not bkt:
+            return ""
+        return (
+            f'<h3>{title}</h3>'
+            f'<table border="1" cellpadding="3" style="border-collapse:collapse;font-size:12px">'
+            f'<tr><th>Faixa</th><th>n</th><th>entry_hit</th><th>TP</th><th>SL</th>'
+            f'<th>no_exit</th><th>entry_not_hit</th><th>WR</th><th>EV(SL-pen)</th><th>avg_gain</th></tr>'
+            f'{_bkt_rows(bkt)}'
+            f'</table>\n'
+        )
+
+    # Age comparison table
+    age_tbl = ""
+    for ac in age_comp:
+        a = ac["age"]
+        wr  = f"{ac['wr_resolved']*100:.1f}%" if ac["wr_resolved"] is not None else "—"
+        wrt = f"{ac['wr_trade']*100:.1f}%"     if ac["wr_trade"]    is not None else "—"
+        ev  = f"{ac['ev_loss']*100:+.1f}%"     if ac["ev_loss"]     is not None else "—"
+        mg  = f"{ac['avg_gain']*100:.0f}%"     if ac["avg_gain"]    is not None else "—"
+        ml  = f"{ac['med_lat']:.1f}s"          if ac["med_lat"]     is not None else "—"
+        p90 = f"{ac['p90_lat']:.1f}s"          if ac["p90_lat"]     is not None else "—"
+        bg  = "background:#f0f8ff" if a == decision_age else ""
+        age_tbl += (
+            f'<tr style="{bg}"><td>{a}s</td>'
+            f'<td>{ac["n"]}</td><td>{ac["coverage_pct"]*100:.0f}%</td>'
+            f'<td>{ac["entry_hit"]}</td>'
+            f'<td style="{_wrc(ac["wr_resolved"])}">{wr}</td>'
+            f'<td style="{_wrc(ac["wr_trade"])}">{wrt}</td>'
+            f'<td>{ac["tp"]}</td><td>{ac["sl"]}</td>'
+            f'<td>{ac["no_exit"]}</td><td>{ac["entry_not_hit"]}</td>'
+            f'<td style="{_evc(ac["ev_loss"])}">{ev}</td>'
+            f'<td>{ml}</td><td>{p90}</td><td>{mg}</td></tr>\n'
+        )
+
+    # Rule scoreboard
+    rule_tbl = ""
+    for rs in rule_scores:
+        if not rs["eligible"]:
+            rule_tbl += (
+                f'<tr style="color:#aaa"><td>{rs["id"]}</td>'
+                f'<td><code>{rs["label"]}</code></td>'
+                f'<td colspan="12">⚠️ requer decision_age ≥ {rs["min_age"]}s</td></tr>\n'
+            )
+            continue
+        warn_tag = ' <span style="color:orange;font-weight:bold" title="Amostra pequena">LOW SAMPLE</span>' \
+                   if rs["sample_warning"] else ""
+        wr_y = f"{rs['wr_yes']*100:.1f}%" if rs["wr_yes"] is not None else "—"
+        wr_n = f"{rs['wr_no']*100:.1f}%"  if rs["wr_no"]  is not None else "—"
+        ev_y = f"{rs['ev_yes']*100:+.1f}%" if rs["ev_yes"] is not None else "—"
+        ev_n = f"{rs['ev_no']*100:+.1f}%"  if rs["ev_no"]  is not None else "—"
+        d_wr = f"{rs['delta_wr']*100:+.1f}pp" if rs["delta_wr"] is not None else "—"
+        d_ev = f"{rs['delta_ev']*100:+.1f}pp" if rs["delta_ev"] is not None else "—"
+        eh_r = f"{rs['eh_rate_yes']*100:.0f}%" if rs["eh_rate_yes"] is not None else "—"
+        ml_y = f"{rs['med_lat_yes']:.1f}s" if rs["med_lat_yes"] is not None else "—"
+        mg_y = f"{rs['avg_gain_yes']*100:.0f}%" if rs["avg_gain_yes"] is not None else "—"
+        rule_tbl += (
+            f'<tr><td><b>{rs["id"]}</b>{warn_tag}</td>'
+            f'<td><code style="font-size:11px">{rs["label"]}</code></td>'
+            f'<td>{rs["n_yes"]}/{rs["n_no"]}</td>'
+            f'<td>{eh_r}</td>'
+            f'<td>{rs["tp_yes"]}</td><td>{rs["sl_yes"]}</td>'
+            f'<td>{rs["ne_yes"]}</td><td>{rs["enh_yes"]}</td>'
+            f'<td style="{_wrc(rs["wr_yes"])}">{wr_y}</td>'
+            f'<td style="{_wrc(rs["wr_no"])}">{wr_n}</td>'
+            f'<td style="{_dc(rs["delta_wr"])}">{d_wr}</td>'
+            f'<td style="{_evc(rs["ev_yes"])}">{ev_y}</td>'
+            f'<td style="{_evc(rs["ev_no"])}">{ev_n}</td>'
+            f'<td style="{_dc(rs["delta_ev"])}">{d_ev}</td>'
+            f'<td>{ml_y}</td><td>{mg_y}</td></tr>\n'
+        )
+
+    # FP/FN section
+    fpfn_html = ""
+    if fpfn:
+        fp_rows = "".join(
+            f'<tr><td>{fp["symbol"]}</td><td style="font-size:10px">{fp["ts_min"]}</td>'
+            f'<td>{fp["pool_quote"]}</td><td>{fp["bounce_pct"]}</td>'
+            f'<td>{fp["pre_10s_net"]}</td><td>{fp["rise_5s_net"]}</td>'
+            f'<td>{"✓" if fp["entry_hit"] else "✗"}</td>'
+            f'<td>{"⚠️" if fp["entry_before_dec"] else "—"}</td>'
+            f'<td>{fp["lat_s"]}</td>'
+            f'<td>{fp["max_gain"]}</td><td>{fp["drawdown"]}</td>'
+            f'<td style="font-size:11px">{fp["diagnostic"]}</td></tr>\n'
+            for fp in fp_details[:30]
+        )
+        fpfn_html = f"""
+<h3>🔴 FP/FN — Regra top: <b>{fpfn["rule_id"]}</b> ({fpfn["rule_label"]})</h3>
+<table border="1" cellpadding="3" style="border-collapse:collapse;font-size:12px;margin-bottom:8px">
+<tr><th></th><th>TP</th><th>SL</th><th>no_exit</th><th>entry_not_hit</th></tr>
+<tr><td><b>Regra=SIM</b></td>
+    <td style="color:green">{fpfn["tp_yes"]}</td>
+    <td style="color:red">{fpfn["sl_yes"]}</td>
+    <td>{fpfn["ne_yes"]}</td><td>{fpfn["enh_yes"]}</td></tr>
+<tr><td><b>Regra=NÃO</b></td>
+    <td style="color:orange">{fpfn["tp_no"]}</td>
+    <td>{fpfn["sl_no"]}</td>
+    <td>{fpfn["ne_no"]}</td><td>{fpfn["enh_no"]}</td></tr>
+</table>
+<p>FP rate (SIM→SL): <b>{fpfn["fp_rate"]*100:.1f}%</b> &nbsp;|&nbsp;
+   FN rate (NÃO→TP perdido): <b>{fpfn["fn_rate"]*100:.1f}%</b></p>
+<h4>Falsos positivos (SIM→SL, max 30)</h4>
+<table border="1" cellpadding="3" style="border-collapse:collapse;font-size:11px">
+<tr><th>Symbol</th><th>ts_min</th><th>pool</th><th>bounce</th>
+    <th>pre10</th><th>rise5</th><th>entry</th><th>pre-dec</th>
+    <th>lat</th><th>max_gain</th><th>drawdown</th><th>diagnóstico</th></tr>
+{fp_rows}
+</table>
+"""
+
+    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>micro-outcomes-v2-2</title>
+<meta http-equiv="refresh" content="60">
+<style>
+body{{font-family:monospace;font-size:13px;padding:16px;background:#fafafa}}
+h2,h3,h4{{margin-top:16px;margin-bottom:4px}}
+table{{border-collapse:collapse;margin-bottom:10px}}
+td,th{{padding:3px 7px;border:1px solid #ccc}}
+th{{background:#eee}}
+.card{{display:inline-block;margin:3px;padding:6px 12px;background:#fff;
+       border:1px solid #ddd;border-radius:4px;min-width:110px;text-align:center}}
+.card b{{display:block;font-size:16px}}
+.card small{{color:#888;font-size:10px}}
+.modebox{{display:inline-block;margin:4px;padding:8px 12px;border:1px solid #ddd;
+          border-radius:4px;background:#fff;max-width:320px;vertical-align:top}}
+</style></head><body>
+
+<h2>🔬 micro-outcomes-v2-2 — Separação Causal</h2>
+<p style="color:#666">
+  Entry mode: <b>{entry_mode}</b> | decision_age={decision_age}s |
+  Entry={entry_pct:.0%} | TP={tp_pct:.0%} | SL={sl_pct:.0%} |
+  SL_penalty={sc_pol} | Últimos {days} dias |
+  sample={comp_sample}
+</p>
+<p>Mode: {mode_nav}</p>
+<p>Decision age: {age_nav}</p>
+<p>
+  <a href="?days={days}&decision_age={decision_age}&entry_mode={entry_mode}&format=json">JSON</a> &nbsp;
+  <a href="?days={days}&decision_age={decision_age}&entry_mode={entry_mode}&format=csv">CSV</a> &nbsp;
+  <a href="/analise/micro-outcomes-v2">V2 (v.anterior)</a>
+</p>
+
+<div>
+  <div class="modebox">
+    <p>{mode_title}</p>
+    <p style="font-size:11px;color:#555">{mode_desc}</p>
+  </div>
+</div>
+
+{ebd_warn_html}
+
+<div style="margin:8px 0">
+  <div class="card"><b>{len(events_dict)}</b><small>eventos totais</small></div>
+  <div class="card"><b>{base["n"]}</b><small>com snap@{decision_age}s</small></div>
+  <div class="card"><b>{base["entry_hit"]}</b><small>entry_hit</small></div>
+  <div class="card"><b>{ebd_count}</b><small>entry_before_decision</small></div>
+  <div class="card"><b style="{_wrc(base['wr_resolved'])}">{_pc(base['wr_resolved'])}</b><small>WR (resolved)</small></div>
+  <div class="card"><b style="{_wrc(base['wr_trade'])}">{_pc(base['wr_trade'])}</b><small>WR (trade)</small></div>
+  <div class="card"><b style="{_evc(base['ev_resolved'])}">{_pc(base['ev_resolved'])}</b><small>EV_resolved</small></div>
+  <div class="card"><b style="{_evc(base['ev_zero'])}">{_pc(base['ev_zero'])}</b><small>EV (noExit=0)</small></div>
+  <div class="card"><b style="{_evc(base['ev_loss'])}">{_pc(base['ev_loss'])}</b><small>EV (noExit=SL)</small></div>
+  <div class="card"><b>{base["tp"]}</b><small>TP</small></div>
+  <div class="card"><b>{base["sl"]}</b><small>SL</small></div>
+  <div class="card"><b>{base["no_exit"]}</b><small>no_exit</small></div>
+  <div class="card"><b>{base["entry_not_hit"]}</b><small>entry_not_hit</small></div>
+  <div class="card"><b>{_fc(base['med_lat'])}s</b><small>latência mediana</small></div>
+</div>
+
+<h3>📊 Decision Age Comparison ({comp_sample})</h3>
+<table border="1" cellpadding="3" style="border-collapse:collapse;font-size:12px">
+<tr><th>age</th><th>n</th><th>coverage</th><th>entry_hit</th>
+    <th>WR_res</th><th>WR_trade</th><th>TP</th><th>SL</th>
+    <th>no_exit</th><th>entry_not_hit</th>
+    <th>EV(SL-pen)</th><th>lat_med</th><th>lat_p90</th><th>avg_gain</th></tr>
+{age_tbl}
+</table>
+<p style="font-size:11px;color:#888">
+  WR_res=TP/(TP+SL). WR_trade=TP/entry_hit. EV(SL-pen): no_exit/entry_not_hit penalizados como SL.
+  Viés de sobrevivência: decision_age alto tem menos eventos (só tokens que sobreviveram até lá).
+</p>
+
+<h3>🏆 Rule Scoreboard (ordenado por Δ EV, min_n={min_n})</h3>
+<table border="1" cellpadding="3" style="border-collapse:collapse;font-size:12px">
+<tr><th>ID</th><th>Regra</th><th>n SIM/NÃO</th><th>entry_hit%</th>
+    <th>TP</th><th>SL</th><th>no_exit</th><th>e_not_hit</th>
+    <th>WR SIM</th><th>WR NÃO</th><th>Δ WR</th>
+    <th>EV SIM</th><th>EV NÃO</th><th>Δ EV</th>
+    <th>lat_med</th><th>avg_gain</th></tr>
+{rule_tbl}
+</table>
+<p style="font-size:11px;color:#888">
+  Δ=SIM−NÃO | EV usa SL penalty para no_exit/entry_not_hit | LOW SAMPLE = n_yes ou n_no &lt; {min_n}
+</p>
+
+{fpfn_html}
+
+{_bkt_table("Pool Depth Buckets", pool_bkt)}
+{_bkt_table("PRE-10s Net Flow", pre10_bkt)}
+{_bkt_table("Bounce% na Decisão", bounce_bkt)}
+{_bkt_table(f"{rise_bkt_lbl} Buckets" if rise_bkt_lbl else "", rise_bkt)}
+{_bkt_table("Entry Latency", lat_bkt)}
+
+<p style="color:#888;font-size:11px;margin-top:20px">
+  Auto-refresh 60s | sc_pol={sc_pol} |
+  TP/SL medidos SOMENTE após entry_ts | features gateadas por decision_age
+</p>
+</body></html>"""
+    return render_template_string(html)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
