@@ -40606,12 +40606,13 @@ def analise_micro_outcomes_v2():  # noqa: C901
             sl_hit = low  <= sl_mc
 
             if tp_hit and sl_hit:
-                mc_open  = t.get("mc_open") or mid_val or 0
-                midpoint = (tp_mc + sl_mc) / 2.0
-                if mc_open >= midpoint:
-                    tp_hit, sl_hit = True, False
-                else:
-                    tp_hit, sl_hit = False, True
+                # Ambos atingidos no mesmo tick = ambíguo
+                # Não força desempate heurístico, marca como ambiguous
+                result["ts_tp"] = tick_ts
+                result["ts_sl"] = tick_ts
+                result["outcome"] = "ambiguous"
+                result["gain_pct"] = None
+                break
 
             if tp_hit and result["ts_tp"] is None:
                 result["ts_tp"] = tick_ts
@@ -40741,18 +40742,19 @@ def analise_micro_outcomes_v2():  # noqa: C901
     def _stats(rows):
         n = len(rows)
         if n == 0:
-            return {"n": 0, "entry_hit": 0, "tp": 0, "sl": 0, "no_exit": 0,
+            return {"n": 0, "entry_hit": 0, "tp": 0, "sl": 0, "no_exit": 0, "ambiguous": 0,
                     "wr": None, "ev_res": None, "ev_zero": None, "ev_loss": None}
         eh = sum(1 for r in rows if r["entry_hit"])
         tp = sum(1 for r in rows if r["outcome"] == "tp")
         sl = sum(1 for r in rows if r["outcome"] == "sl")
         ne = sum(1 for r in rows if r["outcome"] == "no_exit")
-        resolved = tp + sl
+        amb = sum(1 for r in rows if r["outcome"] == "ambiguous")
+        resolved = tp + sl  # Exclui ambiguous
         wr = tp / resolved if resolved else None
         ev_res  = (tp * tp_pct - sl * sl_pct) / resolved if resolved else None
         ev_zero = (tp * tp_pct - sl * sl_pct) / n
         ev_loss = (tp * tp_pct - sl * sl_pct - ne * sl_pct) / n
-        return {"n": n, "entry_hit": eh, "tp": tp, "sl": sl, "no_exit": ne,
+        return {"n": n, "entry_hit": eh, "tp": tp, "sl": sl, "no_exit": ne, "ambiguous": amb,
                 "wr": wr, "ev_res": ev_res, "ev_zero": ev_zero, "ev_loss": ev_loss}
 
     base = _stats(results)

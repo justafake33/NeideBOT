@@ -1327,13 +1327,10 @@ def get_micro_outcomes(
             sl_hit = low  <= sl_mc
 
             if tp_hit and sl_hit:
-                # Desempate via mc_open vs midpoint (nota 34 CLAUDE.md)
-                mc_open  = t.get("mc_open") or t["mc"] or 0
-                midpoint = (tp_mc + sl_mc) / 2
-                if mc_open >= midpoint:
-                    if ts_tp is None: ts_tp = t["tick_ts"]
-                else:
-                    if ts_sl is None: ts_sl = t["tick_ts"]
+                # Ambos atingidos no mesmo candle = ambíguo
+                # Marca como ambiguous, não força desempate heurístico
+                if ts_tp is None: ts_tp = t["tick_ts"]
+                if ts_sl is None: ts_sl = t["tick_ts"]
             elif tp_hit and ts_tp is None:
                 ts_tp = t["tick_ts"]
             elif sl_hit and ts_sl is None:
@@ -1342,8 +1339,13 @@ def get_micro_outcomes(
             if ts_tp and ts_sl:
                 break
 
-        if ts_tp and ts_sl:
-            outcome = "tp" if ts_tp <= ts_sl else "sl"
+        # Detecta ambiguidade: TP e SL atingidos no mesmo tick (impossível saber ordem)
+        is_ambiguous = (ts_tp and ts_sl and ts_tp == ts_sl)
+
+        if is_ambiguous:
+            outcome = "ambiguous"
+        elif ts_tp and ts_sl:
+            outcome = "tp" if ts_tp < ts_sl else "sl"
         elif ts_tp:
             outcome = "tp"
         elif ts_sl:
@@ -1351,14 +1353,20 @@ def get_micro_outcomes(
         else:
             outcome = "no_exit"
 
-        exit_ts = ts_tp if outcome == "tp" else (ts_sl if outcome == "sl" else None)
-        elapsed_exit = (exit_ts - ts_min).total_seconds() / 60 if exit_ts else None
+        # Para ambiguous, não há exit bem-definido
+        if is_ambiguous:
+            exit_ts = None
+            elapsed_exit = None
+            max_gain_pct = None
+        else:
+            exit_ts = ts_tp if outcome == "tp" else (ts_sl if outcome == "sl" else None)
+            elapsed_exit = (exit_ts - ts_min).total_seconds() / 60 if exit_ts else None
 
-        # Fallback: se nunca atingiu entry, max_mc = entry_mc (não pode ganhar sem entrar)
-        if not entry_hit:
-            max_mc_seen = entry_mc
+            # Fallback: se nunca atingiu entry, max_mc = entry_mc (não pode ganhar sem entrar)
+            if not entry_hit:
+                max_mc_seen = entry_mc
 
-        max_gain_pct = (max_mc_seen / entry_mc - 1) * 100 if entry_mc > 0 else None
+            max_gain_pct = (max_mc_seen / entry_mc - 1) * 100 if entry_mc > 0 else None
 
         results.append({
             **b,
