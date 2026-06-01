@@ -40497,5 +40497,620 @@ def debug_micro_diag():
     )
 
 
+@app.route("/analise/micro-outcomes-v2")
+def analise_micro_outcomes_v2():  # noqa: C901
+    """V2: micro-absorption features vs TP/SL simulado com decision_age gating e entry_must_hit."""
+    import json as _json
+
+    days        = int(request.args.get("days", 7))
+    entry_pct   = float(request.args.get("entry", 0.15))
+    tp_pct      = float(request.args.get("tp", 0.75))
+    sl_pct      = float(request.args.get("sl", 0.25))
+    decision_age = int(request.args.get("decision_age", 10))
+    fmt         = request.args.get("format", "html")
+
+    entry_mult  = 1.0 + entry_pct
+
+    DECISION_AGES = [1, 3, 5, 10, 15, 30, 50]
+
+    # Features gated by minimum decision_age (rise_Xs requires age >= Xs)
+    FEATURE_MIN_AGE = {
+        "rise_1s_net": 1, "rise_3s_net": 3, "rise_5s_net": 5, "rise_10s_net": 10,
+        "pre_5s_net": 0, "pre_10s_net": 0, "pre_15s_net": 0, "pre_30s_net": 0,
+        "pre_5s_sell": 0, "pre_10s_sell": 0, "pre_30s_sell": 0,
+        "pre_5s_buy": 0, "pre_10s_buy": 0, "pre_30s_buy": 0,
+        "buy_concentration_5s": 0, "buy_concentration_10s": 0,
+        "pool_quote": 0, "bounce_pct_now": 0, "drop_from_mig": 0,
+        "live_5s_net": 0, "live_10s_net": 0,
+    }
+
+    # Rules: (id, label, min_age, predicate(snap) -> bool | None)
+    def _safe(v, default=None):
+        return v if v is not None else default
+
+    RULES_V2 = [
+        # IDB — Institutional Dump Bottom: high sell volume pre-bottom (seller exhaustion)
+        ("IDB",       "pre_30s_sell > 3 SOL",          0,  lambda s: _safe(s.get("pre_30s_sell"), 0) > 3),
+        # IDB2 — strengthened: sell > buy pre-bottom
+        ("IDB2",      "pre_30s_sell > pre_30s_buy",     0,  lambda s: _safe(s.get("pre_30s_sell"), 0) > _safe(s.get("pre_30s_buy"), 0)),
+        # IDB3 — concentration: largest buyer > 50% of buy vol
+        ("IDB3",      "buy_conc_10s > 0.5",             0,  lambda s: _safe(s.get("buy_concentration_10s"), 0) > 0.5),
+        # PoolStrong — deep pool (less slippage noise)
+        ("PoolStrong","pool_quote > 90 SOL",            0,  lambda s: _safe(s.get("pool_quote"), 0) > 90),
+        # SilentBottom — minimal flow at bottom (no panic, no pump)
+        ("SilentBottom","abs(pre_10s_net) < 0.5 SOL",  0,  lambda s: abs(_safe(s.get("pre_10s_net"), 0)) < 0.5),
+        # RiseHot1 — positive flow in first 1s after bottom
+        ("RiseHot1",  "rise_1s_net > 0",                1,  lambda s: _safe(s.get("rise_1s_net"), 0) > 0),
+        # RiseHot3 — positive flow in first 3s after bottom
+        ("RiseHot3",  "rise_3s_net > 0",                3,  lambda s: _safe(s.get("rise_3s_net"), 0) > 0),
+        # RiseHot5 — positive flow in first 5s after bottom
+        ("RiseHot5",  "rise_5s_net > 0",                5,  lambda s: _safe(s.get("rise_5s_net"), 0) > 0),
+        # RiseHot10 — positive flow in first 10s after bottom
+        ("RiseHot10", "rise_10s_net > 0",               10, lambda s: _safe(s.get("rise_10s_net"), 0) > 0),
+    ]
+
+    def _get_snap_at_age(snaps, age):
+        """First snapshot with bottom_age_sec >= age, or None."""
+        for s in sorted(snaps, key=lambda x: _safe(x.get("bottom_age_sec"), 0)):
+            if _safe(s.get("bottom_age_sec"), 0) >= age:
+                return s
+        return None
+
+    def _simulate_v2(ticks, ts_min, entry_mc, tp_mc, sl_mc):
+        """Walk ticks after ts_min. Returns dict with entry_hit, outcome, timing."""
+        result = {
+            "entry_hit": False,
+            "entry_ts": None,
+            "outcome": "no_exit",
+            "ts_tp": None,
+            "ts_sl": None,
+            "gain_pct": None,
+        }
+        if not ticks:
+            return result
+
+        entry_phase = True
+        for t in ticks:
+            tick_ts = t.get("tick_ts")
+            if tick_ts is None:
+                continue
+            # Only look at ticks after ts_min
+            if hasattr(tick_ts, "timestamp"):
+                if hasattr(ts_min, "timestamp"):
+                    if tick_ts <= ts_min:
+                        continue
+                else:
+                    continue
+
+            src = t.get("source", "trenches")
+            if src == "kline":
+                high = t.get("mc_high") or t.get("mc") or 0
+                low  = t.get("mc_low")  or t.get("mc") or 0
+                mid_val = t.get("mc") or ((high + low) / 2 if high and low else 0)
+            else:
+                high = low = mid_val = t.get("mc") or 0
+
+            if not high and not low:
+                continue
+
+            # Entry phase: wait for price to touch entry_mc
+            if entry_phase:
+                if high >= entry_mc:
+                    result["entry_hit"] = True
+                    result["entry_ts"] = tick_ts
+                    entry_phase = False
+                continue  # Don't measure TP/SL until entry is hit
+
+            # TP/SL detection after entry
+            tp_hit = high >= tp_mc
+            sl_hit = low  <= sl_mc
+
+            if tp_hit and sl_hit:
+                mc_open  = t.get("mc_open") or mid_val or 0
+                midpoint = (tp_mc + sl_mc) / 2.0
+                if mc_open >= midpoint:
+                    tp_hit, sl_hit = True, False
+                else:
+                    tp_hit, sl_hit = False, True
+
+            if tp_hit and result["ts_tp"] is None:
+                result["ts_tp"] = tick_ts
+                result["outcome"] = "tp"
+                result["gain_pct"] = tp_pct
+                break
+            if sl_hit and result["ts_sl"] is None:
+                result["ts_sl"] = tick_ts
+                result["outcome"] = "sl"
+                result["gain_pct"] = -sl_pct
+                break
+
+        return result
+
+    # ── Load data ──────────────────────────────────────────────────────────────
+    events_dict, ticks_dict = db.get_micro_outcomes_v2_data(days=days)
+
+    if not events_dict:
+        if fmt == "json":
+            return app.response_class(
+                response=_json.dumps({"error": "no data", "days": days}),
+                mimetype="application/json",
+            )
+        return render_template_string("""
+        <html><body style="font-family:monospace;padding:20px">
+        <h2>micro-outcomes-v2</h2>
+        <p>Sem dados para os últimos {{ days }} dias.</p>
+        <a href="/analise/micro-outcomes-v2?days=30">Tentar 30 dias</a>
+        </body></html>
+        """, days=days)
+
+    # ── Per-event simulation at chosen decision_age ────────────────────────────
+    results = []
+    coverage_by_age = {a: {"available": 0, "entry_hit": 0, "tp": 0, "sl": 0, "no_exit": 0} for a in DECISION_AGES}
+
+    for key, snaps in events_dict.items():
+        mint = snaps[0]["mint"]
+        ts_min_raw = snaps[0]["ts_min"]
+        mc_min_v = _safe(snaps[0].get("mc_min"), 0)
+        if not mc_min_v:
+            continue
+
+        entry_mc = mc_min_v * entry_mult
+        tp_mc    = entry_mc * (1.0 + tp_pct)
+        sl_mc    = entry_mc * (1.0 - sl_pct)
+
+        mint_ticks = ticks_dict.get(mint, [])
+
+        for age in DECISION_AGES:
+            snap = _get_snap_at_age(snaps, age)
+            if snap is None:
+                continue
+            coverage_by_age[age]["available"] += 1
+            sim = _simulate_v2(mint_ticks, ts_min_raw, entry_mc, tp_mc, sl_mc)
+            coverage_by_age[age]["entry_hit" if sim["entry_hit"] else "entry_hit"]
+            if sim["entry_hit"]:
+                coverage_by_age[age]["entry_hit"] += 1
+            coverage_by_age[age][sim["outcome"]] += 1
+
+        # Main simulation at chosen decision_age
+        snap = _get_snap_at_age(snaps, decision_age)
+        if snap is None:
+            continue
+
+        sim = _simulate_v2(mint_ticks, ts_min_raw, entry_mc, tp_mc, sl_mc)
+
+        row = {
+            "mint": mint,
+            "symbol": snap.get("symbol", "?"),
+            "ts_min": ts_min_raw,
+            "mc_min": mc_min_v,
+            "mc_migration": _safe(snap.get("mc_migration"), 0),
+            "pool_quote": _safe(snap.get("pool_quote"), 0),
+            "elapsed_sec": _safe(snap.get("elapsed_sec"), 0),
+            "drop_from_mig": _safe(snap.get("drop_from_mig"), 0),
+            "bounce_pct_now": _safe(snap.get("bounce_pct_now"), 0),
+            "bottom_age": _safe(snap.get("bottom_age_sec"), 0),
+            # PRE features
+            "pre_5s_net": _safe(snap.get("pre_5s_net"), 0),
+            "pre_10s_net": _safe(snap.get("pre_10s_net"), 0),
+            "pre_15s_net": _safe(snap.get("pre_15s_net"), 0),
+            "pre_30s_net": _safe(snap.get("pre_30s_net"), 0),
+            "pre_5s_sell": _safe(snap.get("pre_5s_sell"), 0),
+            "pre_10s_sell": _safe(snap.get("pre_10s_sell"), 0),
+            "pre_30s_sell": _safe(snap.get("pre_30s_sell"), 0),
+            "pre_5s_buy": _safe(snap.get("pre_5s_buy"), 0),
+            "pre_10s_buy": _safe(snap.get("pre_10s_buy"), 0),
+            "pre_30s_buy": _safe(snap.get("pre_30s_buy"), 0),
+            "buy_concentration_5s": _safe(snap.get("buy_concentration_5s"), 0),
+            "buy_concentration_10s": _safe(snap.get("buy_concentration_10s"), 0),
+            # RISE features (only valid at decision_age >= X)
+            "rise_1s_net": _safe(snap.get("rise_1s_net"), None) if decision_age >= 1 else None,
+            "rise_3s_net": _safe(snap.get("rise_3s_net"), None) if decision_age >= 3 else None,
+            "rise_5s_net": _safe(snap.get("rise_5s_net"), None) if decision_age >= 5 else None,
+            "rise_10s_net": _safe(snap.get("rise_10s_net"), None) if decision_age >= 10 else None,
+            "live_5s_net": _safe(snap.get("live_5s_net"), None),
+            "live_10s_net": _safe(snap.get("live_10s_net"), None),
+            # Outcome
+            "entry_hit": sim["entry_hit"],
+            "entry_ts": sim["entry_ts"],
+            "outcome": sim["outcome"],
+            "ts_tp": sim["ts_tp"],
+            "ts_sl": sim["ts_sl"],
+            "gain_pct": sim["gain_pct"],
+        }
+
+        # Evaluate rules
+        for rule_id, rule_label, rule_min_age, rule_fn in RULES_V2:
+            try:
+                row[f"rule_{rule_id}"] = rule_fn(snap) if decision_age >= rule_min_age else None
+            except Exception:
+                row[f"rule_{rule_id}"] = None
+
+        results.append(row)
+
+    if not results:
+        return render_template_string("""
+        <html><body style="font-family:monospace;padding:20px">
+        <h2>micro-outcomes-v2</h2>
+        <p>Eventos insuficientes (decision_age={{ da }}s exige snapshots com age >= {{ da }}s).</p>
+        <a href="/analise/micro-outcomes-v2?decision_age=5">Tentar decision_age=5</a> |
+        <a href="/analise/micro-outcomes-v2?days=30">30 dias</a>
+        </body></html>
+        """, da=decision_age)
+
+    # ── Aggregate stats ────────────────────────────────────────────────────────
+    def _stats(rows):
+        n = len(rows)
+        if n == 0:
+            return {"n": 0, "entry_hit": 0, "tp": 0, "sl": 0, "no_exit": 0,
+                    "wr": None, "ev_res": None, "ev_zero": None, "ev_loss": None}
+        eh = sum(1 for r in rows if r["entry_hit"])
+        tp = sum(1 for r in rows if r["outcome"] == "tp")
+        sl = sum(1 for r in rows if r["outcome"] == "sl")
+        ne = sum(1 for r in rows if r["outcome"] == "no_exit")
+        resolved = tp + sl
+        wr = tp / resolved if resolved else None
+        ev_res  = (tp * tp_pct - sl * sl_pct) / resolved if resolved else None
+        ev_zero = (tp * tp_pct - sl * sl_pct) / n
+        ev_loss = (tp * tp_pct - sl * sl_pct - ne * sl_pct) / n
+        return {"n": n, "entry_hit": eh, "tp": tp, "sl": sl, "no_exit": ne,
+                "wr": wr, "ev_res": ev_res, "ev_zero": ev_zero, "ev_loss": ev_loss}
+
+    base = _stats(results)
+
+    # ── Decision Age Comparison ────────────────────────────────────────────────
+    age_comparison = []
+    for age in DECISION_AGES:
+        age_rows = []
+        for key, snaps in events_dict.items():
+            mint = snaps[0]["mint"]
+            ts_min_raw = snaps[0]["ts_min"]
+            mc_min_v = _safe(snaps[0].get("mc_min"), 0)
+            if not mc_min_v:
+                continue
+            snap = _get_snap_at_age(snaps, age)
+            if snap is None:
+                continue
+            entry_mc = mc_min_v * entry_mult
+            tp_mc_a  = entry_mc * (1.0 + tp_pct)
+            sl_mc_a  = entry_mc * (1.0 - sl_pct)
+            mint_ticks = ticks_dict.get(mint, [])
+            sim = _simulate_v2(mint_ticks, ts_min_raw, entry_mc, tp_mc_a, sl_mc_a)
+            age_rows.append(sim)
+        st = _stats(age_rows)
+        age_comparison.append({"age": age, **st})
+
+    # ── Rule Scoreboard ────────────────────────────────────────────────────────
+    rule_scores = []
+    for rule_id, rule_label, rule_min_age, _ in RULES_V2:
+        if decision_age < rule_min_age:
+            rule_scores.append({"id": rule_id, "label": rule_label, "eligible": False,
+                                 "min_age": rule_min_age, **{k: None for k in ["n_yes","n_no","wr_yes","wr_no","delta_wr","ev_yes","ev_no","delta_ev"]}})
+            continue
+        col = f"rule_{rule_id}"
+        yes_rows = [r for r in results if r.get(col) is True]
+        no_rows  = [r for r in results if r.get(col) is False]
+        sy = _stats(yes_rows)
+        sn = _stats(no_rows)
+        delta_wr = (sy["wr"] - sn["wr"]) if sy["wr"] is not None and sn["wr"] is not None else None
+        delta_ev = ((sy["ev_loss"] or 0) - (sn["ev_loss"] or 0)) if sy["ev_loss"] is not None else None
+        rule_scores.append({
+            "id": rule_id, "label": rule_label, "eligible": True, "min_age": rule_min_age,
+            "n_yes": sy["n"], "n_no": sn["n"],
+            "wr_yes": sy["wr"], "wr_no": sn["wr"],
+            "delta_wr": delta_wr,
+            "ev_yes": sy["ev_loss"], "ev_no": sn["ev_loss"],
+            "delta_ev": delta_ev,
+        })
+    rule_scores.sort(key=lambda x: -(x["delta_ev"] or -999))
+
+    # ── Bucket tables ──────────────────────────────────────────────────────────
+    def _bucket_table(rows, key_fn, labels):
+        buckets = {lbl: [] for lbl in labels}
+        for r in rows:
+            for lbl, (lo, hi) in labels.items():
+                v = key_fn(r)
+                if v is not None and lo <= v < hi:
+                    buckets[lbl].append(r)
+                    break
+        return {lbl: _stats(brows) for lbl, brows in buckets.items()}
+
+    pool_buckets = _bucket_table(
+        results, lambda r: r["pool_quote"],
+        {"<20 SOL": (0, 20), "20-50": (20, 50), "50-90": (50, 90), ">90": (90, 1e9)}
+    )
+    pre10_buckets = _bucket_table(
+        results, lambda r: r["pre_10s_net"],
+        {"< -5": (-1e9, -5), "-5 a -1": (-5, -1), "-1 a +1": (-1, 1), "+1 a +5": (1, 5), "> +5": (5, 1e9)}
+    )
+    bounce_buckets = _bucket_table(
+        results, lambda r: r["bounce_pct_now"] * 100 if r["bounce_pct_now"] else None,
+        {"<30%": (0, 30), "30-60%": (30, 60), "60-100%": (60, 100), ">100%": (100, 1e9)}
+    )
+    rise_buckets = None
+    if decision_age >= 5:
+        rise_buckets = _bucket_table(
+            results, lambda r: r.get("rise_5s_net"),
+            {"< -1": (-1e9, -1), "-1 a 0": (-1, 0), "0 a +1": (0, 1), "> +1": (1, 1e9)}
+        )
+
+    # ── FP/FN for top rule ─────────────────────────────────────────────────────
+    fp_fn = None
+    if rule_scores and rule_scores[0].get("eligible"):
+        top_id = rule_scores[0]["id"]
+        col = f"rule_{top_id}"
+        yes_tp = [r for r in results if r.get(col) is True and r["outcome"] == "tp"]
+        yes_sl = [r for r in results if r.get(col) is True and r["outcome"] == "sl"]
+        yes_ne = [r for r in results if r.get(col) is True and r["outcome"] == "no_exit"]
+        no_tp  = [r for r in results if r.get(col) is False and r["outcome"] == "tp"]
+        no_sl  = [r for r in results if r.get(col) is False and r["outcome"] == "sl"]
+        no_ne  = [r for r in results if r.get(col) is False and r["outcome"] == "no_exit"]
+        fp_fn = {
+            "rule_id": top_id,
+            "tp_when_yes": len(yes_tp), "sl_when_yes": len(yes_sl), "ne_when_yes": len(yes_ne),
+            "tp_when_no": len(no_tp),  "sl_when_no": len(no_sl),  "ne_when_no": len(no_ne),
+            # FP: rule fires but outcome is SL
+            "fp_rate": len(yes_sl) / max(len(yes_sl) + len(yes_tp), 1),
+            # FN: rule doesn't fire but outcome would have been TP
+            "fn_rate": len(no_tp) / max(len(no_tp) + len(yes_tp), 1),
+        }
+
+    # ── JSON / CSV export ──────────────────────────────────────────────────────
+    if fmt == "json":
+        export = {
+            "params": {"days": days, "entry_pct": entry_pct, "tp_pct": tp_pct,
+                       "sl_pct": sl_pct, "decision_age": decision_age},
+            "base_stats": base,
+            "decision_age_comparison": age_comparison,
+            "rule_scoreboard": rule_scores,
+            "pool_buckets": {k: v for k, v in pool_buckets.items()},
+            "pre10_buckets": {k: v for k, v in pre10_buckets.items()},
+            "bounce_buckets": {k: v for k, v in bounce_buckets.items()},
+            "coverage_by_age": coverage_by_age,
+            "events": [
+                {k: (str(v) if isinstance(v, datetime) else v)
+                 for k, v in r.items()
+                 if not k.startswith("rule_")}
+                for r in results
+            ],
+        }
+        return app.response_class(
+            response=_json.dumps(export, indent=2, default=str),
+            mimetype="application/json",
+        )
+
+    if fmt == "csv":
+        output = io.StringIO()
+        cols = [c for c in (results[0].keys() if results else []) if not c.startswith("rule_")]
+        w = csv.DictWriter(output, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for r in results:
+            w.writerow({k: str(v) if isinstance(v, datetime) else v for k, v in r.items()})
+        return Response(
+            output.getvalue(),
+            mimetype="text/csv",
+            headers={"Content-Disposition": "attachment; filename=micro_outcomes_v2.csv"},
+        )
+
+    # ── HTML render ────────────────────────────────────────────────────────────
+    def _pct(v):
+        if v is None: return "—"
+        return f"{v*100:+.1f}%"
+
+    def _ev_color(v):
+        if v is None: return ""
+        return "color:green" if v > 0 else ("color:red" if v < 0 else "")
+
+    def _wr_color(v):
+        if v is None: return ""
+        return "color:green" if v >= 0.35 else ("color:red" if v < 0.20 else "color:orange")
+
+    def _delta_color(v):
+        if v is None: return ""
+        return "color:green" if v > 0.02 else ("color:red" if v < -0.02 else "")
+
+    nav_ages = " | ".join(
+        f'<a href="?days={days}&entry={entry_pct}&tp={tp_pct}&sl={sl_pct}&decision_age={a}"'
+        f' style="{"font-weight:bold;text-decoration:underline" if a == decision_age else ""}">{a}s</a>'
+        for a in DECISION_AGES
+    )
+
+    # Age comparison table rows
+    age_table_html = ""
+    for ac in age_comparison:
+        a = ac["age"]
+        wr_s  = f"{ac['wr']*100:.1f}%" if ac["wr"] is not None else "—"
+        ev_s  = f"{ac['ev_loss']*100:+.1f}%" if ac["ev_loss"] is not None else "—"
+        highlight = "background:#f0f8ff" if a == decision_age else ""
+        age_table_html += (
+            f'<tr style="{highlight}"><td>{a}s</td>'
+            f'<td>{ac["n"]}</td><td>{ac["entry_hit"]}</td>'
+            f'<td>{ac["tp"]}</td><td>{ac["sl"]}</td><td>{ac["no_exit"]}</td>'
+            f'<td style="{_wr_color(ac["wr"])}">{wr_s}</td>'
+            f'<td style="{_ev_color(ac["ev_loss"])}">{ev_s}</td></tr>\n'
+        )
+
+    # Rule scoreboard rows
+    rule_html = ""
+    for rs in rule_scores:
+        if not rs["eligible"]:
+            rule_html += (
+                f'<tr style="color:gray"><td>{rs["id"]}</td>'
+                f'<td><code>{rs["label"]}</code></td>'
+                f'<td colspan="7">⚠️ requer decision_age ≥ {rs["min_age"]}s</td></tr>\n'
+            )
+            continue
+        wr_y = f"{rs['wr_yes']*100:.1f}%" if rs["wr_yes"] is not None else "—"
+        wr_n = f"{rs['wr_no']*100:.1f}%" if rs["wr_no"] is not None else "—"
+        d_wr = f"{rs['delta_wr']*100:+.1f}pp" if rs["delta_wr"] is not None else "—"
+        ev_y = f"{rs['ev_yes']*100:+.1f}%" if rs["ev_yes"] is not None else "—"
+        ev_n = f"{rs['ev_no']*100:+.1f}%" if rs["ev_no"] is not None else "—"
+        d_ev = f"{rs['delta_ev']*100:+.1f}pp" if rs["delta_ev"] is not None else "—"
+        rule_html += (
+            f'<tr><td><b>{rs["id"]}</b></td>'
+            f'<td><code>{rs["label"]}</code></td>'
+            f'<td>{rs["n_yes"]} / {rs["n_no"]}</td>'
+            f'<td style="{_wr_color(rs["wr_yes"])}">{wr_y}</td>'
+            f'<td style="{_wr_color(rs["wr_no"])}">{wr_n}</td>'
+            f'<td style="{_delta_color(rs["delta_wr"])}">{d_wr}</td>'
+            f'<td style="{_ev_color(rs["ev_yes"])}">{ev_y}</td>'
+            f'<td style="{_ev_color(rs["ev_no"])}">{ev_n}</td>'
+            f'<td style="{_delta_color(rs["delta_ev"])}">{d_ev}</td></tr>\n'
+        )
+
+    def _bucket_rows(bkt):
+        html = ""
+        for lbl, st in bkt.items():
+            wr_s = f"{st['wr']*100:.1f}%" if st["wr"] is not None else "—"
+            ev_s = f"{st['ev_loss']*100:+.1f}%" if st["ev_loss"] is not None else "—"
+            html += (
+                f'<tr><td>{lbl}</td><td>{st["n"]}</td>'
+                f'<td>{st["entry_hit"]}</td>'
+                f'<td>{st["tp"]}</td><td>{st["sl"]}</td><td>{st["no_exit"]}</td>'
+                f'<td style="{_wr_color(st["wr"])}">{wr_s}</td>'
+                f'<td style="{_ev_color(st["ev_loss"])}">{ev_s}</td></tr>\n'
+            )
+        return html
+
+    fp_fn_html = ""
+    if fp_fn:
+        fp_fn_html = f"""
+        <h3>FP/FN — Regra top: {fp_fn['rule_id']}</h3>
+        <table border="1" cellpadding="4" style="border-collapse:collapse;font-size:12px">
+        <tr><th></th><th>TP</th><th>SL</th><th>no_exit</th></tr>
+        <tr><td><b>Regra=SIM</b></td><td style="color:green">{fp_fn['tp_when_yes']}</td>
+            <td style="color:red">{fp_fn['sl_when_yes']}</td><td>{fp_fn['ne_when_yes']}</td></tr>
+        <tr><td><b>Regra=NÃO</b></td><td style="color:orange">{fp_fn['tp_when_no']}</td>
+            <td>{fp_fn['sl_when_no']}</td><td>{fp_fn['ne_when_no']}</td></tr>
+        </table>
+        <p>FP rate (regra=SIM → SL): <b>{fp_fn['fp_rate']*100:.1f}%</b> &nbsp;|&nbsp;
+           FN rate (regra=NÃO → TP perdido): <b>{fp_fn['fn_rate']*100:.1f}%</b></p>
+        """
+
+    rise_bucket_html = ""
+    if rise_buckets:
+        rise_bucket_html = f"""
+        <h3>Rise 5s Net (decision_age ≥ 5s)</h3>
+        <table border="1" cellpadding="4" style="border-collapse:collapse;font-size:12px">
+        <tr><th>Faixa</th><th>n</th><th>entry_hit</th><th>TP</th><th>SL</th><th>no_exit</th><th>WR</th><th>EV (SL penalty)</th></tr>
+        {_bucket_rows(rise_buckets)}
+        </table>
+        """
+
+    coverage_html = ""
+    for age in DECISION_AGES:
+        cov = coverage_by_age[age]
+        avail = cov["available"]
+        eh = cov["entry_hit"]
+        pct = f"{avail / max(len(events_dict), 1) * 100:.0f}%"
+        highlight = "background:#f0f8ff" if age == decision_age else ""
+        coverage_html += (
+            f'<tr style="{highlight}"><td>{age}s</td><td>{avail}</td>'
+            f'<td>{pct}</td><td>{eh}</td>'
+            f'<td>{cov["tp"]}</td><td>{cov["sl"]}</td><td>{cov["no_exit"]}</td></tr>\n'
+        )
+
+    wr_base = f"{base['wr']*100:.1f}%" if base["wr"] is not None else "—"
+    ev_res  = f"{base['ev_res']*100:+.1f}%" if base["ev_res"] is not None else "—"
+    ev_zero = f"{base['ev_zero']*100:+.1f}%" if base["ev_zero"] is not None else "—"
+    ev_loss = f"{base['ev_loss']*100:+.1f}%" if base["ev_loss"] is not None else "—"
+
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>micro-outcomes-v2</title>
+<meta http-equiv="refresh" content="60">
+<style>
+body{{font-family:monospace;font-size:13px;padding:16px;background:#fafafa}}
+h2{{margin-top:20px;margin-bottom:4px}}
+h3{{margin-top:16px;margin-bottom:4px;color:#333}}
+table{{border-collapse:collapse;margin-bottom:12px}}
+td,th{{padding:4px 8px;border:1px solid #ccc}}
+th{{background:#eee}}
+.card{{display:inline-block;margin:4px;padding:8px 14px;background:#fff;
+       border:1px solid #ddd;border-radius:4px;min-width:120px;text-align:center}}
+.card b{{display:block;font-size:18px}}
+.card small{{color:#888;font-size:11px}}
+</style>
+</head><body>
+
+<h2>🔬 micro-outcomes-v2 — Fase 2.1</h2>
+<p style="color:#666">
+  Entry = mc_min × {entry_mult:.2f} | TP = entry × {1+tp_pct:.2f} | SL = entry × {1-sl_pct:.2f}
+  | Últimos {days} dias | decision_age = {decision_age}s
+</p>
+<p>
+  Decision age: {nav_ages}
+  &nbsp;|&nbsp;
+  <a href="?days={days}&decision_age={decision_age}&format=json">JSON</a>
+  <a href="?days={days}&decision_age={decision_age}&format=csv">CSV</a>
+  <a href="/analise/micro-outcomes">V1</a>
+</p>
+
+<div>
+  <div class="card"><b>{len(events_dict)}</b><small>eventos</small></div>
+  <div class="card"><b>{base['n']}</b><small>com snap@{decision_age}s</small></div>
+  <div class="card"><b>{base['entry_hit']}</b><small>entry_hit</small></div>
+  <div class="card"><b style="{_wr_color(base['wr'])}">{wr_base}</b><small>WR (resolved)</small></div>
+  <div class="card"><b style="{_ev_color(base['ev_res'])}">{ev_res}</b><small>EV_resolved</small></div>
+  <div class="card"><b style="{_ev_color(base['ev_zero'])}">{ev_zero}</b><small>EV (no_exit=0)</small></div>
+  <div class="card"><b style="{_ev_color(base['ev_loss'])}">{ev_loss}</b><small>EV (no_exit=SL)</small></div>
+  <div class="card"><b>{base['tp']}</b><small>TP</small></div>
+  <div class="card"><b>{base['sl']}</b><small>SL</small></div>
+  <div class="card"><b>{base['no_exit']}</b><small>no_exit</small></div>
+</div>
+
+<h3>📊 Coverage por Decision Age</h3>
+<table border="1" cellpadding="4" style="border-collapse:collapse;font-size:12px">
+<tr><th>age</th><th>eventos disponíveis</th><th>% cobertura</th><th>entry_hit</th>
+    <th>TP</th><th>SL</th><th>no_exit</th></tr>
+{coverage_html}
+</table>
+
+<h3>📈 Decision Age Comparison (entry_must_hit)</h3>
+<table border="1" cellpadding="4" style="border-collapse:collapse;font-size:12px">
+<tr><th>age</th><th>n</th><th>entry_hit</th><th>TP</th><th>SL</th><th>no_exit</th>
+    <th>WR</th><th>EV (SL penalty)</th></tr>
+{age_table_html}
+</table>
+<p style="font-size:11px;color:#888">WR = TP/(TP+SL) — apenas resolvidos. EV (SL penalty) = (TP×{tp_pct:.0%} − SL×{sl_pct:.0%} − noExit×{sl_pct:.0%}) / n</p>
+
+<h3>🏆 Rule Scoreboard (ordenado por Δ EV desc)</h3>
+<table border="1" cellpadding="4" style="border-collapse:collapse;font-size:12px">
+<tr><th>ID</th><th>Regra</th><th>n SIM/NÃO</th>
+    <th>WR SIM</th><th>WR NÃO</th><th>Δ WR</th>
+    <th>EV SIM</th><th>EV NÃO</th><th>Δ EV</th></tr>
+{rule_html}
+</table>
+<p style="font-size:11px;color:#888">Δ = SIM - NÃO. Verde se SIM &gt; NÃO. EV = SL penalty (no_exit conta como SL).</p>
+
+{fp_fn_html}
+
+<h3>Pool Depth Buckets</h3>
+<table border="1" cellpadding="4" style="border-collapse:collapse;font-size:12px">
+<tr><th>Pool Quote</th><th>n</th><th>entry_hit</th><th>TP</th><th>SL</th><th>no_exit</th><th>WR</th><th>EV</th></tr>
+{_bucket_rows(pool_buckets)}
+</table>
+
+<h3>PRE-10s Net Flow Buckets</h3>
+<table border="1" cellpadding="4" style="border-collapse:collapse;font-size:12px">
+<tr><th>PRE-10s net</th><th>n</th><th>entry_hit</th><th>TP</th><th>SL</th><th>no_exit</th><th>WR</th><th>EV</th></tr>
+{_bucket_rows(pre10_buckets)}
+</table>
+
+<h3>Bounce% na Decisão Buckets</h3>
+<table border="1" cellpadding="4" style="border-collapse:collapse;font-size:12px">
+<tr><th>Bounce%</th><th>n</th><th>entry_hit</th><th>TP</th><th>SL</th><th>no_exit</th><th>WR</th><th>EV</th></tr>
+{_bucket_rows(bounce_buckets)}
+</table>
+
+{rise_bucket_html}
+
+<p style="color:#888;font-size:11px;margin-top:20px">
+  Auto-refresh 60s | entry_must_hit=True — TP/SL medidos apenas após price tocar entry_mc
+</p>
+</body></html>"""
+
+    return render_template_string(html)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)

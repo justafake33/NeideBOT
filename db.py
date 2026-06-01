@@ -1734,3 +1734,67 @@ def get_trades_without_strategy() -> list:
             LIMIT 20
         """)
         return [dict(row) for row in cur.fetchall()]
+
+
+def get_micro_outcomes_v2_data(days: int = 7) -> tuple:
+    """Returns (events_dict, ticks_dict) for /analise/micro-outcomes-v2.
+
+    events_dict: { (mint, ts_min_iso) -> [snapshots sorted by bottom_age_sec ASC] }
+    ticks_dict:  { mint -> [ticks sorted by tick_ts ASC] }
+    """
+    from collections import defaultdict
+    from datetime import timedelta, timezone
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    with _cursor() as cur:
+        cur.execute("""
+            SELECT
+                mint, symbol, ts_min, ts_migration,
+                ts_snapshot, bottom_age_sec, mc_min, mc_current, mc_migration,
+                bounce_pct_now, drop_from_mig, elapsed_sec, pool_quote, candidate_flags,
+                pre_5s_net, pre_10s_net, pre_15s_net, pre_30s_net,
+                pre_5s_buy, pre_10s_buy, pre_30s_buy,
+                pre_5s_sell, pre_10s_sell, pre_30s_sell,
+                pre_5s_events, pre_10s_events, pre_30s_events,
+                pre_5s_largest_buy, pre_10s_largest_buy, pre_30s_largest_buy,
+                buy_concentration_5s, buy_concentration_10s,
+                rise_1s_net, rise_1s_zero_type,
+                rise_3s_net, rise_3s_zero_type,
+                rise_5s_net, rise_5s_zero_type,
+                rise_10s_net, rise_10s_zero_type,
+                rise_now_net, live_5s_net, live_10s_net
+            FROM micro_absorption_snapshots
+            WHERE ts_snapshot >= %(cutoff)s
+              AND mc_min IS NOT NULL
+              AND ts_min IS NOT NULL
+            ORDER BY mint, ts_min, bottom_age_sec
+        """, {"cutoff": cutoff})
+        all_snaps = [dict(r) for r in cur.fetchall()]
+
+    if not all_snaps:
+        return {}, {}
+
+    events: dict = defaultdict(list)
+    for s in all_snaps:
+        ts = s["ts_min"]
+        key = (s["mint"], ts.isoformat() if hasattr(ts, "isoformat") else str(ts))
+        events[key].append(s)
+
+    mints = list({s["mint"] for s in all_snaps})
+    ts_floor = min(s["ts_min"] for s in all_snaps)
+    ts_ceil  = max(s["ts_min"] for s in all_snaps) + timedelta(hours=1, minutes=5)
+
+    with _cursor() as cur:
+        cur.execute("""
+            SELECT mint, tick_ts, mc, mc_open, mc_high, mc_low, source
+            FROM token_ticks
+            WHERE mint = ANY(%(mints)s)
+              AND tick_ts > %(ts_floor)s
+              AND tick_ts <= %(ts_ceil)s
+            ORDER BY mint, tick_ts
+        """, {"mints": mints, "ts_floor": ts_floor, "ts_ceil": ts_ceil})
+        ticks_by_mint: dict = defaultdict(list)
+        for t in cur.fetchall():
+            ticks_by_mint[t["mint"]].append(dict(t))
+
+    return dict(events), dict(ticks_by_mint)
