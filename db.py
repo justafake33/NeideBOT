@@ -1215,6 +1215,155 @@ def get_micro_absorption_stats(days: int = 1, mint: Optional[str] = None) -> dic
     return dict(row) if row else {}
 
 
+def get_micro_outcomes(
+    days: int = 7,
+    min_age: float = 50,
+    entry_pct: float = 0.15,
+    tp_pct: float = 0.75,
+    sl_pct: float = 0.25,
+) -> list:
+    """Combina micro_absorption_snapshots (completos) com token_ticks para simular outcome.
+
+    entry_mc  = mc_min * (1 + entry_pct)   — entrada estimada acima do fundo
+    tp_mc     = entry_mc * (1 + tp_pct)    — alvo de ganho
+    sl_mc     = entry_mc * (1 - sl_pct)    — stop-loss
+    outcome   = 'tp' | 'sl' | 'no_exit'   — determinado pelo primeiro cruzamento em 60 min de ticks
+    """
+    from collections import defaultdict
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    # ── 1. Complete bottom events ────────────────────────────────────────────
+    bottoms_q = """
+        SELECT DISTINCT ON (mint, ts_min)
+            mint, symbol, ts_min, ts_migration,
+            mc_min, mc_migration, bounce_pct_now, drop_from_mig,
+            elapsed_sec, pool_quote, candidate_flags,
+            pre_5s_net,  pre_10s_net,  pre_15s_net,  pre_30s_net,
+            pre_5s_buy,  pre_10s_buy,  pre_30s_buy,
+            pre_5s_sell, pre_10s_sell, pre_30s_sell,
+            pre_5s_events, pre_10s_events, pre_30s_events,
+            pre_5s_largest_buy,  pre_10s_largest_buy,  pre_30s_largest_buy,
+            pre_5s_largest_sell, pre_10s_largest_sell, pre_30s_largest_sell,
+            buy_concentration_5s, buy_concentration_10s,
+            sell_concentration_5s, sell_concentration_10s,
+            rise_1s_net,  rise_3s_net,  rise_5s_net,  rise_10s_net,
+            rise_1s_zero_type, rise_3s_zero_type, rise_5s_zero_type, rise_10s_zero_type,
+            rise_now_net, live_5s_net, live_10s_net
+        FROM micro_absorption_snapshots
+        WHERE bottom_age_sec >= %(min_age)s
+          AND ts_snapshot >= %(cutoff)s
+          AND mc_min IS NOT NULL
+          AND ts_min IS NOT NULL
+        ORDER BY mint, ts_min, bottom_age_sec DESC
+    """
+    with _cursor() as cur:
+        cur.execute(bottoms_q, {"min_age": min_age, "cutoff": cutoff})
+        bottoms = [dict(r) for r in cur.fetchall()]
+
+    if not bottoms:
+        return []
+
+    # ── 2. Bulk-fetch token_ticks para todos os mints no período ────────────
+    mints = list({b["mint"] for b in bottoms})
+    ts_floor = min(b["ts_min"] for b in bottoms)
+    ts_ceil  = max(b["ts_min"] for b in bottoms) + timedelta(hours=1, minutes=5)
+
+    ticks_q = """
+        SELECT mint, tick_ts, mc, mc_open, mc_high, mc_low, source
+        FROM token_ticks
+        WHERE mint = ANY(%(mints)s)
+          AND tick_ts >  %(ts_floor)s
+          AND tick_ts <= %(ts_ceil)s
+        ORDER BY mint, tick_ts
+    """
+    with _cursor() as cur:
+        cur.execute(ticks_q, {"mints": mints, "ts_floor": ts_floor, "ts_ceil": ts_ceil})
+        ticks_by_mint: dict = defaultdict(list)
+        for t in cur.fetchall():
+            ticks_by_mint[t["mint"]].append(dict(t))
+
+    # ── 3. Calcula outcome para cada bottom event ────────────────────────────
+    results = []
+    entry_mult = 1 + entry_pct
+    tp_mult    = 1 + tp_pct
+    sl_mult    = 1 - sl_pct
+
+    for b in bottoms:
+        mc_min = b["mc_min"]
+        ts_min = b["ts_min"]
+        ts_end = ts_min + timedelta(minutes=60)
+
+        entry_mc = mc_min * entry_mult
+        tp_mc    = entry_mc * tp_mult
+        sl_mc    = entry_mc * sl_mult
+
+        window_ticks = [
+            t for t in ticks_by_mint[b["mint"]]
+            if t["tick_ts"] > ts_min and t["tick_ts"] <= ts_end
+        ]
+
+        ts_tp = ts_sl = None
+        max_mc_seen = entry_mc
+
+        for t in window_ticks:  # já vem ordenado por tick_ts
+            if t["source"] == "kline":
+                high = t["mc_high"] or t["mc"] or 0
+                low  = t["mc_low"]  or t["mc"] or 0
+            else:
+                high = low = t["mc"] or 0
+
+            if high > max_mc_seen:
+                max_mc_seen = high
+
+            tp_hit = high >= tp_mc
+            sl_hit = low  <= sl_mc
+
+            if tp_hit and sl_hit:
+                # Desempate via mc_open vs midpoint (nota 34 CLAUDE.md)
+                mc_open  = t.get("mc_open") or t["mc"] or 0
+                midpoint = (tp_mc + sl_mc) / 2
+                if mc_open >= midpoint:
+                    if ts_tp is None: ts_tp = t["tick_ts"]
+                else:
+                    if ts_sl is None: ts_sl = t["tick_ts"]
+            elif tp_hit and ts_tp is None:
+                ts_tp = t["tick_ts"]
+            elif sl_hit and ts_sl is None:
+                ts_sl = t["tick_ts"]
+
+            if ts_tp and ts_sl:
+                break
+
+        if ts_tp and ts_sl:
+            outcome = "tp" if ts_tp <= ts_sl else "sl"
+        elif ts_tp:
+            outcome = "tp"
+        elif ts_sl:
+            outcome = "sl"
+        else:
+            outcome = "no_exit"
+
+        exit_ts = ts_tp if outcome == "tp" else (ts_sl if outcome == "sl" else None)
+        elapsed_exit = (exit_ts - ts_min).total_seconds() / 60 if exit_ts else None
+        max_gain_pct = (max_mc_seen / entry_mc - 1) * 100 if entry_mc > 0 else None
+
+        results.append({
+            **b,
+            "entry_mc":         entry_mc,
+            "tp_mc":            tp_mc,
+            "sl_mc":            sl_mc,
+            "ts_tp":            ts_tp,
+            "ts_sl":            ts_sl,
+            "outcome":          outcome,
+            "tick_count":       len(window_ticks),
+            "elapsed_exit_min": elapsed_exit,
+            "max_gain_pct":     max_gain_pct,
+        })
+
+    return results
+
+
 def insert_ticks_batch(ticks: list):
     """Insere ticks de trenches (source='trenches') — mc = preco no momento do poll."""
     if not ticks:
