@@ -39963,17 +39963,20 @@ def debug_micro_absorption_snapshots():  # noqa: C901
     mint_raw  = request.args.get("mint",   "").strip() or None
     limit_raw = request.args.get("limit",  "200")
     fmt       = request.args.get("format", "html").lower()
+    mode      = request.args.get("mode",   "summary").lower()  # summary | full
 
     try:
         days  = max(1, int(days_raw))
     except ValueError:
         days = 1
     try:
-        limit = max(1, min(2000, int(limit_raw)))
+        limit = max(1, min(5000, int(limit_raw)))
     except ValueError:
         limit = 200
 
-    rows = db.get_micro_absorption_snapshots(days=days, mint=mint_raw, limit=limit)
+    summary = (mode != "full")
+    rows = db.get_micro_absorption_snapshots(days=days, mint=mint_raw, limit=limit,
+                                              summary=summary)
 
     # ── JSON ─────────────────────────────────────────────────────────────────
     if fmt == "json":
@@ -40077,9 +40080,13 @@ def debug_micro_absorption_snapshots():  # noqa: C901
         </tr>"""
 
     filter_note = f"mint={mint_raw}" if mint_raw else f"últimas {days}d"
+    mode_label  = "sumário (1 linha/bounce)" if summary else "completo (série temporal)"
+    base_args   = f"days={days}&limit={limit}" + (f"&mint={mint_raw}" if mint_raw else "")
+    toggle_mode = "full" if summary else "summary"
     html = f"""<!DOCTYPE html><html><head>
 <title>Micro Absorption Snapshots</title>
 <meta charset='utf-8'>
+<meta http-equiv='refresh' content='15'>
 <style>
   body {{ font-family: monospace; font-size: 12px; background: #111; color: #eee; padding: 12px; }}
   h2 {{ color: #f0a; }}
@@ -40093,10 +40100,15 @@ def debug_micro_absorption_snapshots():  # noqa: C901
 </head><body>
 <h2>Micro Absorption Snapshots — Fase 1 V2</h2>
 <p class='note'>
-  Mostrando {len(rows)} de {limit} registros ({filter_note}).
-  Dados research-only — não afetam trading.
-  Formatos: <a href='?days={days}&format=json&limit={limit}{"&mint="+mint_raw if mint_raw else ""}'>JSON</a>
-           | <a href='?days={days}&format=csv&limit={limit}{"&mint="+mint_raw if mint_raw else ""}'>CSV</a>
+  Mostrando <b>{len(rows)}</b> registros · modo: <b>{mode_label}</b> · {filter_note}<br>
+  Modo: <a href='?{base_args}&mode={toggle_mode}'>{"ver série temporal completa" if summary else "ver sumário (1/bounce)"}</a>
+  &nbsp;|&nbsp;
+  Dias: <a href='?{base_args}&mode={mode}&days=1'>1d</a>
+        <a href='?{base_args}&mode={mode}&days=3'>3d</a>
+        <a href='?{base_args}&mode={mode}&days=7'>7d</a>
+  &nbsp;|&nbsp;
+  Formatos: <a href='?{base_args}&mode={mode}&format=json'>JSON</a>
+           | <a href='?{base_args}&mode={mode}&format=csv'>CSV</a>
 </p>
 <table>
 <thead><tr>
