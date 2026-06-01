@@ -41981,6 +41981,7 @@ def debug_pool_deep_tokens():
 
     days       = int(request.args.get("days", 14))
     pool_min   = float(request.args.get("pool_min", 90))
+    min_drop   = float(request.args.get("min_drop", 0))   # ex: 0.40 = só eventos com dump ≥ 40%
     entry_pct  = float(request.args.get("entry_pct", 0.10))
     tp_pct     = float(request.args.get("tp_pct", 0.75))
     sl_pct     = float(request.args.get("sl_pct", 0.25))
@@ -42004,10 +42005,11 @@ def debug_pool_deep_tokens():
         FROM micro_absorption_snapshots
         WHERE ts_snapshot >= %(cutoff)s
           AND pool_quote >= %(pool_min)s
+          AND drop_from_mig >= %(min_drop)s
           AND mc_min IS NOT NULL
           AND ts_min IS NOT NULL
         ORDER BY mint, ts_min, bottom_age_sec DESC
-    """, {"cutoff": cutoff, "pool_min": pool_min})
+    """, {"cutoff": cutoff, "pool_min": pool_min, "min_drop": min_drop})
     bottoms = [dict(r) for r in cur.fetchall()]
 
     rows = []
@@ -42138,7 +42140,9 @@ def debug_pool_deep_tokens():
         pool = f"{r['pool_quote']:.0f}" if r.get("pool_quote") else "—"
         mc_m = _fmt(r.get("mc_migration"))
         mc_b = _fmt(r.get("mc_min"))
-        drop = _pct(r.get("drop_from_mig") and r["drop_from_mig"] * 100)
+        drop_val = r.get("drop_from_mig") or 0
+        drop_color = "#1a7f37" if drop_val >= 0.40 else ("#cc0000" if drop_val < 0.20 else "#856404")
+        drop = f'<span style="color:{drop_color};font-weight:bold">{drop_val*100:+.1f}%</span>'
         bpct = _pct(r.get("bounce_pct_now") and r["bounce_pct_now"] * 100)
         ela  = f"{r['elapsed_sec']:.0f}s" if r.get("elapsed_sec") else "—"
         ent  = _fmt(r.get("entry_mc"))
@@ -42192,17 +42196,22 @@ th{{background:#eee;text-align:left}}
 .card small{{color:#888;font-size:10px}}
 a{{color:#0060df}}
 </style></head><body>
-<h2>🏊 Tokens com Pool &gt; {pool_min:.0f} SOL — últimos {days} dias</h2>
+<h2>🏊 Tokens com Pool &gt; {pool_min:.0f} SOL{f" · Drop ≥ {min_drop:.0%}" if min_drop > 0 else ""} — últimos {days} dias</h2>
 <p style="color:#666;font-size:11px">
   Simulação: entry +{entry_pct:.0%} do fundo | TP +{tp_pct:.0%} | SL -{sl_pct:.0%} |
-  Parâmetros: <a href="?days={days}&pool_min={pool_min}&entry_pct={entry_pct}&tp_pct={tp_pct}&sl_pct={sl_pct}">atual</a> |
-  Pool: <a href="?days={days}&pool_min=50">50+</a>
-  <a href="?days={days}&pool_min=70">70+</a>
-  <a href="?days={days}&pool_min=90">90+</a>
-  <a href="?days={days}&pool_min=120">120+</a> |
-  Dias: <a href="?days=7&pool_min={pool_min:.0f}">7d</a>
-  <a href="?days=14&pool_min={pool_min:.0f}">14d</a>
-  <a href="?days=30&pool_min={pool_min:.0f}">30d</a>
+  Pool: <a href="?days={days}&pool_min=50&min_drop={min_drop}">50+</a>
+  <a href="?days={days}&pool_min=70&min_drop={min_drop}">70+</a>
+  <a href="?days={days}&pool_min=90&min_drop={min_drop}">90+</a>
+  <a href="?days={days}&pool_min=120&min_drop={min_drop}">120+</a> |
+  Drop mín: <a href="?days={days}&pool_min={pool_min:.0f}&min_drop=0">sem filtro</a>
+  <a href="?days={days}&pool_min={pool_min:.0f}&min_drop=0.20">20%+</a>
+  <a href="?days={days}&pool_min={pool_min:.0f}&min_drop=0.30">30%+</a>
+  <a href="?days={days}&pool_min={pool_min:.0f}&min_drop=0.40">40%+</a>
+  <a href="?days={days}&pool_min={pool_min:.0f}&min_drop=0.50">50%+</a>
+  <a href="?days={days}&pool_min={pool_min:.0f}&min_drop=0.60">60%+</a> |
+  Dias: <a href="?days=7&pool_min={pool_min:.0f}&min_drop={min_drop}">7d</a>
+  <a href="?days=14&pool_min={pool_min:.0f}&min_drop={min_drop}">14d</a>
+  <a href="?days=30&pool_min={pool_min:.0f}&min_drop={min_drop}">30d</a>
 </p>
 
 <div style="margin-bottom:10px">
