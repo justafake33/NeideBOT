@@ -102,7 +102,7 @@ def route_scanner():
             
             cur.execute("""
                 SELECT
-                    m.mint, m.symbol, m.ts_migration, m.mc_migration,
+                    m.mint, m.token_nome, m.ts_migration, m.mc_migration,
                     m.mc_min, m.pct_drop, m.time_to_bottom,
                     m.smart_wallets, m.rug_ratio, m.top10_holder_rate,
                     bs.mc_at_signal, bs.bounce_pct, bs.elapsed_sec,
@@ -157,7 +157,7 @@ def route_scanner():
         
         rows_html = ""
         for r in rows:
-            symbol = r["symbol"] or r["mint"][:8]
+            symbol = r["token_nome"] or r["mint"][:8]
             ts = fmt_ts(r["ts_migration"])
             mc = fmt_mc(r["mc_migration"])
             drop = f"{r.get('pct_drop', 0)*100:+.0f}%" if r.get("pct_drop") else "—"
@@ -212,7 +212,7 @@ def debug_pool_deep_tokens():
     # ── 1. Bounces históricos com pool_quote filtrado (completo, não apenas V2 Fase 1)
     cur.execute("""
         SELECT
-            bs.mint, m.symbol, bs.ts_signal as ts_min, m.ts_migration,
+            bs.mint, m.token_nome as symbol, bs.ts_signal as ts_min, m.ts_migration,
             bs.mc_min, m.mc_migration,
             (bs.mc_at_signal - bs.mc_min) / NULLIF(bs.mc_min, 0) as bounce_pct_now,
             (m.mc_migration - bs.mc_min) / NULLIF(m.mc_migration, 0) as drop_from_mig,
