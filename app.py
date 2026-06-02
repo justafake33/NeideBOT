@@ -41975,7 +41975,7 @@ th{{background:#eee}}
 
 @app.route("/debug/pool-deep-tokens")
 def debug_pool_deep_tokens():
-    """Tokens com pool_quote > threshold: fundo capturado + outcome simulado + links."""
+    """Tokens com pool_quote > threshold: fundo capturado + outcome simulado + links. """
     from collections import defaultdict
     from datetime import timedelta, timezone
 
