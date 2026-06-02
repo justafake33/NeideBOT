@@ -42409,7 +42409,7 @@ td:nth-child(2){{text-align:left}}
 def analise_signal_anatomy():
     """
     Ground truth: token_ticks (independente da nossa execução).
-    Outcome = token atingiu +75% do entry (winner) ou -25% (loser) nos 20min após signal.
+    Outcome = token atingiu +75% do entry (winner) ou -25% (loser) nos 60min após signal.
     Testa combinações de features H22-H26 + smart + creator_status.
     Seção 2: anatomia dos 22 TPs reais (big wins vs small wins).
     """
@@ -42465,7 +42465,7 @@ def analise_signal_anatomy():
                 min_ts = min(b['ts_signal'] for b in bounces)
                 max_ts = max(b['ts_signal'] for b in bounces)
 
-                # Ticks no intervalo [min_ts, max_ts+21min] para todos os mints relevantes
+                # Ticks no intervalo [min_ts, max_ts+61min] para todos os mints relevantes
                 cur.execute("""
                     SELECT mint, tick_ts,
                            COALESCE(mc_high, mc) AS hi,
@@ -42473,7 +42473,7 @@ def analise_signal_anatomy():
                     FROM token_ticks
                     WHERE mint = ANY(%s)
                       AND tick_ts > %s
-                      AND tick_ts <= %s + INTERVAL '21 minutes'
+                      AND tick_ts <= %s + INTERVAL '61 minutes'
                     ORDER BY mint, tick_ts
                 """, [mints, min_ts, max_ts])
                 tick_rows = cur.fetchall()
@@ -42489,7 +42489,7 @@ def analise_signal_anatomy():
         for b in bounces:
             entry  = float(b['entry'])
             ts_sig = b['ts_signal']
-            ts_end = ts_sig + timedelta(minutes=20)
+            ts_end = ts_sig + timedelta(minutes=60)
 
             rel = [(ts, hi, lo) for ts, hi, lo in tick_idx.get(b['mint'], [])
                    if ts_sig < ts <= ts_end]
@@ -42674,14 +42674,14 @@ a{{color:#7bf}}
 <h1>Signal Anatomy — Ground Truth: token_ticks</h1>
 <p style="color:#888">
   <strong style="color:#ddd">{n_all}</strong> bounce_signals |
-  <strong>{n_wd}</strong> com ticks 20min |
+  <strong>{n_wd}</strong> com ticks 60min |
   <span style="color:#555">{n_nd_disp} sem ticks</span> |
-  Outcome independente da nossa execução: winner=+75% antes de -25% em 20min a partir de mc_at_signal.
+  Outcome independente da nossa execução: winner=+75% antes de -25% em 60min a partir de mc_at_signal.
   <a href="?clean=1">apenas pós-05-26 (dados limpos)</a> |
   <a href="?">todos</a>
 </p>
 <p style="color:#666;font-size:11px">
-  Winner: max_hi_20m ≥ entry × 1.75 | Loser: min_lo_20m ≤ entry × 0.75 | Chop: nem um nem outro.
+  Winner: max_hi_60m ≥ entry × 1.75 | Loser: min_lo_60m ≤ entry × 0.75 | Chop: nem um nem outro.
   Baseline WR={base_wr2:.0f}% (W={base_w} L={base_l} C={base_c}).
   Delta pp = diferença vs baseline.
 </p>
