@@ -42010,21 +42010,15 @@ def debug_pool_deep_tokens():
                 bs.pool_quote,
                 m.pct_drop,
                 m.time_to_bottom,
-                -- Outcome: pega primeiro trade (TP ou SL) ou no_exit
-                CASE
-                    WHEN t.status = 'tp' THEN 'tp'
-                    WHEN t.status = 'sl' THEN 'sl'
-                    ELSE 'no_exit'
-                END AS outcome
+                COALESCE(t.status, 'no_exit') AS outcome
             FROM bounce_signals bs
             LEFT JOIN migrations m ON bs.mint = m.mint
             LEFT JOIN (
-                -- Pega o trade mais antigo (primeiro trade) para cada mint
-                SELECT DISTINCT ON (mint) mint, status, ts_signal
+                SELECT mint, status, ts_signal,
+                       ROW_NUMBER() OVER (PARTITION BY mint ORDER BY ts_signal ASC) as rn
                 FROM trades
                 WHERE status IN ('tp','sl')
-                ORDER BY mint, ts_signal ASC
-            ) t ON bs.mint = t.mint
+            ) t ON bs.mint = t.mint AND t.rn = 1
             WHERE bs.ts_signal > NOW() - INTERVAL '%s days'
               AND m.pct_drop IS NOT NULL
               AND m.time_to_bottom IS NOT NULL
