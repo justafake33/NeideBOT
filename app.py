@@ -42405,6 +42405,331 @@ td:nth-child(2){{text-align:left}}
         return f"<pre>Erro: {e}</pre>", 500
 
 
+@app.route("/analise/signal-anatomy")
+def analise_signal_anatomy():
+    """
+    Ground truth: token_ticks (independente da nossa execução).
+    Outcome = token atingiu +75% do entry (winner) ou -25% (loser) nos 20min após signal.
+    Testa combinações de features H22-H26 + smart + creator_status.
+    Seção 2: anatomia dos 22 TPs reais (big wins vs small wins).
+    """
+    clean_only = request.args.get("clean", "0") == "1"
+    min_n      = int(request.args.get("min_n", "5"))
+
+    try:
+        import psycopg2, psycopg2.extras as _pge2
+        from collections import defaultdict
+
+        with psycopg2.connect(db.DATABASE_URL, cursor_factory=_pge2.RealDictCursor) as conn:
+            with conn.cursor() as cur:
+                date_filter = "AND bs.ts_signal >= '2026-05-26'" if clean_only else ""
+                cur.execute(f"""
+                    SELECT
+                        bs.mint,
+                        bs.ts_signal,
+                        bs.mc_at_signal                              AS entry,
+                        bs.bounce_pct,
+                        bs.drop_from_mig,
+                        bs.elapsed_sec,
+                        bs.net_sol_flow,
+                        bs.h23_window,
+                        bs.rise_net_flow,
+                        bs.rise_buy_vol,
+                        bs.rise_sell_vol,
+                        bs.pool_quote_at_signal,
+                        bs.dump_seller_hhi,
+                        bs.dump_top_seller_frac,
+                        bs.buy_concentration,
+                        bs.absorption_events,
+                        COALESCE(bs.data_quality, 'unk')             AS data_quality,
+                        m.smart_wallets,
+                        m.creator_token_status,
+                        t.status                                     AS trade_status,
+                        t.pnl_pct_real                               AS trade_pnl
+                    FROM bounce_signals bs
+                    LEFT JOIN migrations m ON m.mint = bs.mint
+                    LEFT JOIN trades t
+                        ON t.mint = bs.mint
+                       AND t.exit_type = 'helius_sell_recovery'
+                    WHERE bs.mc_at_signal IS NOT NULL
+                      AND bs.mc_at_signal > 0
+                    {date_filter}
+                    ORDER BY bs.ts_signal
+                """)
+                bounces = cur.fetchall()
+
+                if not bounces:
+                    return "<pre>Nenhum bounce_signal encontrado.</pre>"
+
+                mints  = list({b['mint'] for b in bounces})
+                min_ts = min(b['ts_signal'] for b in bounces)
+                max_ts = max(b['ts_signal'] for b in bounces)
+
+                # Ticks no intervalo [min_ts, max_ts+21min] para todos os mints relevantes
+                cur.execute("""
+                    SELECT mint, tick_ts,
+                           COALESCE(mc_high, mc) AS hi,
+                           COALESCE(mc_low,  mc) AS lo
+                    FROM token_ticks
+                    WHERE mint = ANY(%s)
+                      AND tick_ts > %s
+                      AND tick_ts <= %s + INTERVAL '21 minutes'
+                    ORDER BY mint, tick_ts
+                """, [mints, min_ts, max_ts])
+                tick_rows = cur.fetchall()
+
+        # Índice de ticks: {mint: [(ts, hi, lo)]}
+        tick_idx = defaultdict(list)
+        for t in tick_rows:
+            tick_idx[t['mint']].append((t['tick_ts'], float(t['hi'] or 0), float(t['lo'] or 0)))
+
+        WIN = 1.75   # +75% = winner
+        SL  = 0.75   # -25% = loser
+
+        for b in bounces:
+            entry  = float(b['entry'])
+            ts_sig = b['ts_signal']
+            ts_end = ts_sig + timedelta(minutes=20)
+
+            rel = [(ts, hi, lo) for ts, hi, lo in tick_idx.get(b['mint'], [])
+                   if ts_sig < ts <= ts_end]
+
+            b['tick_count'] = len(rel)
+            if not rel or entry <= 0:
+                b['outcome'] = 'no_data'; b['max_mfe'] = None; b['max_mae'] = None
+                continue
+
+            max_hi = max((hi for _, hi, _ in rel if hi > 0), default=0)
+            min_lo = min((lo for _, _, lo in rel if lo > 0), default=0)
+
+            b['max_mfe'] = round((max_hi / entry - 1) * 100, 1) if max_hi else None
+            b['max_mae'] = round((min_lo / entry - 1) * 100, 1) if min_lo else None
+
+            if max_hi >= entry * WIN:
+                b['outcome'] = 'winner'
+            elif min_lo > 0 and min_lo <= entry * SL:
+                b['outcome'] = 'loser'
+            else:
+                b['outcome'] = 'chop'
+
+        with_data = [b for b in bounces if b['outcome'] != 'no_data']
+        n_nd = len(bounces) - len(with_data)
+
+        # ------ Condições para testar ------
+        conds = [
+            ("bounce 50–100%",       lambda b: b['bounce_pct'] is not None and 0.50 <= b['bounce_pct'] < 1.00),
+            ("bounce 30–50%",        lambda b: b['bounce_pct'] is not None and b['bounce_pct'] < 0.50),
+            ("bounce >= 100%",       lambda b: b['bounce_pct'] is not None and b['bounce_pct'] >= 1.00),
+            ("elapsed < 5min",       lambda b: b['elapsed_sec'] is not None and b['elapsed_sec'] < 300),
+            ("elapsed 5–15min",      lambda b: b['elapsed_sec'] is not None and 300 <= b['elapsed_sec'] < 900),
+            ("rise_net > 1 SOL",     lambda b: b['rise_net_flow'] is not None and b['rise_net_flow'] > 1.0),
+            ("rise_net <= 0",        lambda b: b['rise_net_flow'] is not None and b['rise_net_flow'] <= 0),
+            ("creator_hold",         lambda b: b['creator_token_status'] == 'creator_hold'),
+            ("creator_close",        lambda b: b['creator_token_status'] == 'creator_close'),
+            ("smart >= 3",           lambda b: b['smart_wallets'] is not None and b['smart_wallets'] >= 3),
+            ("smart < 3",            lambda b: b['smart_wallets'] is not None and b['smart_wallets'] < 3),
+            ("net_flow > -5 SOL",    lambda b: b['net_sol_flow'] is not None and b['net_sol_flow'] > -5),
+            ("net_flow <= -10 SOL",  lambda b: b['net_sol_flow'] is not None and b['net_sol_flow'] <= -10),
+            ("pool >= 40 SOL",       lambda b: b['pool_quote_at_signal'] is not None and b['pool_quote_at_signal'] >= 40),
+            ("dump_conc > 50%",      lambda b: b['dump_top_seller_frac'] is not None and b['dump_top_seller_frac'] > 0.5),
+            ("buy_conc > 0.40",      lambda b: b['buy_concentration'] is not None and b['buy_concentration'] > 0.40),
+        ]
+
+        # Pares contraditórios a pular
+        contradicts = {
+            frozenset(["bounce 50–100%", "bounce 30–50%"]),
+            frozenset(["bounce 50–100%", "bounce >= 100%"]),
+            frozenset(["bounce 30–50%", "bounce >= 100%"]),
+            frozenset(["creator_hold", "creator_close"]),
+            frozenset(["smart >= 3", "smart < 3"]),
+            frozenset(["rise_net > 1 SOL", "rise_net <= 0"]),
+            frozenset(["elapsed < 5min", "elapsed 5–15min"]),
+        }
+
+        def stats(subset):
+            w = sum(1 for b in subset if b['outcome'] == 'winner')
+            l = sum(1 for b in subset if b['outcome'] == 'loser')
+            c = sum(1 for b in subset if b['outcome'] == 'chop')
+            wr = w / (w + l) * 100 if (w + l) > 0 else 0
+            mfes = [b['max_mfe'] for b in subset if b['max_mfe'] is not None]
+            maes = [b['max_mae'] for b in subset if b['max_mae'] is not None]
+            avg_mfe = sum(mfes) / len(mfes) if mfes else None
+            avg_mae = sum(maes) / len(maes) if maes else None
+            return w, l, c, wr, avg_mfe, avg_mae
+
+        results = []
+        w, l, c, wr, mfe, mae = stats(with_data)
+        results.append(("🔵 BASELINE", len(with_data), w, l, c, wr, mfe, mae))
+
+        for name, fn in conds:
+            sub = [b for b in with_data if fn(b)]
+            if len(sub) >= min_n:
+                w, l, c, wr, mfe, mae = stats(sub)
+                results.append((name, len(sub), w, l, c, wr, mfe, mae))
+
+        for i, (n1, f1) in enumerate(conds):
+            for j, (n2, f2) in enumerate(conds):
+                if j <= i:
+                    continue
+                if frozenset([n1, n2]) in contradicts:
+                    continue
+                sub = [b for b in with_data if f1(b) and f2(b)]
+                if len(sub) >= min_n:
+                    w, l, c, wr, mfe, mae = stats(sub)
+                    results.append((f"{n1} + {n2}", len(sub), w, l, c, wr, mfe, mae))
+
+        baseline = results[0]
+        rest = sorted(results[1:], key=lambda x: (-x[5], -x[1]))
+        results = [baseline] + rest
+
+        def row_html(label, n, w, l, c, wr, mfe, mae, baseline_wr):
+            wr_col = "#4f4" if wr >= 35 else ("#fa4" if wr >= 25 else ("#888" if wr < 15 else "#ddd"))
+            delta  = wr - baseline_wr
+            delta_col = "#4f4" if delta > 5 else ("#f44" if delta < -5 else "#888")
+            delta_str = f"{delta:+.1f}pp" if label != "🔵 BASELINE" else "—"
+            mfe_s = f"{mfe:+.0f}%" if mfe is not None else "—"
+            mae_s = f"{mae:+.0f}%" if mae is not None else "—"
+            return (f"<tr>"
+                    f"<td style='text-align:left'>{label}</td>"
+                    f"<td>{n}</td><td style='color:#4f4'>{w}</td><td style='color:#f44'>{l}</td><td>{c}</td>"
+                    f"<td style='color:{wr_col};font-weight:bold'>{wr:.0f}%</td>"
+                    f"<td style='color:{delta_col}'>{delta_str}</td>"
+                    f"<td style='color:#adf'>{mfe_s}</td><td style='color:#fa8'>{mae_s}</td>"
+                    f"</tr>")
+
+        base_wr = results[0][5]
+        combo_html = "".join(row_html(*r, baseline_wr=base_wr) for r in results)
+
+        # ------ Seção 2: Anatomia dos TPs reais ------
+        tp_all   = [b for b in bounces if b.get('trade_status') == 'tp' and b.get('trade_pnl') is not None]
+        sl_all   = [b for b in bounces if b.get('trade_status') == 'sl']
+        big_wins = [b for b in tp_all if b['trade_pnl'] > 0.80]
+        sml_wins = [b for b in tp_all if b['trade_pnl'] <= 0.80]
+
+        def fav(lst, key, mult=1):
+            vals = [b[key] * mult for b in lst if b.get(key) is not None]
+            return f"{sum(vals)/len(vals):.2f}" if vals else "—"
+
+        def fpct(lst, key, thresh, op=">"):
+            vals = [b[key] for b in lst if b.get(key) is not None]
+            if not vals: return "—"
+            if op == ">":
+                return f"{sum(1 for v in vals if v > thresh)/len(vals)*100:.0f}%"
+            return f"{sum(1 for v in vals if v == thresh)/len(vals)*100:.0f}%"
+
+        anatomy_features = [
+            ("bounce_pct",           "Bounce do Fundo",      100, "%"),
+            ("drop_from_mig",        "Drop da Migração",     100, "%"),
+            ("elapsed_sec",          "Elapsed",              1/60, "min"),
+            ("net_sol_flow",         "Net SOL Flow (bottom)", 1, " SOL"),
+            ("rise_net_flow",        "Rise Net Flow",        1, " SOL"),
+            ("rise_buy_vol",         "Rise Buy Vol",         1, " SOL"),
+            ("pool_quote_at_signal", "Pool Depth",           1, " SOL"),
+            ("dump_seller_hhi",      "Dump Seller HHI",      1, ""),
+            ("dump_top_seller_frac", "Dump Top Seller Frac", 100, "%"),
+            ("buy_concentration",    "Buy Concentration",    1, ""),
+            ("absorption_events",    "Absorção Events",      1, ""),
+            ("smart_wallets",        "Smart Wallets",        1, ""),
+        ]
+
+        def anat_row(label, key, mult, unit, groups):
+            cells = ""
+            for grp in groups:
+                if not grp: cells += "<td>—</td>"; continue
+                vals = [b[key] * mult for b in grp if b.get(key) is not None]
+                cells += f"<td>{sum(vals)/len(vals):.2f}{unit}</td>" if vals else "<td>—</td>"
+            return f"<tr><td style='text-align:left'>{label}</td>{cells}</tr>"
+
+        groups = [tp_all, big_wins, sml_wins, sl_all[:30]]  # cap SLs at 30 for display
+        anat_rows = "".join(anat_row(lbl, key, mult, unit, groups)
+                            for lbl, key, mult, unit in anatomy_features)
+
+        # Creator status breakdown for trades
+        def trade_wr_by(key, val):
+            sub = [b for b in bounces if b.get('trade_status') in ('tp','sl') and b.get(key) == val]
+            tp_ = sum(1 for b in sub if b['trade_status'] == 'tp')
+            return f"{tp_}/{len(sub)} = {tp_/len(sub)*100:.0f}%" if sub else "—"
+
+        n_all = len(bounces)
+        n_nd_disp = n_nd
+        n_wd  = len(with_data)
+        base_w, base_l, base_c, base_wr2, _, _ = stats(with_data)
+
+        html = f"""<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>Signal Anatomy</title>
+<style>
+body{{background:#111;color:#ddd;font-family:monospace;font-size:12px;padding:16px}}
+h1{{color:#7bf;font-size:16px}}
+h2{{color:#adf;font-size:14px;margin-top:28px;border-bottom:1px solid #333;padding-bottom:4px}}
+h3{{color:#fa4;font-size:13px;margin-top:16px}}
+table{{border-collapse:collapse;width:100%;max-width:960px;margin-top:8px}}
+th,td{{border:1px solid #333;padding:4px 8px;text-align:right}}
+th{{background:#1a1a2a;color:#aaa;text-align:center}}
+td:first-child{{text-align:left}}
+a{{color:#7bf}}
+</style>
+</head><body>
+<h1>Signal Anatomy — Ground Truth: token_ticks</h1>
+<p style="color:#888">
+  <strong style="color:#ddd">{n_all}</strong> bounce_signals |
+  <strong>{n_wd}</strong> com ticks 20min |
+  <span style="color:#555">{n_nd_disp} sem ticks</span> |
+  Outcome independente da nossa execução: winner=+75% antes de -25% em 20min a partir de mc_at_signal.
+  <a href="?clean=1">apenas pós-05-26 (dados limpos)</a> |
+  <a href="?">todos</a>
+</p>
+<p style="color:#666;font-size:11px">
+  Winner: max_hi_20m ≥ entry × 1.75 | Loser: min_lo_20m ≤ entry × 0.75 | Chop: nem um nem outro.
+  Baseline WR={base_wr2:.0f}% (W={base_w} L={base_l} C={base_c}).
+  Delta pp = diferença vs baseline.
+</p>
+
+<h2>1. Combinações de Features — WR por filtro</h2>
+<table>
+<thead><tr>
+  <th style="text-align:left">Filtro / Combinação</th>
+  <th>n</th><th style="color:#4f4">W</th><th style="color:#f44">L</th><th>Chop</th>
+  <th>WR</th><th>Δ vs base</th><th>avg MFE</th><th>avg MAE</th>
+</tr></thead>
+<tbody>{combo_html}</tbody>
+</table>
+<p style="color:#555;font-size:11px;margin-top:4px">
+  Ordenado por WR decrescente. Verde = WR≥35%. Amarelo = WR≥25%. min_n={min_n} (ajustar via ?min_n=3).
+</p>
+
+<h2>2. Anatomia dos TPs reais (helius_sell_recovery)</h2>
+<p style="color:#888">
+  TPs blockchain-confirmados: <strong>{len(tp_all)}</strong> total |
+  <span style="color:#4f4">Big wins (&gt;80% PnL): {len(big_wins)}</span> |
+  <span style="color:#fa4">Small wins (≤80%): {len(sml_wins)}</span> |
+  SLs: {len(sl_all)}
+</p>
+<p style="color:#555;font-size:11px">
+  creator_hold WR: {trade_wr_by('creator_token_status','creator_hold')} |
+  creator_close WR: {trade_wr_by('creator_token_status','creator_close')}
+</p>
+<table>
+<thead><tr>
+  <th style="text-align:left">Feature</th>
+  <th>Todos TPs<br>(n={len(tp_all)})</th>
+  <th style="color:#4f4">Big Wins &gt;80%<br>(n={len(big_wins)})</th>
+  <th style="color:#fa4">Small Wins ≤80%<br>(n={len(sml_wins)})</th>
+  <th style="color:#f44">SLs<br>(n={len(sl_all)})</th>
+</tr></thead>
+<tbody>{anat_rows}</tbody>
+</table>
+
+</body></html>"""
+
+        return render_template_string(html)
+
+    except Exception as e:
+        import traceback
+        return f"<pre>Erro: {e}\n\n{traceback.format_exc()}</pre>", 500
+
+
 @app.route("/analise/feature-vs-outcome")
 def analise_feature_vs_outcome():
     """Cross-referencia todos os outcomes confirmados (helius_sell_recovery) com features de bounce/token."""
