@@ -42405,5 +42405,389 @@ td:nth-child(2){{text-align:left}}
         return f"<pre>Erro: {e}</pre>", 500
 
 
+@app.route("/analise/feature-vs-outcome")
+def analise_feature_vs_outcome():
+    """Cross-referencia todos os outcomes confirmados (helius_sell_recovery) com features de bounce/token."""
+    try:
+        import psycopg2, psycopg2.extras as _pge2
+        with psycopg2.connect(db.DATABASE_URL, cursor_factory=_pge2.RealDictCursor) as conn:
+            with conn.cursor() as cur:
+                # Ground truth: trades com outcomes blockchain-confirmados
+                cur.execute("""
+                    SELECT
+                        t.mint,
+                        t.status,
+                        t.pnl_pct_real,
+                        t.ts_signal,
+                        -- bounce_signals features
+                        b.drop_from_mig,
+                        b.bounce_pct,
+                        b.elapsed_sec,
+                        b.mc_at_signal,
+                        b.mc_migration,
+                        b.mc_min,
+                        b.absorption_buy_vol,
+                        b.absorption_sell_vol,
+                        b.absorption_buy_cnt,
+                        b.absorption_sell_cnt,
+                        b.absorption_events,
+                        b.net_sol_flow,
+                        b.h23_window,
+                        b.pool_quote_at_signal,
+                        b.dump_seller_hhi,
+                        b.dump_seller_count,
+                        b.dump_top_seller_frac,
+                        b.buy_concentration,
+                        b.rise_buy_vol,
+                        b.rise_sell_vol,
+                        b.rise_net_flow,
+                        b.rise_events,
+                        -- migrations features
+                        m.smart_wallets,
+                        m.top10_holder_rate,
+                        m.rug_ratio,
+                        m.creator_token_status,
+                        m.is_wash_trading,
+                        m.renowned_wallets,
+                        m.sniper_wallets,
+                        m.rat_trader_rate,
+                        m.cto_flag,
+                        m.bot_degen_rate,
+                        m.time_to_migrate_sec
+                    FROM trades t
+                    LEFT JOIN bounce_signals b ON b.mint = t.mint
+                    LEFT JOIN migrations m ON m.mint = t.mint
+                    WHERE t.exit_type = 'helius_sell_recovery'
+                      AND t.pnl_pct_real IS NOT NULL
+                      AND t.status IN ('tp', 'sl')
+                    ORDER BY t.ts_signal DESC
+                """)
+                rows = cur.fetchall()
+
+        if not rows:
+            return "<pre>Nenhum trade com exit_type='helius_sell_recovery' encontrado.</pre>"
+
+        tp_rows = [r for r in rows if r["status"] == "tp"]
+        sl_rows = [r for r in rows if r["status"] == "sl"]
+        n_total = len(rows)
+        n_tp = len(tp_rows)
+        n_sl = len(sl_rows)
+        wr = n_tp / n_total * 100 if n_total else 0
+
+        # Computa média de features ignorando NULL
+        def avg(lst, key):
+            vals = [r[key] for r in lst if r[key] is not None]
+            return sum(vals) / len(vals) if vals else None
+
+        def pct(lst, key, truthy=True):
+            vals = [r[key] for r in lst if r[key] is not None]
+            if not vals:
+                return None
+            if truthy:
+                return sum(1 for v in vals if v) / len(vals) * 100
+            return None
+
+        # Lista de features numéricas a comparar
+        numeric_features = [
+            ("drop_from_mig",       "Drop da Migração (%)",         100),
+            ("bounce_pct",          "Bounce do Fundo (%)",          100),
+            ("elapsed_sec",         "Elapsed (s) — tempo pós-mig",   1),
+            ("pool_quote_at_signal","Pool Depth no Sinal (SOL)",     1),
+            ("absorption_buy_vol",  "Absorção Buy Vol (SOL)",        1),
+            ("absorption_sell_vol", "Absorção Sell Vol (SOL)",       1),
+            ("net_sol_flow",        "Net SOL Flow (buy-sell)",       1),
+            ("absorption_buy_cnt",  "Absorção Buy Count",            1),
+            ("absorption_events",   "Total Events Helius",           1),
+            ("rise_buy_vol",        "Rise Buy Vol (SOL) [ts_min→signal]",  1),
+            ("rise_sell_vol",       "Rise Sell Vol (SOL)",           1),
+            ("rise_net_flow",       "Rise Net Flow (SOL)",           1),
+            ("rise_events",         "Rise Events",                   1),
+            ("dump_seller_hhi",     "Dump Seller HHI (concentração)",1),
+            ("dump_seller_count",   "Dump Seller Count",             1),
+            ("dump_top_seller_frac","Dump Top Seller Frac",          1),
+            ("buy_concentration",   "Buy Concentration (lrg/total)", 1),
+            ("smart_wallets",       "Smart Wallets",                 1),
+            ("renowned_wallets",    "KOL Wallets",                   1),
+            ("sniper_wallets",      "Sniper Wallets",                1),
+            ("top10_holder_rate",   "Top 10 Holder Rate (%)",      100),
+            ("rug_ratio",           "Rug Ratio",                     1),
+            ("rat_trader_rate",     "Rat Trader Rate (%)",         100),
+            ("bot_degen_rate",      "Bot Degen Rate (%)",          100),
+            ("time_to_migrate_sec", "Tempo até Migrar (s)",          1),
+        ]
+
+        # Cálculo de deltas
+        feature_stats = []
+        for key, label, mult in numeric_features:
+            tp_avg = avg(tp_rows, key)
+            sl_avg = avg(sl_rows, key)
+            tp_n   = sum(1 for r in tp_rows if r[key] is not None)
+            sl_n   = sum(1 for r in sl_rows if r[key] is not None)
+            if tp_avg is None and sl_avg is None:
+                continue
+            delta = None
+            if tp_avg is not None and sl_avg is not None:
+                delta = (tp_avg - sl_avg) * mult
+            feature_stats.append({
+                "key":    key,
+                "label":  label,
+                "mult":   mult,
+                "tp_avg": tp_avg,
+                "sl_avg": sl_avg,
+                "tp_n":   tp_n,
+                "sl_n":   sl_n,
+                "delta":  delta,
+            })
+
+        # Ordena por |delta| decrescente
+        feature_stats.sort(key=lambda x: abs(x["delta"]) if x["delta"] is not None else 0, reverse=True)
+
+        def fmt(v, mult):
+            if v is None:
+                return '<span style="color:#555">N/A</span>'
+            return f"{v * mult:.2f}"
+
+        def delta_color(d):
+            if d is None:
+                return "#555"
+            return "#4f4" if d > 0 else "#f44"
+
+        # Tabela de feature means
+        rows_html = ""
+        for s in feature_stats:
+            d = s["delta"]
+            d_str = f"{d:+.2f}" if d is not None else "N/A"
+            d_col = delta_color(d)
+            rows_html += f"""<tr>
+  <td style="text-align:left">{s['label']}</td>
+  <td>{fmt(s['tp_avg'], s['mult'])} <small style="color:#555">(n={s['tp_n']})</small></td>
+  <td>{fmt(s['sl_avg'], s['mult'])} <small style="color:#555">(n={s['sl_n']})</small></td>
+  <td style="color:{d_col};font-weight:bold">{d_str}</td>
+</tr>"""
+
+        # ---- Seção de buckets por feature principal ----
+        def wr_bucket_table(feature_key, feature_label, buckets, mult=1):
+            """Gera tabela de WR por bucket para uma feature numérica."""
+            bucket_rows = ""
+            for lo, hi, label in buckets:
+                bucket_tp = [r for r in rows if r["status"] == "tp"
+                             and r[feature_key] is not None
+                             and (lo is None or r[feature_key] * mult >= lo)
+                             and (hi is None or r[feature_key] * mult < hi)]
+                bucket_sl = [r for r in rows if r["status"] == "sl"
+                             and r[feature_key] is not None
+                             and (lo is None or r[feature_key] * mult >= lo)
+                             and (hi is None or r[feature_key] * mult < hi)]
+                bn = len(bucket_tp) + len(bucket_sl)
+                bwr = len(bucket_tp) / bn * 100 if bn else 0
+                wr_col = "#4f4" if bwr >= 30 else ("#fa4" if bwr >= 20 else "#f44")
+                bucket_rows += f"""<tr>
+  <td style="text-align:left">{label}</td>
+  <td>{bn}</td>
+  <td>{len(bucket_tp)}</td>
+  <td>{len(bucket_sl)}</td>
+  <td style="color:{wr_col};font-weight:bold">{bwr:.0f}%</td>
+</tr>"""
+            return f"""
+<h3 style="color:#fa4;margin-top:24px">{feature_label}</h3>
+<table>
+<thead><tr><th style="text-align:left">Faixa</th><th>n</th><th>TP</th><th>SL</th><th>WR</th></tr></thead>
+<tbody>{bucket_rows}</tbody>
+</table>"""
+
+        buckets_html = ""
+
+        # Drop da migração
+        buckets_html += wr_bucket_table("drop_from_mig", "Drop da Migração (%)", [
+            (None, 30, "&lt;30%"),
+            (30, 50, "30–50%"),
+            (50, 65, "50–65%"),
+            (65, 80, "65–80%"),
+            (80, None, "≥80%"),
+        ], mult=100)
+
+        # Bounce do fundo
+        buckets_html += wr_bucket_table("bounce_pct", "Bounce do Fundo (%)", [
+            (None, 30, "&lt;30%"),
+            (30, 50, "30–50%"),
+            (50, 75, "50–75%"),
+            (75, 100, "75–100%"),
+            (100, None, "≥100%"),
+        ], mult=100)
+
+        # Elapsed (tempo pós-migração em minutos)
+        buckets_html += wr_bucket_table("elapsed_sec", "Elapsed (minutos pós-migração)", [
+            (None, 180,  "&lt;3min"),
+            (180, 360,   "3–6min"),
+            (360, 600,   "6–10min"),
+            (600, 900,   "10–15min"),
+            (900, 1200,  "15–20min"),
+        ], mult=1/60)
+
+        # Pool depth
+        buckets_html += wr_bucket_table("pool_quote_at_signal", "Pool Depth no Sinal (SOL)", [
+            (None, 15,  "&lt;15 SOL"),
+            (15,   30,  "15–30 SOL"),
+            (30,   60,  "30–60 SOL"),
+            (60,   90,  "60–90 SOL"),
+            (90,   None,"≥90 SOL"),
+        ])
+
+        # Smart wallets
+        buckets_html += wr_bucket_table("smart_wallets", "Smart Wallets", [
+            (None, 2, "&lt;2"),
+            (2, 3,   "2"),
+            (3, 5,   "3–4"),
+            (5, 10,  "5–9"),
+            (10, None,"≥10"),
+        ])
+
+        # Net SOL flow
+        buckets_html += wr_bucket_table("net_sol_flow", "Net SOL Flow (absorção do fundo)", [
+            (None, -5,    "&lt;-5 SOL"),
+            (-5,   0,     "-5–0 SOL"),
+            (0,    2,     "0–2 SOL"),
+            (2,    5,     "2–5 SOL"),
+            (5,    None,  "≥5 SOL"),
+        ])
+
+        # H23 window breakdown — bottom vs bounce
+        h23_rows = ""
+        for win in ["bottom", "bounce", None]:
+            label = win if win else "NULL"
+            sub = [r for r in rows if r["h23_window"] == win]
+            stp = [r for r in sub if r["status"] == "tp"]
+            ssl = [r for r in sub if r["status"] == "sl"]
+            bn = len(sub)
+            bwr = len(stp) / bn * 100 if bn else 0
+            wr_col = "#4f4" if bwr >= 30 else ("#fa4" if bwr >= 20 else "#f44")
+            h23_rows += f"""<tr>
+  <td style="text-align:left">{label}</td>
+  <td>{bn}</td>
+  <td>{len(stp)}</td>
+  <td>{len(ssl)}</td>
+  <td style="color:{wr_col};font-weight:bold">{bwr:.0f}%</td>
+</tr>"""
+
+        h23_table = f"""
+<h3 style="color:#fa4;margin-top:24px">H23 Window (qualidade da janela de absorção)</h3>
+<table>
+<thead><tr><th style="text-align:left">Janela</th><th>n</th><th>TP</th><th>SL</th><th>WR</th></tr></thead>
+<tbody>{h23_rows}</tbody>
+</table>"""
+
+        # Creator status
+        creator_rows_html = ""
+        for val in ["creator_close", "creator_hold", None]:
+            label = val if val else "NULL"
+            sub = [r for r in rows if r["creator_token_status"] == val]
+            stp = [r for r in sub if r["status"] == "tp"]
+            ssl = [r for r in sub if r["status"] == "sl"]
+            bn = len(sub)
+            bwr = len(stp) / bn * 100 if bn else 0
+            wr_col = "#4f4" if bwr >= 30 else ("#fa4" if bwr >= 20 else "#f44")
+            creator_rows_html += f"""<tr>
+  <td style="text-align:left">{label}</td>
+  <td>{bn}</td>
+  <td>{len(stp)}</td>
+  <td>{len(ssl)}</td>
+  <td style="color:{wr_col};font-weight:bold">{bwr:.0f}%</td>
+</tr>"""
+
+        creator_table = f"""
+<h3 style="color:#fa4;margin-top:24px">Creator Token Status</h3>
+<table>
+<thead><tr><th style="text-align:left">Status</th><th>n</th><th>TP</th><th>SL</th><th>WR</th></tr></thead>
+<tbody>{creator_rows_html}</tbody>
+</table>"""
+
+        # Trade list — todos os trades confirmados
+        trade_list_html = ""
+        for r in rows:
+            pnl = (r["pnl_pct_real"] or 0) * 100
+            pnl_col = "#4f4" if r["status"] == "tp" else "#f44"
+            bp = f"{(r['bounce_pct'] or 0)*100:.0f}%" if r["bounce_pct"] else "-"
+            drop = f"{(r['drop_from_mig'] or 0)*100:.0f}%" if r["drop_from_mig"] else "-"
+            el = f"{int(r['elapsed_sec'] or 0)//60}m" if r["elapsed_sec"] else "-"
+            pool = f"{(r['pool_quote_at_signal'] or 0):.0f}" if r["pool_quote_at_signal"] else "-"
+            nsf = f"{(r['net_sol_flow'] or 0):+.2f}" if r["net_sol_flow"] is not None else "-"
+            smart = r["smart_wallets"] or "-"
+            ts = r["ts_signal"].strftime("%m-%d %H:%M") if r["ts_signal"] else "-"
+            dexurl = f"https://dexscreener.com/solana/{r['mint']}"
+            trade_list_html += f"""<tr>
+  <td>{ts}</td>
+  <td><a href="{dexurl}" target="_blank" style="color:#7bf">{r['mint'][:8]}</a></td>
+  <td style="color:{pnl_col}">{r['status'].upper()}</td>
+  <td style="color:{pnl_col}">{pnl:+.0f}%</td>
+  <td>{drop}</td>
+  <td>{bp}</td>
+  <td>{el}</td>
+  <td>{pool}</td>
+  <td>{nsf}</td>
+  <td>{smart}</td>
+</tr>"""
+
+        html = f"""<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>Feature vs Outcome</title>
+<style>
+body{{background:#111;color:#ddd;font-family:monospace;font-size:12px;padding:16px}}
+h1{{color:#7bf;font-size:16px}}
+h2{{color:#adf;font-size:14px;margin-top:28px;border-bottom:1px solid #333;padding-bottom:4px}}
+h3{{color:#fa4;font-size:13px;margin-top:20px}}
+table{{border-collapse:collapse;width:100%;max-width:900px;margin-top:8px}}
+th,td{{border:1px solid #333;padding:4px 8px;text-align:right}}
+th{{background:#1a1a2a;color:#aaa;text-align:center}}
+td:first-child{{text-align:left}}
+.badge{{display:inline-block;padding:2px 8px;border-radius:3px;font-weight:bold}}
+</style>
+</head><body>
+<h1>Feature vs Outcome — Ground Truth: helius_sell_recovery</h1>
+<p style="color:#888">
+  <strong style="color:#ddd">{n_total}</strong> trades blockchain-confirmados |
+  <span style="color:#4f4"><strong>{n_tp} TP</strong></span> |
+  <span style="color:#f44"><strong>{n_sl} SL</strong></span> |
+  WR: <strong style="color:{'#4f4' if wr>=25 else '#fa4'}">{wr:.1f}%</strong>
+</p>
+<p style="color:#666;font-size:11px">
+  Apenas trades com exit_type='helius_sell_recovery' — fundo real on-chain verificado.
+  Features de bounce_signals (erpc) e migrations (trenches). Delta = TP_avg − SL_avg.
+  Verde = TP tem mais. Vermelho = SL tem mais.
+</p>
+
+<h2>1. Discriminadores por Delta (ordenados por |delta|)</h2>
+<table>
+<thead><tr>
+  <th style="text-align:left">Feature</th>
+  <th>TP avg</th>
+  <th>SL avg</th>
+  <th>Delta (TP−SL)</th>
+</tr></thead>
+<tbody>{rows_html}</tbody>
+</table>
+
+<h2>2. WR por Bucket — Features Principais</h2>
+{buckets_html}
+{h23_table}
+{creator_table}
+
+<h2>3. Todos os Trades Confirmados</h2>
+<table>
+<thead><tr>
+  <th>Data</th><th>Mint</th><th>Status</th><th>PnL</th>
+  <th>Drop%</th><th>Bounce%</th><th>Elapsed</th><th>Pool(SOL)</th><th>NetFlow</th><th>Smart</th>
+</tr></thead>
+<tbody>{trade_list_html}</tbody>
+</table>
+</body></html>"""
+
+        return render_template_string(html)
+
+    except Exception as e:
+        import traceback
+        return f"<pre>Erro: {e}\n\n{traceback.format_exc()}</pre>", 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
