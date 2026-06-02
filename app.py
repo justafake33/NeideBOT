@@ -42069,6 +42069,8 @@ def debug_pool_deep_tokens():
     n_resolved = n_tp + n_sl
 
     wr = n_tp / n_resolved if n_resolved else None
+    wr_color = "#3fb950" if (wr and wr >= 0.40) else ("#f85149" if (wr and wr < 0.20) else "#d29922")
+    wr_pct_str = f"{wr*100:.1f}%" if wr is not None else "—"
 
     # Pool sub-buckets dentro do range
     def make_buckets(rows, bucket_labels):
@@ -42173,7 +42175,7 @@ td:first-child, th:first-child {{text-align: left}}
     <td><b>Resolved (TP+SL)</b></td><td>{n_resolved}</td>
 </tr>
 <tr>
-    <td><b>Win Rate</b></td><td style="color:{'#3fb950' if (wr and wr >= 0.40) else ('#f85149' if (wr and wr < 0.20) else '#d29922')}"><b>{wr*100:.1f}%</b></td>
+    <td><b>Win Rate</b></td><td style="color:{wr_color}"><b>{wr_pct_str}</b></td>
 </tr>
 </table>
 
