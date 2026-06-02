@@ -43418,7 +43418,7 @@ def _v2_build_candidates(events_dict, ticks_dict, bounce_dict,
         v1_match = None
         match_status = "no_v1"
         v1_delay_sec = None
-        v1_entry_improvement = None  # positive = V2 entry more expensive (V1 better)
+        v1_entry_improvement = None  # positivo = V2 entrou mais barato que V1
 
         if v1_match_mode == "first_after_v2":
             for bs in bounce_dict.get(mint, []):
@@ -43433,7 +43433,9 @@ def _v2_build_candidates(events_dict, ticks_dict, bounce_dict,
                     v1_delay_sec = bs_ts_f - dec_ts
                     bs_entry = bs.get("mc_at_signal")
                     if bs_entry and bs_entry > 0 and entry_mc and entry_mc > 0:
-                        v1_entry_improvement = (entry_mc - bs_entry) / entry_mc
+                        # positivo = V2 entrou mais barato que V1
+                        # ex: entry_mc=20000, bs_entry=30000 → 30000/20000-1 = +0.50
+                        v1_entry_improvement = (bs_entry / entry_mc) - 1
                     break
 
         candidates.append({
@@ -44185,6 +44187,515 @@ th{{background:#eee}}
 
 {br_sections}
 </body></html>"""
+        return render_template_string(html)
+
+    except Exception as e:
+        import traceback
+        return f"<pre>Erro: {e}\n\n{traceback.format_exc()}</pre>", 500
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# /analise/v2-brain-report — Grid cartesiano + Recomendação Bigplayer
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/analise/v2-brain-report")
+def analise_v2_brain_report():  # noqa: C901
+    """Grid cartesiano de parâmetros V2 com recomendação automática.
+
+    Carrega dados UMA VEZ e aplica todas as combinações em memória.
+
+    Query params:
+      days=14            janela de dados
+      format=html|json   saída
+      min_n=10           mínimo de candidatos para combo ser válido
+      tp_pct=0.75        take-profit %
+      sl_pct=0.25        stop-loss %
+      same_candle_policy=conservative_sl_first|optimistic_tp_first|midpoint
+      top=50             top N combos por tabela
+      include_details=0  se 1, inclui lista de candidatos
+      candidate_scope=all|mint_first|bottom_events
+    """
+    import itertools, statistics as _stats_mod
+
+    try:
+        days            = int(request.args.get("days", 14))
+        fmt             = request.args.get("format", "html")
+        min_n           = int(request.args.get("min_n", 10))
+        tp_pct          = float(request.args.get("tp_pct", 0.75))
+        sl_pct          = float(request.args.get("sl_pct", 0.25))
+        sc_pol          = request.args.get("same_candle_policy", "conservative_sl_first")
+        top_n           = int(request.args.get("top", 50))
+        include_details = request.args.get("include_details", "0") == "1"
+        scope_override  = request.args.get("candidate_scope", "all")
+
+        # ── Grid de parâmetros ────────────────────────────────────────────────
+        DECISION_AGES = [3, 5, 10, 15, 30]
+        NET_MINS      = [-5.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0]
+        MIN_POOLS     = [10.0, 20.0, 40.0, 80.0]
+        MIN_EVENTS    = [1, 3, 5, 8]
+        # (min_bounce, max_bounce) — None = sem limite
+        BOUNCE_RANGES = [
+            (None, None),
+            (0.10, None),
+            (0.20, None),
+            (0.30, None),
+            (0.30, 1.00),
+            (0.10, 0.50),
+        ]
+        BOUNCE_RANGE_LABELS = {
+            (None, None):     "qualquer",
+            (0.10, None):     "≥10%",
+            (0.20, None):     "≥20%",
+            (0.30, None):     "≥30%",
+            (0.30, 1.00):     "30-100%",
+            (0.10, 0.50):     "10-50%",
+        }
+        # Windows disponíveis — restringir ao que existe nos dados
+        ALL_NET_WINDOWS = ["live_5s", "live_10s", "live_30s", "live_60s",
+                           "pre_10s", "pre_30s"]
+        SCOPES = (["mint_first", "bottom_events"]
+                  if scope_override == "all"
+                  else [scope_override if scope_override in ("mint_first", "bottom_events")
+                        else "mint_first"])
+
+        # ── Carregar dados UMA VEZ ────────────────────────────────────────────
+        events_dict, ticks_dict, bounce_dict = _v2_load_data(days)
+
+        if not events_dict:
+            msg = "Sem dados em micro_absorption_snapshots nos últimos {} dias.".format(days)
+            if fmt == "json":
+                return jsonify({"error": msg}), 200
+            return f"<p style='font-family:monospace'>{msg}</p>", 200
+
+        # Detectar windows com dados não-NULL
+        available_windows: list = []
+        for nw in ALL_NET_WINDOWS:
+            net_col = nw + "_net"
+            has_data = any(
+                s.get(net_col) is not None
+                for snaps in events_dict.values()
+                for s in snaps
+            )
+            if has_data:
+                available_windows.append(nw)
+
+        if not available_windows:
+            available_windows = ["live_10s"]  # fallback
+
+        # ── Helpers ───────────────────────────────────────────────────────────
+        def _score_ev_risk(st: dict) -> float | None:
+            ev = st.get("expectancy_all")
+            if ev is None:
+                return None
+            dd = (st.get("p75_max_dd") or
+                  st.get("median_max_dd") or 0)
+            n  = st.get("n", 0)
+            return ev - abs(dd) * 0.10 - max(0, 20 - n) * 0.002
+
+        def _confidence_label(st: dict) -> str:
+            n   = st.get("n", 0)
+            ev  = st.get("expectancy_all")
+            wr  = st.get("wr_ex_chop")
+            scr = _score_ev_risk(st)
+            if n < 10 or ev is None or ev <= 0:
+                return "weak_sample"
+            if n < 20:
+                return "watch"
+            if scr is None or scr <= 0:
+                return "watch"
+            if wr is None or wr < 0.30:
+                return "candidate"
+            if wr < 0.40 or n < 40:
+                return "strong"
+            return "production_candidate"
+
+        # ── Grid loop ─────────────────────────────────────────────────────────
+        all_combos: list = []
+
+        for scope, da, nw, net_min, mp, mev, (bmin, bmax) in itertools.product(
+                SCOPES, DECISION_AGES, available_windows,
+                NET_MINS, MIN_POOLS, MIN_EVENTS, BOUNCE_RANGES):
+
+            cands = _v2_build_candidates(
+                events_dict, ticks_dict, bounce_dict,
+                decision_age=da,
+                net_window=nw,
+                net_min=net_min,
+                min_pool=mp,
+                min_events=mev,
+                min_bounce_pct=bmin,
+                max_bounce_pct=bmax,
+                tp_pct=tp_pct,
+                sl_pct=sl_pct,
+                sc_pol=sc_pol,
+                candidate_scope=scope,
+                v1_match_mode="first_after_v2",
+            )
+            if not cands:
+                continue
+
+            st = _v2_stats(cands, tp_pct, sl_pct)
+            n  = st.get("n", 0)
+            ev = st.get("expectancy_all")
+
+            if n < min_n or ev is None or ev <= 0:
+                continue
+
+            scr = _score_ev_risk(st)
+            lbl = _confidence_label(st)
+
+            combo = {
+                "scope":         scope,
+                "decision_age":  da,
+                "net_window":    nw,
+                "net_min":       net_min,
+                "min_pool":      mp,
+                "min_events":    mev,
+                "bounce_range":  BOUNCE_RANGE_LABELS.get((bmin, bmax), f"{bmin}-{bmax}"),
+                "bounce_min":    bmin,
+                "bounce_max":    bmax,
+                "score_ev_risk": scr,
+                "confidence":    lbl,
+                **st,
+                "candidates":    cands if include_details else None,
+            }
+            all_combos.append(combo)
+
+        if not all_combos:
+            msg = ("Nenhuma combinação válida (n≥{} e EV>0). "
+                   "Acumule mais dados.").format(min_n)
+            if fmt == "json":
+                return jsonify({"error": msg, "days": days}), 200
+            return f"<p style='font-family:monospace'>{msg}</p>", 200
+
+        # ── Ordenações ────────────────────────────────────────────────────────
+        top_by_score = sorted(
+            all_combos,
+            key=lambda c: c["score_ev_risk"] or -999,
+            reverse=True
+        )[:top_n]
+
+        top_by_ev = sorted(
+            all_combos,
+            key=lambda c: c.get("expectancy_all") or -999,
+            reverse=True
+        )[:top_n]
+
+        risk_ranked = sorted(
+            all_combos,
+            key=lambda c: abs(c.get("median_max_dd") or 0)
+        )[:top_n]
+
+        # ── Agregações ────────────────────────────────────────────────────────
+        # Scope comparison
+        scope_comp: dict = {}
+        for scope in SCOPES:
+            sc_combos = [c for c in all_combos if c["scope"] == scope]
+            if sc_combos:
+                best = max(sc_combos, key=lambda c: c["score_ev_risk"] or -999)
+                scope_comp[scope] = {
+                    "n_combos":    len(sc_combos),
+                    "best_score":  best["score_ev_risk"],
+                    "best_ev":     best.get("expectancy_all"),
+                    "best_wr":     best.get("wr_ex_chop"),
+                }
+
+        # Bounce range comparison — best combo per range
+        bounce_comp: dict = {}
+        for _, (bmin, bmax) in enumerate(BOUNCE_RANGES):
+            lbl_br = BOUNCE_RANGE_LABELS[(bmin, bmax)]
+            br_combos = [c for c in all_combos if c["bounce_min"] == bmin and c["bounce_max"] == bmax]
+            if br_combos:
+                best = max(br_combos, key=lambda c: c["score_ev_risk"] or -999)
+                bounce_comp[lbl_br] = {
+                    "n_combos":   len(br_combos),
+                    "best_score": best["score_ev_risk"],
+                    "best_ev":    best.get("expectancy_all"),
+                    "best_wr":    best.get("wr_ex_chop"),
+                    "best_n":     best.get("n"),
+                }
+
+        # Net window comparison — best combo per window
+        nw_comp: dict = {}
+        for nw in available_windows:
+            nw_combos = [c for c in all_combos if c["net_window"] == nw]
+            if nw_combos:
+                best = max(nw_combos, key=lambda c: c["score_ev_risk"] or -999)
+                nw_comp[nw] = {
+                    "n_combos":   len(nw_combos),
+                    "best_score": best["score_ev_risk"],
+                    "best_ev":    best.get("expectancy_all"),
+                    "best_wr":    best.get("wr_ex_chop"),
+                    "best_n":     best.get("n"),
+                }
+
+        # ── Bigplayer Recommendation ──────────────────────────────────────────
+        has_prod   = any(c["confidence"] == "production_candidate" for c in all_combos)
+        has_strong = any(c["confidence"] in ("strong", "production_candidate") for c in all_combos)
+        best_ev    = max((c.get("expectancy_all") or 0) for c in all_combos)
+        best_n     = max(c.get("n", 0) for c in all_combos)
+
+        if best_n < 10:
+            rec_label = "NÃO PRODUZIR"
+            rec_detail = (f"n_max={best_n} — insuficiente para qualquer conclusão. "
+                          "Acumule ≥30 bounces com outcomes GMGN confirmados.")
+        elif best_ev <= 0:
+            rec_label = "COLETAR MAIS DADOS"
+            rec_detail = ("EV≤0 em todas as combinações válidas. "
+                          "Sinal não lucrativo com os parâmetros atuais. "
+                          "Verifique se os outcomes de TP/SL estão corretos.")
+        elif has_prod:
+            best_c = max(
+                [c for c in all_combos if c["confidence"] == "production_candidate"],
+                key=lambda c: c["score_ev_risk"] or -999
+            )
+            rec_label = "MICRO-PROD CONTROLADA"
+            rec_detail = (
+                f"decision_age={best_c['decision_age']}s  "
+                f"net_window={best_c['net_window']}  "
+                f"net_min={best_c['net_min']}  "
+                f"min_pool={best_c['min_pool']}  "
+                f"min_events={best_c['min_events']}  "
+                f"bounce={best_c['bounce_range']}  "
+                f"scope={best_c['scope']}  "
+                f"→  n={best_c['n']}  WR={best_c.get('wr_ex_chop') or 0:.1%}  "
+                f"EV={best_c.get('expectancy_all') or 0:+.3f}  "
+                f"score={best_c['score_ev_risk']:+.4f}"
+            )
+        elif has_strong:
+            best_c = max(
+                [c for c in all_combos if c["confidence"] in ("strong", "production_candidate")],
+                key=lambda c: c["score_ev_risk"] or -999
+            )
+            rec_label = "DRY-RUN V2"
+            rec_detail = (
+                f"decision_age={best_c['decision_age']}s  "
+                f"net_window={best_c['net_window']}  "
+                f"net_min={best_c['net_min']}  "
+                f"min_pool={best_c['min_pool']}  "
+                f"min_events={best_c['min_events']}  "
+                f"bounce={best_c['bounce_range']}  "
+                f"scope={best_c['scope']}  "
+                f"→  n={best_c['n']}  WR={best_c.get('wr_ex_chop') or 0:.1%}  "
+                f"EV={best_c.get('expectancy_all') or 0:+.3f}  "
+                f"score={best_c['score_ev_risk']:+.4f}"
+            )
+        else:
+            rec_label = "COLETAR MAIS DADOS"
+            best_c = max(all_combos, key=lambda c: c["score_ev_risk"] or -999)
+            rec_detail = (
+                f"Melhor combo: confidence={best_c['confidence']}  "
+                f"n={best_c['n']}  EV={best_c.get('expectancy_all') or 0:+.3f}. "
+                "Aguarde ≥40 candidatos com WR≥40% confirmados."
+            )
+
+        # ── JSON output ───────────────────────────────────────────────────────
+        if fmt == "json":
+            def _clean(c):
+                out = {k: v for k, v in c.items() if k != "candidates"}
+                # make datetime JSON-serialisable
+                for k, v in out.items():
+                    if hasattr(v, "isoformat"):
+                        out[k] = v.isoformat()
+                return out
+            return jsonify({
+                "recommendation": {"label": rec_label, "detail": rec_detail},
+                "n_valid_combos": len(all_combos),
+                "top_by_score":  [_clean(c) for c in top_by_score[:20]],
+                "top_by_ev":     [_clean(c) for c in top_by_ev[:20]],
+                "scope_comp":    scope_comp,
+                "bounce_comp":   bounce_comp,
+                "nw_comp":       nw_comp,
+                "params": {
+                    "days": days, "min_n": min_n, "tp_pct": tp_pct,
+                    "sl_pct": sl_pct, "sc_pol": sc_pol,
+                    "available_windows": available_windows,
+                },
+            })
+
+        # ── HTML output ───────────────────────────────────────────────────────
+        CONF_COLOR = {
+            "weak_sample":          "#888",
+            "watch":                "#aaa66b",
+            "candidate":            "#6baaa6",
+            "strong":               "#6ba66b",
+            "production_candidate": "#2a8a2a",
+        }
+        REC_COLOR = {
+            "NÃO PRODUZIR":         "#c0392b",
+            "COLETAR MAIS DADOS":   "#d68910",
+            "DRY-RUN V2":           "#1a7fa8",
+            "MICRO-PROD CONTROLADA":"#2a8a2a",
+        }
+
+        def _pct(v):
+            return f"{v:.1%}" if v is not None else "—"
+
+        def _f3(v):
+            return f"{v:+.3f}" if v is not None else "—"
+
+        def _f2(v):
+            return f"{v:.2f}" if v is not None else "—"
+
+        def _combo_row(c, rank=None):
+            conf_col = CONF_COLOR.get(c["confidence"], "#888")
+            rank_td  = f"<td>{rank}</td>" if rank is not None else ""
+            return (
+                f"<tr>"
+                f"{rank_td}"
+                f"<td>{c['scope']}</td>"
+                f"<td>{c['decision_age']}s</td>"
+                f"<td>{c['net_window']}</td>"
+                f"<td>{c['net_min']:+.0f}</td>"
+                f"<td>{c['min_pool']:.0f}</td>"
+                f"<td>{c['min_events']}</td>"
+                f"<td>{c['bounce_range']}</td>"
+                f"<td>{c['n']}</td>"
+                f"<td>{_pct(c.get('wr_ex_chop'))}</td>"
+                f"<td>{_f3(c.get('expectancy_all'))}</td>"
+                f"<td>{_f3(c.get('score_ev_risk'))}</td>"
+                f"<td style='color:{conf_col};font-weight:bold'>{c['confidence']}</td>"
+                f"<td>{_pct(c.get('median_max_dd'))}</td>"
+                f"<td>{_pct(c.get('avg_entry_improvement'))}</td>"
+                f"</tr>"
+            )
+
+        COMBO_TH = (
+            "<tr><th>#</th><th>scope</th><th>age</th><th>window</th>"
+            "<th>net_min</th><th>pool</th><th>evts</th><th>bounce</th>"
+            "<th>n</th><th>WR</th><th>EV</th><th>score</th>"
+            "<th>confidence</th><th>med_dd</th><th>v1_impr</th></tr>"
+        )
+
+        top_score_rows = "\n".join(
+            _combo_row(c, i+1) for i, c in enumerate(top_by_score)
+        )
+        top_ev_rows = "\n".join(
+            _combo_row(c, i+1) for i, c in enumerate(top_by_ev)
+        )
+        risk_rows = "\n".join(
+            _combo_row(c, i+1) for i, c in enumerate(risk_ranked)
+        )
+
+        # Scope comparison table
+        scope_rows = ""
+        for sc, sv in scope_comp.items():
+            scope_rows += (
+                f"<tr><td>{sc}</td><td>{sv['n_combos']}</td>"
+                f"<td>{_f3(sv['best_score'])}</td>"
+                f"<td>{_f3(sv['best_ev'])}</td>"
+                f"<td>{_pct(sv['best_wr'])}</td></tr>"
+            )
+
+        # Bounce range comparison table
+        bounce_rows = ""
+        for br_lbl, bv in sorted(bounce_comp.items(), key=lambda x: -(x[1]["best_score"] or -999)):
+            avg_n_str = f"{bv['best_n']}"
+            bounce_rows += (
+                f"<tr><td>{br_lbl}</td><td>{bv['n_combos']}</td>"
+                f"<td>{_f3(bv['best_score'])}</td>"
+                f"<td>{_f3(bv['best_ev'])}</td>"
+                f"<td>{_pct(bv['best_wr'])}</td>"
+                f"<td>{avg_n_str}</td></tr>"
+            )
+
+        # Net window comparison table
+        nw_rows = ""
+        for nw_lbl, nv in sorted(nw_comp.items(), key=lambda x: -(x[1]["best_score"] or -999)):
+            nw_rows += (
+                f"<tr><td>{nw_lbl}</td><td>{nv['n_combos']}</td>"
+                f"<td>{_f3(nv['best_score'])}</td>"
+                f"<td>{_f3(nv['best_ev'])}</td>"
+                f"<td>{_pct(nv['best_wr'])}</td>"
+                f"<td>{nv['best_n']}</td></tr>"
+            )
+
+        rec_col = REC_COLOR.get(rec_label, "#888")
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
+
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>V2 Brain Report</title>
+<style>
+  body{{font-family:monospace;background:#111;color:#ddd;padding:20px;}}
+  h1{{color:#f0c060;}} h2{{color:#88aaff;border-bottom:1px solid #444;padding-bottom:4px;}}
+  table{{border-collapse:collapse;width:100%;margin-bottom:20px;}}
+  th,td{{border:1px solid #444;padding:4px 8px;text-align:left;font-size:12px;}}
+  th{{background:#222;color:#aaa;}}
+  tr:nth-child(even){{background:#1a1a1a;}}
+  .rec{{font-size:18px;font-weight:bold;padding:12px 20px;border-radius:6px;
+        background:#1e1e1e;border-left:6px solid {rec_col};color:{rec_col};}}
+  .sub{{font-size:12px;color:#aaa;margin-top:6px;}}
+  .meta{{color:#666;font-size:11px;}}
+  a{{color:#88aaff;}}
+</style>
+</head>
+<body>
+<h1>V2 Brain Report</h1>
+<p class="meta">Gerado: {now_str} | janela: {days}d | min_n: {min_n} |
+TP: {tp_pct:.0%} SL: {sl_pct:.0%} | combos válidos: {len(all_combos)} |
+windows: {', '.join(available_windows)}</p>
+
+<h2>1. Executive Summary</h2>
+<div class="rec">{rec_label}</div>
+<div class="sub" style="margin-top:8px;padding:8px;background:#1a1a1a;border-radius:4px;">
+{rec_detail}
+</div>
+
+<h2>2. Top {len(top_by_score)} por score_ev_risk</h2>
+<table>
+{COMBO_TH}
+{top_score_rows}
+</table>
+
+<h2>3. Top {len(top_by_ev)} por expectancy_all</h2>
+<table>
+{COMBO_TH}
+{top_ev_rows}
+</table>
+
+<h2>4. Risk Table (menor drawdown mediano)</h2>
+<table>
+{COMBO_TH}
+{risk_rows}
+</table>
+
+<h2>5. Scope Comparison</h2>
+<table>
+<tr><th>scope</th><th>n_combos</th><th>best_score</th><th>best_EV</th><th>best_WR</th></tr>
+{scope_rows}
+</table>
+
+<h2>6. Bounce Range Comparison</h2>
+<table>
+<tr><th>bounce_range</th><th>n_combos</th><th>best_score</th><th>best_EV</th><th>best_WR</th><th>best_n</th></tr>
+{bounce_rows}
+</table>
+
+<h2>7. Net Window Comparison</h2>
+<table>
+<tr><th>window</th><th>n_combos</th><th>best_score</th><th>best_EV</th><th>best_WR</th><th>best_n</th></tr>
+{nw_rows}
+</table>
+
+<h2>8. Recomendação Bigplayer</h2>
+<div class="rec">{rec_label}</div>
+<div class="sub" style="margin-top:8px;padding:8px 12px;background:#1a1a1a;border-radius:4px;white-space:pre-wrap;">{rec_detail}</div>
+<p class="meta" style="margin-top:16px;">
+  score_ev_risk = expectancy_all − |p75_dd|×0.10 − max(0, 20−n)×0.002<br>
+  confidence: weak_sample → watch → candidate → strong → production_candidate<br>
+  v1_entry_improvement: positivo = V2 entrou mais barato que V1 (bs_entry/entry_mc − 1)<br>
+  <a href="/analise/v2-brain-report?days={days}&format=json">→ JSON</a>
+  &nbsp;|&nbsp;
+  <a href="/analise/v2-threshold-grid?days={days}">→ Threshold Grid</a>
+  &nbsp;|&nbsp;
+  <a href="/analise/v2-decision-tape?days={days}">→ Decision Tape</a>
+</p>
+</body>
+</html>"""
+
         return render_template_string(html)
 
     except Exception as e:
