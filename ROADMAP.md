@@ -580,7 +580,7 @@ Dashboard mostra correlação H22 → outcome com n atual. 3 tabelas: por `absor
 | H22 | Buy volume > sell volume nos 60s pós-fundo discrimina WR ≥15pp | ⏳ **DATA COLLECTION** — janela rolante ativa, métricas brutas salvas em bounce_signals. Score aguarda n≥30 outcomes GMGN. |
 | H23 | `net_sol_flow = buy_vol_sol - sell_vol_sol > threshold` discrimina WR | 🟡 **COLETA ATIVA** — implementado e corrigido. Bug de janela (time.time vs ts_min) descoberto e corrigido. h23_window='bottom' para novos bounces. Bounce-window (n=61): zona 3-10 SOL tem WR 35.7% (+16pp), mas 42% dos TPs tinham H23 negativo. Gate: n≥30 com h23_window='bottom' + outcomes GMGN. |
 | H24 | Seller exhaustion (top-3 sellers > 70% do dump_vol) → WR maior | ⏳ **PENDENTE IMPLEMENTAÇÃO** — hipótese central pós H21. Requer acumular sellers únicos via Helius entre ts_migration e ts_min. |
-| H25 | Pool depth `pool_quote < 20 SOL` → SL é ruído de pool thin, não price action | ⏳ **PENDENTE IMPLEMENTAÇÃO** — dado em offset 56 do BuyEvent já chega via Helius. Falta salvar em bounce_signals. |
+| H25 | Pool depth `pool_quote < 20 SOL` → SL é ruído de pool thin, não price action · **EXTENSÃO**: pool_quote > 90 SOL = net inflow desde migração → sinal positivo forte | 🟡 **COLETA ATIVA (V2 Fase 1)** — `micro_absorption_snapshots` já salva `pool_quote` por snapshot. Dados de 3 dias (05/30–06/02) revelaram gradiente monotônico: pool>90 sem filtro = 58.3% WR (290 eventos); pool>90+drop≥20% = 85.1% WR (121 eventos); pool>90+drop≥40% = **100% WR (74 eventos, 73 TP / 0 SL)**. Caveats: 3 dias = possível viés de regime; 74 eventos ≠ 74 tokens únicos (múltiplos snapshots por token); simulação, não execução. Gate para filtro: n≥30 dias + cross-check outcomes GMGN reais. |
 | H26 | Buy concentration `largest_buy / buy_vol` alta → WR maior | ⏳ **PENDENTE CORRELAÇÃO** — campo calculável dos dados existentes. Gate: n≥30 com outcomes GMGN. |
 
 ---
@@ -620,6 +620,7 @@ Dashboard mostra correlação H22 → outcome com n atual. 3 tabelas: por `absor
 - bounce_pct >70%: WR 74% (n=23, +45pp) — maior discriminador encontrado, mas já coberto por BOUNCE_MIN_PCT
 - Pearson H23 × bounce_pct = -0.085 → informação independente, porém fraca isoladamente
 - Tokens com bounce >100% frequentemente têm H23 negativo (profit-taking durante a subida)
+- **pool_quote > 90 SOL + drop_from_mig ≥ 40% = 100% WR em 74 eventos (V2 Fase 1, 2026-06-02)**: gradiente perfeito: pool>90 = 58.3% → pool>90+drop≥20% = 85.1% → pool>90+drop≥40% = 100%. Interpretação econômica: pAMM inicia com ~79 SOL → pool>90 = net inflow desde a migração (compradores absorveram o dump). Combinado com drop≥40% = preço caiu ≥40% APESAR da absorção = tensão elástica máxima. Caveats: 3 dias de dados (regime único), múltiplos snapshots por token (74 eventos ≠ 74 tokens únicos), simulação não execução. Gate: n≥30 dias + outcomes GMGN reais. Dashboard: `/debug/pool-deep-tokens`.
 
 ---
 
