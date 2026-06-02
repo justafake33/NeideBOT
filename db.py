@@ -494,6 +494,15 @@ def init_db():
             "ADD COLUMN IF NOT EXISTS rise_10s_buy_concentration FLOAT",
             "ADD COLUMN IF NOT EXISTS live_5s_buy_concentration  FLOAT",
             "ADD COLUMN IF NOT EXISTS live_10s_buy_concentration FLOAT",
+            # live_30s / live_60s — janelas LIVE mais largas (V2 Fase 1, adicionadas pós-deploy)
+            "ADD COLUMN IF NOT EXISTS live_30s_buy    FLOAT",
+            "ADD COLUMN IF NOT EXISTS live_30s_sell   FLOAT",
+            "ADD COLUMN IF NOT EXISTS live_30s_net    FLOAT",
+            "ADD COLUMN IF NOT EXISTS live_30s_events INT",
+            "ADD COLUMN IF NOT EXISTS live_60s_buy    FLOAT",
+            "ADD COLUMN IF NOT EXISTS live_60s_sell   FLOAT",
+            "ADD COLUMN IF NOT EXISTS live_60s_net    FLOAT",
+            "ADD COLUMN IF NOT EXISTS live_60s_events INT",
         ]:
             cur.execute(f"ALTER TABLE micro_absorption_snapshots {col}")
 
@@ -1115,6 +1124,8 @@ def insert_micro_absorption_snapshot(data: dict) -> None:
                     rise_now_largest_buy, rise_now_largest_sell, rise_now_zero_type,
                     live_5s_buy,  live_5s_sell,  live_5s_net,  live_5s_events,
                     live_10s_buy, live_10s_sell, live_10s_net, live_10s_events,
+                    live_30s_buy, live_30s_sell, live_30s_net, live_30s_events,
+                    live_60s_buy, live_60s_sell, live_60s_net, live_60s_events,
                     buy_concentration_5s,  buy_concentration_10s,
                     sell_concentration_5s, sell_concentration_10s,
                     pre_5s_buy_concentration,  pre_10s_buy_concentration,
@@ -1146,6 +1157,8 @@ def insert_micro_absorption_snapshot(data: dict) -> None:
                     %(rise_now_largest_buy)s, %(rise_now_largest_sell)s, %(rise_now_zero_type)s,
                     %(live_5s_buy)s,  %(live_5s_sell)s,  %(live_5s_net)s,  %(live_5s_events)s,
                     %(live_10s_buy)s, %(live_10s_sell)s, %(live_10s_net)s, %(live_10s_events)s,
+                    %(live_30s_buy)s, %(live_30s_sell)s, %(live_30s_net)s, %(live_30s_events)s,
+                    %(live_60s_buy)s, %(live_60s_sell)s, %(live_60s_net)s, %(live_60s_events)s,
                     %(buy_concentration_5s)s,  %(buy_concentration_10s)s,
                     %(sell_concentration_5s)s, %(sell_concentration_10s)s,
                     %(pre_5s_buy_concentration)s,  %(pre_10s_buy_concentration)s,

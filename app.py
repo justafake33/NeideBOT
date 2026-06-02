@@ -43114,5 +43114,682 @@ td:first-child{{text-align:left}}
         return f"<pre>Erro: {e}\n\n{traceback.format_exc()}</pre>", 500
 
 
+@app.route("/analise/v2-decision-tape")
+def analise_v2_decision_tape():  # noqa: C901
+    """V2 Decision Tape — primeiro snapshot elegível por bounce (anti look-ahead bias).
+
+    Para cada par (mint, ts_min) em micro_absorption_snapshots, seleciona o
+    PRIMEIRO snapshot que passa em todos os gates V2. O mc_current desse snapshot
+    é tratado como o preço de entrada que o bot V2 pagaria.
+
+    Parâmetros (query string):
+      days=14          janela de coleta em dias
+      decision_age=10  bottom_age_sec mínimo para confirmar fundo
+      min_drop=0.30    drop_from_mig mínimo
+      max_elapsed_sec=300   elapsed_sec máximo
+      min_pool=10      pool_quote mínimo (SOL)
+      min_events=3     eventos na janela net_window mínimos
+      net_window=live_10s  janela usada para net_flow (live_5s|live_10s|live_30s|live_60s|pre_10s|pre_30s|rise_now)
+      net_min=-5       net_flow mínimo (SOL)
+      max_bounce_pct   bounce_pct_now máximo (default: sem filtro)
+      format=html|json|csv
+      min_n=5          mínimo de candidatos para mostrar análise
+    """
+    import json as _json
+    import csv as _csv
+    import io
+
+    days           = int(request.args.get("days", 14))
+    decision_age   = float(request.args.get("decision_age", 10))
+    min_drop       = float(request.args.get("min_drop", 0.30))
+    max_elapsed    = int(request.args.get("max_elapsed_sec", 300))
+    min_pool       = float(request.args.get("min_pool", 10))
+    min_events     = int(request.args.get("min_events", 3))
+    net_window     = request.args.get("net_window", "live_10s")
+    net_min        = float(request.args.get("net_min", -5))
+    max_bounce_pct_str = request.args.get("max_bounce_pct", "")
+    max_bounce_pct = float(max_bounce_pct_str) if max_bounce_pct_str else None
+    fmt            = request.args.get("format", "html")
+    min_n          = int(request.args.get("min_n", 5))
+
+    # Map net_window to column names
+    _NET_WINDOWS = {
+        "live_5s":  ("live_5s_net",  "live_5s_events"),
+        "live_10s": ("live_10s_net", "live_10s_events"),
+        "live_30s": ("live_30s_net", "live_30s_events"),
+        "live_60s": ("live_60s_net", "live_60s_events"),
+        "pre_10s":  ("pre_10s_net",  "pre_10s_events"),
+        "pre_30s":  ("pre_30s_net",  "pre_30s_events"),
+        "rise_now": ("rise_now_net", "rise_now_events"),
+    }
+    if net_window not in _NET_WINDOWS:
+        net_window = "live_10s"
+    net_col, events_col = _NET_WINDOWS[net_window]
+
+    try:
+        from datetime import timedelta, timezone
+        import psycopg2, psycopg2.extras
+        conn = psycopg2.connect(db.DATABASE_URL)
+        conn.autocommit = True
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+        # Load all snapshots ordered by (mint, ts_min, bottom_age_sec ASC)
+        # so we can pick the FIRST eligible one per bounce event.
+        cur.execute("""
+            SELECT
+                mint, symbol, ts_min, ts_snapshot, ts_migration,
+                bottom_age_sec, mc_min, mc_current, mc_migration,
+                bounce_pct_now, drop_from_mig, elapsed_sec, pool_quote,
+                pre_5s_net, pre_10s_net, pre_30s_net,
+                live_5s_net,  live_5s_events,
+                live_10s_net, live_10s_events,
+                live_30s_net, live_30s_events,
+                live_60s_net, live_60s_events,
+                rise_now_net, rise_now_events,
+                pre_10s_events, pre_30s_events
+            FROM micro_absorption_snapshots
+            WHERE ts_snapshot >= %(cutoff)s
+              AND mc_current IS NOT NULL
+              AND ts_min IS NOT NULL
+              AND mc_min IS NOT NULL
+            ORDER BY mint, ts_min, bottom_age_sec ASC
+        """, {"cutoff": cutoff})
+        all_snaps = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+
+        if not all_snaps:
+            msg = f"Sem dados para os últimos {days} dias."
+            if fmt == "json":
+                return app.response_class(
+                    response=_json.dumps({"error": msg}), mimetype="application/json"
+                )
+            return f"<html><body><h2>v2-decision-tape</h2><p>{msg}</p></body></html>"
+
+        def _s(v, d=0):
+            return v if v is not None else d
+
+        def _passes_gates(snap):
+            """Returns True if snapshot passes all V2 entry gates."""
+            if _s(snap.get("drop_from_mig"), 0) < min_drop:
+                return False
+            if _s(snap.get("elapsed_sec"), 9999) > max_elapsed:
+                return False
+            if _s(snap.get("bottom_age_sec"), 0) < decision_age:
+                return False
+            if _s(snap.get("pool_quote"), 0) < min_pool:
+                return False
+            net_v    = _s(snap.get(net_col), 0)
+            events_v = _s(snap.get(events_col), 0)
+            if events_v < min_events:
+                return False
+            if net_v < net_min:
+                return False
+            if max_bounce_pct is not None:
+                if _s(snap.get("bounce_pct_now"), 0) > max_bounce_pct:
+                    return False
+            return True
+
+        # Group by (mint, ts_min) and pick FIRST eligible snapshot
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for s in all_snaps:
+            key = (s["mint"], s["ts_min"])
+            groups[key].append(s)
+
+        candidates = []
+        for key, snaps in groups.items():
+            # snaps already sorted by bottom_age_sec ASC
+            for snap in snaps:
+                if _passes_gates(snap):
+                    candidates.append(snap)
+                    break  # First eligible only — anti look-ahead bias
+
+        candidates.sort(key=lambda r: r.get("ts_min") or r.get("ts_snapshot"), reverse=True)
+
+        if fmt == "json":
+            out = []
+            for c in candidates:
+                row = {k: (v.isoformat() if hasattr(v, "isoformat") else v)
+                       for k, v in c.items()}
+                out.append(row)
+            return app.response_class(
+                response=_json.dumps({"n": len(out), "candidates": out}),
+                mimetype="application/json"
+            )
+
+        if fmt == "csv":
+            si = io.StringIO()
+            if candidates:
+                writer = _csv.DictWriter(si, fieldnames=list(candidates[0].keys()))
+                writer.writeheader()
+                for c in candidates:
+                    row = {k: (v.isoformat() if hasattr(v, "isoformat") else v)
+                           for k, v in c.items()}
+                    writer.writerow(row)
+            return app.response_class(
+                response=si.getvalue(),
+                mimetype="text/csv",
+                headers={"Content-Disposition": "attachment; filename=v2_decision_tape.csv"}
+            )
+
+        # HTML output
+        n_total_bounces = len(groups)
+        n_candidates    = len(candidates)
+        coverage_pct    = (n_candidates / n_total_bounces * 100) if n_total_bounces else 0
+
+        rows_html = ""
+        for c in candidates:
+            ts_min_str   = c.get("ts_min")
+            ts_min_str   = ts_min_str.strftime("%m-%d %H:%M") if hasattr(ts_min_str, "strftime") else str(ts_min_str)
+            ts_snap_str  = c.get("ts_snapshot")
+            ts_snap_str  = ts_snap_str.strftime("%H:%M:%S") if hasattr(ts_snap_str, "strftime") else str(ts_snap_str)
+            drop_pct     = _s(c.get("drop_from_mig"), 0) * 100
+            bounce_pct   = _s(c.get("bounce_pct_now"), 0) * 100
+            net_v        = _s(c.get(net_col), 0)
+            events_v     = _s(c.get(events_col), 0)
+            pool_v       = _s(c.get("pool_quote"), 0)
+            age_v        = _s(c.get("bottom_age_sec"), 0)
+            mc_cur       = _s(c.get("mc_current"), 0)
+            mc_mig       = _s(c.get("mc_migration"), 0)
+            entry_ratio  = (mc_cur / mc_mig * 100) if mc_mig > 0 else 0
+            sym          = c.get("symbol") or c.get("mint", "")[:8]
+            mint         = c.get("mint", "")
+            dex_url      = f"https://dexscreener.com/solana/{mint}"
+
+            net_color = "#28a745" if net_v >= 0 else "#dc3545"
+            rows_html += f"""
+            <tr>
+              <td>{ts_min_str}</td>
+              <td><a href="{dex_url}" target="_blank">{sym}</a></td>
+              <td>{ts_snap_str}</td>
+              <td>{age_v:.1f}s</td>
+              <td>${mc_cur:,.0f}</td>
+              <td>${mc_mig:,.0f}</td>
+              <td style="color:#6c757d">{entry_ratio:.1f}%</td>
+              <td>{drop_pct:.1f}%</td>
+              <td>{bounce_pct:.1f}%</td>
+              <td>{pool_v:.1f}</td>
+              <td style="color:{net_color};font-weight:bold">{net_v:+.2f}</td>
+              <td>{events_v}</td>
+            </tr>"""
+
+        # Build filter summary
+        filters_html = (
+            f"<b>Filtros:</b> drop≥{min_drop*100:.0f}% · elapsed≤{max_elapsed}s · "
+            f"decision_age≥{decision_age:.0f}s · pool≥{min_pool:.0f}SOL · "
+            f"events≥{min_events} · {net_window}_net≥{net_min:+.1f} SOL"
+        )
+        if max_bounce_pct is not None:
+            filters_html += f" · bounce≤{max_bounce_pct*100:.0f}%"
+
+        # Build URL for adjusting params
+        base_url = request.path
+        def _link(**kw):
+            p = dict(request.args)
+            p.update({k: str(v) for k, v in kw.items()})
+            return base_url + "?" + "&".join(f"{k}={v}" for k, v in p.items())
+
+        html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>V2 Decision Tape</title>
+<style>
+body{{font-family:monospace;padding:16px;background:#0d0d0d;color:#e0e0e0}}
+h2{{color:#4fc3f7}}
+table{{border-collapse:collapse;width:100%;font-size:12px}}
+th,td{{border:1px solid #333;padding:4px 8px;text-align:right;white-space:nowrap}}
+th{{background:#1a1a2e;color:#90caf9;text-align:center}}
+td:nth-child(2){{text-align:left}}
+tr:hover{{background:#1a1a1a}}
+a{{color:#4fc3f7;text-decoration:none}}
+.stats{{background:#111;padding:8px;margin:8px 0;border-radius:4px}}
+.links a{{margin-right:12px;color:#81d4fa}}
+</style>
+</head><body>
+<h2>V2 Decision Tape — Primeiro Snapshot Elegível por Bounce</h2>
+<div class="stats">
+  Bounces totais: <b>{n_total_bounces}</b> &nbsp;|&nbsp;
+  Candidatos V2: <b>{n_candidates}</b> ({coverage_pct:.1f}%) &nbsp;|&nbsp;
+  Janela: <b>{days}d</b>
+  <br>{filters_html}
+</div>
+<div class="links">
+  Janela net:
+  <a href="{_link(net_window='live_5s')}">live_5s</a>
+  <a href="{_link(net_window='live_10s')}">live_10s</a>
+  <a href="{_link(net_window='live_30s')}">live_30s</a>
+  <a href="{_link(net_window='live_60s')}">live_60s</a>
+  <a href="{_link(net_window='pre_10s')}">pre_10s</a>
+  <a href="{_link(net_window='pre_30s')}">pre_30s</a>
+  <a href="{_link(net_window='rise_now')}">rise_now</a>
+  &nbsp;|&nbsp;
+  <a href="{_link(format='json')}">JSON</a>
+  <a href="{_link(format='csv')}">CSV</a>
+  &nbsp;|&nbsp;
+  <a href="/analise/v2-vs-v1-entry?days={days}&decision_age={int(decision_age)}&min_drop={min_drop}&max_elapsed_sec={max_elapsed}&min_pool={min_pool}&min_events={min_events}&net_window={net_window}&net_min={net_min}">→ Comparar V2 vs V1</a>
+</div>
+<table>
+<thead><tr>
+  <th>ts_min</th><th>Token</th><th>Decision ts</th><th>Age</th>
+  <th>Entry MC</th><th>MC Migr</th><th>Entry%</th>
+  <th>Drop%</th><th>Bounce%</th><th>Pool(SOL)</th>
+  <th>{net_window}_net(SOL)</th><th>Events</th>
+</tr></thead>
+<tbody>{rows_html}</tbody>
+</table>
+</body></html>"""
+        return render_template_string(html)
+
+    except Exception as e:
+        import traceback
+        return f"<pre>Erro: {e}\n\n{traceback.format_exc()}</pre>", 500
+
+
+@app.route("/analise/v2-vs-v1-entry")
+def analise_v2_vs_v1_entry():  # noqa: C901
+    """Comparação V2 (microestrutura) vs V1 (bounce 30%) por token.
+
+    Para cada candidato V2 (primeiro snapshot elegível), busca o bounce_signal V1
+    correspondente e calcula a melhoria de entrada. Simula outcomes via token_ticks
+    com TP=75% e SL=25% a partir de cada ponto de entrada.
+
+    Parâmetros: mesmos do v2-decision-tape + tp_pct=0.75 + sl_pct=0.25.
+    """
+    import json as _json
+    from datetime import timedelta, timezone
+    from collections import defaultdict
+
+    days           = int(request.args.get("days", 14))
+    decision_age   = float(request.args.get("decision_age", 10))
+    min_drop       = float(request.args.get("min_drop", 0.30))
+    max_elapsed    = int(request.args.get("max_elapsed_sec", 300))
+    min_pool       = float(request.args.get("min_pool", 10))
+    min_events     = int(request.args.get("min_events", 3))
+    net_window     = request.args.get("net_window", "live_10s")
+    net_min        = float(request.args.get("net_min", -5))
+    max_bounce_pct_str = request.args.get("max_bounce_pct", "")
+    max_bounce_pct = float(max_bounce_pct_str) if max_bounce_pct_str else None
+    tp_pct         = float(request.args.get("tp_pct", 0.75))
+    sl_pct         = float(request.args.get("sl_pct", 0.25))
+    fmt            = request.args.get("format", "html")
+
+    _NET_WINDOWS = {
+        "live_5s":  ("live_5s_net",  "live_5s_events"),
+        "live_10s": ("live_10s_net", "live_10s_events"),
+        "live_30s": ("live_30s_net", "live_30s_events"),
+        "live_60s": ("live_60s_net", "live_60s_events"),
+        "pre_10s":  ("pre_10s_net",  "pre_10s_events"),
+        "pre_30s":  ("pre_30s_net",  "pre_30s_events"),
+        "rise_now": ("rise_now_net", "rise_now_events"),
+    }
+    if net_window not in _NET_WINDOWS:
+        net_window = "live_10s"
+    net_col, events_col = _NET_WINDOWS[net_window]
+
+    def _s(v, d=0):
+        return v if v is not None else d
+
+    def _ts(dt):
+        try:
+            return dt.timestamp() if dt is not None else None
+        except Exception:
+            return None
+
+    def _passes_v2_gates(snap):
+        if _s(snap.get("drop_from_mig"), 0) < min_drop:
+            return False
+        if _s(snap.get("elapsed_sec"), 9999) > max_elapsed:
+            return False
+        if _s(snap.get("bottom_age_sec"), 0) < decision_age:
+            return False
+        if _s(snap.get("pool_quote"), 0) < min_pool:
+            return False
+        if _s(snap.get(events_col), 0) < min_events:
+            return False
+        if _s(snap.get(net_col), 0) < net_min:
+            return False
+        if max_bounce_pct is not None:
+            if _s(snap.get("bounce_pct_now"), 0) > max_bounce_pct:
+                return False
+        return True
+
+    def _simulate_outcome(ticks, ts_min_dt, entry_ts, entry_mc, tp_mc, sl_mc):
+        """Walk ticks after entry_ts, detect TP or SL.
+        Returns dict: outcome, max_gain, max_drawdown.
+        Same-candle conflict → conservative (sl first).
+        """
+        res = {"outcome": "no_ticks" if not ticks else "no_exit",
+               "max_gain": None, "max_drawdown": None}
+        if not ticks or not entry_mc:
+            return res
+
+        ts_min_ts = _ts(ts_min_dt)
+        entry_ts_f = entry_ts if isinstance(entry_ts, float) else _ts(entry_ts)
+        if ts_min_ts is None or entry_ts_f is None:
+            return res
+
+        mx = mn = None
+        resolved = False
+
+        for t in ticks:
+            tts = _ts(t.get("tick_ts"))
+            if tts is None or tts <= ts_min_ts:
+                continue
+            if tts < entry_ts_f:
+                continue  # before our entry point
+
+            src = t.get("source", "trenches")
+            if src == "kline":
+                hi = t.get("mc_high") or t.get("mc") or 0
+                lo = t.get("mc_low")  or t.get("mc") or 0
+                op = t.get("mc_open") or t.get("mc") or 0
+            else:
+                hi = lo = op = t.get("mc") or 0
+
+            if not hi:
+                continue
+
+            mx = max(mx, hi) if mx is not None else hi
+            mn = min(mn, lo) if mn is not None else lo
+
+            if resolved:
+                continue
+
+            tp_hit = hi >= tp_mc
+            sl_hit = lo <= sl_mc
+            if tp_hit and sl_hit:
+                midpt = (tp_mc + sl_mc) / 2
+                if op >= midpt:
+                    res["outcome"] = "tp"; resolved = True
+                else:
+                    res["outcome"] = "sl"; resolved = True
+            elif tp_hit:
+                res["outcome"] = "tp"; resolved = True
+            elif sl_hit:
+                res["outcome"] = "sl"; resolved = True
+
+        if mx is not None and entry_mc:
+            res["max_gain"]     = (mx - entry_mc) / entry_mc
+            res["max_drawdown"] = (mn - entry_mc) / entry_mc if mn is not None else None
+        return res
+
+    try:
+        import psycopg2, psycopg2.extras
+        conn = psycopg2.connect(db.DATABASE_URL)
+        conn.autocommit = True
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+        # 1. Micro snapshots (all, ordered ASC for first-eligible selection)
+        cur.execute("""
+            SELECT
+                mint, symbol, ts_min, ts_snapshot, ts_migration,
+                bottom_age_sec, mc_min, mc_current, mc_migration,
+                bounce_pct_now, drop_from_mig, elapsed_sec, pool_quote,
+                pre_10s_net, pre_30s_net,
+                live_5s_net,  live_5s_events,
+                live_10s_net, live_10s_events,
+                live_30s_net, live_30s_events,
+                live_60s_net, live_60s_events,
+                rise_now_net, rise_now_events,
+                pre_10s_events, pre_30s_events
+            FROM micro_absorption_snapshots
+            WHERE ts_snapshot >= %(cutoff)s
+              AND mc_current IS NOT NULL
+              AND ts_min IS NOT NULL
+              AND mc_min IS NOT NULL
+            ORDER BY mint, ts_min, bottom_age_sec ASC
+        """, {"cutoff": cutoff})
+        all_snaps = [dict(r) for r in cur.fetchall()]
+
+        if not all_snaps:
+            cur.close(); conn.close()
+            return "<html><body><h2>v2-vs-v1-entry</h2><p>Sem dados.</p></body></html>"
+
+        # 2. Bounce signals (V1)
+        cur.execute("""
+            SELECT mint, ts_signal, mc_at_signal, bounce_pct
+            FROM bounce_signals
+            WHERE ts_signal >= %(cutoff)s
+        """, {"cutoff": cutoff})
+        v1_by_mint = {r["mint"]: dict(r) for r in cur.fetchall()}
+
+        # 3. Token ticks
+        mints = list({s["mint"] for s in all_snaps})
+        ts_floor = min(s["ts_min"] for s in all_snaps if s.get("ts_min"))
+        ts_ceil  = max(s["ts_min"] for s in all_snaps if s.get("ts_min")) + timedelta(hours=1, minutes=10)
+        cur.execute("""
+            SELECT mint, tick_ts, mc, mc_open, mc_high, mc_low, source
+            FROM token_ticks
+            WHERE mint = ANY(%(mints)s)
+              AND tick_ts > %(ts_floor)s
+              AND tick_ts <= %(ts_ceil)s
+            ORDER BY mint, tick_ts
+        """, {"mints": mints, "ts_floor": ts_floor, "ts_ceil": ts_ceil})
+        ticks_by_mint = defaultdict(list)
+        for t in cur.fetchall():
+            ticks_by_mint[t["mint"]].append(dict(t))
+
+        cur.close(); conn.close()
+
+        # 4. Select first eligible V2 snapshot per bounce
+        groups = defaultdict(list)
+        for s in all_snaps:
+            key = (s["mint"], s["ts_min"])
+            groups[key].append(s)
+
+        rows = []
+        for key, snaps in groups.items():
+            mint = snaps[0]["mint"]
+            v2_snap = None
+            for snap in snaps:
+                if _passes_v2_gates(snap):
+                    v2_snap = snap
+                    break
+            if v2_snap is None:
+                continue
+
+            ts_min_dt     = v2_snap.get("ts_min")
+            v2_entry_mc   = _s(v2_snap.get("mc_current"), 0)
+            v2_decision_ts = v2_snap.get("ts_snapshot")
+            mc_migration   = _s(v2_snap.get("mc_migration"), 0)
+
+            if not v2_entry_mc or not ts_min_dt:
+                continue
+
+            v2_tp_mc = v2_entry_mc * (1 + tp_pct)
+            v2_sl_mc = v2_entry_mc * (1 - sl_pct)
+
+            # Simulate V2 outcome from decision timestamp
+            v2_entry_ts = _ts(v2_decision_ts)
+            v2_sim = _simulate_outcome(
+                ticks_by_mint.get(mint, []),
+                ts_min_dt, v2_entry_ts,
+                v2_entry_mc, v2_tp_mc, v2_sl_mc
+            )
+
+            # V1 info (if bounce signal exists for this mint)
+            v1 = v1_by_mint.get(mint, {})
+            v1_ts_signal    = v1.get("ts_signal")
+            v1_mc_at_signal = v1.get("mc_at_signal")
+            v1_bounce_pct   = v1.get("bounce_pct")
+
+            v1_signal_delay_sec = None
+            entry_improvement_pct = None
+            v1_sim = {"outcome": "no_v1", "max_gain": None, "max_drawdown": None}
+
+            if v1_ts_signal and v2_decision_ts:
+                try:
+                    v1_signal_delay_sec = (_ts(v1_ts_signal) or 0) - (v2_entry_ts or 0)
+                except Exception:
+                    pass
+
+            if v1_mc_at_signal and v2_entry_mc and v2_entry_mc > 0:
+                entry_improvement_pct = v1_mc_at_signal / v2_entry_mc - 1
+
+            if v1_mc_at_signal:
+                v1_tp_mc = v1_mc_at_signal * (1 + tp_pct)
+                v1_sl_mc = v1_mc_at_signal * (1 - sl_pct)
+                v1_entry_ts = _ts(v1_ts_signal)
+                v1_sim = _simulate_outcome(
+                    ticks_by_mint.get(mint, []),
+                    ts_min_dt, v1_entry_ts,
+                    v1_mc_at_signal, v1_tp_mc, v1_sl_mc
+                )
+
+            rows.append({
+                "mint":                   mint,
+                "symbol":                 v2_snap.get("symbol") or mint[:8],
+                "ts_min":                 ts_min_dt,
+                "v2_decision_ts":         v2_decision_ts,
+                "v2_bottom_age_sec":      _s(v2_snap.get("bottom_age_sec")),
+                "v2_entry_mc":            v2_entry_mc,
+                "v2_drop_from_mig":       _s(v2_snap.get("drop_from_mig")),
+                "v2_bounce_pct_now":      _s(v2_snap.get("bounce_pct_now")),
+                "v2_pool_quote":          _s(v2_snap.get("pool_quote")),
+                "v2_net_flow":            _s(v2_snap.get(net_col)),
+                "v2_events":              _s(v2_snap.get(events_col)),
+                "v2_outcome":             v2_sim["outcome"],
+                "v2_max_gain":            v2_sim["max_gain"],
+                "v2_max_drawdown":        v2_sim["max_drawdown"],
+                "v1_ts_signal":           v1_ts_signal,
+                "v1_mc_at_signal":        v1_mc_at_signal,
+                "v1_bounce_pct":          v1_bounce_pct,
+                "v1_signal_delay_sec":    v1_signal_delay_sec,
+                "entry_improvement_pct":  entry_improvement_pct,
+                "v1_outcome":             v1_sim["outcome"],
+                "v1_max_gain":            v1_sim["max_gain"],
+                "v1_max_drawdown":        v1_sim["max_drawdown"],
+            })
+
+        rows.sort(key=lambda r: r.get("ts_min") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+
+        if fmt == "json":
+            out = []
+            for r in rows:
+                row = {k: (v.isoformat() if hasattr(v, "isoformat") else v)
+                       for k, v in r.items()}
+                out.append(row)
+            return app.response_class(
+                response=_json.dumps({"n": len(out), "rows": out}),
+                mimetype="application/json"
+            )
+
+        # Summary stats
+        n_total   = len(rows)
+        n_with_v1 = sum(1 for r in rows if r.get("v1_mc_at_signal"))
+        n_v2_tp   = sum(1 for r in rows if r.get("v2_outcome") == "tp")
+        n_v2_sl   = sum(1 for r in rows if r.get("v2_outcome") == "sl")
+        n_v1_tp   = sum(1 for r in rows if r.get("v1_outcome") == "tp")
+        n_v1_sl   = sum(1 for r in rows if r.get("v1_outcome") == "sl")
+        v2_wr     = (n_v2_tp / (n_v2_tp + n_v2_sl) * 100) if (n_v2_tp + n_v2_sl) > 0 else None
+        v1_wr     = (n_v1_tp / (n_v1_tp + n_v1_sl) * 100) if (n_v1_tp + n_v1_sl) > 0 else None
+
+        improvements = [r["entry_improvement_pct"] for r in rows if r.get("entry_improvement_pct") is not None]
+        avg_improvement = (sum(improvements) / len(improvements) * 100) if improvements else None
+
+        def _oc(outcome):
+            if outcome == "tp":    return "style='color:#28a745;font-weight:bold'"
+            if outcome == "sl":    return "style='color:#dc3545'"
+            if outcome == "no_v1": return "style='color:#6c757d'"
+            return ""
+
+        rows_html = ""
+        for r in rows:
+            ts_min_str = r.get("ts_min")
+            ts_min_str = ts_min_str.strftime("%m-%d %H:%M") if hasattr(ts_min_str, "strftime") else str(ts_min_str)
+            v2_dec_str = r.get("v2_decision_ts")
+            v2_dec_str = v2_dec_str.strftime("%H:%M:%S") if hasattr(v2_dec_str, "strftime") else ""
+            sym     = r.get("symbol") or r.get("mint", "")[:8]
+            mint    = r.get("mint", "")
+            dex_url = f"https://dexscreener.com/solana/{mint}"
+
+            impr    = r.get("entry_improvement_pct")
+            impr_str = f"{impr*100:+.1f}%" if impr is not None else "—"
+            impr_color = "#28a745" if (impr is not None and impr > 0.05) else \
+                         "#dc3545" if (impr is not None and impr < -0.05) else "#aaa"
+
+            v2_gain_str = f"{r['v2_max_gain']*100:+.0f}%" if r.get("v2_max_gain") is not None else "—"
+            v1_gain_str = f"{r['v1_max_gain']*100:+.0f}%" if r.get("v1_max_gain") is not None else "—"
+            v1_sig_delay_str = f"{r['v1_signal_delay_sec']:+.0f}s" if r.get("v1_signal_delay_sec") is not None else "—"
+
+            rows_html += f"""
+            <tr>
+              <td>{ts_min_str}</td>
+              <td><a href="{dex_url}" target="_blank">{sym}</a></td>
+              <td>${_s(r.get('v2_entry_mc')):,.0f}</td>
+              <td>{v2_dec_str}</td>
+              <td>{_s(r.get('v2_bottom_age_sec')):.1f}s</td>
+              <td>{_s(r.get('v2_drop_from_mig'))*100:.1f}%</td>
+              <td>{_s(r.get('v2_bounce_pct_now'))*100:.1f}%</td>
+              <td>{_s(r.get('v2_net_flow')):+.2f}</td>
+              <td {_oc(r.get('v2_outcome'))}>{r.get('v2_outcome','—')}</td>
+              <td>{v2_gain_str}</td>
+              <td>${_s(r.get('v1_mc_at_signal')):,.0f}</td>
+              <td>{v1_sig_delay_str}</td>
+              <td style="color:{impr_color};font-weight:bold">{impr_str}</td>
+              <td {_oc(r.get('v1_outcome'))}>{r.get('v1_outcome','—')}</td>
+              <td>{v1_gain_str}</td>
+            </tr>"""
+
+        v2_wr_str = f"{v2_wr:.1f}%" if v2_wr is not None else "—"
+        v1_wr_str = f"{v1_wr:.1f}%" if v1_wr is not None else "—"
+        avg_impr_str = f"{avg_improvement:+.1f}%" if avg_improvement is not None else "—"
+
+        html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>V2 vs V1 Entry</title>
+<style>
+body{{font-family:monospace;padding:16px;background:#0d0d0d;color:#e0e0e0}}
+h2{{color:#4fc3f7}}
+table{{border-collapse:collapse;width:100%;font-size:11px}}
+th,td{{border:1px solid #333;padding:3px 6px;text-align:right;white-space:nowrap}}
+th{{background:#1a1a2e;color:#90caf9;text-align:center}}
+td:nth-child(2){{text-align:left}}
+tr:hover{{background:#1a1a1a}}
+a{{color:#4fc3f7;text-decoration:none}}
+.stats{{background:#111;padding:8px;margin:8px 0;border-radius:4px;line-height:1.8}}
+.sep{{border-left:3px solid #4fc3f7}}
+</style>
+</head><body>
+<h2>V2 vs V1 Entry Comparison</h2>
+<div class="stats">
+  Candidatos V2: <b>{n_total}</b> &nbsp;|&nbsp;
+  Com sinal V1: <b>{n_with_v1}</b> &nbsp;|&nbsp;
+  Melhoria média de entrada V2: <b style="color:#28a745">{avg_impr_str}</b>
+  <br>
+  V2 WR simulado: <b>{v2_wr_str}</b> (TP={n_v2_tp}/SL={n_v2_sl}) &nbsp;|&nbsp;
+  V1 WR simulado: <b>{v1_wr_str}</b> (TP={n_v1_tp}/SL={n_v1_sl})
+  <br>
+  <small>entry_improvement_pct = v1_mc_at_signal / v2_entry_mc - 1 &gt; 0 → V2 entrou mais barato que V1</small>
+  <br>
+  <small>TP={tp_pct*100:.0f}% · SL={sl_pct*100:.0f}% · same-candle conflict → conservative (SL first)</small>
+</div>
+<p><a href="/analise/v2-decision-tape?days={days}&decision_age={int(decision_age)}&min_drop={min_drop}&net_window={net_window}&net_min={net_min}">← V2 Decision Tape</a></p>
+<table>
+<thead><tr>
+  <th>ts_min</th><th>Token</th>
+  <th colspan="8" class="sep">V2</th>
+  <th colspan="5" class="sep">V1</th>
+</tr>
+<tr>
+  <th>ts_min</th><th>Token</th>
+  <th>Entry MC</th><th>Decision ts</th><th>Age</th><th>Drop%</th><th>Bounce%</th>
+  <th>{net_window}_net</th><th>V2 Outcome</th><th>V2 MaxGain</th>
+  <th>V1 MC</th><th>V1 Delay</th><th>ImprovEntry</th><th>V1 Outcome</th><th>V1 MaxGain</th>
+</tr></thead>
+<tbody>{rows_html}</tbody>
+</table>
+</body></html>"""
+        return render_template_string(html)
+
+    except Exception as e:
+        import traceback
+        return f"<pre>Erro: {e}\n\n{traceback.format_exc()}</pre>", 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)

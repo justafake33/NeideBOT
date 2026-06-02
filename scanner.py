@@ -680,6 +680,8 @@ class HotMonitor:
             # LIVE: [now - Xs, now] — sempre completas
             live_5  = _wf(5,  now_ts)
             live_10 = _wf(10, now_ts)
+            live_30 = _wf(30, now_ts)
+            live_60 = _wf(60, now_ts)
 
             def _wp(feat: dict, prefix: str) -> dict:
                 return {
@@ -737,6 +739,15 @@ class HotMonitor:
                 "live_10s_sell":   live_10.get("sell"),
                 "live_10s_net":    live_10.get("net"),
                 "live_10s_events": live_10.get("events"),
+                # LIVE 30s / 60s — janelas mais largas, permitem checar fluxo sustentado
+                "live_30s_buy":    live_30.get("buy"),
+                "live_30s_sell":   live_30.get("sell"),
+                "live_30s_net":    live_30.get("net"),
+                "live_30s_events": live_30.get("events"),
+                "live_60s_buy":    live_60.get("buy"),
+                "live_60s_sell":   live_60.get("sell"),
+                "live_60s_net":    live_60.get("net"),
+                "live_60s_events": live_60.get("events"),
                 # Concentrações legacy (mantidas para retrocompat — mapeiam pre_5s/pre_10s)
                 "buy_concentration_5s":   pre_5.get("buy_concentration"),
                 "buy_concentration_10s":  pre_10.get("buy_concentration"),
