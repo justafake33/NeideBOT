@@ -43125,6 +43125,11 @@ def _v2_load_data(days: int):
     events_dict : {(mint, ts_min_iso) -> [snaps sorted by bottom_age_sec ASC]}
     ticks_dict  : {mint -> [ticks sorted by tick_ts ASC]}
     bounce_dict : {mint -> [bounce_signal rows sorted by ts_signal ASC]}
+
+    Fix B4: detects optional columns (live_30s_*, live_60s_*) via information_schema
+    and substitutes NULL::TYPE AS col for any that are absent in the schema.
+    This prevents column-not-found errors while still returning the column name
+    so the rest of the code can safely do snap.get("live_30s_net").
     """
     import psycopg2, psycopg2.extras as _pg2e
     from collections import defaultdict
@@ -43133,8 +43138,34 @@ def _v2_load_data(days: int):
     cutoff = datetime.now(_tz.utc) - timedelta(days=days)
 
     with psycopg2.connect(db.DATABASE_URL, cursor_factory=_pg2e.RealDictCursor) as conn:
+        # Detect which optional columns actually exist in the schema (B4 fix)
+        _OPTIONAL_FLOAT_COLS = [
+            "live_30s_net", "live_30s_buy", "live_30s_sell", "live_60s_net",
+            "live_60s_buy", "live_60s_sell", "rise_now_net",
+        ]
+        _OPTIONAL_INT_COLS = [
+            "live_30s_events", "live_60s_events", "rise_now_events",
+            "live_5s_events", "live_10s_events",
+        ]
         with conn.cursor() as cur:
             cur.execute("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'micro_absorption_snapshots'
+            """)
+            _existing = {r["column_name"] for r in cur.fetchall()}
+
+        def _sel_float(col):
+            return col if col in _existing else f"NULL::FLOAT AS {col}"
+
+        def _sel_int(col):
+            return col if col in _existing else f"NULL::INT AS {col}"
+
+        opt_float_expr = ",\n                    ".join(_sel_float(c) for c in _OPTIONAL_FLOAT_COLS)
+        opt_int_expr   = ",\n                    ".join(_sel_int(c)   for c in _OPTIONAL_INT_COLS)
+
+        with conn.cursor() as cur:
+            cur.execute(f"""
                 SELECT
                     mint, symbol, ts_min, ts_migration, ts_snapshot,
                     bottom_age_sec, mc_min, mc_current, mc_migration,
@@ -43143,10 +43174,12 @@ def _v2_load_data(days: int):
                     pre_5s_buy,  pre_10s_buy,  pre_30s_buy,
                     pre_5s_sell, pre_10s_sell, pre_30s_sell,
                     pre_5s_events, pre_10s_events, pre_30s_events,
-                    rise_3s_net, rise_5s_net, rise_10s_net, rise_now_net,
+                    rise_3s_net, rise_5s_net, rise_10s_net,
                     live_5s_net, live_10s_net,
                     buy_concentration_5s, buy_concentration_10s,
-                    candidate_flags
+                    candidate_flags,
+                    {opt_float_expr},
+                    {opt_int_expr}
                 FROM micro_absorption_snapshots
                 WHERE ts_snapshot >= %(cutoff)s
                   AND mc_min IS NOT NULL
@@ -43277,67 +43310,92 @@ def _v2_build_candidates(events_dict, ticks_dict, bounce_dict,
     """Build candidate rows for V2 analysis.
 
     candidate_scope:
-      'mint_first'    — one candidate per mint (first ts_min)
+      'mint_first'    — one candidate per mint (first eligible bottom)
       'bottom_events' — one candidate per (mint, ts_min) event
 
     Returns list of candidate dicts.
+
+    Bug fixes applied:
+      B1+B2: mint_first dedup happens AFTER gates — iterates ALL snapshots
+             in age order and picks first passing all gates (not first by age).
+      B3: events_col derived from net_window via _V2_NET_WINDOW_MAP, not hardcoded.
     """
-    # Pick net column — only live_10s and live_5s exist in schema
-    _NET_MAP = {
-        "live_10s": "live_10s_net",
-        "live_5s":  "live_5s_net",
-        "pre_10s":  "pre_10s_net",
-        "pre_30s":  "pre_30s_net",
+    # Fix B3: map each net_window to its own (net_col, events_col) pair
+    _V2_NET_WINDOW_MAP = {
+        "live_5s":  ("live_5s_net",  "live_5s_events"),
+        "live_10s": ("live_10s_net", "live_10s_events"),
+        "live_30s": ("live_30s_net", "live_30s_events"),
+        "live_60s": ("live_60s_net", "live_60s_events"),
+        "pre_10s":  ("pre_10s_net",  "pre_10s_events"),
+        "pre_30s":  ("pre_30s_net",  "pre_30s_events"),
+        "rise_now": ("rise_now_net", "rise_now_events"),
     }
-    net_col = _NET_MAP.get(net_window, "live_10s_net")
+    net_col, events_col = _V2_NET_WINDOW_MAP.get(net_window, ("live_10s_net", "live_10s_events"))
 
-    # Deduplicate by scope
-    if candidate_scope == "mint_first":
-        seen_mints: set = set()
-        filtered_keys = []
-        for key in sorted(events_dict.keys(), key=lambda k: k[1]):
-            mint = key[0]
-            if mint not in seen_mints:
-                seen_mints.add(mint)
-                filtered_keys.append(key)
-    else:
-        filtered_keys = list(events_dict.keys())
+    def _passes_gates(snap):
+        """Return True if snap passes all candidate gates."""
+        mc_min_ = snap.get("mc_min")
+        mc_cur_ = snap.get("mc_current")
+        ts_min_ = snap.get("ts_min")
+        if not mc_min_ or mc_min_ <= 0 or ts_min_ is None or not mc_cur_ or mc_cur_ <= 0:
+            return False
+        # decision_age gate
+        age_val = snap.get("bottom_age_sec")
+        if age_val is None or age_val < decision_age:
+            return False
+        # bounce_pct_now filter
+        bounce_now_ = snap.get("bounce_pct_now") or 0
+        if min_bounce_pct is not None and bounce_now_ < min_bounce_pct:
+            return False
+        if max_bounce_pct is not None and bounce_now_ > max_bounce_pct:
+            return False
+        # pool depth filter
+        pool_q_ = snap.get("pool_quote") or 0
+        if pool_q_ < min_pool:
+            return False
+        # net flow filter (B3 fix: use net_col from map)
+        net_val_ = snap.get(net_col)
+        if net_val_ is None or net_val_ < net_min:
+            return False
+        # events filter (B3 fix: use events_col from map)
+        ev_val_ = (snap.get(events_col) or 0)
+        if ev_val_ < min_events:
+            return False
+        return True
 
+    # Fix B1+B2: collect all keys, then for each key iterate snaps in ASC order
+    # and pick the first snap passing all gates.  Dedup by mint happens AFTER
+    # the per-event gate check so we don't skip a passing bottom just because
+    # an earlier (failing) bottom existed for the same mint.
+    all_keys = sorted(events_dict.keys(), key=lambda k: k[1])
+
+    seen_mints: set = set()
     candidates = []
-    for key in filtered_keys:
+    for key in all_keys:
         snaps = events_dict[key]
-        snap = _v2_get_snap(snaps, decision_age)
+        # Iterate all snaps in ASC order (already sorted by SQL) to find first passing
+        snap = None
+        for s in snaps:
+            if _passes_gates(s):
+                snap = s
+                break
         if snap is None:
             continue
 
         mint = snap["mint"]
+        # Fix B1: dedup AFTER gate check
+        if candidate_scope == "mint_first":
+            if mint in seen_mints:
+                continue
+            seen_mints.add(mint)
+
         mc_min  = snap.get("mc_min")
         mc_cur  = snap.get("mc_current")
         ts_min  = snap.get("ts_min")
-        if not mc_min or mc_min <= 0 or ts_min is None or not mc_cur or mc_cur <= 0:
-            continue
-
-        # bounce_pct_now filter
         bounce_now = snap.get("bounce_pct_now") or 0
-        if min_bounce_pct is not None and bounce_now < min_bounce_pct:
-            continue
-        if max_bounce_pct is not None and bounce_now > max_bounce_pct:
-            continue
-
-        # pool depth filter
         pool_q = snap.get("pool_quote") or 0
-        if pool_q < min_pool:
-            continue
-
-        # net flow filter
         net_val = snap.get(net_col)
-        if net_val is None or net_val < net_min:
-            continue
-
-        # events filter (use pre_10s_events as proxy for activity)
-        events_val = (snap.get("pre_10s_events") or 0)
-        if events_val < min_events:
-            continue
+        events_val = (snap.get(events_col) or 0)
 
         try:
             ts_min_ts = ts_min.timestamp() if hasattr(ts_min, "timestamp") else float(ts_min)
@@ -43922,13 +43980,18 @@ def analise_v2_threshold_grid():  # noqa: C901
         if not events_dict:
             return "<pre>Sem dados.</pre>"
 
-        # Detect which net windows have non-null data
-        _LIVE_COLS = {
-            "live_10s": "live_10s_net",
+        # Fix B5: detect ALL net windows with non-null data (not just live_5s/live_10s)
+        _ALL_NET_WINDOWS = {
             "live_5s":  "live_5s_net",
+            "live_10s": "live_10s_net",
+            "live_30s": "live_30s_net",
+            "live_60s": "live_60s_net",
+            "pre_10s":  "pre_10s_net",
+            "pre_30s":  "pre_30s_net",
+            "rise_now": "rise_now_net",
         }
         avail_windows = [
-            win for win, col in _LIVE_COLS.items()
+            win for win, col in _ALL_NET_WINDOWS.items()
             if any(s.get(col) is not None
                    for snaps in events_dict.values() for s in snaps)
         ]
