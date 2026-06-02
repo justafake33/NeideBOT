@@ -41975,5 +41975,231 @@ th{{background:#eee}}
     return render_template_string(html)
 
 
+@app.route("/debug/pool-deep-tokens")
+def debug_pool_deep_tokens():
+    """
+    Analisa outcomes de bounces por profundidade de pool.
+    Sem filtros de outcome por pool — retorna TP+SL+no_exit para todos os buckets.
+
+    ?days=14         — janela (default 14)
+    ?pool_min=0      — pool SOL mínimo (default 0)
+    ?pool_max=1000   — pool SOL máximo (default 1000)
+    ?min_drop=0.30   — drop mínimo % (default 0.30 = 30%)
+    ?min_ttb=0       — time_to_bottom mín (min, default 0)
+    ?max_ttb=30      — time_to_bottom máx (min, default 30)
+    """
+    days = int(request.args.get("days", 14))
+    pool_min = float(request.args.get("pool_min", 0))
+    pool_max = float(request.args.get("pool_max", 1000))
+    min_drop = float(request.args.get("min_drop", 0.30))
+    min_ttb = float(request.args.get("min_ttb", 0))
+    max_ttb = float(request.args.get("max_ttb", 30))
+
+    # Carregar bounces + migrations + trades
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                bs.mint,
+                bs.symbol,
+                bs.ts_signal,
+                bs.bounce_pct,
+                bs.drop_from_mig,
+                bs.mc_min,
+                bs.mc_at_signal,
+                bs.elapsed_sec,
+                bs.pool_quote,
+                m.pct_drop,
+                m.time_to_bottom,
+                -- Outcome: TP se exit via TP, SL se exit via SL, no_exit caso contrário
+                CASE
+                    WHEN t.status = 'tp' THEN 'tp'
+                    WHEN t.status = 'sl' THEN 'sl'
+                    WHEN t.status IS NOT NULL AND t.status NOT IN ('pending','error','open') THEN 'resolved'
+                    ELSE 'no_exit'
+                END AS outcome
+            FROM bounce_signals bs
+            LEFT JOIN migrations m ON bs.mint = m.mint
+            LEFT JOIN (
+                SELECT mint, status, MIN(ts_signal) as first_ts
+                FROM trades
+                WHERE status IN ('tp','sl')
+                GROUP BY mint, status
+            ) t ON bs.mint = t.mint
+            WHERE bs.ts_signal > NOW() - INTERVAL '%s days'
+              AND m.pct_drop IS NOT NULL
+              AND m.time_to_bottom IS NOT NULL
+              AND m.pct_drop >= %s
+              AND m.time_to_bottom >= %s
+              AND m.time_to_bottom <= %s
+            ORDER BY bs.ts_signal DESC
+        """, (days, min_drop, min_ttb, max_ttb))
+        rows = [dict(r) for r in cur.fetchall()]
+
+    if not rows:
+        return {
+            "error": "Nenhum bounce encontrado com os filtros",
+            "params": {
+                "days": days,
+                "pool_min": pool_min,
+                "pool_max": pool_max,
+                "min_drop": min_drop,
+                "min_ttb": min_ttb,
+                "max_ttb": max_ttb,
+            }
+        }, 200
+
+    # Bucket: [pool_min, pool_max)
+    def in_range(row):
+        pool = row.get("pool_quote", 0) or 0
+        return pool_min <= pool < pool_max
+
+    eligible = [r for r in rows if in_range(r)]
+
+    if not eligible:
+        return {
+            "error": f"Nenhum bounce em range {pool_min}-{pool_max} SOL",
+            "total_bounces": len(rows),
+            "params": {
+                "days": days,
+                "pool_min": pool_min,
+                "pool_max": pool_max,
+                "min_drop": min_drop,
+            }
+        }, 200
+
+    # Stats por outcome
+    n_total = len(eligible)
+    n_tp = sum(1 for r in eligible if r.get("outcome") == "tp")
+    n_sl = sum(1 for r in eligible if r.get("outcome") == "sl")
+    n_no_exit = sum(1 for r in eligible if r.get("outcome") == "no_exit")
+    n_resolved = n_tp + n_sl
+
+    wr = n_tp / n_resolved if n_resolved else None
+
+    # Pool sub-buckets dentro do range
+    def make_buckets(rows, bucket_labels):
+        """bucket_labels = {label: (min, max), ...}"""
+        buckets = {lbl: [] for lbl in bucket_labels}
+        for r in rows:
+            pool = r.get("pool_quote", 0) or 0
+            for lbl, (lo, hi) in bucket_labels.items():
+                if lo <= pool < hi:
+                    buckets[lbl].append(r)
+                    break
+        return buckets
+
+    sub_buckets = make_buckets(eligible, {
+        "0-20": (0, 20),
+        "20-30": (20, 30),
+        "30-50": (30, 50),
+        "50-70": (50, 70),
+        "70-90": (70, 90),
+        "90-100": (90, 100),
+        "100+": (100, 1e9),
+    })
+
+    def bucket_stats(rows_list):
+        n = len(rows_list)
+        tp = sum(1 for r in rows_list if r.get("outcome") == "tp")
+        sl = sum(1 for r in rows_list if r.get("outcome") == "sl")
+        ne = sum(1 for r in rows_list if r.get("outcome") == "no_exit")
+        resolved = tp + sl
+        wr_b = tp / resolved if resolved else None
+        return {
+            "n": n,
+            "tp": tp,
+            "sl": sl,
+            "no_exit": ne,
+            "resolved": resolved,
+            "wr": wr_b,
+        }
+
+    bucket_results = {lbl: bucket_stats(rows_list) for lbl, rows_list in sub_buckets.items()}
+
+    # HTML
+    pool_range_str = f"{pool_min:.0f}-{pool_max:.0f} SOL" if pool_max < 1e8 else f">{pool_min:.0f} SOL"
+
+    bucket_rows_html = ""
+    for lbl, stats in bucket_results.items():
+        if stats["n"] == 0:
+            continue
+        wr_pct = f"{stats['wr']*100:.1f}%" if stats["wr"] is not None else "—"
+        wr_color = "#3fb950" if (stats["wr"] is not None and stats["wr"] >= 0.40) else ("#f85149" if (stats["wr"] is not None and stats["wr"] < 0.20) else "#d29922")
+        bucket_rows_html += f"""
+        <tr>
+            <td><b>{lbl} SOL</b></td>
+            <td>{stats['n']}</td>
+            <td style="color:#3fb950">{stats['tp']}</td>
+            <td style="color:#f85149">{stats['sl']}</td>
+            <td style="color:#8b949e">{stats['no_exit']}</td>
+            <td>{stats['resolved']}</td>
+            <td style="color:{wr_color}"><b>{wr_pct}</b></td>
+        </tr>"""
+
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>Pool Deep Tokens</title>
+<meta http-equiv="refresh" content="30">
+<style>
+body {{font-family: monospace; background: #0d1117; color: #e6edf3; padding: 20px; font-size: 13px}}
+h2 {{color: #58a6ff; margin-bottom: 8px}}
+.info {{color: #8b949e; margin-bottom: 16px; font-size: 12px}}
+table {{border-collapse: collapse; width: 100%; margin-bottom: 20px}}
+th, td {{border: 1px solid #30363d; padding: 6px 10px; text-align: right}}
+th {{background: #161b22; color: #58a6ff; text-align: center}}
+td:first-child, th:first-child {{text-align: left}}
+.green {{color: #3fb950}}
+.red {{color: #f85149}}
+</style>
+</head><body>
+
+<h2>Pool Deep Tokens — {pool_range_str}</h2>
+<p class="info">
+  {n_total} bounces elegíveis | drop≥{min_drop*100:.0f}% | TTB {min_ttb:.0f}-{max_ttb:.0f}min | últimos {days} dias
+</p>
+
+<h3>Resumo Range {pool_range_str}</h3>
+<table>
+<tr>
+    <th>Métrica</th><th>Valor</th>
+</tr>
+<tr>
+    <td><b>Total</b></td><td>{n_total}</td>
+</tr>
+<tr>
+    <td><b style="color:#3fb950">TP</b></td><td style="color:#3fb950">{n_tp}</td>
+</tr>
+<tr>
+    <td><b style="color:#f85149">SL</b></td><td style="color:#f85149">{n_sl}</td>
+</tr>
+<tr>
+    <td><b style="color:#8b949e">No Exit</b></td><td style="color:#8b949e">{n_no_exit}</td>
+</tr>
+<tr>
+    <td><b>Resolved (TP+SL)</b></td><td>{n_resolved}</td>
+</tr>
+<tr>
+    <td><b>Win Rate</b></td><td style="color:{'#3fb950' if (wr and wr >= 0.40) else ('#f85149' if (wr and wr < 0.20) else '#d29922')}"><b>{wr*100:.1f}%</b></td>
+</tr>
+</table>
+
+<h3>Sub-buckets (Pool Depth)</h3>
+<table>
+<tr>
+    <th>Pool Range</th><th>n</th><th class="green">TP</th><th class="red">SL</th><th>no_exit</th><th>Resolved</th><th>WR</th>
+</tr>
+{bucket_rows_html}
+</table>
+
+<p style="color:#8b949e; font-size:11px; margin-top: 20px">
+  ⚠️ BUG CHECK: High-pool ranges mostrando SL=0 indicam possível filtro indevido no código.
+  <br>Esperado: todos os ranges (0-20, 20-30, ..., 100+) com mix realista de TP+SL.
+</p>
+
+</body></html>"""
+
+    return html
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
