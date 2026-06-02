@@ -41982,7 +41982,7 @@ def debug_pool_deep_tokens():
     days       = int(request.args.get("days", 14))
     pool_min   = float(request.args.get("pool_min", 90))
     min_drop   = float(request.args.get("min_drop", 0))   # ex: 0.40 = só eventos com dump ≥ 40%
-    entry_pct  = float(request.args.get("entry_pct", 0.10))
+    entry_pct  = float(request.args.get("entry_pct", 0.01))  # slippage — erpc é a entrada real
     tp_pct     = float(request.args.get("tp_pct", 0.75))
     sl_pct     = float(request.args.get("sl_pct", 0.25))
 
@@ -41993,11 +41993,15 @@ def debug_pool_deep_tokens():
     conn.autocommit = True
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    # ── 1. Melhor snapshot por (mint, ts_min) ────────────────────────────────
+    # ── 1. PRIMEIRO snapshot onde as condições são satisfeitas (ASC) ─────────
+    # Simula o momento exato em que o sinal dispararia em produção.
+    # mc_current nesse snapshot = preço real que pagariamos (fonte: erpc).
+    # Antes usávamos bottom_age_sec DESC (snapshot mais tardio) + mc_min×1.10
+    # → look-ahead bias: entrava no fundo histórico, não no preço do sinal.
     cur.execute("""
         SELECT DISTINCT ON (mint, ts_min)
-            mint, symbol, ts_min, ts_migration,
-            mc_min, mc_migration, bounce_pct_now, drop_from_mig,
+            mint, symbol, ts_min, ts_snapshot, ts_migration,
+            mc_min, mc_migration, mc_current, bounce_pct_now, drop_from_mig,
             elapsed_sec, pool_quote,
             pre_10s_net, pre_30s_net,
             rise_5s_net, rise_10s_net,
@@ -42006,9 +42010,10 @@ def debug_pool_deep_tokens():
         WHERE ts_snapshot >= %(cutoff)s
           AND pool_quote >= %(pool_min)s
           AND drop_from_mig >= %(min_drop)s
+          AND mc_current IS NOT NULL
           AND mc_min IS NOT NULL
           AND ts_min IS NOT NULL
-        ORDER BY mint, ts_min, bottom_age_sec DESC
+        ORDER BY mint, ts_min, bottom_age_sec ASC
     """, {"cutoff": cutoff, "pool_min": pool_min, "min_drop": min_drop})
     bottoms = [dict(r) for r in cur.fetchall()]
 
@@ -42018,8 +42023,9 @@ def debug_pool_deep_tokens():
         ts_floor  = min(b["ts_min"] for b in bottoms)
         ts_ceil   = max(b["ts_min"] for b in bottoms) + timedelta(hours=1, minutes=5)
 
-        # ── 2. Snapshots erpc por (mint, ts_min): preço real pós-fundo (2s..60s) ──
-        # Usados ANTES dos token_ticks para evitar artefato da vela do fundo.
+        # ── 2. Snapshots erpc APÓS o sinal (ts_snapshot do sinal em diante) ──
+        # Fonte: erpc via HeliusWS — preço real a cada ~2s sem artefato de OHLC.
+        # Rastreamos apenas a partir do ts_snapshot do sinal (não antes).
         cur.execute("""
             SELECT mint, ts_min, ts_snapshot, bottom_age_sec, mc_current
             FROM micro_absorption_snapshots
@@ -42034,7 +42040,7 @@ def debug_pool_deep_tokens():
             key = (r["mint"], r["ts_min"])
             erpc_by_key[key].append({"ts": r["ts_snapshot"], "mc": float(r["mc_current"] or 0)})
 
-        # ── 3. Token ticks para a janela de 60min (pós primeiro minuto) ──────────
+        # ── 3. Token ticks para a janela de 60min (pós fundo + 60s) ─────────
         cur.execute("""
             SELECT mint, tick_ts, mc, mc_open, mc_high, mc_low, source
             FROM token_ticks
@@ -42048,28 +42054,31 @@ def debug_pool_deep_tokens():
             ticks_by_mint[t["mint"]].append(dict(t))
 
         # ── 4. Simula TP/SL para cada bottom ─────────────────────────────────────
-        entry_mult = 1.0 + entry_pct
         tp_mult    = 1.0 + tp_pct
         sl_mult    = 1.0 - sl_pct
 
         for b in bottoms:
-            mc_min_v   = b["mc_min"] or 0
             ts_min_v   = b["ts_min"]
             ts_end     = ts_min_v + timedelta(minutes=60)
-            entry_mc   = mc_min_v * entry_mult
+            signal_ts  = b["ts_snapshot"]   # momento real do sinal
+
+            # Entry = mc_current no sinal (erpc) + slippage mínimo.
+            # mc_current é o preço on-chain no momento em que pool≥threshold E drop≥threshold.
+            mc_signal  = float(b["mc_current"] or 0)
+            entry_mc   = mc_signal * (1.0 + entry_pct)
             tp_mc      = entry_mc * tp_mult
             sl_mc      = entry_mc * sl_mult
 
-            # Fase 1: snapshots erpc (ts_min + 2s .. ts_min + 60s)
-            # Preço real post-fundo capturado pelo HeliusWS — sem artefato de OHLC.
+            # Fase 1: snapshots erpc ESTRITAMENTE após o sinal
+            # (o sinal em si não conta — seria fill impossível no mesmo tick)
             erpc_snaps = erpc_by_key.get((b["mint"], ts_min_v), [])
 
             ts_tp = ts_sl = None
             max_mc = entry_mc
 
             for s in erpc_snaps:
-                if s["ts"] <= ts_min_v:
-                    continue  # snap é do fundo ou antes — pula
+                if s["ts"] <= signal_ts:
+                    continue  # snap é do sinal ou antes — pula
                 mc_v = s["mc"]
                 if mc_v > max_mc:
                     max_mc = mc_v
@@ -42080,9 +42089,9 @@ def debug_pool_deep_tokens():
                 if ts_tp and ts_sl:
                     break
 
-            # Fase 2: token_ticks — apenas candles INTEIRAMENTE após o fundo (60s gap)
-            # Ignora o primeiro candle kline que CONTÉM ts_min (mc_high é da descida).
-            ts_post_fundo = ts_min_v + timedelta(seconds=60)
+            # Fase 2: token_ticks — candles após ts_min+60s (pula candle do fundo).
+            # Início = max(signal_ts, ts_min+60s) — nunca antes do sinal nem do gap do fundo.
+            ts_post_fundo = max(signal_ts, ts_min_v + timedelta(seconds=60))
             window = [t for t in ticks_by_mint[b["mint"]]
                       if t["tick_ts"] > ts_post_fundo and t["tick_ts"] <= ts_end]
 
@@ -42122,16 +42131,21 @@ def debug_pool_deep_tokens():
             exit_ts = ts_tp if outcome == "tp" else (ts_sl if outcome == "sl" else None)
             min_exit = round((exit_ts - ts_min_v).total_seconds() / 60, 1) if exit_ts else None
             max_gain = round((max_mc / entry_mc - 1) * 100, 1) if entry_mc > 0 else None
+            # Quanto o preço já subiu do fundo até o momento do sinal
+            signal_premium = round((mc_signal / (b["mc_min"] or mc_signal) - 1) * 100, 1) if b["mc_min"] else None
 
             rows.append({
                 **b,
-                "entry_mc":   entry_mc,
-                "tp_mc":      tp_mc,
-                "sl_mc":      sl_mc,
-                "outcome":    outcome,
-                "n_ticks":    len(window),
-                "min_exit":   min_exit,
-                "max_gain":   max_gain,
+                "mc_signal":      mc_signal,
+                "signal_age":     b["bottom_age_sec"],   # segundos do fundo até o sinal
+                "signal_premium": signal_premium,         # % que o preço subiu antes do sinal
+                "entry_mc":       entry_mc,
+                "tp_mc":          tp_mc,
+                "sl_mc":          sl_mc,
+                "outcome":        outcome,
+                "n_ticks":        len(window),
+                "min_exit":       min_exit,
+                "max_gain":       max_gain,
             })
 
     cur.close()
@@ -42181,8 +42195,13 @@ def debug_pool_deep_tokens():
         drop_val = r.get("drop_from_mig") or 0
         drop_color = "#1a7f37" if drop_val >= 0.40 else ("#cc0000" if drop_val < 0.20 else "#856404")
         drop = f'<span style="color:{drop_color};font-weight:bold">{drop_val*100:+.1f}%</span>'
-        bpct = _pct(r.get("bounce_pct_now") and r["bounce_pct_now"] * 100)
         ela  = f"{r['elapsed_sec']:.0f}s" if r.get("elapsed_sec") else "—"
+        # Sinal: quando disparou e a que preço (erpc)
+        sig_age  = f"{r.get('signal_age', '?'):.0f}s"
+        sig_prem = r.get("signal_premium")
+        sig_prem_color = "#cc0000" if (sig_prem or 0) > 20 else ("#856404" if (sig_prem or 0) > 5 else "#1a7f37")
+        sig_prem_html = f'<span style="color:{sig_prem_color}">{sig_prem:+.1f}%</span>' if sig_prem is not None else "—"
+        mc_sig = _fmt(r.get("mc_signal"))
         ent  = _fmt(r.get("entry_mc"))
         tp_v = _fmt(r.get("tp_mc"))
         sl_v = _fmt(r.get("sl_mc"))
@@ -42191,7 +42210,6 @@ def debug_pool_deep_tokens():
         mg   = _pct(r.get("max_gain"))
         p10  = _flow(r.get("pre_10s_net"))
         r5   = _flow(r.get("rise_5s_net"))
-        age  = f"{r.get('bottom_age_sec','?')}s"
         gmgn = f'<a href="https://gmgn.ai/sol/token/{mint}" target="_blank">GMGN</a>'
         dex  = f'<a href="https://dexscreener.com/solana/{mint}" target="_blank">DS</a>'
 
@@ -42204,6 +42222,9 @@ def debug_pool_deep_tokens():
   <td style="text-align:right">{mc_b}</td>
   <td style="text-align:right">{drop}</td>
   <td style="text-align:right">{ela}</td>
+  <td style="text-align:center">{sig_age}</td>
+  <td style="text-align:right">{mc_sig}</td>
+  <td style="text-align:right">{sig_prem_html}</td>
   <td style="text-align:right">{ent}</td>
   <td style="text-align:right">{tp_v}</td>
   <td style="text-align:right">{sl_v}</td>
@@ -42213,7 +42234,6 @@ def debug_pool_deep_tokens():
   <td style="text-align:right">{mg}</td>
   <td style="text-align:right">{p10}</td>
   <td style="text-align:right">{r5}</td>
-  <td style="text-align:center">{age}</td>
   <td>{gmgn} {dex}</td>
 </tr>"""
 
@@ -42236,7 +42256,8 @@ a{{color:#0060df}}
 </style></head><body>
 <h2>🏊 Tokens com Pool &gt; {pool_min:.0f} SOL{f" · Drop ≥ {min_drop:.0%}" if min_drop > 0 else ""} — últimos {days} dias</h2>
 <p style="color:#666;font-size:11px">
-  Simulação: entry +{entry_pct:.0%} do fundo | TP +{tp_pct:.0%} | SL -{sl_pct:.0%} |
+  Entry = mc_erpc no 1º sinal + {entry_pct:.1%} slippage | TP +{tp_pct:.0%} | SL -{sl_pct:.0%} |
+  Sinal@: 1º snapshot onde pool≥{pool_min:.0f} SOL + drop≥{min_drop:.0%} | Premium = preço já subiu antes do sinal |
   Pool: <a href="?days={days}&pool_min=50&min_drop={min_drop}">50+</a>
   <a href="?days={days}&pool_min=70&min_drop={min_drop}">70+</a>
   <a href="?days={days}&pool_min=90&min_drop={min_drop}">90+</a>
@@ -42266,18 +42287,20 @@ a{{color:#0060df}}
   <th>Hora</th><th>Token</th><th>Mint</th>
   <th>Pool SOL</th><th>MC Mig.</th><th>MC Fundo</th>
   <th>Drop%</th><th>t→fundo</th>
+  <th>Sinal@</th><th>MC Sinal</th><th>Premium</th>
   <th>Entry</th><th>TP alvo</th><th>SL alvo</th>
   <th>Ticks</th><th>Outcome</th><th>Saída</th><th>Max Gain</th>
-  <th>Pre10</th><th>Rise5</th><th>Snap age</th><th>Links</th>
+  <th>Pre10</th><th>Rise5</th><th>Links</th>
 </tr></thead>
 <tbody>
-{rows_html if rows_html else '<tr><td colspan="19" style="text-align:center;color:#888">Nenhum evento encontrado com pool ≥ ' + str(pool_min) + ' SOL nos últimos ' + str(days) + ' dias</td></tr>'}
+{rows_html if rows_html else '<tr><td colspan="21" style="text-align:center;color:#888">Nenhum evento encontrado com pool ≥ ' + str(pool_min) + ' SOL nos últimos ' + str(days) + ' dias</td></tr>'}
 </tbody>
 </table>
 
 <p style="color:#888;font-size:10px;margin-top:10px">
-  Auto-refresh 60s | Drop% = queda da migração ao fundo | t→fundo = elapsed desde migração |
-  Pre10 / Rise5 = fluxo líquido SOL (verde=compra, vermelho=venda) |
+  Auto-refresh 60s | Sinal@: quantos segundos após o fundo as condições foram satisfeitas |
+  Premium: % que o preço subiu do fundo até o sinal (>20% = vermelho = entrada cara) |
+  Drop% = queda da migração ao fundo | Pre10 / Rise5 = fluxo SOL (verde=compra) |
   Snap age = antiguidade do snapshot no momento da captura |
   Outcome simulado a partir do mc_min capturado pelo erpc, SEM execução real
 </p>

@@ -187,58 +187,8 @@ class HotMonitor:
             except Exception as e:
                 logger.debug("helius.subscribe %s: %s", mint[:8], e)
 
-        # Gap coverage: dispara um kline imediato para cobrir os 5-15s entre migração
-        # e o primeiro ciclo do _precise_loop. mc_min só vem do kline — nunca do deque erpc.
-        if added:
-            threading.Thread(
-                target=self._precise_bottom_single,
-                args=(mint,),
-                daemon=True,
-                name=f"precise1-{mint[:8]}",
-            ).start()
-
-    def _precise_bottom_single(self, mint: str):
-        """
-        Kline imediato chamado uma vez ao adicionar o token (hot.add).
-        Contingência para candles fechados (elapsed ≥ 90s) — erpc é a fonte primária
-        de mc_min via push_mc (token_data=None). Kline complementa candles que
-        erpc possa ter perdido por polling gap ou reconexão.
-        """
-        time.sleep(2)  # aguarda GMGN indexar os primeiros candles
-        with self._lock:
-            state = self._tokens.get(mint)
-        if not state or mint in self._cancelled:
-            return
-        try:
-            now_ts = int(datetime.now(timezone.utc).timestamp())
-            ts_mig = state["ts_mig_unix"]
-            candles = self.gmgn.get_token_kline(
-                mint, "sol", "1m",
-                from_ts=ts_mig,
-                to_ts=now_ts,
-            )
-            if not candles:
-                return
-            for c in sorted(candles, key=lambda c: int(c.get("time", 0))):
-                candle_ts   = int(c.get("time", 0)) / 1000
-                elapsed_sec = int(candle_ts - ts_mig)
-                if elapsed_sec < 90 or elapsed_sec > 3660:
-                    continue
-                low_price = _float(c.get("low"))
-                if not low_price or low_price <= 0:
-                    continue
-                mc_low = low_price * state["total_supply"]
-                with self._lock:
-                    inner = self._tokens.get(mint)
-                    if inner and mc_low < inner["mc_min"]:
-                        inner["mc_min"]   = mc_low
-                        inner["time_min"] = elapsed_sec / 60
-                        inner["ts_min"]   = datetime.fromtimestamp(candle_ts, tz=timezone.utc)
-                        db.update_bottom(mint, mc_low, elapsed_sec / 60)
-                        logger.info("Fundo(kline1) %s: $%.2f em %.1fmin",
-                                    state["symbol"], mc_low, elapsed_sec / 60)
-        except Exception as e:
-            logger.debug("_precise_bottom_single %s: %s", mint[:8], e)
+        # erpc global (pAMM) é a única fonte de mc_min — captura TODOS os swaps
+        # em tempo real sem gap. _precise_bottom_single removido: kline não escreve mc_min.
 
     def cancel(self, mint: str):
         with self._lock:
