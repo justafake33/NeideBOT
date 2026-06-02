@@ -274,6 +274,10 @@ class HotMonitor:
         if self._helius and state.get("ts_min") is not None:
             self._maybe_record_micro_snapshot(mint, state, mc, ref_ts)
 
+        # Sell exhaustion — research-only data accumulation (nunca afeta trading)
+        if self._helius and state.get("ts_min") is not None:
+            self._maybe_record_sell_exhaustion(mint, state, mc, ref_ts)
+
     # ------------------------------------------------------------------
     # Bounce detector
     # ------------------------------------------------------------------
@@ -752,6 +756,88 @@ class HotMonitor:
 
         except Exception as e:
             logger.debug("micro_snapshot %s: %s", mint[:8], e)
+
+    # ------------------------------------------------------------------
+    # Sell exhaustion — research-only data accumulation
+    # Registra candidatos de seller exhaustion para validar se a pausa de sells
+    # antes do fundo é preditiva de recovery. Nunca afeta trading.
+    # ------------------------------------------------------------------
+
+    _SELL_EXH_RATE_SEC  = 5.0   # grava no máximo 1 candidato a cada 5s por token
+    _SELL_EXH_WINDOW_SEC = 120  # grava até 120s após o fundo (fundo pode não ser detectado ainda)
+
+    def _maybe_record_sell_exhaustion(self, mint: str, state: dict,
+                                      mc: float, ref_ts: datetime) -> None:
+        """Rate-limiter: captura snapshot de sell velocity perto do fundo."""
+        ts_min = state.get("ts_min")
+        if ts_min is None:
+            return
+
+        now_ts      = ref_ts.timestamp()
+        ts_min_ts   = ts_min.timestamp()
+        bottom_age  = now_ts - ts_min_ts
+
+        # Só grava na janela [0, 120s] após o fundo mais recente
+        if bottom_age < 0 or bottom_age > self._SELL_EXH_WINDOW_SEC:
+            return
+
+        # Rate limit por token
+        last = state.get("last_sell_exh_ts", 0)
+        if now_ts - last < self._SELL_EXH_RATE_SEC:
+            return
+        state["last_sell_exh_ts"] = now_ts
+
+        # Executa em thread daemon para não bloquear push_mc
+        threading.Thread(
+            target=self._record_sell_exhaustion,
+            args=(mint, dict(state), mc, now_ts, ts_min_ts, round(bottom_age, 2)),
+            daemon=True,
+            name=f"sexh-{mint[:6]}",
+        ).start()
+
+    def _record_sell_exhaustion(
+        self, mint: str, state: dict, mc_current: float,
+        now_ts: float, ts_min_ts: float, bottom_age_sec: float,
+    ) -> None:
+        """Persiste um snapshot de sell velocity para o mint. Research-only."""
+        try:
+            vel = self._helius.get_sell_velocity_snapshot(mint, ref_ts=ts_min_ts)
+
+            mc_migration  = state.get("mc_migration") or 0
+            mc_min        = state.get("mc_min") or 0
+            drop_from_mig = (mc_migration - mc_min) / mc_migration if mc_migration > 0 else None
+            ts_migration  = state.get("ts_migration")
+            elapsed_sec   = int(now_ts - ts_migration.timestamp()) if ts_migration else None
+
+            pool_quote = self._helius.get_pool_quote(mint)
+
+            db.insert_sell_exhaustion_candidate({
+                "mint":           mint,
+                "symbol":         state.get("symbol"),
+                "ts_signal":      datetime.fromtimestamp(now_ts, tz=timezone.utc),
+                "mc_at_signal":   mc_current,
+                "mc_migration":   mc_migration,
+                "mc_min":         mc_min,
+                "drop_from_mig":  round(drop_from_mig, 4) if drop_from_mig is not None else None,
+                "elapsed_sec":    elapsed_sec,
+                "pool_quote":     pool_quote,
+                "sell_5s":        vel["sell_5s"],
+                "sell_5_15s":     vel["sell_5_15s"],
+                "sell_cnt_5s":    vel["sell_cnt_5s"],
+                "sell_ratio":     vel["ratio"],
+                "bottom_age_sec": bottom_age_sec,
+            })
+
+            if vel["exhausted"]:
+                logger.info(
+                    "SellExhausted %s: sell_5s=%.3f sell_5_15s=%.3f ratio=%s age=%.0fs",
+                    state.get("symbol", mint[:8]),
+                    vel["sell_5s"], vel["sell_5_15s"],
+                    f"{vel['ratio']:.2f}" if vel["ratio"] is not None else "∞",
+                    bottom_age_sec,
+                )
+        except Exception as e:
+            logger.debug("sell_exhaustion %s: %s", mint[:8], e)
 
     def _backfill_slope_ticks(self, mint: str, state: dict):
         """

@@ -42308,5 +42308,102 @@ a{{color:#0060df}}
     return render_template_string(html)
 
 
+@app.route("/debug/sell-exhaustion")
+def debug_sell_exhaustion():
+    """Visualiza candidatos de sell exhaustion acumulados."""
+    days   = int(request.args.get("days", 7))
+    limit  = int(request.args.get("limit", 200))
+    only_exhausted = request.args.get("exhausted", "0") == "1"
+
+    try:
+        import psycopg2, psycopg2.extras as _pge2
+        with psycopg2.connect(db.DATABASE_URL, cursor_factory=_pge2.RealDictCursor) as conn:
+            with conn.cursor() as cur:
+                where = "WHERE ts_signal >= NOW() - INTERVAL %s"
+                params = [f"{days} days"]
+                if only_exhausted:
+                    where += " AND sell_5_15s >= 0.5 AND sell_ratio IS NOT NULL AND sell_ratio < 0.25"
+                cur.execute(f"""
+                    SELECT mint, symbol, ts_signal, mc_at_signal, mc_migration, mc_min,
+                           drop_from_mig, elapsed_sec, pool_quote,
+                           sell_5s, sell_5_15s, sell_cnt_5s, sell_ratio, bottom_age_sec
+                    FROM sell_exhaustion_candidates
+                    {where}
+                    ORDER BY ts_signal DESC
+                    LIMIT %s
+                """, params + [limit])
+                rows = cur.fetchall()
+
+        # Summary stats
+        exhausted = [r for r in rows if r["sell_ratio"] is not None and r["sell_ratio"] < 0.25 and (r["sell_5_15s"] or 0) >= 0.5]
+        total_mints = len(set(r["mint"] for r in rows))
+
+        rows_html = ""
+        for r in rows:
+            ratio = r["sell_ratio"]
+            is_exh = ratio is not None and ratio < 0.25 and (r["sell_5_15s"] or 0) >= 0.5
+            exh_style = "background:#1a3a1a" if is_exh else ""
+            ratio_str = f"{ratio:.2f}" if ratio is not None else "∞"
+            ratio_color = "#4f4" if is_exh else ("#fa4" if ratio is not None and ratio < 0.5 else "#888")
+            drop_pct = f"{(r['drop_from_mig'] or 0)*100:.0f}%" if r["drop_from_mig"] else "-"
+            mc_str = f"${(r['mc_at_signal'] or 0):,.0f}"
+            dexurl = f"https://dexscreener.com/solana/{r['mint']}"
+            rows_html += f"""<tr style="{exh_style}">
+  <td>{(r['ts_signal'].strftime('%H:%M:%S') if r['ts_signal'] else '-')}</td>
+  <td><a href="{dexurl}" target="_blank" style="color:#7bf">{r['symbol'] or r['mint'][:8]}</a></td>
+  <td>{mc_str}</td>
+  <td>{drop_pct}</td>
+  <td>{r['elapsed_sec'] or '-'}s</td>
+  <td>{r['pool_quote'] or '-'}</td>
+  <td>{(r['sell_5_15s'] or 0):.3f}</td>
+  <td>{(r['sell_5s'] or 0):.3f}</td>
+  <td style="color:{ratio_color};font-weight:bold">{ratio_str}</td>
+  <td>{r['sell_cnt_5s'] or 0}</td>
+  <td>{(r['bottom_age_sec'] or 0):.0f}s</td>
+  <td style="color:{'#4f4' if is_exh else '#888'}">{'✅' if is_exh else ''}</td>
+</tr>"""
+
+        html = f"""<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="15">
+<title>Sell Exhaustion Candidates</title>
+<style>
+body{{background:#111;color:#ddd;font-family:monospace;font-size:12px;padding:12px}}
+table{{border-collapse:collapse;width:100%}}
+th,td{{border:1px solid #333;padding:4px 8px;text-align:right}}
+th{{background:#222;color:#aaa;text-align:center}}
+td:nth-child(2){{text-align:left}}
+</style>
+</head><body>
+<h2 style="color:#7bf">Sell Exhaustion Candidates</h2>
+<p style="color:#888">
+  Últimos {days} dias | {len(rows)} registros | {total_mints} tokens únicos |
+  <span style="color:#4f4">{len(exhausted)} candidatos exhausted</span> (ratio&lt;0.25 + baseline≥0.5 SOL) |
+  <a href="?days={days}&exhausted=1" style="color:#7bf">apenas exhausted</a> |
+  <a href="?days={days}" style="color:#7bf">todos</a>
+</p>
+<table>
+<thead><tr>
+  <th>Hora</th><th>Token</th><th>MC</th><th>Drop%</th><th>Elapsed</th>
+  <th>Pool(SOL)</th><th>Sell 5-15s</th><th>Sell 0-5s</th>
+  <th>Ratio</th><th>Sell#</th><th>BottomAge</th><th>Exh</th>
+</tr></thead>
+<tbody>
+{rows_html if rows_html else '<tr><td colspan="12" style="text-align:center;color:#888">Nenhum registro</td></tr>'}
+</tbody>
+</table>
+<p style="color:#555;margin-top:10px;font-size:10px">
+  Ratio = sell_0-5s / sell_5-15s (velocidade de sells caindo = sellers parando) |
+  Exhausted = ratio &lt; 0.25 + baseline ≥ 0.5 SOL |
+  BottomAge = segundos desde ts_min quando snapshot foi capturado |
+  Auto-refresh 15s
+</p>
+</body></html>"""
+        return render_template_string(html)
+    except Exception as e:
+        return f"<pre>Erro: {e}</pre>", 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)

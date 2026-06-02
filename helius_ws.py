@@ -1111,6 +1111,41 @@ class HeliusWS:
             v = self._pool_quote_last.get(mint, 0)
         return v if v > 0 else None
 
+    def get_sell_velocity_snapshot(self, mint: str, ref_ts: float = None) -> dict:
+        """
+        Sell exhaustion detector — compara velocidade de venda em [0-5s] vs [5-15s] atrás.
+
+        ref_ts: timestamp Unix de referência (default = agora). Passar ts_min para capturar
+                o estado dos sells exatamente quando o fundo foi detectado.
+
+        Retorna:
+          sell_5s      — SOL vendido nos últimos 0-5s
+          sell_5_15s   — SOL vendido entre 5-15s atrás
+          sell_cnt_5s  — número de sells nos últimos 5s
+          ratio        — sell_5s / sell_5_15s (None se sem baseline)
+          exhausted    — True se ratio < 0.25 e houve baseline real (≥ 0.5 SOL em 5-15s)
+          total_events — total de eventos na janela de 15s
+        """
+        now = ref_ts if ref_ts is not None else time.time()
+        with self._lock:
+            events = list(self._swap_events.get(mint, []))
+
+        sell_5s     = sum(e["sol"] for e in events if e["side"] == "sell" and now - e["ts"] <= 5)
+        sell_5_15s  = sum(e["sol"] for e in events if e["side"] == "sell" and 5 < now - e["ts"] <= 15)
+        sell_cnt_5s = sum(1 for e in events if e["side"] == "sell" and now - e["ts"] <= 5)
+        total_ev    = sum(1 for e in events if now - e["ts"] <= 15)
+
+        ratio = sell_5s / sell_5_15s if sell_5_15s > 0.001 else None
+
+        return {
+            "sell_5s":      round(sell_5s, 4),
+            "sell_5_15s":   round(sell_5_15s, 4),
+            "sell_cnt_5s":  sell_cnt_5s,
+            "ratio":        round(ratio, 3) if ratio is not None else None,
+            "exhausted":    ratio is not None and ratio < 0.25 and sell_5_15s >= 0.5,
+            "total_events": total_ev,
+        }
+
     def get_dump_seller_concentration(
         self, mint: str, window_start_ts: float, window_end_ts: float
     ) -> dict:

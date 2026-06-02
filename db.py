@@ -497,7 +497,53 @@ def init_db():
         ]:
             cur.execute(f"ALTER TABLE micro_absorption_snapshots {col}")
 
+        # Sell exhaustion candidates — research-only data accumulation
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sell_exhaustion_candidates (
+                id              BIGSERIAL PRIMARY KEY,
+                mint            TEXT NOT NULL,
+                symbol          TEXT,
+                ts_signal       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                mc_at_signal    FLOAT,
+                mc_migration    FLOAT,
+                mc_min          FLOAT,
+                drop_from_mig   FLOAT,
+                elapsed_sec     INT,
+                pool_quote      FLOAT,
+                sell_5s         FLOAT,
+                sell_5_15s      FLOAT,
+                sell_cnt_5s     INT,
+                sell_ratio      FLOAT,
+                bottom_age_sec  FLOAT,
+                UNIQUE (mint, ts_signal)
+            )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sell_exh_ts "
+            "ON sell_exhaustion_candidates (ts_signal DESC)"
+        )
+
     logger.info("DB inicializado")
+
+
+def insert_sell_exhaustion_candidate(data: dict) -> None:
+    """Persiste um candidato de sell exhaustion. Research-only, nunca afeta trading."""
+    try:
+        with _cursor() as cur:
+            cur.execute("""
+                INSERT INTO sell_exhaustion_candidates (
+                    mint, symbol, ts_signal, mc_at_signal, mc_migration, mc_min,
+                    drop_from_mig, elapsed_sec, pool_quote,
+                    sell_5s, sell_5_15s, sell_cnt_5s, sell_ratio, bottom_age_sec
+                ) VALUES (
+                    %(mint)s, %(symbol)s, %(ts_signal)s, %(mc_at_signal)s, %(mc_migration)s, %(mc_min)s,
+                    %(drop_from_mig)s, %(elapsed_sec)s, %(pool_quote)s,
+                    %(sell_5s)s, %(sell_5_15s)s, %(sell_cnt_5s)s, %(sell_ratio)s, %(bottom_age_sec)s
+                )
+                ON CONFLICT (mint, ts_signal) DO NOTHING
+            """, data)
+    except Exception as e:
+        logger.warning("insert_sell_exhaustion_candidate failed: %s", e)
 
 
 def upsert_watchlist(data: dict):
