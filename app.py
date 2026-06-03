@@ -42466,6 +42466,10 @@ def analise_signal_anatomy():
     Seção 2: anatomia dos 22 TPs reais (big wins vs small wins).
     """
     clean_only = request.args.get("clean", "0") == "1"
+    clean_strict = request.args.get("clean_strict", "1").lower() not in ("0", "false", "no", "off")
+    same_candle_policy = request.args.get("same_candle_policy", "conservative_sl_first")
+    if same_candle_policy not in ("conservative_sl_first", "optimistic_tp_first"):
+        same_candle_policy = "conservative_sl_first"
     min_n      = int(request.args.get("min_n", "5"))
 
     try:
@@ -42474,7 +42478,13 @@ def analise_signal_anatomy():
 
         with psycopg2.connect(db.DATABASE_URL, cursor_factory=_pge2.RealDictCursor) as conn:
             with conn.cursor() as cur:
-                date_filter = "AND bs.ts_signal >= '2026-05-26'" if clean_only else ""
+                clean_clauses = []
+                if clean_only:
+                    clean_clauses.append("bs.ts_signal >= '2026-05-26'")
+                    if clean_strict:
+                        clean_clauses.append("bs.h23_window = 'bottom'")
+                        clean_clauses.append("COALESCE(bs.data_quality, 'ok') != 'bad'")
+                clean_filter = "AND " + " AND ".join(clean_clauses) if clean_clauses else ""
                 cur.execute(f"""
                     SELECT
                         bs.mint,
@@ -42505,7 +42515,7 @@ def analise_signal_anatomy():
                        AND t.exit_type = 'helius_sell_recovery'
                     WHERE bs.mc_at_signal IS NOT NULL
                       AND bs.mc_at_signal > 0
-                    {date_filter}
+                    {clean_filter}
                     ORDER BY bs.ts_signal
                 """)
                 bounces = cur.fetchall()
@@ -42549,6 +42559,7 @@ def analise_signal_anatomy():
             b['tick_count'] = len(rel)
             if not rel or entry <= 0:
                 b['outcome'] = 'no_data'; b['max_mfe'] = None; b['max_mae'] = None
+                b['first_tp_ts'] = None; b['first_sl_ts'] = None; b['same_tick_conflict'] = False
                 continue
 
             max_hi = max((hi for _, hi, _ in rel if hi > 0), default=0)
@@ -42557,9 +42568,33 @@ def analise_signal_anatomy():
             b['max_mfe'] = round((max_hi / entry - 1) * 100, 1) if max_hi else None
             b['max_mae'] = round((min_lo / entry - 1) * 100, 1) if min_lo else None
 
-            if max_hi >= entry * WIN:
+            first_tp_ts = None
+            first_sl_ts = None
+            same_tick_conflict = False
+            for ts, hi, lo in rel:
+                tp_hit = hi > 0 and hi >= entry * WIN
+                sl_hit = lo > 0 and lo <= entry * SL
+                if tp_hit:
+                    first_tp_ts = ts
+                if sl_hit:
+                    first_sl_ts = ts
+                if tp_hit or sl_hit:
+                    same_tick_conflict = tp_hit and sl_hit
+                    break
+
+            b['first_tp_ts'] = first_tp_ts
+            b['first_sl_ts'] = first_sl_ts
+            b['same_tick_conflict'] = same_tick_conflict
+            if first_tp_ts and first_sl_ts:
+                if first_tp_ts == first_sl_ts:
+                    b['outcome'] = 'winner' if same_candle_policy == 'optimistic_tp_first' else 'loser'
+                elif first_tp_ts < first_sl_ts:
+                    b['outcome'] = 'winner'
+                else:
+                    b['outcome'] = 'loser'
+            elif first_tp_ts:
                 b['outcome'] = 'winner'
-            elif min_lo > 0 and min_lo <= entry * SL:
+            elif first_sl_ts:
                 b['outcome'] = 'loser'
             else:
                 b['outcome'] = 'chop'
@@ -42570,7 +42605,7 @@ def analise_signal_anatomy():
         # ------ Condições para testar ------
         conds = [
             ("bounce 50–100%",       lambda b: b['bounce_pct'] is not None and 0.50 <= b['bounce_pct'] < 1.00),
-            ("bounce 30–50%",        lambda b: b['bounce_pct'] is not None and b['bounce_pct'] < 0.50),
+            ("bounce 30–50%",        lambda b: b['bounce_pct'] is not None and 0.30 <= b['bounce_pct'] < 0.50),
             ("bounce >= 100%",       lambda b: b['bounce_pct'] is not None and b['bounce_pct'] >= 1.00),
             ("elapsed < 5min",       lambda b: b['elapsed_sec'] is not None and b['elapsed_sec'] < 300),
             ("elapsed 5–15min",      lambda b: b['elapsed_sec'] is not None and 300 <= b['elapsed_sec'] < 900),
@@ -42651,6 +42686,12 @@ def analise_signal_anatomy():
 
         base_wr = results[0][5]
         combo_html = "".join(row_html(*r, baseline_wr=base_wr) for r in results)
+        robust_min_n = max(30, min_n)
+        robust_results = [r for r in rest if r[1] >= robust_min_n]
+        robust_html = "".join(row_html(*r, baseline_wr=base_wr) for r in robust_results[:30])
+        if not robust_html:
+            robust_html = f"<tr><td colspan='9'>Nenhuma combinação com n≥{robust_min_n}.</td></tr>"
+        same_tick_conflicts = sum(1 for b in with_data if b.get('same_tick_conflict'))
 
         # ------ Seção 2: Anatomia dos TPs reais ------
         tp_all   = [b for b in bounces if b.get('trade_status') == 'tp' and b.get('trade_pnl') is not None]
@@ -42728,17 +42769,29 @@ a{{color:#7bf}}
   <strong style="color:#ddd">{n_all}</strong> bounce_signals |
   <strong>{n_wd}</strong> com ticks 60min |
   <span style="color:#555">{n_nd_disp} sem ticks</span> |
-  Outcome independente da nossa execução: winner=+75% antes de -25% em 60min a partir de mc_at_signal.
+  Outcome independente da nossa execução: primeiro toque em +75% ou -25% em 60min a partir de mc_at_signal.
   <a href="?clean=1">apenas pós-05-26 (dados limpos)</a> |
   <a href="?">todos</a>
 </p>
 <p style="color:#666;font-size:11px">
-  Winner: max_hi_60m ≥ entry × 1.75 | Loser: min_lo_60m ≤ entry × 0.75 | Chop: nem um nem outro.
+  Winner: primeiro tick que bate entry × 1.75 antes do SL | Loser: primeiro tick que bate entry × 0.75 antes do TP | Chop: nem um nem outro.
+  same_candle_policy={same_candle_policy} ({same_tick_conflicts} conflitos no mesmo tick) | clean_strict={int(clean_strict)} (h23_window=bottom e data_quality≠bad).
   Baseline WR={base_wr2:.0f}% (W={base_w} L={base_l} C={base_c}).
   Delta pp = diferença vs baseline.
 </p>
 
-<h2>1. Combinações de Features — WR por filtro</h2>
+<h2>1. Combinações robustas — n≥{robust_min_n}</h2>
+<p style="color:#888;font-size:11px">Esta é a tabela principal para evitar chasing de WR fictício com amostra pequena.</p>
+<table>
+<thead><tr>
+  <th style="text-align:left">Filtro / Combinação</th>
+  <th>n</th><th style="color:#4f4">W</th><th style="color:#f44">L</th><th>Chop</th>
+  <th>WR</th><th>Δ vs base</th><th>avg MFE</th><th>avg MAE</th>
+</tr></thead>
+<tbody>{robust_html}</tbody>
+</table>
+
+<h2>2. Todas as Combinações de Features — WR por filtro</h2>
 <table>
 <thead><tr>
   <th style="text-align:left">Filtro / Combinação</th>
@@ -42751,7 +42804,7 @@ a{{color:#7bf}}
   Ordenado por WR decrescente. Verde = WR≥35%. Amarelo = WR≥25%. min_n={min_n} (ajustar via ?min_n=3).
 </p>
 
-<h2>2. Anatomia dos TPs reais (helius_sell_recovery)</h2>
+<h2>3. Anatomia dos TPs reais (helius_sell_recovery)</h2>
 <p style="color:#888">
   TPs blockchain-confirmados: <strong>{len(tp_all)}</strong> total |
   <span style="color:#4f4">Big wins (&gt;80% PnL): {len(big_wins)}</span> |
