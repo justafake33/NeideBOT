@@ -6296,8 +6296,11 @@ def _start_services():
     if not os.getenv("DATABASE_URL"):
         logger.warning("DATABASE_URL não configurado — serviços não iniciados")
         return
-    db.init_db()
-    db.backfill_data_quality()   # classifica dados históricos na inicialização
+    if os.getenv("RUN_DB_MIGRATIONS", "0") == "1":
+        db.init_db()
+        db.backfill_data_quality()   # classifica dados históricos na inicialização
+    else:
+        logger.info("RUN_DB_MIGRATIONS=0 — pulando init_db/backfill_data_quality no startup")
     gmgn      = GmgnClient()
     executor  = TradeExecutor(gmgn)
     monitor   = TradeMonitor()
@@ -40627,7 +40630,28 @@ def analise_micro_outcomes_v2():  # noqa: C901
         return result
 
     # ── Load data ──────────────────────────────────────────────────────────────
-    events_dict, ticks_dict = db.get_micro_outcomes_v2_data(days=days)
+    import psycopg2
+    try:
+        events_dict, ticks_dict = db.get_micro_outcomes_v2_data(days=days)
+    except (psycopg2.errors.DeadlockDetected,
+            psycopg2.errors.LockNotAvailable,
+            psycopg2.errors.QueryCanceled) as _dbe:
+        err_msg = f"DB busy / lock contention: {type(_dbe).__name__}. Retry in a few seconds."
+        if fmt == "json":
+            return app.response_class(
+                response=_json.dumps({"error": err_msg, "retry": True}),
+                status=503, mimetype="application/json",
+            )
+        return (f"<html><body style='font-family:monospace;padding:20px'>"
+                f"<h2>DB Busy</h2><p>{err_msg}</p>"
+                f"<p>Se persistir, verifique se init_db/migration está rodando concorrentemente.</p>"
+                f"<p><a href='javascript:location.reload()'>Retry</a> &nbsp;"
+                f"<a href='/debug/db-locks'>Ver locks</a></p>"
+                f"</body></html>"), 503
+    except Exception as _e:
+        if request.args.get("debug") == "1":
+            raise
+        return f"<p>Erro interno: {type(_e).__name__}: {_e}</p>", 500
 
     if not events_dict:
         if fmt == "json":
@@ -41357,7 +41381,28 @@ def analise_micro_outcomes_v22():  # noqa: C901
     ]
 
     # ── Load data ────────────────────────────────────────────────────────────────
-    events_dict, ticks_dict = db.get_micro_outcomes_v2_data(days=days)
+    import psycopg2 as _psycopg2
+    try:
+        events_dict, ticks_dict = db.get_micro_outcomes_v2_data(days=days)
+    except (_psycopg2.errors.DeadlockDetected,
+            _psycopg2.errors.LockNotAvailable,
+            _psycopg2.errors.QueryCanceled) as _dbe:
+        err_msg = f"DB busy / lock contention: {type(_dbe).__name__}. Retry in a few seconds."
+        if fmt == "json":
+            return app.response_class(
+                response=_json.dumps({"error": err_msg, "retry": True}),
+                status=503, mimetype="application/json",
+            )
+        return (f"<html><body style='font-family:monospace;padding:20px'>"
+                f"<h2>DB Busy</h2><p>{err_msg}</p>"
+                f"<p>Se persistir, verifique se init_db/migration está rodando concorrentemente.</p>"
+                f"<p><a href='javascript:location.reload()'>Retry</a> &nbsp;"
+                f"<a href='/debug/db-locks'>Ver locks</a></p>"
+                f"</body></html>"), 503
+    except Exception as _e:
+        if request.args.get("debug") == "1":
+            raise
+        return f"<p>Erro interno: {type(_e).__name__}: {_e}</p>", 500
 
     if not events_dict:
         msg = f"Sem dados para os últimos {days} dias."
@@ -43137,7 +43182,9 @@ def _v2_load_data(days: int):
 
     cutoff = datetime.now(_tz.utc) - timedelta(days=days)
 
-    with psycopg2.connect(db.DATABASE_URL, cursor_factory=_pg2e.RealDictCursor) as conn:
+    conn = psycopg2.connect(db.DATABASE_URL, cursor_factory=_pg2e.RealDictCursor)
+    conn.autocommit = True  # cada SELECT libera o lock imediatamente — evita deadlock com init_db DDL
+    try:
         # Detect which optional columns actually exist in the schema (B4 fix)
         _OPTIONAL_FLOAT_COLS = [
             "live_30s_net", "live_30s_buy", "live_30s_sell", "live_60s_net",
@@ -43226,7 +43273,9 @@ def _v2_load_data(days: int):
             for b in cur.fetchall():
                 bounce_by_mint[b["mint"]].append(dict(b))
 
-    return dict(events), dict(ticks_by_mint), dict(bounce_by_mint)
+        return dict(events), dict(ticks_by_mint), dict(bounce_by_mint)
+    finally:
+        conn.close()
 
 
 def _v2_simulate_outcome(ticks, ts_min_ts, entry_mc, tp_pct, sl_pct,
@@ -44701,6 +44750,72 @@ windows: {', '.join(available_windows)}</p>
     except Exception as e:
         import traceback
         return f"<pre>Erro: {e}\n\n{traceback.format_exc()}</pre>", 500
+
+
+# ==============================================================================
+# /debug/db-locks — visibilidade de atividade e locks do PostgreSQL
+# ==============================================================================
+
+@app.route("/debug/db-locks")
+def debug_db_locks():
+    """Mostra atividade atual do PostgreSQL — útil para diagnosticar deadlocks e contention."""
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+
+    conn = psycopg2.connect(db.DATABASE_URL, cursor_factory=RealDictCursor)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    a.pid,
+                    a.state,
+                    a.wait_event_type,
+                    a.wait_event,
+                    extract(epoch from (now() - a.query_start))::int AS age_sec,
+                    left(a.query, 300) AS query,
+                    pg_blocking_pids(a.pid) AS blocked_by
+                FROM pg_stat_activity a
+                WHERE a.datname = current_database()
+                  AND a.pid != pg_backend_pid()
+                ORDER BY a.query_start NULLS LAST
+                LIMIT 30
+            """)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if request.args.get("format") == "json":
+        from flask import jsonify
+        return jsonify({"locks": [dict(r) for r in rows]})
+
+    # HTML simples
+    CSS = ("<style>body{background:#0d1117;color:#e6edf3;font:12px/1.6 monospace;padding:20px}"
+           "h2{color:#58a6ff}table{border-collapse:collapse;width:100%;white-space:pre-wrap}"
+           "th{background:#161b22;padding:6px 10px;text-align:left;font-size:11px;color:#8b949e;"
+           "border-bottom:2px solid #30363d}"
+           "td{padding:4px 10px;border-bottom:1px solid #21262d;font-size:11px;vertical-align:top}"
+           ".blocked{background:#3a1a1a}.waiting{background:#3a2a1a}"
+           "a{color:#58a6ff}</style>")
+    h = f"<html><head><meta charset='utf-8'>{CSS}</head><body>"
+    h += "<h2>DB Activity / Locks</h2>"
+    h += f"<p style='color:#8b949e'>{len(rows)} conexões ativas &nbsp;|&nbsp; "
+    h += "<a href='?format=json'>JSON</a> &nbsp;|&nbsp; "
+    h += "<a href='javascript:location.reload()'>Refresh</a></p>"
+    h += "<table><tr><th>PID</th><th>State</th><th>Wait</th><th>Age(s)</th>"
+    h += "<th>Blocked by</th><th>Query</th></tr>"
+    for r in rows:
+        blocked = r.get("blocked_by") or []
+        row_class = "blocked" if blocked else ("waiting" if r.get("wait_event") else "")
+        h += f"<tr class='{row_class}'>"
+        h += f"<td>{r['pid']}</td>"
+        h += f"<td>{r['state'] or ''}</td>"
+        h += f"<td>{(r['wait_event_type'] or '')}/{(r['wait_event'] or '')}</td>"
+        h += f"<td>{r['age_sec'] or 0}</td>"
+        h += f"<td>{'['+','.join(str(x) for x in blocked)+']' if blocked else ''}</td>"
+        h += f"<td><code>{(r['query'] or '').replace('<','&lt;')}</code></td></tr>"
+    h += "</table></body></html>"
+    return h
 
 
 if __name__ == "__main__":
