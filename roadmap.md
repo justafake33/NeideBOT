@@ -150,9 +150,36 @@ Parâmetros:
 
 ## Próximas Fases
 
-### [AGORA] Religar com $10/trade
+### [AGORA] V2 Shadow oficial em web+worker separados
 
-**Gate:** TRADING_ENABLED=true, CALIBRATION_AMOUNT_USD=10
+**Runtime Railway:**
+- `web`: Flask/Gunicorn, `RUN_BOT_SERVICES=0`, serve endpoints e dashboards.
+- `worker`: `python worker.py`, `RUN_BOT_SERVICES=1`, coleta eRPC/Helius + scanner + HotMonitor.
+- `RUN_DB_MIGRATIONS=0` nos dois; migrations apenas via one-off task.
+
+**Gate shadow V2.1 (sem compra real):**
+```
+TRADING_ENABLED=false
+V2_SHADOW_ENABLED=true
+V2_DECISION_AGE_SEC=10
+V2_NET_WINDOW=live_5s
+V2_NET_MIN=-2
+V2_MIN_POOL_SOL=10
+V2_MIN_EVENTS=5
+V2_MIN_BOUNCE_PCT=0.30
+V2_MAX_BOUNCE_PCT=0.50
+V2_CANDIDATE_SCOPE=mint_first
+```
+
+Acompanhar `/analise/v2-shadow-live?days=3` e `/analise/v2-brain-report?days=3` por 3–7 dias para confirmar:
+- WR_ex_chop ≥ 30%
+- EV_all positivo após considerar slippage/latência
+- n≥100 em `mint_first`
+- V1 entry improvement estável ou compensado por EV maior
+
+### [Depois do shadow] Religar com $10/trade
+
+**Gate:** TRADING_ENABLED=true, CALIBRATION_AMOUNT_USD=10 somente após validação do V2 Shadow.
 
 Aguardar 30+ trades para confirmar:
 - WR ≥ 17% (consistente com calibração)
@@ -206,6 +233,7 @@ confirmar WR e trailing com $10/trade.
 | Fase 6.1 | WR a $10/trade | ≥17% | ⏳ aguardando |
 | Fase 6.1 | trailing_active rate | ≥30% dos trades | ⏳ aguardando |
 | H9 | Validação smart money | ≥20pp delta | 🟡 +11.8pp (n=14) |
+| V2 Shadow | Gate eRPC live_5s mint_first | WR≥30%, EV>0, n≥100 | ⏳ coletando via worker |
 | Jupiter | Break-even WR | ~18% | ⏳ médio prazo |
 
 ---

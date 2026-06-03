@@ -227,12 +227,16 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO 2026-05-04)
 >
 > **`TRADING_ENABLED=false`** — Bot parado intencionalmente para acumulação de dados na tabela `micro_absorption_snapshots` (V2 Fase 1).
 >
+> **Runtime Railway separado (2026-06-03):** `web` roda Flask/Gunicorn com `RUN_BOT_SERVICES=0` e serve apenas endpoints; `worker` roda `worker.py` com `RUN_BOT_SERVICES=1` e inicia scanner + HotMonitor + Helius/eRPC. Essa separação evita que ping/pong timeout ou loops do scanner congelem `/analise/*`.
+>
+> **V2 Shadow oficial (dry-run):** `/analise/v2-shadow-live` materializa o gate V2.1 a partir de `micro_absorption_snapshots`, sem chamar executor e sem gravar trades. Gate padrão: `scope=mint_first`, `decision_age=10s`, `net_window=live_5s`, `net_min=-2`, `min_pool=10`, `min_events=5`, `bounce=30-50%`. Config por env: `V2_SHADOW_ENABLED`, `V2_DECISION_AGE_SEC`, `V2_NET_WINDOW`, `V2_NET_MIN`, `V2_MIN_POOL_SOL`, `V2_MIN_EVENTS`, `V2_MIN_BOUNCE_PCT`, `V2_MAX_BOUNCE_PCT`, `V2_CANDIDATE_SCOPE`.
+>
 > **Objetivo:** coletar microdados de fluxo de ordens (PRE/RISE/LIVE) ao redor do fundo de cada token durante os próximos dias/semanas para validar H22, H23, H24 e derivadas (H26, pool depth, seller exhaustion) com n≥30 bounces com outcomes GMGN confirmados.
 >
 > **Branch ativo:** `claude/nifty-hamilton-tQORb` (V2 Fase 1)
 > **Fases V2 pendentes (em standby):** Fase 2 (Micro Absorption Lab) → Fase 3 (Shadow Entry Signals) → Fase 4 (EntryEngineV2) → Fase 5 (Dry-run) → Fase 6 (ExecutionEngineV2 Real Scout)
 >
-> **Reativar trading:** setar `TRADING_ENABLED=true` no Railway + aguardar n≥30 snapshots com outcomes.
+> **Reativar trading:** setar `TRADING_ENABLED=true` no Railway somente depois de validação shadow; manter web e worker separados.
 
 > ### ⚠️ LEITURA OBRIGATÓRIA ANTES DE ANALISAR QUALQUER NÚMERO DESTA SEÇÃO
 >
@@ -529,6 +533,7 @@ get_sol_usd() [gmgn_client.py]
 | `trades` | **Fase 6** — log completo de cada trade live. Coluna `fill_source TEXT` rastreia origem do fill data (`gmgn`/`helius`/`helius_recovery`/`gmgn_recovery`). |
 | `trade_absorption_ticks` | Snapshots contínuos de absorção Helius (+30s/+60s pós-bounce) por trade em monitoramento. |
 | `micro_absorption_snapshots` | **V2 Fase 1 (2026-05-30)** — série temporal de microdados de fluxo por token, capturados a cada 2s durante os 60s após o fundo. ~97 colunas: janelas PRE (5/10/15/30s antes do fundo), RISE (1/3/5/10s após fundo, com guard de completude), LIVE (5/10s antes do snapshot), concentrações nomeadas por janela, `candidate_flags` JSONB. Research-only — nunca afeta trading. |
+| `v2_shadow_live` | **Endpoint derivado, não tabela** — `/analise/v2-shadow-live` aplica o gate V2.1 ativo sobre `micro_absorption_snapshots` + `token_ticks` + `bounce_signals`, reporta WR/EV/drawdown/V1-improvement e não escreve no banco. |
 
 ### HeapScheduler
 - Thread única com heap de eventos futuros
@@ -637,6 +642,8 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 | `/analise/h22-correlation` | **H22 Correlation** — correlação entre absorção pós-fundo (Helius) e outcome TP/SL. Tabelas por bucket: absorption_events (0/1-2/3-5/6-10/≥11), buy/sell ratio (∞/≥3×/1.5-3×/etc.), concentração (largest_buy/buy_vol). Instrumento pronto antes dos dados chegarem — n=? cresce com o bot ativo. Gate: n≥30 com Helius. |
 | `/debug/open-trades` | **Diagnóstico de trades abertos** — por trade `open`/`trailing_active`: entry_expected, entry_mc_real, sl_mc, tp_mc, contagem de ticks, min_low, max_high, flags sl_hit/tp_hit, resposta ao vivo do GMGN `query_order` com raw JSON. Identifica trades presos + por que TradeMonitor não detectou saída. |
 | `/debug/micro-absorption-snapshots` | **V2 Fase 1** — visualiza `micro_absorption_snapshots`. Suporta `?days=1&mint=&limit=200&format=html\|json\|csv`. HTML com células PRE/RISE/LIVE coloridas (verde/vermelho para net positivo/negativo). RISE incompleto mostra ⏳ com tooltip. Indicadores de completude por janela. |
+| `/analise/v2-shadow-live` | **V2.1 Shadow Live** — aplica o gate ativo (`live_5s`, `net_min=-2`, `min_events=5`, `bounce=30-50%`, `mint_first`) sobre snapshots existentes, mostra WR/EV/drawdown e comparação V1. Research/dry-run only: não chama executor. |
+| `/analise/v2-brain-report` | **V2 Brain Report** — grid cartesiano com recomendação Bigplayer. Default `mode=fast` para não travar o web; `mode=full` apenas para diagnóstico pesado. |
 
 ---
 
