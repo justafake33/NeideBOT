@@ -44270,10 +44270,13 @@ def analise_v2_brain_report():  # noqa: C901
       top=50             top N combos por tabela
       include_details=0  se 1, inclui lista de candidatos
       candidate_scope=all|mint_first|bottom_events
+      mode=fast|full     fast evita travar o web; full varre o grid completo
+      max_runtime_sec=20 orçamento de tempo para retornar parcial em vez de congelar
     """
-    import itertools, statistics as _stats_mod
+    import itertools, statistics as _stats_mod, time as _time_mod
 
     try:
+        started_at = _time_mod.monotonic()
         days            = int(request.args.get("days", 14))
         fmt             = request.args.get("format", "html")
         min_n           = int(request.args.get("min_n", 10))
@@ -44283,28 +44286,47 @@ def analise_v2_brain_report():  # noqa: C901
         top_n           = int(request.args.get("top", 50))
         include_details = request.args.get("include_details", "0") == "1"
         scope_override  = request.args.get("candidate_scope", "all")
+        mode            = request.args.get("mode", "fast")
+        max_runtime_sec = float(request.args.get("max_runtime_sec", 20))
 
         # ── Grid de parâmetros ────────────────────────────────────────────────
-        DECISION_AGES = [3, 5, 10, 15, 30]
-        NET_MINS      = [-5.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0]
-        MIN_POOLS     = [10.0, 20.0, 40.0, 80.0]
-        MIN_EVENTS    = [1, 3, 5, 8]
-        # (min_bounce, max_bounce) — None = sem limite
-        BOUNCE_RANGES = [
-            (None, None),
-            (0.10, None),
-            (0.20, None),
-            (0.30, None),
-            (0.30, 1.00),
-            (0.10, 0.50),
-        ]
+        # Fast is the default because the full Cartesian grid can exceed one
+        # Gunicorn request window while recomputing outcomes thousands of times.
+        # Use mode=full explicitly when running offline/worker-side diagnostics.
+        if mode == "full":
+            DECISION_AGES = [3, 5, 10, 15, 30]
+            NET_MINS      = [-5.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0]
+            MIN_POOLS     = [10.0, 20.0, 40.0, 80.0]
+            MIN_EVENTS    = [1, 3, 5, 8]
+            BOUNCE_RANGES = [
+                (None, None),
+                (None, 0.15),
+                (0.15, 0.30),
+                (None, 0.30),
+                (0.30, 0.50),
+                (0.50, 1.00),
+            ]
+        else:
+            mode = "fast"
+            DECISION_AGES = [10, 15]
+            NET_MINS      = [-5.0, -2.0, 0.0]
+            MIN_POOLS     = [10.0, 20.0]
+            MIN_EVENTS    = [3, 5]
+            BOUNCE_RANGES = [
+                (None, None),
+                (None, 0.15),
+                (0.15, 0.30),
+                (None, 0.30),
+                (0.30, 0.50),
+            ]
+
         BOUNCE_RANGE_LABELS = {
             (None, None):     "qualquer",
-            (0.10, None):     "≥10%",
-            (0.20, None):     "≥20%",
-            (0.30, None):     "≥30%",
-            (0.30, 1.00):     "30-100%",
-            (0.10, 0.50):     "10-50%",
+            (None, 0.15):     "<15%",
+            (0.15, 0.30):     "15-30%",
+            (None, 0.30):     "0-30%",
+            (0.30, 0.50):     "30-50%",
+            (0.50, 1.00):     "50-100%",
         }
         # Windows disponíveis — restringir ao que existe nos dados
         ALL_NET_WINDOWS = ["live_5s", "live_10s", "live_30s", "live_60s",
@@ -44337,6 +44359,10 @@ def analise_v2_brain_report():  # noqa: C901
 
         if not available_windows:
             available_windows = ["live_10s"]  # fallback
+        if mode == "fast":
+            preferred_windows = ["live_10s", "live_5s"]
+            fast_windows = [nw for nw in preferred_windows if nw in available_windows]
+            available_windows = fast_windows or available_windows[:2]
 
         # ── Helpers ───────────────────────────────────────────────────────────
         def _score_ev_risk(st: dict) -> float | None:
@@ -44367,10 +44393,16 @@ def analise_v2_brain_report():  # noqa: C901
 
         # ── Grid loop ─────────────────────────────────────────────────────────
         all_combos: list = []
+        total_combos_tested = 0
+        partial = False
 
         for scope, da, nw, net_min, mp, mev, (bmin, bmax) in itertools.product(
                 SCOPES, DECISION_AGES, available_windows,
                 NET_MINS, MIN_POOLS, MIN_EVENTS, BOUNCE_RANGES):
+            if (_time_mod.monotonic() - started_at) > max_runtime_sec:
+                partial = True
+                break
+            total_combos_tested += 1
 
             cands = _v2_build_candidates(
                 events_dict, ticks_dict, bounce_dict,
@@ -44566,6 +44598,10 @@ def analise_v2_brain_report():  # noqa: C901
                     "days": days, "min_n": min_n, "tp_pct": tp_pct,
                     "sl_pct": sl_pct, "sc_pol": sc_pol,
                     "available_windows": available_windows,
+                    "mode": mode,
+                    "partial": partial,
+                    "total_combos_tested": total_combos_tested,
+                    "elapsed_sec": round(_time_mod.monotonic() - started_at, 3),
                 },
             })
 
@@ -44691,8 +44727,10 @@ def analise_v2_brain_report():  # noqa: C901
 <body>
 <h1>V2 Brain Report</h1>
 <p class="meta">Gerado: {now_str} | janela: {days}d | min_n: {min_n} |
-TP: {tp_pct:.0%} SL: {sl_pct:.0%} | combos válidos: {len(all_combos)} |
+TP: {tp_pct:.0%} SL: {sl_pct:.0%} | mode: {mode} | partial: {partial} |
+combos testados: {total_combos_tested} | combos válidos: {len(all_combos)} |
 windows: {', '.join(available_windows)}</p>
+<p class="meta">Padrão é <code>mode=fast</code> para não travar o web. Use <code>?mode=full&format=json</code> somente se precisar da varredura completa.</p>
 
 <h2>1. Executive Summary</h2>
 <div class="rec">{rec_label}</div>
