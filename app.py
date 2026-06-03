@@ -6316,7 +6316,14 @@ def _start_services():
     logger.info("Todos os serviços iniciados")
 
 
-_start_services()
+# Runtime split:
+# - web process serves Flask endpoints only (default)
+# - worker process sets RUN_BOT_SERVICES=1 and runs scanners/Helius/eRPC
+# This prevents websocket/scanner stalls from freezing the analysis dashboard.
+if os.getenv("RUN_BOT_SERVICES", "0") == "1":
+    _start_services()
+else:
+    logger.info("RUN_BOT_SERVICES=0 — web-only mode, bot services not started")
 
 
 @app.route("/debug/open-trades")
