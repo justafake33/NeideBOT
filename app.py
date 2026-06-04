@@ -1,5 +1,6 @@
 import os
 import logging
+import socket
 import statistics
 from datetime import datetime, timezone, timedelta
 
@@ -6661,15 +6662,90 @@ def _executor_status_inner():
     return h
 
 
+def _current_outbound_ip() -> tuple[str | None, str, str | None]:
+    import requests as _req
+    source = os.getenv("OUTBOUND_IP_URL", "https://ifconfig.me/ip")
+    try:
+        ip = _req.get(source, timeout=5).text.strip()
+        return ip or None, source, None
+    except Exception as e:
+        return None, source, str(e)
+
+
 @app.route("/debug/my-ip")
 def debug_my_ip():
-    """Retorna o IP de saída do Railway — necessário para whitelist GMGN."""
-    import requests as _req
-    try:
-        ip = _req.get("https://ifconfig.me/ip", timeout=5).text.strip()
-    except Exception as e:
-        ip = f"erro: {e}"
-    return f"<pre>Railway outbound IP: {ip}\n\nAdicione este IP na whitelist do GMGN OpenAPI.</pre>"
+    """Retorna o IP de saída do processo web. Para trading, use /debug/runtime-ips."""
+    ip, source, error = _current_outbound_ip()
+    shown = ip if ip else f"erro: {error}"
+    return (
+        f"<pre>Web outbound IP: {shown}\n"
+        f"Source: {source}\n\n"
+        "⚠️ Após o split web/worker, este é o IP do WEB.\n"
+        "Para whitelist GMGN do bot/trading, use o IP do WORKER em /debug/runtime-ips.</pre>"
+    )
+
+
+@app.route("/debug/runtime-ips")
+def debug_runtime_ips():
+    """Mostra IP do web e último IP reportado pelo worker para whitelist GMGN."""
+    web_ip, source, web_error = _current_outbound_ip()
+    rows = db.get_runtime_heartbeats()
+    payload = {
+        "web": {
+            "role": "web",
+            "outbound_ip": web_ip,
+            "ip_source": source,
+            "error": web_error,
+            "service_name": os.getenv("RAILWAY_SERVICE_NAME") or os.getenv("RAILWAY_SERVICE_ID"),
+            "deployment_id": os.getenv("RAILWAY_DEPLOYMENT_ID"),
+            "replica_id": os.getenv("RAILWAY_REPLICA_ID"),
+            "hostname": socket.gethostname(),
+        },
+        "heartbeats": [dict(r) for r in rows],
+        "note": "Use worker.outbound_ip para whitelist GMGN; /debug/my-ip mostra apenas o web.",
+    }
+    if request.args.get("format") == "json":
+        return jsonify(payload)
+
+    def _fmt_dt(v):
+        if not v:
+            return "—"
+        try:
+            return v.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        except Exception:
+            return str(v)
+
+    h = """<!doctype html><html><head><meta charset='utf-8'><title>Runtime IPs</title>
+<style>body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:16px}table{border-collapse:collapse}td,th{border:1px solid #30363d;padding:7px 10px}.ok{color:#3fb950}.bad{color:#f85149}.warn{color:#d29922}</style></head><body>"""
+    h += "<h1>Runtime Outbound IPs</h1>"
+    h += "<p class='warn'><b>GMGN whitelist:</b> use o IP do <b>worker</b>, não apenas o web. O worker é quem roda scanner/executor/trades.</p>"
+    h += "<p><a style='color:#58a6ff' href='/debug/runtime-ips?format=json'>JSON</a> · <a style='color:#58a6ff' href='/debug/runtime-ips'>Refresh</a></p>"
+    h += "<h2>Web atual</h2><table><tr><th>role</th><th>outbound_ip</th><th>source</th><th>error</th><th>service</th><th>deployment</th><th>replica</th><th>hostname</th></tr>"
+    web_cls = "ok" if web_ip else "bad"
+    h += (
+        f"<tr><td>web</td><td class='{web_cls}'>{web_ip or '—'}</td>"
+        f"<td>{source}</td><td>{web_error or '—'}</td>"
+        f"<td>{payload['web']['service_name'] or '—'}</td><td>{payload['web']['deployment_id'] or '—'}</td>"
+        f"<td>{payload['web']['replica_id'] or '—'}</td><td>{payload['web']['hostname'] or '—'}</td></tr></table>"
+    )
+    h += "<h2>Heartbeats registrados</h2>"
+    if not rows:
+        h += "<p class='bad'>Nenhum heartbeat encontrado. Se o worker já está rodando, rode a migration: <code>RUN_DB_MIGRATIONS=1 python migrate.py</code>, ou aguarde até 60s.</p>"
+    else:
+        h += "<table><tr><th>role</th><th>outbound_ip</th><th>updated_at</th><th>source</th><th>error</th><th>service</th><th>deployment</th><th>replica</th><th>hostname</th></tr>"
+        for r in rows:
+            cls = "ok" if r.get("outbound_ip") and not r.get("error") else "bad"
+            h += (
+                f"<tr><td>{r.get('role') or '—'}</td><td class='{cls}'>{r.get('outbound_ip') or '—'}</td>"
+                f"<td>{_fmt_dt(r.get('updated_at'))}</td><td>{r.get('ip_source') or '—'}</td>"
+                f"<td>{r.get('error') or '—'}</td><td>{r.get('service_name') or '—'}</td>"
+                f"<td>{r.get('deployment_id') or '—'}</td><td>{r.get('replica_id') or '—'}</td>"
+                f"<td>{r.get('hostname') or '—'}</td></tr>"
+            )
+        h += "</table>"
+    h += "<p class='warn'>Se web e worker tiverem IPs diferentes, coloque o IP do worker na GMGN. Se o IP muda após restart, considere Static Outbound IP no serviço worker.</p>"
+    h += "</body></html>"
+    return h
 
 
 @app.route("/debug/sign-test")

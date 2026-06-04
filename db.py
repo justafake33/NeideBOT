@@ -423,6 +423,23 @@ def _do_init_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_tat_trade ON trade_absorption_ticks (trade_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_tat_mint  ON trade_absorption_ticks (mint)")
 
+        # Runtime heartbeats — registra IP de saída real do web/worker para whitelist GMGN.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS runtime_heartbeats (
+                role          TEXT PRIMARY KEY,
+                service_name  TEXT,
+                deployment_id TEXT,
+                replica_id    TEXT,
+                hostname      TEXT,
+                outbound_ip   TEXT,
+                ip_source     TEXT,
+                error         TEXT,
+                updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_runtime_hb_updated ON runtime_heartbeats (updated_at DESC)")
+
         # ── Fase 1 V2 — Micro absorption snapshots (research-only) ──────────
         cur.execute("""
             CREATE TABLE IF NOT EXISTS micro_absorption_snapshots (
@@ -583,6 +600,48 @@ def _do_init_db():
         )
 
     logger.info("DB inicializado")
+
+
+def upsert_runtime_heartbeat(data: dict) -> None:
+    """Registra heartbeat runtime (web/worker) e IP de saída. Debug-only."""
+    try:
+        with _cursor() as cur:
+            cur.execute("""
+                INSERT INTO runtime_heartbeats (
+                    role, service_name, deployment_id, replica_id, hostname,
+                    outbound_ip, ip_source, error, updated_at
+                ) VALUES (
+                    %(role)s, %(service_name)s, %(deployment_id)s, %(replica_id)s, %(hostname)s,
+                    %(outbound_ip)s, %(ip_source)s, %(error)s, NOW()
+                )
+                ON CONFLICT (role) DO UPDATE SET
+                    service_name  = EXCLUDED.service_name,
+                    deployment_id = EXCLUDED.deployment_id,
+                    replica_id    = EXCLUDED.replica_id,
+                    hostname      = EXCLUDED.hostname,
+                    outbound_ip   = EXCLUDED.outbound_ip,
+                    ip_source     = EXCLUDED.ip_source,
+                    error         = EXCLUDED.error,
+                    updated_at    = NOW()
+            """, data)
+    except Exception as e:
+        logger.warning("upsert_runtime_heartbeat %s failed: %s", data.get("role"), e)
+
+
+def get_runtime_heartbeats() -> list:
+    """Retorna heartbeats runtime mais recentes. Se tabela não existir, retorna []."""
+    try:
+        with _cursor() as cur:
+            cur.execute("""
+                SELECT role, service_name, deployment_id, replica_id, hostname,
+                       outbound_ip, ip_source, error, updated_at, created_at
+                  FROM runtime_heartbeats
+                 ORDER BY role
+            """)
+            return cur.fetchall()
+    except Exception as e:
+        logger.warning("get_runtime_heartbeats failed: %s", e)
+        return []
 
 
 def insert_sell_exhaustion_candidate(data: dict) -> None:
@@ -1751,6 +1810,10 @@ REQUIRED_RUNTIME_SCHEMA = {
     },
     "token_ticks": {
         "mint", "tick_ts", "mc", "mc_open", "mc_high", "mc_low", "source",
+    },
+    "runtime_heartbeats": {
+        "role", "service_name", "deployment_id", "replica_id", "hostname",
+        "outbound_ip", "ip_source", "error", "updated_at",
     },
 }
 

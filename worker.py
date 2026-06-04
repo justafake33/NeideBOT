@@ -9,7 +9,11 @@ HTTP analytics endpoints.
 import logging
 import os
 import signal
+import socket
+import threading
 import time
+
+import requests
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,6 +27,47 @@ os.environ.setdefault("RUN_BOT_SERVICES", "1")
 import app as _app_module  # noqa: E402,F401  # importing starts services when RUN_BOT_SERVICES=1
 
 _running = True
+
+
+def _fetch_outbound_ip() -> tuple[str | None, str, str | None]:
+    """Consulta IP público de saída do container worker."""
+    source = os.getenv("OUTBOUND_IP_URL", "https://ifconfig.me/ip")
+    try:
+        ip = requests.get(source, timeout=5).text.strip()
+        return ip or None, source, None
+    except Exception as e:
+        return None, source, str(e)
+
+
+def _runtime_heartbeat_loop():
+    """Persiste IP real do worker para o web expor em /debug/runtime-ips."""
+    while _running:
+        ip, source, error = _fetch_outbound_ip()
+        _app_module.db.upsert_runtime_heartbeat({
+            "role": os.getenv("RUNTIME_ROLE", "worker"),
+            "service_name": os.getenv("RAILWAY_SERVICE_NAME") or os.getenv("RAILWAY_SERVICE_ID"),
+            "deployment_id": os.getenv("RAILWAY_DEPLOYMENT_ID"),
+            "replica_id": os.getenv("RAILWAY_REPLICA_ID"),
+            "hostname": socket.gethostname(),
+            "outbound_ip": ip,
+            "ip_source": source,
+            "error": error,
+        })
+        if error:
+            logger.warning("Worker outbound IP heartbeat failed: %s", error)
+        else:
+            logger.info("Worker outbound IP heartbeat: %s", ip)
+        for _ in range(60):
+            if not _running:
+                break
+            time.sleep(1)
+
+
+threading.Thread(
+    target=_runtime_heartbeat_loop,
+    daemon=True,
+    name="runtime-heartbeat",
+).start()
 
 
 def _stop(signum, frame):  # noqa: ARG001
