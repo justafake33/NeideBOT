@@ -351,6 +351,17 @@ def _do_init_db():
                 config_trailing_drawdown_pct   FLOAT,
                 config_slippage_bps           INT,
                 git_sha                       TEXT,
+                -- Audit: gate Helius de compra real
+                helius_gate_passed            BOOLEAN,
+                helius_gate_reason            TEXT,
+                helius_pool_quote_at_signal   FLOAT,
+                helius_absorption_events      INT,
+                helius_net_sol_flow           FLOAT,
+                helius_rise_events            INT,
+                helius_rise_net_flow          FLOAT,
+                helius_dump_seller_hhi        FLOAT,
+                helius_buy_concentration      FLOAT,
+                helius_h23_window             TEXT,
                 -- Estado
                 status              TEXT         DEFAULT 'pending',
                 error_msg           TEXT,
@@ -375,6 +386,16 @@ def _do_init_db():
             "ADD COLUMN IF NOT EXISTS config_trailing_drawdown_pct   FLOAT",
             "ADD COLUMN IF NOT EXISTS config_slippage_bps            INT",
             "ADD COLUMN IF NOT EXISTS git_sha                        TEXT",
+            "ADD COLUMN IF NOT EXISTS helius_gate_passed             BOOLEAN",
+            "ADD COLUMN IF NOT EXISTS helius_gate_reason             TEXT",
+            "ADD COLUMN IF NOT EXISTS helius_pool_quote_at_signal    FLOAT",
+            "ADD COLUMN IF NOT EXISTS helius_absorption_events       INT",
+            "ADD COLUMN IF NOT EXISTS helius_net_sol_flow            FLOAT",
+            "ADD COLUMN IF NOT EXISTS helius_rise_events             INT",
+            "ADD COLUMN IF NOT EXISTS helius_rise_net_flow           FLOAT",
+            "ADD COLUMN IF NOT EXISTS helius_dump_seller_hhi         FLOAT",
+            "ADD COLUMN IF NOT EXISTS helius_buy_concentration       FLOAT",
+            "ADD COLUMN IF NOT EXISTS helius_h23_window              TEXT",
             # Tiering de qualidade de dados
             "ADD COLUMN IF NOT EXISTS data_quality                   TEXT",
         ]:
@@ -1688,7 +1709,10 @@ def insert_trade(data: dict) -> int:
                  config_bounce_min_pct, config_bounce_max_pct, config_bounce_drop_min,
                  config_trade_sl_pct, config_trailing_activation_pct,
                  config_trailing_drawdown_pct, config_slippage_bps, git_sha,
-                 data_quality)
+                 helius_gate_passed, helius_gate_reason, helius_pool_quote_at_signal,
+                 helius_absorption_events, helius_net_sol_flow, helius_rise_events,
+                 helius_rise_net_flow, helius_dump_seller_hhi, helius_buy_concentration,
+                 helius_h23_window, data_quality)
             VALUES
                 (%(mint)s, %(symbol)s, %(ts_signal)s, %(mc_bottom)s, %(mc_migration)s,
                  %(entry_expected)s, %(amount_sol)s, %(amount_usd)s,
@@ -1699,9 +1723,27 @@ def insert_trade(data: dict) -> int:
                  %(config_bounce_drop_min)s, %(config_trade_sl_pct)s,
                  %(config_trailing_activation_pct)s, %(config_trailing_drawdown_pct)s,
                  %(config_slippage_bps)s, %(git_sha)s,
+                 %(helius_gate_passed)s, %(helius_gate_reason)s,
+                 %(helius_pool_quote_at_signal)s, %(helius_absorption_events)s,
+                 %(helius_net_sol_flow)s, %(helius_rise_events)s,
+                 %(helius_rise_net_flow)s, %(helius_dump_seller_hhi)s,
+                 %(helius_buy_concentration)s, %(helius_h23_window)s,
                  %(data_quality)s)
             RETURNING id
-        """, {**data, "data_quality": dq})
+        """, {
+            **data,
+            "helius_gate_passed": data.get("helius_gate_passed"),
+            "helius_gate_reason": data.get("helius_gate_reason"),
+            "helius_pool_quote_at_signal": data.get("helius_pool_quote_at_signal"),
+            "helius_absorption_events": data.get("helius_absorption_events"),
+            "helius_net_sol_flow": data.get("helius_net_sol_flow"),
+            "helius_rise_events": data.get("helius_rise_events"),
+            "helius_rise_net_flow": data.get("helius_rise_net_flow"),
+            "helius_dump_seller_hhi": data.get("helius_dump_seller_hhi"),
+            "helius_buy_concentration": data.get("helius_buy_concentration"),
+            "helius_h23_window": data.get("helius_h23_window"),
+            "data_quality": dq,
+        })
         return cur.fetchone()["id"]
 
 
@@ -1724,10 +1766,15 @@ def get_trade_by_id(trade_id: int) -> Optional[dict]:
 
 
 def count_trades(exclude_errors: bool = True) -> int:
-    """Conta trades (exclui erros por padrão para o limite de calibração)."""
+    """Conta trades para calibração. Bloqueios pré-swap não consomem limite."""
     with _cursor() as cur:
         if exclude_errors:
-            cur.execute("SELECT COUNT(*) AS n FROM trades WHERE status != 'error'")
+            cur.execute("""
+                SELECT COUNT(*) AS n
+                  FROM trades
+                 WHERE status != 'error'
+                   AND (order_id IS NOT NULL OR status IN ('open','tp','sl','trailing_active','expired'))
+            """)
         else:
             cur.execute("SELECT COUNT(*) AS n FROM trades")
         return cur.fetchone()["n"]

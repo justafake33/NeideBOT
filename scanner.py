@@ -457,17 +457,38 @@ class HotMonitor:
         if rise_bv > 0:
             buy_concentration = round(rise_lb / rise_bv, 4)
 
-        # C3 — Gate de pool depth: pool rasa = bounce é ruído de AMM, não demanda real.
-        # pool_quote < POOL_MIN_SOL_BOUNCE → um único sell de ~$300 move o preço 25%.
-        # get_pool_quote() lê _pool_quote_last[mint] sob lock — in-memory, zero latência.
-        # Só aplica quando helius está disponível E retornou algum dado para o mint.
-        POOL_MIN_SOL_BOUNCE = float(os.getenv("POOL_MIN_SOL_BOUNCE", "10"))
-        if POOL_MIN_SOL_BOUNCE > 0 and self._helius is not None:
-            pool_depth = self._helius.get_pool_quote(mint)
-            if pool_depth is not None and pool_depth < POOL_MIN_SOL_BOUNCE:
-                logger.info("BOUNCE skip %s — pool=%.1f SOL < min=%.0f SOL",
-                            state.get("symbol", mint[:8]), pool_depth, POOL_MIN_SOL_BOUNCE)
+        # Piso anti-fake para pesquisa: pools extremamente rasas durante migração
+        # poluem o dataset. Este piso só descarta fake-pools óbvias; o piso
+        # rígido de COMPRA REAL fica no TradeExecutor via TRADE_MIN_POOL_SOL.
+        bounce_record_min_pool = float(os.getenv("BOUNCE_RECORD_MIN_POOL_SOL", "5"))
+        if bounce_record_min_pool > 0 and self._helius is not None and pool_quote_at_signal is not None:
+            if pool_quote_at_signal < bounce_record_min_pool:
+                logger.info(
+                    "BOUNCE skip %s — fake/raso pool=%.1f SOL < record_min=%.0f SOL",
+                    state.get("symbol", mint[:8]), pool_quote_at_signal, bounce_record_min_pool,
+                )
                 return
+
+        net_sol_flow = (
+            (absorption_window.get("buy_vol_sol") or 0) -
+            (absorption_window.get("sell_vol_sol") or 0)
+        ) if absorption_window.get("total_events") else None
+        rise_net_flow = (
+            (rise_window.get("buy_vol_sol") or 0) -
+            (rise_window.get("sell_vol_sol") or 0)
+        ) if rise_window.get("total_events") else None
+        helius_context = {
+            "pool_quote_at_signal": pool_quote_at_signal,
+            "absorption_events": absorption_window.get("total_events"),
+            "net_sol_flow": net_sol_flow,
+            "rise_events": rise_window.get("total_events"),
+            "rise_net_flow": rise_net_flow,
+            "dump_seller_count": dump_concentration.get("seller_count"),
+            "dump_seller_hhi": dump_concentration.get("seller_hhi"),
+            "dump_top_seller_frac": dump_concentration.get("top_seller_frac"),
+            "buy_concentration": buy_concentration,
+            "h23_window": "bottom",
+        }
 
         # ── Atomic bounce_fired set: todos os filtros passaram, agora commita o sinal ────
         # Usar lock novamente para garantir que nenhuma outra thread setou bounce_fired
@@ -505,18 +526,12 @@ class HotMonitor:
                 "absorption_sell_cnt": absorption_window.get("sell_count"),
                 "absorption_lrg_buy":  absorption_window.get("largest_buy"),
                 "absorption_events":   absorption_window.get("total_events"),
-                "net_sol_flow": (
-                    (absorption_window.get("buy_vol_sol") or 0) -
-                    (absorption_window.get("sell_vol_sol") or 0)
-                ) if absorption_window.get("total_events") else None,
+                "net_sol_flow": net_sol_flow,
                 "h23_window":          "bottom",
                 # Janela RISE: [ts_min → ts_signal]
                 "rise_buy_vol":  rise_window.get("buy_vol_sol"),
                 "rise_sell_vol": rise_window.get("sell_vol_sol"),
-                "rise_net_flow": (
-                    (rise_window.get("buy_vol_sol")  or 0) -
-                    (rise_window.get("sell_vol_sol") or 0)
-                ) if rise_window.get("total_events") else None,
+                "rise_net_flow": rise_net_flow,
                 "rise_events":   rise_window.get("total_events"),
                 "rise_lrg_buy":  rise_window.get("largest_buy"),
                 # H25 — pool depth
@@ -593,6 +608,7 @@ class HotMonitor:
                     config_bounce_min_pct=self.BOUNCE_MIN_PCT,
                     config_bounce_max_pct=self.BOUNCE_MAX_PCT,
                     config_bounce_drop_min=self.BOUNCE_DROP_MIN,
+                    helius_context=helius_context,
                 )
             except Exception as e:
                 logger.error("executor.on_bounce %s: %s", symbol, e)

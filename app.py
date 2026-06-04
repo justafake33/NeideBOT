@@ -5,7 +5,7 @@ from datetime import datetime, timezone, timedelta
 
 import csv
 import io
-from flask import Flask, render_template_string, redirect, Response, request, stream_with_context
+from flask import Flask, render_template_string, redirect, Response, request, stream_with_context, jsonify
 
 import db
 from monitoring import init_sentry
@@ -6316,7 +6316,14 @@ def _start_services():
     logger.info("Todos os serviços iniciados")
 
 
-_start_services()
+# Runtime split:
+# - web process serves Flask endpoints only (default)
+# - worker process sets RUN_BOT_SERVICES=1 and runs scanners/Helius/eRPC
+# This prevents websocket/scanner stalls from freezing the analysis dashboard.
+if os.getenv("RUN_BOT_SERVICES", "0") == "1":
+    _start_services()
+else:
+    logger.info("RUN_BOT_SERVICES=0 — web-only mode, bot services not started")
 
 
 @app.route("/debug/open-trades")
@@ -42459,6 +42466,10 @@ def analise_signal_anatomy():
     Seção 2: anatomia dos 22 TPs reais (big wins vs small wins).
     """
     clean_only = request.args.get("clean", "0") == "1"
+    clean_strict = request.args.get("clean_strict", "1").lower() not in ("0", "false", "no", "off")
+    same_candle_policy = request.args.get("same_candle_policy", "conservative_sl_first")
+    if same_candle_policy not in ("conservative_sl_first", "optimistic_tp_first"):
+        same_candle_policy = "conservative_sl_first"
     min_n      = int(request.args.get("min_n", "5"))
 
     try:
@@ -42467,7 +42478,13 @@ def analise_signal_anatomy():
 
         with psycopg2.connect(db.DATABASE_URL, cursor_factory=_pge2.RealDictCursor) as conn:
             with conn.cursor() as cur:
-                date_filter = "AND bs.ts_signal >= '2026-05-26'" if clean_only else ""
+                clean_clauses = []
+                if clean_only:
+                    clean_clauses.append("bs.ts_signal >= '2026-05-26'")
+                    if clean_strict:
+                        clean_clauses.append("bs.h23_window = 'bottom'")
+                        clean_clauses.append("COALESCE(bs.data_quality, 'ok') != 'bad'")
+                clean_filter = "AND " + " AND ".join(clean_clauses) if clean_clauses else ""
                 cur.execute(f"""
                     SELECT
                         bs.mint,
@@ -42498,7 +42515,7 @@ def analise_signal_anatomy():
                        AND t.exit_type = 'helius_sell_recovery'
                     WHERE bs.mc_at_signal IS NOT NULL
                       AND bs.mc_at_signal > 0
-                    {date_filter}
+                    {clean_filter}
                     ORDER BY bs.ts_signal
                 """)
                 bounces = cur.fetchall()
@@ -42542,6 +42559,7 @@ def analise_signal_anatomy():
             b['tick_count'] = len(rel)
             if not rel or entry <= 0:
                 b['outcome'] = 'no_data'; b['max_mfe'] = None; b['max_mae'] = None
+                b['first_tp_ts'] = None; b['first_sl_ts'] = None; b['same_tick_conflict'] = False
                 continue
 
             max_hi = max((hi for _, hi, _ in rel if hi > 0), default=0)
@@ -42550,9 +42568,33 @@ def analise_signal_anatomy():
             b['max_mfe'] = round((max_hi / entry - 1) * 100, 1) if max_hi else None
             b['max_mae'] = round((min_lo / entry - 1) * 100, 1) if min_lo else None
 
-            if max_hi >= entry * WIN:
+            first_tp_ts = None
+            first_sl_ts = None
+            same_tick_conflict = False
+            for ts, hi, lo in rel:
+                tp_hit = hi > 0 and hi >= entry * WIN
+                sl_hit = lo > 0 and lo <= entry * SL
+                if tp_hit:
+                    first_tp_ts = ts
+                if sl_hit:
+                    first_sl_ts = ts
+                if tp_hit or sl_hit:
+                    same_tick_conflict = tp_hit and sl_hit
+                    break
+
+            b['first_tp_ts'] = first_tp_ts
+            b['first_sl_ts'] = first_sl_ts
+            b['same_tick_conflict'] = same_tick_conflict
+            if first_tp_ts and first_sl_ts:
+                if first_tp_ts == first_sl_ts:
+                    b['outcome'] = 'winner' if same_candle_policy == 'optimistic_tp_first' else 'loser'
+                elif first_tp_ts < first_sl_ts:
+                    b['outcome'] = 'winner'
+                else:
+                    b['outcome'] = 'loser'
+            elif first_tp_ts:
                 b['outcome'] = 'winner'
-            elif min_lo > 0 and min_lo <= entry * SL:
+            elif first_sl_ts:
                 b['outcome'] = 'loser'
             else:
                 b['outcome'] = 'chop'
@@ -42563,7 +42605,7 @@ def analise_signal_anatomy():
         # ------ Condições para testar ------
         conds = [
             ("bounce 50–100%",       lambda b: b['bounce_pct'] is not None and 0.50 <= b['bounce_pct'] < 1.00),
-            ("bounce 30–50%",        lambda b: b['bounce_pct'] is not None and b['bounce_pct'] < 0.50),
+            ("bounce 30–50%",        lambda b: b['bounce_pct'] is not None and 0.30 <= b['bounce_pct'] < 0.50),
             ("bounce >= 100%",       lambda b: b['bounce_pct'] is not None and b['bounce_pct'] >= 1.00),
             ("elapsed < 5min",       lambda b: b['elapsed_sec'] is not None and b['elapsed_sec'] < 300),
             ("elapsed 5–15min",      lambda b: b['elapsed_sec'] is not None and 300 <= b['elapsed_sec'] < 900),
@@ -42644,6 +42686,12 @@ def analise_signal_anatomy():
 
         base_wr = results[0][5]
         combo_html = "".join(row_html(*r, baseline_wr=base_wr) for r in results)
+        robust_min_n = max(30, min_n)
+        robust_results = [r for r in rest if r[1] >= robust_min_n]
+        robust_html = "".join(row_html(*r, baseline_wr=base_wr) for r in robust_results[:30])
+        if not robust_html:
+            robust_html = f"<tr><td colspan='9'>Nenhuma combinação com n≥{robust_min_n}.</td></tr>"
+        same_tick_conflicts = sum(1 for b in with_data if b.get('same_tick_conflict'))
 
         # ------ Seção 2: Anatomia dos TPs reais ------
         tp_all   = [b for b in bounces if b.get('trade_status') == 'tp' and b.get('trade_pnl') is not None]
@@ -42721,17 +42769,29 @@ a{{color:#7bf}}
   <strong style="color:#ddd">{n_all}</strong> bounce_signals |
   <strong>{n_wd}</strong> com ticks 60min |
   <span style="color:#555">{n_nd_disp} sem ticks</span> |
-  Outcome independente da nossa execução: winner=+75% antes de -25% em 60min a partir de mc_at_signal.
+  Outcome independente da nossa execução: primeiro toque em +75% ou -25% em 60min a partir de mc_at_signal.
   <a href="?clean=1">apenas pós-05-26 (dados limpos)</a> |
   <a href="?">todos</a>
 </p>
 <p style="color:#666;font-size:11px">
-  Winner: max_hi_60m ≥ entry × 1.75 | Loser: min_lo_60m ≤ entry × 0.75 | Chop: nem um nem outro.
+  Winner: primeiro tick que bate entry × 1.75 antes do SL | Loser: primeiro tick que bate entry × 0.75 antes do TP | Chop: nem um nem outro.
+  same_candle_policy={same_candle_policy} ({same_tick_conflicts} conflitos no mesmo tick) | clean_strict={int(clean_strict)} (h23_window=bottom e data_quality≠bad).
   Baseline WR={base_wr2:.0f}% (W={base_w} L={base_l} C={base_c}).
   Delta pp = diferença vs baseline.
 </p>
 
-<h2>1. Combinações de Features — WR por filtro</h2>
+<h2>1. Combinações robustas — n≥{robust_min_n}</h2>
+<p style="color:#888;font-size:11px">Esta é a tabela principal para evitar chasing de WR fictício com amostra pequena.</p>
+<table>
+<thead><tr>
+  <th style="text-align:left">Filtro / Combinação</th>
+  <th>n</th><th style="color:#4f4">W</th><th style="color:#f44">L</th><th>Chop</th>
+  <th>WR</th><th>Δ vs base</th><th>avg MFE</th><th>avg MAE</th>
+</tr></thead>
+<tbody>{robust_html}</tbody>
+</table>
+
+<h2>2. Todas as Combinações de Features — WR por filtro</h2>
 <table>
 <thead><tr>
   <th style="text-align:left">Filtro / Combinação</th>
@@ -42744,7 +42804,7 @@ a{{color:#7bf}}
   Ordenado por WR decrescente. Verde = WR≥35%. Amarelo = WR≥25%. min_n={min_n} (ajustar via ?min_n=3).
 </p>
 
-<h2>2. Anatomia dos TPs reais (helius_sell_recovery)</h2>
+<h2>3. Anatomia dos TPs reais (helius_sell_recovery)</h2>
 <p style="color:#888">
   TPs blockchain-confirmados: <strong>{len(tp_all)}</strong> total |
   <span style="color:#4f4">Big wins (&gt;80% PnL): {len(big_wins)}</span> |
@@ -44244,6 +44304,200 @@ th{{background:#eee}}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ── /analise/v2-shadow-live ───────────────────────────────────────────────────
+
+@app.route("/analise/v2-shadow-live")
+def analise_v2_shadow_live():  # noqa: C901
+    """V2.1 Shadow gate dashboard derived from micro_absorption_snapshots.
+
+    Minimal production-safe implementation: no executor calls, no trading side
+    effects, and no additional writes. The worker keeps collecting snapshots;
+    this endpoint materializes the active shadow gate from those snapshots.
+    """
+    def _pct(v):
+        return "—" if v is None else f"{v*100:.1f}%"
+
+    def _money(v):
+        return "—" if v is None else f"${v:,.0f}"
+
+    def _fmt_dt(v):
+        if v is None:
+            return "—"
+        try:
+            return v.strftime("%m-%d %H:%M:%S")
+        except Exception:
+            return str(v)
+
+    try:
+        days = int(request.args.get("days", 3))
+        fmt = request.args.get("format", "html")
+        limit = int(request.args.get("limit", 200))
+        tp_pct = float(request.args.get("tp_pct", 0.75))
+        sl_pct = float(request.args.get("sl_pct", 0.25))
+        sc_pol = request.args.get("same_candle_policy", "conservative_sl_first")
+
+        decision_age = int(request.args.get(
+            "decision_age",
+            os.getenv("V2_SHADOW_DECISION_AGE_SEC")
+            or os.getenv("V2_DECISION_AGE_SEC", "10"),
+        ))
+        net_window = request.args.get("net_window", os.getenv("V2_NET_WINDOW", "live_5s"))
+        net_min = float(request.args.get("net_min", os.getenv("V2_NET_MIN", "-2")))
+        min_pool = float(request.args.get("min_pool", os.getenv("V2_MIN_POOL_SOL", "10")))
+        min_events = int(request.args.get("min_events", os.getenv("V2_MIN_EVENTS", "5")))
+        min_bounce_pct = float(request.args.get(
+            "min_bounce_pct", os.getenv("V2_MIN_BOUNCE_PCT", "0.30")))
+        max_bounce_pct = float(request.args.get(
+            "max_bounce_pct", os.getenv("V2_MAX_BOUNCE_PCT", "0.50")))
+        scope = request.args.get("candidate_scope", os.getenv("V2_CANDIDATE_SCOPE", "mint_first"))
+        if scope not in ("mint_first", "bottom_events"):
+            scope = "mint_first"
+
+        events_dict, ticks_dict, bounce_dict = _v2_load_data(days)
+        cands = _v2_build_candidates(
+            events_dict, ticks_dict, bounce_dict,
+            decision_age=decision_age,
+            net_window=net_window,
+            net_min=net_min,
+            min_pool=min_pool,
+            min_events=min_events,
+            min_bounce_pct=min_bounce_pct,
+            max_bounce_pct=max_bounce_pct,
+            tp_pct=tp_pct,
+            sl_pct=sl_pct,
+            sc_pol=sc_pol,
+            candidate_scope=scope,
+            v1_match_mode="first_after_v2",
+        )
+        stats = _v2_stats(cands, tp_pct, sl_pct)
+        recent = sorted(cands, key=lambda c: c.get("ts_snap") or c.get("ts_min"), reverse=True)[:limit]
+
+        gate = {
+            "version": "v2.1_early_bounce_2026_06_03",
+            "source": "derived_from_micro_absorption_snapshots",
+            "shadow_enabled": os.getenv("V2_SHADOW_ENABLED", "true").lower() == "true",
+            "trading_enabled": os.getenv("TRADING_ENABLED", "false").lower() == "true",
+            "decision_age": decision_age,
+            "net_window": net_window,
+            "net_min": net_min,
+            "min_pool": min_pool,
+            "min_events": min_events,
+            "min_bounce_pct": min_bounce_pct,
+            "max_bounce_pct": max_bounce_pct,
+            "candidate_scope": scope,
+            "tp_pct": tp_pct,
+            "sl_pct": sl_pct,
+            "same_candle_policy": sc_pol,
+            "days": days,
+        }
+
+        if fmt == "json":
+            def _clean_candidate(c: dict) -> dict:
+                out = dict(c)
+                for k in ("ts_min", "ts_snap"):
+                    v = out.get(k)
+                    if hasattr(v, "isoformat"):
+                        out[k] = v.isoformat()
+                out.pop("v1_match", None)
+                return out
+            return jsonify({
+                "gate": gate,
+                "stats": stats,
+                "recent": [_clean_candidate(c) for c in recent],
+            })
+
+        def _card(label: str, value: str, color: str = "#111") -> str:
+            return (
+                "<div class='card'>"
+                f"<b style='color:{color}'>{value}</b>"
+                f"<small>{label}</small>"
+                "</div>"
+            )
+
+        rows = []
+        for c in recent:
+            outcome = c.get("outcome") or "—"
+            oc_col = "#080" if outcome == "tp" else "#b00" if outcome == "sl" else "#777"
+            match = c.get("match_status") or "no_v1"
+            rows.append(
+                "<tr>"
+                f"<td>{_fmt_dt(c.get('ts_snap'))}</td>"
+                f"<td>{_fmt_dt(c.get('ts_min'))}</td>"
+                f"<td>{c.get('symbol') or '?'}</td>"
+                f"<td><code>{str(c.get('mint') or '')[:8]}</code></td>"
+                f"<td>{c.get('bottom_age_actual') or 0:.1f}s</td>"
+                f"<td>{_money(c.get('mc_current'))}</td>"
+                f"<td>{_pct(c.get('bounce_pct_now'))}</td>"
+                f"<td>{_pct(c.get('drop_from_mig'))}</td>"
+                f"<td>{c.get('pool_quote') or 0:.1f}</td>"
+                f"<td>{c.get('net_val') if c.get('net_val') is not None else '—'}</td>"
+                f"<td>{c.get('events_val') or 0}</td>"
+                f"<td style='color:{oc_col};font-weight:bold'>{outcome}</td>"
+                f"<td>{_pct(c.get('max_gain'))}</td>"
+                f"<td>{_pct(c.get('max_dd'))}</td>"
+                f"<td>{match}</td>"
+                f"<td>{_pct(c.get('v1_entry_improvement'))}</td>"
+                "</tr>"
+            )
+
+        qs = (
+            f"days={days}&decision_age={decision_age}&net_window={net_window}"
+            f"&net_min={net_min}&min_pool={min_pool}&min_events={min_events}"
+            f"&min_bounce_pct={min_bounce_pct}&max_bounce_pct={max_bounce_pct}"
+            f"&candidate_scope={scope}&tp_pct={tp_pct}&sl_pct={sl_pct}"
+        )
+        warn = "" if not gate["trading_enabled"] else (
+            "<div class='warn'>⚠️ TRADING_ENABLED=true detectado. Este endpoint não compra, "
+            "mas o executor global está habilitado.</div>"
+        )
+
+        html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>V2 Shadow Live</title>
+<meta http-equiv="refresh" content="120">
+<style>
+body{{font-family:monospace;font-size:12px;padding:14px;background:#fafafa;color:#111}}
+a{{color:#06c}} table{{border-collapse:collapse;margin-top:10px;background:white}}
+td,th{{padding:3px 6px;border:1px solid #ccc;font-size:11px}} th{{background:#eee}}
+.card{{display:inline-block;margin:3px;padding:7px 10px;background:white;border:1px solid #ddd;border-radius:5px;min-width:110px;text-align:center}}
+.card b{{display:block;font-size:16px}} .card small{{display:block;color:#777;font-size:10px}}
+.warn{{background:#fff3cd;border:1px solid #f2d27b;padding:8px;margin:8px 0}}
+.note{{color:#666}}
+</style></head><body>
+<h2>🧠 V2 Shadow Live — {gate['version']}</h2>
+<p class="note">
+  Fonte: micro_absorption_snapshots → materialização do gate ativo. Research/dry-run only; não chama executor e não faz swap.<br>
+  gate: scope={scope} decision_age={decision_age}s {net_window}≥{net_min} min_pool={min_pool}SOL min_events={min_events} bounce=[{min_bounce_pct:.0%},{max_bounce_pct:.0%}] | últimos {days}d
+</p>
+{warn}
+<p>
+  <a href="?{qs}&format=json">JSON</a> |
+  <a href="/analise/v2-vs-v1-entry?{qs}">v2-vs-v1-entry</a> |
+  <a href="/analise/v2-decision-tape?{qs}">Decision Tape</a> |
+  <a href="/analise/v2-brain-report?days={days}">Brain Report</a>
+</p>
+<div>
+  {_card('candidatos', str(stats['n']))}
+  {_card('WR_ex_chop', _pct(stats['wr_ex_chop']), '#080' if (stats['wr_ex_chop'] or 0) >= 0.30 else '#b00')}
+  {_card('TP', str(stats['tp']))}
+  {_card('SL', str(stats['sl']))}
+  {_card('no_exit', str(stats['no_exit']))}
+  {_card('EV_all', _pct(stats['expectancy_all']), '#080' if (stats['expectancy_all'] or 0) > 0 else '#b00')}
+  {_card('median_dd', _pct(stats['median_max_dd']))}
+  {_card('V1 matches', str(stats['n_v1']))}
+  {_card('V1 entry impr', _pct(stats['avg_entry_improvement']))}
+</div>
+<h3>Últimos {len(recent)} sinais derivados</h3>
+<table>
+<tr><th>ts_signal</th><th>ts_min</th><th>symbol</th><th>mint</th><th>age</th><th>entry_mc</th><th>bounce</th><th>drop</th><th>pool</th><th>{net_window}</th><th>events</th><th>outcome</th><th>max_gain</th><th>max_dd</th><th>V1</th><th>V1 impr</th></tr>
+{''.join(rows)}
+</table>
+</body></html>"""
+        return render_template_string(html)
+    except Exception as e:
+        import traceback
+        return f"<pre>Erro: {e}\n\n{traceback.format_exc()}</pre>", 500
+
 # /analise/v2-brain-report — Grid cartesiano + Recomendação Bigplayer
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -44263,10 +44517,13 @@ def analise_v2_brain_report():  # noqa: C901
       top=50             top N combos por tabela
       include_details=0  se 1, inclui lista de candidatos
       candidate_scope=all|mint_first|bottom_events
+      mode=fast|full     fast evita travar o web; full varre o grid completo
+      max_runtime_sec=20 orçamento de tempo para retornar parcial em vez de congelar
     """
-    import itertools, statistics as _stats_mod
+    import itertools, statistics as _stats_mod, time as _time_mod
 
     try:
+        started_at = _time_mod.monotonic()
         days            = int(request.args.get("days", 14))
         fmt             = request.args.get("format", "html")
         min_n           = int(request.args.get("min_n", 10))
@@ -44276,28 +44533,47 @@ def analise_v2_brain_report():  # noqa: C901
         top_n           = int(request.args.get("top", 50))
         include_details = request.args.get("include_details", "0") == "1"
         scope_override  = request.args.get("candidate_scope", "all")
+        mode            = request.args.get("mode", "fast")
+        max_runtime_sec = float(request.args.get("max_runtime_sec", 20))
 
         # ── Grid de parâmetros ────────────────────────────────────────────────
-        DECISION_AGES = [3, 5, 10, 15, 30]
-        NET_MINS      = [-5.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0]
-        MIN_POOLS     = [10.0, 20.0, 40.0, 80.0]
-        MIN_EVENTS    = [1, 3, 5, 8]
-        # (min_bounce, max_bounce) — None = sem limite
-        BOUNCE_RANGES = [
-            (None, None),
-            (0.10, None),
-            (0.20, None),
-            (0.30, None),
-            (0.30, 1.00),
-            (0.10, 0.50),
-        ]
+        # Fast is the default because the full Cartesian grid can exceed one
+        # Gunicorn request window while recomputing outcomes thousands of times.
+        # Use mode=full explicitly when running offline/worker-side diagnostics.
+        if mode == "full":
+            DECISION_AGES = [3, 5, 10, 15, 30]
+            NET_MINS      = [-5.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0]
+            MIN_POOLS     = [10.0, 20.0, 40.0, 80.0]
+            MIN_EVENTS    = [1, 3, 5, 8]
+            BOUNCE_RANGES = [
+                (None, None),
+                (None, 0.15),
+                (0.15, 0.30),
+                (None, 0.30),
+                (0.30, 0.50),
+                (0.50, 1.00),
+            ]
+        else:
+            mode = "fast"
+            DECISION_AGES = [10, 15]
+            NET_MINS      = [-5.0, -2.0, 0.0]
+            MIN_POOLS     = [10.0, 20.0]
+            MIN_EVENTS    = [3, 5]
+            BOUNCE_RANGES = [
+                (None, None),
+                (None, 0.15),
+                (0.15, 0.30),
+                (None, 0.30),
+                (0.30, 0.50),
+            ]
+
         BOUNCE_RANGE_LABELS = {
             (None, None):     "qualquer",
-            (0.10, None):     "≥10%",
-            (0.20, None):     "≥20%",
-            (0.30, None):     "≥30%",
-            (0.30, 1.00):     "30-100%",
-            (0.10, 0.50):     "10-50%",
+            (None, 0.15):     "<15%",
+            (0.15, 0.30):     "15-30%",
+            (None, 0.30):     "0-30%",
+            (0.30, 0.50):     "30-50%",
+            (0.50, 1.00):     "50-100%",
         }
         # Windows disponíveis — restringir ao que existe nos dados
         ALL_NET_WINDOWS = ["live_5s", "live_10s", "live_30s", "live_60s",
@@ -44330,6 +44606,10 @@ def analise_v2_brain_report():  # noqa: C901
 
         if not available_windows:
             available_windows = ["live_10s"]  # fallback
+        if mode == "fast":
+            preferred_windows = ["live_10s", "live_5s"]
+            fast_windows = [nw for nw in preferred_windows if nw in available_windows]
+            available_windows = fast_windows or available_windows[:2]
 
         # ── Helpers ───────────────────────────────────────────────────────────
         def _score_ev_risk(st: dict) -> float | None:
@@ -44360,10 +44640,16 @@ def analise_v2_brain_report():  # noqa: C901
 
         # ── Grid loop ─────────────────────────────────────────────────────────
         all_combos: list = []
+        total_combos_tested = 0
+        partial = False
 
         for scope, da, nw, net_min, mp, mev, (bmin, bmax) in itertools.product(
                 SCOPES, DECISION_AGES, available_windows,
                 NET_MINS, MIN_POOLS, MIN_EVENTS, BOUNCE_RANGES):
+            if (_time_mod.monotonic() - started_at) > max_runtime_sec:
+                partial = True
+                break
+            total_combos_tested += 1
 
             cands = _v2_build_candidates(
                 events_dict, ticks_dict, bounce_dict,
@@ -44559,6 +44845,10 @@ def analise_v2_brain_report():  # noqa: C901
                     "days": days, "min_n": min_n, "tp_pct": tp_pct,
                     "sl_pct": sl_pct, "sc_pol": sc_pol,
                     "available_windows": available_windows,
+                    "mode": mode,
+                    "partial": partial,
+                    "total_combos_tested": total_combos_tested,
+                    "elapsed_sec": round(_time_mod.monotonic() - started_at, 3),
                 },
             })
 
@@ -44684,8 +44974,10 @@ def analise_v2_brain_report():  # noqa: C901
 <body>
 <h1>V2 Brain Report</h1>
 <p class="meta">Gerado: {now_str} | janela: {days}d | min_n: {min_n} |
-TP: {tp_pct:.0%} SL: {sl_pct:.0%} | combos válidos: {len(all_combos)} |
+TP: {tp_pct:.0%} SL: {sl_pct:.0%} | mode: {mode} | partial: {partial} |
+combos testados: {total_combos_tested} | combos válidos: {len(all_combos)} |
 windows: {', '.join(available_windows)}</p>
+<p class="meta">Padrão é <code>mode=fast</code> para não travar o web. Use <code>?mode=full&format=json</code> somente se precisar da varredura completa.</p>
 
 <h2>1. Executive Summary</h2>
 <div class="rec">{rec_label}</div>
