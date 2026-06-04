@@ -25,6 +25,104 @@ def _cursor():
         conn.close()
 
 
+# Runtime schema healthcheck: read-only, no DDL. Used by /debug/schema to catch
+# Railway deploys where the migration one-off was not executed before web/worker.
+REQUIRED_RUNTIME_SCHEMA = {
+    "trades": {
+        "id", "mint", "symbol", "status", "order_id",
+        "helius_gate_passed", "helius_gate_reason",
+        "helius_pool_quote_at_signal", "helius_absorption_events",
+        "helius_net_sol_flow", "helius_rise_events", "helius_rise_net_flow",
+        "helius_dump_seller_hhi", "helius_buy_concentration", "helius_h23_window",
+        "data_quality",
+    },
+    "bounce_signals": {
+        "id", "mint", "ts_signal", "mc_at_signal", "bounce_pct",
+        "pool_quote_at_signal", "absorption_events", "net_sol_flow",
+        "rise_events", "rise_net_flow", "dump_seller_hhi",
+        "dump_top_seller_frac", "buy_concentration", "h23_window",
+        "data_quality",
+    },
+    "micro_absorption_snapshots": {
+        "id", "mint", "ts_snapshot", "bottom_age_sec", "mc_current",
+        "pool_quote", "live_5s_net", "live_5s_events",
+        "live_10s_net", "live_10s_events",
+        "live_30s_net", "live_30s_events",
+        "live_60s_net", "live_60s_events",
+        "pre_5s_buy_concentration", "pre_10s_buy_concentration",
+        "rise_5s_buy_concentration", "rise_10s_buy_concentration",
+        "live_5s_buy_concentration", "live_10s_buy_concentration",
+        "candidate_flags",
+    },
+    "token_ticks": {
+        "mint", "tick_ts", "mc", "mc_open", "mc_high", "mc_low", "source",
+    },
+}
+
+
+def check_runtime_schema() -> dict:
+    """Read-only schema check for runtime-critical analytics/trade columns.
+
+    This intentionally does not run DDL. Missing columns mean the Railway one-off
+    migration should be run with RUN_DB_MIGRATIONS=1 python migrate.py.
+    """
+    result = {
+        "ok": False,
+        "database_url_configured": bool(DATABASE_URL),
+        "tables": {},
+        "missing_tables": [],
+        "missing_columns": {},
+        "required_schema_version": "helius_trade_gate_v1",
+    }
+    if not DATABASE_URL:
+        result["error"] = "DATABASE_URL not configured"
+        return result
+
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.autocommit = True
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SET lock_timeout = '1500ms'")
+            cur.execute("SET statement_timeout = '5000ms'")
+            cur.execute("""
+                SELECT table_name, column_name
+                  FROM information_schema.columns
+                 WHERE table_schema = 'public'
+                   AND table_name = ANY(%s)
+            """, (list(REQUIRED_RUNTIME_SCHEMA.keys()),))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    found = {}
+    for r in rows:
+        found.setdefault(r["table_name"], set()).add(r["column_name"])
+
+    for table, required_cols in REQUIRED_RUNTIME_SCHEMA.items():
+        cols = found.get(table, set())
+        if not cols:
+            result["missing_tables"].append(table)
+            result["tables"][table] = {
+                "exists": False,
+                "missing_columns": sorted(required_cols),
+            }
+            result["missing_columns"][table] = sorted(required_cols)
+            continue
+        missing = sorted(required_cols - cols)
+        result["tables"][table] = {
+            "exists": True,
+            "required_columns": sorted(required_cols),
+            "missing_columns": missing,
+            "present_required_count": len(required_cols) - len(missing),
+            "required_count": len(required_cols),
+        }
+        if missing:
+            result["missing_columns"][table] = missing
+
+    result["ok"] = not result["missing_tables"] and not result["missing_columns"]
+    return result
+
+
 def init_db():
     # Advisory lock: evita execução concorrente de DDL (ALTER TABLE / CREATE INDEX)
     # que causaria deadlock com queries analíticas segurando AccessShareLock.
@@ -351,6 +449,17 @@ def _do_init_db():
                 config_trailing_drawdown_pct   FLOAT,
                 config_slippage_bps           INT,
                 git_sha                       TEXT,
+                -- Audit: gate Helius de compra real
+                helius_gate_passed            BOOLEAN,
+                helius_gate_reason            TEXT,
+                helius_pool_quote_at_signal   FLOAT,
+                helius_absorption_events      INT,
+                helius_net_sol_flow           FLOAT,
+                helius_rise_events            INT,
+                helius_rise_net_flow          FLOAT,
+                helius_dump_seller_hhi        FLOAT,
+                helius_buy_concentration      FLOAT,
+                helius_h23_window             TEXT,
                 -- Estado
                 status              TEXT         DEFAULT 'pending',
                 error_msg           TEXT,
@@ -375,6 +484,16 @@ def _do_init_db():
             "ADD COLUMN IF NOT EXISTS config_trailing_drawdown_pct   FLOAT",
             "ADD COLUMN IF NOT EXISTS config_slippage_bps            INT",
             "ADD COLUMN IF NOT EXISTS git_sha                        TEXT",
+            "ADD COLUMN IF NOT EXISTS helius_gate_passed             BOOLEAN",
+            "ADD COLUMN IF NOT EXISTS helius_gate_reason             TEXT",
+            "ADD COLUMN IF NOT EXISTS helius_pool_quote_at_signal    FLOAT",
+            "ADD COLUMN IF NOT EXISTS helius_absorption_events       INT",
+            "ADD COLUMN IF NOT EXISTS helius_net_sol_flow            FLOAT",
+            "ADD COLUMN IF NOT EXISTS helius_rise_events             INT",
+            "ADD COLUMN IF NOT EXISTS helius_rise_net_flow           FLOAT",
+            "ADD COLUMN IF NOT EXISTS helius_dump_seller_hhi         FLOAT",
+            "ADD COLUMN IF NOT EXISTS helius_buy_concentration       FLOAT",
+            "ADD COLUMN IF NOT EXISTS helius_h23_window              TEXT",
             # Tiering de qualidade de dados
             "ADD COLUMN IF NOT EXISTS data_quality                   TEXT",
         ]:
@@ -1688,7 +1807,10 @@ def insert_trade(data: dict) -> int:
                  config_bounce_min_pct, config_bounce_max_pct, config_bounce_drop_min,
                  config_trade_sl_pct, config_trailing_activation_pct,
                  config_trailing_drawdown_pct, config_slippage_bps, git_sha,
-                 data_quality)
+                 helius_gate_passed, helius_gate_reason, helius_pool_quote_at_signal,
+                 helius_absorption_events, helius_net_sol_flow, helius_rise_events,
+                 helius_rise_net_flow, helius_dump_seller_hhi, helius_buy_concentration,
+                 helius_h23_window, data_quality)
             VALUES
                 (%(mint)s, %(symbol)s, %(ts_signal)s, %(mc_bottom)s, %(mc_migration)s,
                  %(entry_expected)s, %(amount_sol)s, %(amount_usd)s,
@@ -1699,9 +1821,27 @@ def insert_trade(data: dict) -> int:
                  %(config_bounce_drop_min)s, %(config_trade_sl_pct)s,
                  %(config_trailing_activation_pct)s, %(config_trailing_drawdown_pct)s,
                  %(config_slippage_bps)s, %(git_sha)s,
+                 %(helius_gate_passed)s, %(helius_gate_reason)s,
+                 %(helius_pool_quote_at_signal)s, %(helius_absorption_events)s,
+                 %(helius_net_sol_flow)s, %(helius_rise_events)s,
+                 %(helius_rise_net_flow)s, %(helius_dump_seller_hhi)s,
+                 %(helius_buy_concentration)s, %(helius_h23_window)s,
                  %(data_quality)s)
             RETURNING id
-        """, {**data, "data_quality": dq})
+        """, {
+            **data,
+            "helius_gate_passed": data.get("helius_gate_passed"),
+            "helius_gate_reason": data.get("helius_gate_reason"),
+            "helius_pool_quote_at_signal": data.get("helius_pool_quote_at_signal"),
+            "helius_absorption_events": data.get("helius_absorption_events"),
+            "helius_net_sol_flow": data.get("helius_net_sol_flow"),
+            "helius_rise_events": data.get("helius_rise_events"),
+            "helius_rise_net_flow": data.get("helius_rise_net_flow"),
+            "helius_dump_seller_hhi": data.get("helius_dump_seller_hhi"),
+            "helius_buy_concentration": data.get("helius_buy_concentration"),
+            "helius_h23_window": data.get("helius_h23_window"),
+            "data_quality": dq,
+        })
         return cur.fetchone()["id"]
 
 
@@ -1724,10 +1864,15 @@ def get_trade_by_id(trade_id: int) -> Optional[dict]:
 
 
 def count_trades(exclude_errors: bool = True) -> int:
-    """Conta trades (exclui erros por padrão para o limite de calibração)."""
+    """Conta trades para calibração. Bloqueios pré-swap não consomem limite."""
     with _cursor() as cur:
         if exclude_errors:
-            cur.execute("SELECT COUNT(*) AS n FROM trades WHERE status != 'error'")
+            cur.execute("""
+                SELECT COUNT(*) AS n
+                  FROM trades
+                 WHERE status != 'error'
+                   AND (order_id IS NOT NULL OR status IN ('open','tp','sl','trailing_active','expired'))
+            """)
         else:
             cur.execute("SELECT COUNT(*) AS n FROM trades")
         return cur.fetchone()["n"]
