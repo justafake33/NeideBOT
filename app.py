@@ -45044,6 +45044,60 @@ windows: {', '.join(available_windows)}</p>
         return f"<pre>Erro: {e}\n\n{traceback.format_exc()}</pre>", 500
 
 
+
+@app.route("/debug/schema")
+def debug_schema():
+    """Read-only runtime schema healthcheck. Does not run migrations/DDL."""
+    try:
+        schema = db.check_runtime_schema()
+    except Exception as e:
+        schema = {"ok": False, "error": str(e)}
+
+    status = 200 if schema.get("ok") else 503
+    if request.args.get("format") == "json":
+        return jsonify(schema), status
+
+    CSS = ("<style>body{background:#0d1117;color:#e6edf3;font:13px/1.5 monospace;padding:20px}"
+           "h2{color:#58a6ff}.ok{color:#3fb950}.bad{color:#f85149}.warn{color:#d29922}"
+           "table{border-collapse:collapse;width:100%;margin-top:12px}"
+           "td,th{padding:6px 8px;border-bottom:1px solid #30363d;text-align:left;vertical-align:top}"
+           "th{color:#8b949e;background:#161b22}code{white-space:pre-wrap}"
+           "a{color:#58a6ff}</style>")
+    ok = bool(schema.get("ok"))
+    h = f"<html><head><meta charset='utf-8'>{CSS}</head><body>"
+    h += "<h2>Runtime Schema Healthcheck</h2>"
+    status_label = "OK" if ok else "MISSING / ERROR"
+    status_class = "ok" if ok else "bad"
+    h += f"<p>Status: <b class='{status_class}'>{status_label}</b> "
+    h += "&nbsp;|&nbsp; <a href='?format=json'>JSON</a> &nbsp;|&nbsp; "
+    h += "<a href='javascript:location.reload()'>Refresh</a></p>"
+    h += "<p class='warn'>Read-only: este endpoint não roda ALTER TABLE. "
+    h += "Se falhar, rode a one-off migration: "
+    h += "<code>RUN_DB_MIGRATIONS=1 python migrate.py</code>.</p>"
+    if schema.get("error"):
+        h += f"<p class='bad'>Erro: <code>{str(schema.get('error')).replace('<','&lt;')}</code></p>"
+    h += "<table><tr><th>Tabela</th><th>Status</th><th>Colunas faltando</th><th>Coverage</th></tr>"
+    for table, info in (schema.get("tables") or {}).items():
+        exists = info.get("exists")
+        missing = info.get("missing_columns") or []
+        row_ok = exists and not missing
+        if exists:
+            present_count = info.get("present_required_count", 0)
+            required_count = info.get("required_count", len(missing))
+            coverage = f"{present_count}/{required_count}"
+        else:
+            coverage = "0/?"
+        h += "<tr>"
+        h += f"<td><b>{table}</b></td>"
+        row_class = "ok" if row_ok else "bad"
+        row_status = "OK" if row_ok else ("missing table" if not exists else "missing cols")
+        h += f"<td class='{row_class}'>{row_status}</td>"
+        h += f"<td><code>{', '.join(missing) if missing else '—'}</code></td>"
+        h += f"<td>{coverage}</td>"
+        h += "</tr>"
+    h += "</table></body></html>"
+    return h, status
+
 # ==============================================================================
 # /debug/db-locks — visibilidade de atividade e locks do PostgreSQL
 # ==============================================================================
