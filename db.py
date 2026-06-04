@@ -25,126 +25,6 @@ def _cursor():
         conn.close()
 
 
-# Runtime schema healthcheck: read-only, no DDL. Used by /debug/schema to catch
-# Railway deploys where the migration one-off was not executed before web/worker.
-REQUIRED_RUNTIME_SCHEMA = {
-    "trades": {
-        "id", "mint", "symbol", "status", "order_id",
-        "helius_gate_passed", "helius_gate_reason",
-        "helius_pool_quote_at_signal", "helius_absorption_events",
-        "helius_net_sol_flow", "helius_rise_events", "helius_rise_net_flow",
-        "helius_dump_seller_hhi", "helius_buy_concentration", "helius_h23_window",
-        "data_quality",
-    },
-    "bounce_signals": {
-        "id",
-        "mint",
-        "ts_signal",
-        "mc_at_signal",
-        "bounce_pct",
-        "pool_quote_at_signal",
-        "absorption_events",
-        "net_sol_flow",
-        "rise_events",
-        "rise_net_flow",
-        "dump_seller_hhi",
-        "dump_top_seller_frac",
-        "buy_concentration",
-        "h23_window",
-        "data_quality",
-    },
-    "micro_absorption_snapshots": {
-        "id",
-        "mint",
-        "ts_snapshot",
-        "bottom_age_sec",
-        "mc_current",
-        "pool_quote",
-        "live_5s_net",
-        "live_5s_events",
-        "live_10s_net",
-        "live_10s_events",
-        "live_30s_net",
-        "live_30s_events",
-        "live_60s_net",
-        "live_60s_events",
-        "pre_5s_buy_concentration",
-        "pre_10s_buy_concentration",
-        "rise_5s_buy_concentration",
-        "rise_10s_buy_concentration",
-        "live_5s_buy_concentration",
-        "live_10s_buy_concentration",
-        "candidate_flags",
-    },
-    "token_ticks": {
-        "mint", "tick_ts", "mc", "mc_open", "mc_high", "mc_low", "source",
-    },
-}
-
-
-def check_runtime_schema() -> dict:
-    """Read-only schema check for runtime-critical analytics/trade columns.
-
-    This intentionally does not run DDL. Missing columns mean the Railway one-off
-    migration should be run with RUN_DB_MIGRATIONS=1 python migrate.py.
-    """
-    result = {
-        "ok": False,
-        "database_url_configured": bool(DATABASE_URL),
-        "tables": {},
-        "missing_tables": [],
-        "missing_columns": {},
-        "required_schema_version": "helius_trade_gate_v1",
-    }
-    if not DATABASE_URL:
-        result["error"] = "DATABASE_URL not configured"
-        return result
-
-    conn = psycopg2.connect(DATABASE_URL)
-    conn.autocommit = True
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SET lock_timeout = '1500ms'")
-            cur.execute("SET statement_timeout = '5000ms'")
-            cur.execute("""
-                SELECT table_name, column_name
-                  FROM information_schema.columns
-                 WHERE table_schema = 'public'
-                   AND table_name = ANY(%s)
-            """, (list(REQUIRED_RUNTIME_SCHEMA.keys()),))
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-
-    found = {}
-    for r in rows:
-        found.setdefault(r["table_name"], set()).add(r["column_name"])
-
-    for table, required_cols in REQUIRED_RUNTIME_SCHEMA.items():
-        cols = found.get(table, set())
-        if not cols:
-            result["missing_tables"].append(table)
-            result["tables"][table] = {
-                "exists": False,
-                "missing_columns": sorted(required_cols),
-            }
-            result["missing_columns"][table] = sorted(required_cols)
-            continue
-        missing = sorted(required_cols - cols)
-        result["tables"][table] = {
-            "exists": True,
-            "required_columns": sorted(required_cols),
-            "missing_columns": missing,
-            "present_required_count": len(required_cols) - len(missing),
-            "required_count": len(required_cols),
-        }
-        if missing:
-            result["missing_columns"][table] = missing
-
-    result["ok"] = not result["missing_tables"] and not result["missing_columns"]
-    return result
-
-
 def init_db():
     # Advisory lock: evita execução concorrente de DDL (ALTER TABLE / CREATE INDEX)
     # que causaria deadlock com queries analíticas segurando AccessShareLock.
@@ -1815,6 +1695,127 @@ def _trade_data_quality(ts_signal, mint: str) -> str:
     except Exception:
         pass
     return "ok"
+
+
+
+# Runtime schema healthcheck: read-only, no DDL. Used by /debug/schema to catch
+# Railway deploys where the migration one-off was not executed before web/worker.
+REQUIRED_RUNTIME_SCHEMA = {
+    "trades": {
+        "id", "mint", "symbol", "status", "order_id",
+        "helius_gate_passed", "helius_gate_reason",
+        "helius_pool_quote_at_signal", "helius_absorption_events",
+        "helius_net_sol_flow", "helius_rise_events", "helius_rise_net_flow",
+        "helius_dump_seller_hhi", "helius_buy_concentration", "helius_h23_window",
+        "data_quality",
+    },
+    "bounce_signals": {
+        "id",
+        "mint",
+        "ts_signal",
+        "mc_at_signal",
+        "bounce_pct",
+        "pool_quote_at_signal",
+        "absorption_events",
+        "net_sol_flow",
+        "rise_events",
+        "rise_net_flow",
+        "dump_seller_hhi",
+        "dump_top_seller_frac",
+        "buy_concentration",
+        "h23_window",
+        "data_quality",
+    },
+    "micro_absorption_snapshots": {
+        "id",
+        "mint",
+        "ts_snapshot",
+        "bottom_age_sec",
+        "mc_current",
+        "pool_quote",
+        "live_5s_net",
+        "live_5s_events",
+        "live_10s_net",
+        "live_10s_events",
+        "live_30s_net",
+        "live_30s_events",
+        "live_60s_net",
+        "live_60s_events",
+        "pre_5s_buy_concentration",
+        "pre_10s_buy_concentration",
+        "rise_5s_buy_concentration",
+        "rise_10s_buy_concentration",
+        "live_5s_buy_concentration",
+        "live_10s_buy_concentration",
+        "candidate_flags",
+    },
+    "token_ticks": {
+        "mint", "tick_ts", "mc", "mc_open", "mc_high", "mc_low", "source",
+    },
+}
+
+
+def check_runtime_schema() -> dict:
+    """Read-only schema check for runtime-critical analytics/trade columns.
+
+    This intentionally does not run DDL. Missing columns mean the Railway one-off
+    migration should be run with RUN_DB_MIGRATIONS=1 python migrate.py.
+    """
+    result = {
+        "ok": False,
+        "database_url_configured": bool(DATABASE_URL),
+        "tables": {},
+        "missing_tables": [],
+        "missing_columns": {},
+        "required_schema_version": "helius_trade_gate_v1",
+    }
+    if not DATABASE_URL:
+        result["error"] = "DATABASE_URL not configured"
+        return result
+
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.autocommit = True
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SET lock_timeout = '1500ms'")
+            cur.execute("SET statement_timeout = '5000ms'")
+            cur.execute("""
+                SELECT table_name, column_name
+                  FROM information_schema.columns
+                 WHERE table_schema = 'public'
+                   AND table_name = ANY(%s)
+            """, (list(REQUIRED_RUNTIME_SCHEMA.keys()),))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    found = {}
+    for r in rows:
+        found.setdefault(r["table_name"], set()).add(r["column_name"])
+
+    for table, required_cols in REQUIRED_RUNTIME_SCHEMA.items():
+        cols = found.get(table, set())
+        if not cols:
+            result["missing_tables"].append(table)
+            result["tables"][table] = {
+                "exists": False,
+                "missing_columns": sorted(required_cols),
+            }
+            result["missing_columns"][table] = sorted(required_cols)
+            continue
+        missing = sorted(required_cols - cols)
+        result["tables"][table] = {
+            "exists": True,
+            "required_columns": sorted(required_cols),
+            "missing_columns": missing,
+            "present_required_count": len(required_cols) - len(missing),
+            "required_count": len(required_cols),
+        }
+        if missing:
+            result["missing_columns"][table] = missing
+
+    result["ok"] = not result["missing_tables"] and not result["missing_columns"]
+    return result
 
 
 def insert_trade(data: dict) -> int:
