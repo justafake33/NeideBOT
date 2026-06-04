@@ -157,6 +157,7 @@ Parâmetros recomendados:
 - `web`: Flask/Gunicorn, `RUN_BOT_SERVICES=0`, serve endpoints e dashboards.
 - `worker`: `python worker.py`, `RUN_BOT_SERVICES=1`, coleta eRPC/Helius + scanner + HotMonitor + executor.
 - `RUN_DB_MIGRATIONS=0` nos dois; migrations apenas via one-off/pre-deploy temporário. Confirmar `/debug/schema` = OK antes de trade real.
+- `/debug/runtime-ips` mostra o IP do web e o último `worker.outbound_ip`; usar o IP do worker na whitelist GMGN. Heartbeat default: `RUNTIME_HEARTBEAT_INTERVAL_SEC=300`.
 
 **Gate real V1.5 (compra com bounce, NÃO V2):**
 ```
@@ -164,6 +165,8 @@ TRADING_ENABLED=true              # somente para micro-calibração
 CALIBRATION_AMOUNT_USD=1
 CALIBRATION_MAX_TRADES=20
 BOUNCE_RECORD_MIN_POOL_SOL=5
+RUNTIME_HEARTBEAT_ENABLED=true
+RUNTIME_HEARTBEAT_INTERVAL_SEC=300
 TRADE_GATE_ENABLED=true
 TRADE_REQUIRE_HELIUS_FEATURES=true
 TRADE_REQUIRE_H23_BOTTOM=true

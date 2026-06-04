@@ -229,6 +229,8 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO 2026-05-04)
 >
 > **Runtime Railway separado:** `web` roda Flask/Gunicorn com `RUN_BOT_SERVICES=0` e serve apenas endpoints; `worker` roda `worker.py` com `RUN_BOT_SERVICES=1` e inicia scanner + HotMonitor + Helius/eRPC. Essa separação evita que ping/pong timeout ou loops do scanner congelem `/analise/*`.
 >
+> **Debug de IP GMGN:** `/debug/my-ip` mostra apenas o IP do web. Para whitelist GMGN/trading, usar `/debug/runtime-ips` e copiar o `worker.outbound_ip`. O worker registra heartbeat no DB a cada `RUNTIME_HEARTBEAT_INTERVAL_SEC` (default 300s), sem entrar no caminho do scanner/trade.
+>
 > **Schema runtime validado:** `/debug/schema` deve estar `Status: OK` antes de qualquer trade real. Migrations continuam fora do startup normal; rodar `RUN_DB_MIGRATIONS=1 python migrate.py` apenas como one-off/pre-deploy temporário quando o schema mudar.
 >
 > **V1.5 Trade Gate Helius:** o scanner continua gravando `bounce_signals`, mas o executor só chama GMGN se o gate passar: Helius context presente, `h23_window=bottom`, `elapsed_sec <= 300`, `pool_quote_at_signal >= TRADE_MIN_POOL_SOL`, `net_sol_flow > TRADE_MIN_NET_SOL_FLOW`. Trades bloqueados são auditados como `blocked_helius_gate` e não consomem `CALIBRATION_MAX`.
@@ -602,6 +604,10 @@ TRADE_SLIPPAGE_BPS=500        # slippage máximo em basis points (5%)
 ORDER_POLL_SEC=2              # intervalo de poll do fill (segundos)
 ORDER_TIMEOUT_SEC=60          # timeout do fill (segundos)
 # PERSISTENCE_WAIT_SEC e PERSISTENCE_MIN_TICKS REMOVIDOS — A.4 desativado (hardcoded = 0)
+
+# Runtime heartbeat/IP debug — não entra no caminho do scanner/trade
+RUNTIME_HEARTBEAT_ENABLED=true
+RUNTIME_HEARTBEAT_INTERVAL_SEC=300
 
 # Trade Gate Helius — bloqueia execução GMGN, não a coleta de bounce_signals
 BOUNCE_RECORD_MIN_POOL_SOL=5

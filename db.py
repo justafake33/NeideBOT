@@ -1885,6 +1885,22 @@ def insert_trade(data: dict) -> int:
     """Cria registro de trade. Retorna o id gerado."""
     dq = _trade_data_quality(data.get("ts_signal"), data.get("mint", ""))
     with _cursor() as cur:
+        # Merge-conflict guard: keep the full Helius gate audit block plus data_quality.
+        # These fields are required to understand why V1.5 trades passed/failed the gate.
+        params = {
+            **data,
+            "helius_gate_passed": data.get("helius_gate_passed"),
+            "helius_gate_reason": data.get("helius_gate_reason"),
+            "helius_pool_quote_at_signal": data.get("helius_pool_quote_at_signal"),
+            "helius_absorption_events": data.get("helius_absorption_events"),
+            "helius_net_sol_flow": data.get("helius_net_sol_flow"),
+            "helius_rise_events": data.get("helius_rise_events"),
+            "helius_rise_net_flow": data.get("helius_rise_net_flow"),
+            "helius_dump_seller_hhi": data.get("helius_dump_seller_hhi"),
+            "helius_buy_concentration": data.get("helius_buy_concentration"),
+            "helius_h23_window": data.get("helius_h23_window"),
+            "data_quality": dq,
+        }
         cur.execute("""
             INSERT INTO trades
                 (mint, symbol, ts_signal, mc_bottom, mc_migration, entry_expected,
@@ -1914,20 +1930,7 @@ def insert_trade(data: dict) -> int:
                  %(helius_buy_concentration)s, %(helius_h23_window)s,
                  %(data_quality)s)
             RETURNING id
-        """, {
-            **data,
-            "helius_gate_passed": data.get("helius_gate_passed"),
-            "helius_gate_reason": data.get("helius_gate_reason"),
-            "helius_pool_quote_at_signal": data.get("helius_pool_quote_at_signal"),
-            "helius_absorption_events": data.get("helius_absorption_events"),
-            "helius_net_sol_flow": data.get("helius_net_sol_flow"),
-            "helius_rise_events": data.get("helius_rise_events"),
-            "helius_rise_net_flow": data.get("helius_rise_net_flow"),
-            "helius_dump_seller_hhi": data.get("helius_dump_seller_hhi"),
-            "helius_buy_concentration": data.get("helius_buy_concentration"),
-            "helius_h23_window": data.get("helius_h23_window"),
-            "data_quality": dq,
-        })
+        """, params)
         return cur.fetchone()["id"]
 
 

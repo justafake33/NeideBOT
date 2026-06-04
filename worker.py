@@ -27,6 +27,8 @@ os.environ.setdefault("RUN_BOT_SERVICES", "1")
 import app as _app_module  # noqa: E402,F401  # importing starts services when RUN_BOT_SERVICES=1
 
 _running = True
+RUNTIME_HEARTBEAT_ENABLED = os.getenv("RUNTIME_HEARTBEAT_ENABLED", "true").lower() == "true"
+RUNTIME_HEARTBEAT_INTERVAL_SEC = int(os.getenv("RUNTIME_HEARTBEAT_INTERVAL_SEC", "300"))
 
 
 def _fetch_outbound_ip() -> tuple[str | None, str, str | None]:
@@ -57,17 +59,20 @@ def _runtime_heartbeat_loop():
             logger.warning("Worker outbound IP heartbeat failed: %s", error)
         else:
             logger.info("Worker outbound IP heartbeat: %s", ip)
-        for _ in range(60):
+        for _ in range(max(1, RUNTIME_HEARTBEAT_INTERVAL_SEC)):
             if not _running:
                 break
             time.sleep(1)
 
 
-threading.Thread(
-    target=_runtime_heartbeat_loop,
-    daemon=True,
-    name="runtime-heartbeat",
-).start()
+if RUNTIME_HEARTBEAT_ENABLED:
+    threading.Thread(
+        target=_runtime_heartbeat_loop,
+        daemon=True,
+        name="runtime-heartbeat",
+    ).start()
+else:
+    logger.info("Runtime heartbeat disabled (RUNTIME_HEARTBEAT_ENABLED=false)")
 
 
 def _stop(signum, frame):  # noqa: ARG001
