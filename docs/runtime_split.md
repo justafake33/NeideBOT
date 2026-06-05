@@ -9,6 +9,14 @@ Este documento resume o runtime atual para reduzir conflitos nos documentos prin
 
 O `worker` deve iniciar com `RUN_BOT_SERVICES=1`; o `web` deve ficar em modo web-only.
 
+## Start command manual no Railway
+
+Se o `Procfile` do `main` estiver em conflito, configure o serviço `worker` diretamente no Railway com:
+
+```bash
+RUN_BOT_SERVICES=1 python bot_worker.py
+```
+
 ## Endpoints operacionais
 
 - `/debug/my-ip`: mostra o IP de saída do processo web.

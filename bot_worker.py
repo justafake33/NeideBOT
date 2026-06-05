@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 # Must be set before importing app: app.py conditionally starts services at import.
 os.environ.setdefault("RUN_BOT_SERVICES", "1")
 
+import runtime_support  # noqa: E402
+runtime_support.ensure_trade_audit_columns()
+runtime_support.ensure_runtime_heartbeat_table()
 import app as _app_module  # noqa: E402,F401  # importing starts services when RUN_BOT_SERVICES=1
 
 _running = True
@@ -45,7 +48,7 @@ def _runtime_heartbeat_loop():
     """Persiste IP real do worker para o web expor em /debug/runtime-ips."""
     while _running:
         ip, source, error = _fetch_outbound_ip()
-        _app_module.db.upsert_runtime_heartbeat({
+        runtime_support.upsert_runtime_heartbeat({
             "role": os.getenv("RUNTIME_ROLE", "worker"),
             "service_name": os.getenv("RAILWAY_SERVICE_NAME") or os.getenv("RAILWAY_SERVICE_ID"),
             "deployment_id": os.getenv("RAILWAY_DEPLOYMENT_ID"),
