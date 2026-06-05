@@ -24,13 +24,14 @@ from datetime import datetime, timezone
 
 import db
 import helius_rpc
+import runtime_support
 from gmgn_client import GmgnClient, get_sol_usd
 
 logger = logging.getLogger(__name__)
 
 TRADING_ENABLED    = os.getenv("TRADING_ENABLED",         "false").lower() == "true"
 CALIBRATION_AMOUNT = float(os.getenv("CALIBRATION_AMOUNT_USD",  "1.0"))
-CALIBRATION_MAX    = int(os.getenv(  "CALIBRATION_MAX_TRADES",  "50"))
+CALIBRATION_MAX    = int(os.getenv(  "CALIBRATION_MAX_TRADES",  "500"))
 TRADE_SL_PCT       = float(os.getenv("TRADE_SL_PCT",            "0.15"))
 SLIPPAGE_BPS       = int(os.getenv(  "TRADE_SLIPPAGE_BPS",      "500"))  # 5% max slippage
 ORDER_POLL_SEC     = int(os.getenv(  "ORDER_POLL_SEC",           "2"))
@@ -111,7 +112,7 @@ class TradeExecutor:
 
         with self._lock:
             try:
-                n = db.count_trades()
+                n = runtime_support.count_executable_trades()
             except Exception as e:
                 logger.error("count_trades: %s", e)
                 return
@@ -174,6 +175,14 @@ class TradeExecutor:
         db.update_trade(trade_id, {
             "helius_gate_passed": gate_passed,
             "helius_gate_reason": gate_reason,
+            "helius_pool_quote_at_signal": (helius_context or {}).get("pool_quote_at_signal"),
+            "helius_absorption_events": (helius_context or {}).get("absorption_events"),
+            "helius_net_sol_flow": (helius_context or {}).get("net_sol_flow"),
+            "helius_rise_events": (helius_context or {}).get("rise_events"),
+            "helius_rise_net_flow": (helius_context or {}).get("rise_net_flow"),
+            "helius_dump_seller_hhi": (helius_context or {}).get("dump_seller_hhi"),
+            "helius_buy_concentration": (helius_context or {}).get("buy_concentration"),
+            "helius_h23_window": (helius_context or {}).get("h23_window"),
         })
         if not gate_passed:
             db.update_trade(trade_id, {
