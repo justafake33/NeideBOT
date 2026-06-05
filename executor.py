@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 TRADING_ENABLED    = os.getenv("TRADING_ENABLED",         "false").lower() == "true"
 CALIBRATION_AMOUNT = float(os.getenv("CALIBRATION_AMOUNT_USD",  "1.0"))
-CALIBRATION_MAX    = int(os.getenv(  "CALIBRATION_MAX_TRADES",  "50"))
+CALIBRATION_MAX    = int(os.getenv(  "CALIBRATION_MAX_TRADES",  "500"))
 TRADE_SL_PCT       = float(os.getenv("TRADE_SL_PCT",            "0.15"))
 SLIPPAGE_BPS       = int(os.getenv(  "TRADE_SLIPPAGE_BPS",      "500"))  # 5% max slippage
 ORDER_POLL_SEC     = int(os.getenv(  "ORDER_POLL_SEC",           "2"))
@@ -42,6 +42,14 @@ ORDER_TIMEOUT_SEC  = int(os.getenv(  "ORDER_TIMEOUT_SEC",        "60"))
 # Simulação (n=119 válidos): trailing 30% ativ. 100% → avg 159.2% vs TP fixo 71.3%
 TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "100"))  # %
 TRAILING_DRAWDOWN_PCT   = float(os.getenv("TRAILING_DRAWDOWN_PCT",   "30"))   # %
+
+# Gate Helius de compra real — bloqueia apenas execução, não a pesquisa em bounce_signals.
+TRADE_GATE_ENABLED = os.getenv("TRADE_GATE_ENABLED", "true").lower() == "true"
+TRADE_REQUIRE_HELIUS_FEATURES = os.getenv("TRADE_REQUIRE_HELIUS_FEATURES", "true").lower() == "true"
+TRADE_REQUIRE_H23_BOTTOM = os.getenv("TRADE_REQUIRE_H23_BOTTOM", "true").lower() == "true"
+TRADE_MAX_ELAPSED_SEC = int(os.getenv("TRADE_MAX_ELAPSED_SEC", "300"))
+TRADE_MIN_NET_SOL_FLOW = float(os.getenv("TRADE_MIN_NET_SOL_FLOW", "-5"))
+TRADE_MIN_POOL_SOL = float(os.getenv("TRADE_MIN_POOL_SOL", "40"))
 
 # A.4 — Persistência: aguarda N segundos e verifica que os últimos K ticks estão acima do entry.
 # 3 ticks consecutivos acima do entry → WR 36.4% vs 12.1% (+24.3pp).
@@ -95,7 +103,8 @@ class TradeExecutor:
                   mc_at_signal: float = 0.0, bounce_pct: float = 0.0,
                   drop_from_mig: float = 0.0,
                   config_bounce_min_pct: float = 0.0, config_bounce_max_pct: float = 0.0,
-                  config_bounce_drop_min: float = 0.0):
+                  config_bounce_drop_min: float = 0.0,
+                  helius_context: dict | None = None):
         if not TRADING_ENABLED:
             logger.info("DRY-RUN bounce %s mc_bottom=$%.0f (TRADING_ENABLED=false)", symbol, mc_bottom)
             return
@@ -145,9 +154,34 @@ class TradeExecutor:
                 "config_trailing_drawdown_pct":    TRAILING_DRAWDOWN_PCT,
                 "config_slippage_bps":             SLIPPAGE_BPS,
                 "git_sha":                         _GIT_SHA or None,
+                # Audit: gate Helius / microestrutura no momento do sinal
+                "helius_gate_passed":              None,
+                "helius_gate_reason":              None,
+                "helius_pool_quote_at_signal":     (helius_context or {}).get("pool_quote_at_signal"),
+                "helius_absorption_events":        (helius_context or {}).get("absorption_events"),
+                "helius_net_sol_flow":             (helius_context or {}).get("net_sol_flow"),
+                "helius_rise_events":              (helius_context or {}).get("rise_events"),
+                "helius_rise_net_flow":            (helius_context or {}).get("rise_net_flow"),
+                "helius_dump_seller_hhi":          (helius_context or {}).get("dump_seller_hhi"),
+                "helius_buy_concentration":        (helius_context or {}).get("buy_concentration"),
+                "helius_h23_window":               (helius_context or {}).get("h23_window"),
             })
         except Exception as e:
             logger.error("insert_trade %s: %s", symbol, e)
+            return
+
+        gate_passed, gate_reason = self._evaluate_helius_trade_gate(elapsed_sec, helius_context)
+        db.update_trade(trade_id, {
+            "helius_gate_passed": gate_passed,
+            "helius_gate_reason": gate_reason,
+        })
+        if not gate_passed:
+            db.update_trade(trade_id, {
+                "status": "blocked_helius_gate",
+                "exit_type": "blocked_helius_gate",
+                "error_msg": gate_reason,
+            })
+            logger.info("TRADE BLOCKED #%d %s — Helius gate: %s", trade_id, symbol, gate_reason)
             return
 
         logger.info("TRADE #%d %s — $%.2f (%.5f SOL @ $%.0f/SOL)",
@@ -159,6 +193,35 @@ class TradeExecutor:
             daemon=True,
             name=f"trade-{trade_id}",
         ).start()
+
+    def _evaluate_helius_trade_gate(self, elapsed_sec: int, helius_context: dict | None) -> tuple[bool, str]:
+        """Gate final antes de compra real. Não consulta rede; usa contexto já coletado pelo scanner."""
+        if not TRADE_GATE_ENABLED:
+            return True, "gate_disabled"
+
+        ctx = helius_context or {}
+        if TRADE_REQUIRE_HELIUS_FEATURES and not ctx:
+            return False, "missing_helius_context"
+
+        if TRADE_MAX_ELAPSED_SEC > 0 and elapsed_sec is not None and elapsed_sec > TRADE_MAX_ELAPSED_SEC:
+            return False, f"elapsed_sec>{TRADE_MAX_ELAPSED_SEC}"
+
+        if TRADE_REQUIRE_H23_BOTTOM and ctx.get("h23_window") != "bottom":
+            return False, "h23_window_not_bottom"
+
+        pool = ctx.get("pool_quote_at_signal")
+        if TRADE_REQUIRE_HELIUS_FEATURES and pool is None:
+            return False, "missing_pool_quote"
+        if pool is not None and TRADE_MIN_POOL_SOL > 0 and pool < TRADE_MIN_POOL_SOL:
+            return False, f"pool<{TRADE_MIN_POOL_SOL:g}"
+
+        net_flow = ctx.get("net_sol_flow")
+        if TRADE_REQUIRE_HELIUS_FEATURES and net_flow is None:
+            return False, "missing_net_sol_flow"
+        if net_flow is not None and net_flow <= TRADE_MIN_NET_SOL_FLOW:
+            return False, f"net_sol_flow<={TRADE_MIN_NET_SOL_FLOW:g}"
+
+        return True, "passed"
 
     # ------------------------------------------------------------------
     # Execução — roda em thread própria
@@ -710,7 +773,19 @@ class TradeMonitor:
             low     = float(tick["mc_low"]  or 0)
             tick_ts = tick["tick_ts"]
 
-            if tp_mc and high >= tp_mc:
+            tp_hit = bool(tp_mc and high >= tp_mc)
+            sl_hit = bool(low > 0 and low <= sl_mc)
+
+            if sl_hit:
+                if tp_hit:
+                    logger.info(
+                        "TradeMonitor #%d %s — TP/SL same tick; SL-first policy "
+                        "(high=$%.0f tp_mc=$%.0f low=$%.0f sl_mc=$%.0f)",
+                        trade_id, symbol, high, tp_mc or 0, low, sl_mc,
+                    )
+                self._record_exit(trade, "sl", -sl_pct, tick_ts, sol_usd)
+                return
+            if tp_hit:
                 # Fill desconhecido → marca trailing_active (GMGN gerencia saída real).
                 # Fill conhecido → trailing_active para _check_trailing_exit acompanhar.
                 exit_label = "trailing_active"
@@ -720,9 +795,6 @@ class TradeMonitor:
                     " via entry_expected" if tp_from_expected else "",
                 )
                 self._record_exit(trade, exit_label, tp_pct, tick_ts, sol_usd)
-                return
-            if low > 0 and low <= sl_mc:
-                self._record_exit(trade, "sl", -sl_pct, tick_ts, sol_usd)
                 return
 
     def _check_via_gmgn(self, trade: dict, sol_usd: float, now: datetime) -> bool:
