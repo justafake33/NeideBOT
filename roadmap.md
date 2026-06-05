@@ -136,80 +136,28 @@ EV positivo confirmado (TP=75%, SL=15%, n=68)
 - Trailing TP implementado com dados reais (n=119 válidos)
 - A.6 bottom freshness implementado
 
-### Fase 6.1 — V1.5 Micro-calibração com eRPC/Helius ⏳ ATUAL
+### Fase 6.1 — Trading $10/trade ⏳ PRÓXIMA
 ```
-Parâmetros recomendados:
-  Entry  : bounce V1 confirmado (drop ≥30%, bounce ≥30%) com mc_min eRPC/Helius
-  Size   : $1/trade inicialmente
-  Cap    : 20 trades antes de aumentar para 50
-  TP     : trailing profit_stop_trace
-  SL     : conservador via executor/condition_orders + TradeMonitor SL-first no mesmo tick
-  Gate   : Helius obrigatório antes de GMGN swap
+Parâmetros:
+  Entry  : bounce (drop ≥30%, bounce ≥15%, elapsed ≤20min)
+  Size   : $10/trade
+  TP     : trailing profit_stop_trace (ativ. 75%, drawdown 30%)
+  SL     : -15% fixo
+  Filtros: A.2, A.3, A.5, A.6
 ```
 
 ---
 
 ## Próximas Fases
 
-### [AGORA] V1.5 micro-calibração + V2 Shadow oficial
+### [AGORA] Religar com $10/trade
 
-**Runtime Railway:**
-- `web`: Flask/Gunicorn, `RUN_BOT_SERVICES=0`, serve endpoints e dashboards.
-- `worker`: `python worker.py`, `RUN_BOT_SERVICES=1`, coleta eRPC/Helius + scanner + HotMonitor + executor.
-- `RUN_DB_MIGRATIONS=0` nos dois; migrations apenas via one-off/pre-deploy temporário. Confirmar `/debug/schema` = OK antes de trade real.
-- `/debug/runtime-ips` mostra o IP do web e o último `worker.outbound_ip`; usar o IP do worker na whitelist GMGN. Heartbeat default: `RUNTIME_HEARTBEAT_INTERVAL_SEC=300`.
+**Gate:** TRADING_ENABLED=true, CALIBRATION_AMOUNT_USD=10
 
-**Gate real V1.5 (compra com bounce, NÃO V2):**
-```
-TRADING_ENABLED=true              # somente para micro-calibração
-CALIBRATION_AMOUNT_USD=1
-CALIBRATION_MAX_TRADES=500
-SOL_USD_FALLBACK=65
-BOUNCE_RECORD_MIN_POOL_SOL=5
-RUNTIME_HEARTBEAT_ENABLED=true
-RUNTIME_HEARTBEAT_INTERVAL_SEC=300
-TRADE_GATE_ENABLED=true
-TRADE_REQUIRE_HELIUS_FEATURES=true
-TRADE_REQUIRE_H23_BOTTOM=true
-TRADE_MAX_ELAPSED_SEC=300
-TRADE_MIN_NET_SOL_FLOW=-5
-TRADE_MIN_POOL_SOL=40
-```
-
-**O que esse gate compra:** V1 bounce confirmado com fundo mais correto via eRPC/Helius e bloqueio final por microestrutura. Trades reprovados ficam `blocked_helius_gate`, não chamam GMGN e não consomem `CALIBRATION_MAX`.
-
-**Gate shadow V2.1 (sem compra real):**
-```
-V2_SHADOW_ENABLED=true
-V2_DECISION_AGE_SEC=10
-V2_NET_WINDOW=live_5s
-V2_NET_MIN=-2
-V2_MIN_POOL_SOL=10
-V2_MIN_EVENTS=5
-V2_MIN_BOUNCE_PCT=0.30
-V2_MAX_BOUNCE_PCT=0.50
-V2_CANDIDATE_SCOPE=mint_first
-```
-
-Acompanhar `/analise/v2-shadow-live?days=3`, `/analise/v2-brain-report?days=3`, `/debug/schema`, `/debug/executor-status` e os trades `blocked_helius_gate` por motivo.
-
-**Stop rules da micro-calibração:**
-- 5 SLs seguidos
-- 3 falhas GMGN/fill seguidas
-- muitos bloqueios por `missing_net_sol_flow` ou `missing_pool_quote`
-- slippage/fill real muito acima do esperado
-- worker instável ou sem ticks pós-compra
-
-### [Após 20 trades V1.5] Decisão de aumentar cap
-
-Operacional: `CALIBRATION_MAX_TRADES=500` evita travar por histórico antigo; revisar fills/slippage/gate antes de aumentar tamanho por trade. Só considerar $10/trade após validação operacional e WR first-touch real.
-
-Aguardar 20–50 trades para confirmar:
-- auditoria Helius preenchida em todos os trades executados
-- motivo dos bloqueios coerente com `signal-anatomy`
-- WR real first-touch acima do baseline corrigido
+Aguardar 30+ trades para confirmar:
+- WR ≥ 17% (consistente com calibração)
 - trailing_active detectado em % razoável de trades
-- friction total compatível com tamanho da posição
+- Friction total < 5% por trade (vs 36% a $1/trade)
 
 ### [30 trades] Ajuste do trailing
 
@@ -255,11 +203,9 @@ confirmar WR e trailing com $10/trade.
 | Trailing | Avg gain vs TP fixo | +50pp | ✅ +88pp (sim. n=119) |
 | Fase 6-lite | Calibração $1/trade | 50 trades | ✅ CONCLUÍDA |
 | Fase 6-lite | Friction medida | < 5% a $10 | ✅ ~9.2% a $10 (aceitável) |
-| Fase 6.1 V1.5 | Micro-calibração | 20 trades $1 com gate Helius | ⏳ pronto para ligar |
-| Fase 6.1 V1.5 | Auditoria Helius | 100% dos trades executados com gate/pool/net | ⏳ aguardando |
-| Fase 6.2 | WR a $10/trade | ≥ baseline first-touch corrigido | ⏳ depois da micro-calibração |
+| Fase 6.1 | WR a $10/trade | ≥17% | ⏳ aguardando |
+| Fase 6.1 | trailing_active rate | ≥30% dos trades | ⏳ aguardando |
 | H9 | Validação smart money | ≥20pp delta | 🟡 +11.8pp (n=14) |
-| V2 Shadow | Gate eRPC live_5s mint_first | WR≥30%, EV>0, n≥100 | ⏳ coletando via worker |
 | Jupiter | Break-even WR | ~18% | ⏳ médio prazo |
 
 ---

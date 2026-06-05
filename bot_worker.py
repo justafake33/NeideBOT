@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NeideBOT background worker.
+"""NeideBOT background worker entrypoint.
 
 Runs scanner/HotMonitor/Helius/eRPC services outside the Flask web process.
 Keep this as a separate Railway service/process so websocket stalls do not freeze

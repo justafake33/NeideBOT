@@ -223,23 +223,16 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO 2026-05-04)
 
 ## 🔍 ESTADO ATUAL
 
-> ### 🟢 V1.5 MICRO-CALIBRAÇÃO + V2 SHADOW (2026-06-04)
+> ### 🛑 BOT PARADO — CAPTAÇÃO DE MICRODADOS (2026-05-30)
 >
-> **Modo operacional atual:** o projeto está pronto para **teste real mínimo em V1.5** (`bounce_signal` confirmado + fundo eRPC/Helius + gate Helius), enquanto o **V2 pré-bounce continua apenas shadow/research**. Não confundir: ligar trading hoje **não liga V2 EntryEngine**.
+> **`TRADING_ENABLED=false`** — Bot parado intencionalmente para acumulação de dados na tabela `micro_absorption_snapshots` (V2 Fase 1).
 >
-> **Runtime Railway separado:** `web` roda Flask/Gunicorn com `RUN_BOT_SERVICES=0` e serve apenas endpoints; `worker` roda `worker.py` com `RUN_BOT_SERVICES=1` e inicia scanner + HotMonitor + Helius/eRPC. Essa separação evita que ping/pong timeout ou loops do scanner congelem `/analise/*`.
+> **Objetivo:** coletar microdados de fluxo de ordens (PRE/RISE/LIVE) ao redor do fundo de cada token durante os próximos dias/semanas para validar H22, H23, H24 e derivadas (H26, pool depth, seller exhaustion) com n≥30 bounces com outcomes GMGN confirmados.
 >
-> **Debug de IP GMGN:** `/debug/my-ip` mostra apenas o IP do web. Para whitelist GMGN/trading, usar `/debug/runtime-ips` e copiar o `worker.outbound_ip`. O worker registra heartbeat no DB a cada `RUNTIME_HEARTBEAT_INTERVAL_SEC` (default 300s), sem entrar no caminho do scanner/trade.
+> **Branch ativo:** `claude/nifty-hamilton-tQORb` (V2 Fase 1)
+> **Fases V2 pendentes (em standby):** Fase 2 (Micro Absorption Lab) → Fase 3 (Shadow Entry Signals) → Fase 4 (EntryEngineV2) → Fase 5 (Dry-run) → Fase 6 (ExecutionEngineV2 Real Scout)
 >
-> **Schema runtime validado:** `/debug/schema` deve estar `Status: OK` antes de qualquer trade real. Migrations continuam fora do startup normal; rodar `RUN_DB_MIGRATIONS=1 python migrate.py` apenas como one-off/pre-deploy temporário quando o schema mudar.
->
-> **V1.5 Trade Gate Helius:** o scanner continua gravando `bounce_signals`, mas o executor só chama GMGN se o gate passar: Helius context presente, `h23_window=bottom`, `elapsed_sec <= 300`, `pool_quote_at_signal >= TRADE_MIN_POOL_SOL`, `net_sol_flow > TRADE_MIN_NET_SOL_FLOW`. Trades bloqueados são auditados como `blocked_helius_gate` e não consomem `CALIBRATION_MAX`.
->
-> **Config recomendada para voltar ao mercado como calibração, não produção:** `TRADING_ENABLED=true`, `CALIBRATION_AMOUNT_USD=1`, `CALIBRATION_MAX_TRADES=500`, `SOL_USD_FALLBACK=65`, `TRADE_GATE_ENABLED=true`, `TRADE_REQUIRE_HELIUS_FEATURES=true`, `TRADE_REQUIRE_H23_BOTTOM=true`, `TRADE_MAX_ELAPSED_SEC=300`, `TRADE_MIN_NET_SOL_FLOW=-5`, `TRADE_MIN_POOL_SOL=40`, `BOUNCE_RECORD_MIN_POOL_SOL=5`.
->
-> **V2 Shadow oficial (dry-run):** `/analise/v2-shadow-live` materializa o gate V2.1 a partir de `micro_absorption_snapshots`, sem chamar executor e sem gravar trades. Gate padrão: `scope=mint_first`, `decision_age=10s`, `net_window=live_5s`, `net_min=-2`, `min_pool=10`, `min_events=5`, `bounce=30-50%`. Config por env: `V2_SHADOW_ENABLED`, `V2_DECISION_AGE_SEC`, `V2_NET_WINDOW`, `V2_NET_MIN`, `V2_MIN_POOL_SOL`, `V2_MIN_EVENTS`, `V2_MIN_BOUNCE_PCT`, `V2_MAX_BOUNCE_PCT`, `V2_CANDIDATE_SCOPE`.
->
-> **Signal Anatomy corrigido:** `/analise/signal-anatomy?clean=1` agora usa primeiro toque real TP/SL via `token_ticks`, `same_candle_policy=conservative_sl_first`, `clean_strict=1` e tabela robusta n≥30. O melhor filtro robusto atual é `elapsed <5min + net_flow > -5 SOL` (n≈32, WR≈39%, MAE alto), por isso o retorno ao mercado deve ser micro-calibração.
+> **Reativar trading:** setar `TRADING_ENABLED=true` no Railway + aguardar n≥30 snapshots com outcomes.
 
 > ### ⚠️ LEITURA OBRIGATÓRIA ANTES DE ANALISAR QUALQUER NÚMERO DESTA SEÇÃO
 >
@@ -536,7 +529,6 @@ get_sol_usd() [gmgn_client.py]
 | `trades` | **Fase 6** — log completo de cada trade live. Coluna `fill_source TEXT` rastreia origem do fill data (`gmgn`/`helius`/`helius_recovery`/`gmgn_recovery`). |
 | `trade_absorption_ticks` | Snapshots contínuos de absorção Helius (+30s/+60s pós-bounce) por trade em monitoramento. |
 | `micro_absorption_snapshots` | **V2 Fase 1 (2026-05-30)** — série temporal de microdados de fluxo por token, capturados a cada 2s durante os 60s após o fundo. ~97 colunas: janelas PRE (5/10/15/30s antes do fundo), RISE (1/3/5/10s após fundo, com guard de completude), LIVE (5/10s antes do snapshot), concentrações nomeadas por janela, `candidate_flags` JSONB. Research-only — nunca afeta trading. |
-| `v2_shadow_live` | **Endpoint derivado, não tabela** — `/analise/v2-shadow-live` aplica o gate V2.1 ativo sobre `micro_absorption_snapshots` + `token_ticks` + `bounce_signals`, reporta WR/EV/drawdown/V1-improvement e não escreve no banco. |
 
 ### HeapScheduler
 - Thread única com heap de eventos futuros
@@ -593,31 +585,17 @@ BOUNCE_DROP_MIN=0.30         # drop mínimo da migração para considerar (30%)
 BOUNCE_TIME_MAX=20.0         # A.5: janela máxima em minutos (100% TPs em ≤20min)
 BOTTOM_FRESHNESS_SEC=180     # A.6: máx 3min desde o último mc_min (bloqueia sinais tardios; reduzido de 300s em 2026-05-28)
 
-# Fase 6.1 — V1.5 micro-calibração (configuráveis sem redeploy)
-TRADING_ENABLED=true          # true apenas para micro-calibração; V2 pré-bounce continua shadow
-CALIBRATION_AMOUNT_USD=1.0    # tamanho inicial por trade real
-CALIBRATION_MAX_TRADES=500    # hard cap operacional para não travar após histórico antigo contado
-TRADE_SL_PCT=0.25             # stop loss (25%; 15% disparava em segundos por volatilidade do pAMM)
-TRAILING_ACTIVATION_PCT=75    # trailing: gain% mínimo para ativar (75% = início conservador)
-TRAILING_DRAWDOWN_PCT=30      # trailing: recuo máximo do pico antes de vender (30%)
-TRADE_SLIPPAGE_BPS=500        # slippage máximo em basis points (5%)
-ORDER_POLL_SEC=2              # intervalo de poll do fill (segundos)
-ORDER_TIMEOUT_SEC=60          # timeout do fill (segundos)
-SOL_USD_FALLBACK=65         # fallback se CoinGecko/GMGN falharem antes da compra
+# Fase 6 — Execução de trades (configuráveis sem redeploy)
+TRADING_ENABLED=true         # true para ativar trades reais
+CALIBRATION_AMOUNT_USD=1.0   # tamanho de cada trade em USD
+CALIBRATION_MAX_TRADES=999999 # sem limite prático — executor para apenas manualmente
+TRADE_SL_PCT=0.25            # stop loss (testando 25% — 15% disparava em segundos por volatilidade do pAMM)
+TRAILING_ACTIVATION_PCT=75   # trailing: gain% mínimo para ativar (75% = início conservador)
+TRAILING_DRAWDOWN_PCT=30     # trailing: recuo máximo do pico antes de vender (30%)
+TRADE_SLIPPAGE_BPS=500       # slippage máximo em basis points (5%)
+ORDER_POLL_SEC=2             # intervalo de poll do fill (segundos)
+ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
 # PERSISTENCE_WAIT_SEC e PERSISTENCE_MIN_TICKS REMOVIDOS — A.4 desativado (hardcoded = 0)
-
-# Runtime heartbeat/IP debug — não entra no caminho do scanner/trade
-RUNTIME_HEARTBEAT_ENABLED=true
-RUNTIME_HEARTBEAT_INTERVAL_SEC=300
-
-# Trade Gate Helius — bloqueia execução GMGN, não a coleta de bounce_signals
-BOUNCE_RECORD_MIN_POOL_SOL=5
-TRADE_GATE_ENABLED=true
-TRADE_REQUIRE_HELIUS_FEATURES=true
-TRADE_REQUIRE_H23_BOTTOM=true
-TRADE_MAX_ELAPSED_SEC=300
-TRADE_MIN_NET_SOL_FLOW=-5
-TRADE_MIN_POOL_SOL=40
 
 # Helius RPC (leitura on-chain direta — preenchimento de fill + detecção de posição fechada)
 HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (diferente do WSS para pAMM events)
@@ -659,8 +637,6 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 | `/analise/h22-correlation` | **H22 Correlation** — correlação entre absorção pós-fundo (Helius) e outcome TP/SL. Tabelas por bucket: absorption_events (0/1-2/3-5/6-10/≥11), buy/sell ratio (∞/≥3×/1.5-3×/etc.), concentração (largest_buy/buy_vol). Instrumento pronto antes dos dados chegarem — n=? cresce com o bot ativo. Gate: n≥30 com Helius. |
 | `/debug/open-trades` | **Diagnóstico de trades abertos** — por trade `open`/`trailing_active`: entry_expected, entry_mc_real, sl_mc, tp_mc, contagem de ticks, min_low, max_high, flags sl_hit/tp_hit, resposta ao vivo do GMGN `query_order` com raw JSON. Identifica trades presos + por que TradeMonitor não detectou saída. |
 | `/debug/micro-absorption-snapshots` | **V2 Fase 1** — visualiza `micro_absorption_snapshots`. Suporta `?days=1&mint=&limit=200&format=html\|json\|csv`. HTML com células PRE/RISE/LIVE coloridas (verde/vermelho para net positivo/negativo). RISE incompleto mostra ⏳ com tooltip. Indicadores de completude por janela. |
-| `/analise/v2-shadow-live` | **V2.1 Shadow Live** — aplica o gate ativo (`live_5s`, `net_min=-2`, `min_events=5`, `bounce=30-50%`, `mint_first`) sobre snapshots existentes, mostra WR/EV/drawdown e comparação V1. Research/dry-run only: não chama executor. |
-| `/analise/v2-brain-report` | **V2 Brain Report** — grid cartesiano com recomendação Bigplayer. Default `mode=fast` para não travar o web; `mode=full` apenas para diagnóstico pesado. |
 
 ---
 
