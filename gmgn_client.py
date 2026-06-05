@@ -489,9 +489,21 @@ def get_sol_usd() -> Optional[float]:
             _sol_usd_ts    = time.time()
         logger.debug("SOL/USD atualizado: $%.2f", price)
     else:
-        logger.warning("Não foi possível obter preço SOL/USD — usando último conhecido")
+        logger.warning("Não foi possível obter preço SOL/USD via CoinGecko/GMGN — usando fallback")
         with _sol_usd_lock:
             price = _sol_usd_value
+        if not price:
+            try:
+                price = float(os.getenv("SOL_USD_FALLBACK", "150"))
+                if price <= 0:
+                    price = None
+            except Exception:
+                price = None
+        if price and price > 0:
+            with _sol_usd_lock:
+                _sol_usd_value = price
+                _sol_usd_ts = time.time()
+            logger.warning("SOL/USD fallback ativo: $%.2f", price)
 
     return price
 

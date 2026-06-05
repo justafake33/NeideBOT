@@ -6519,7 +6519,7 @@ def _executor_status_inner():
     import datetime as _dt
 
     trading_enabled = os.getenv("TRADING_ENABLED", "false").lower() == "true"
-    cal_max         = int(os.getenv("CALIBRATION_MAX_TRADES", "50"))
+    cal_max         = int(os.getenv("CALIBRATION_MAX_TRADES", "500"))
     cal_amount      = float(os.getenv("CALIBRATION_AMOUNT_USD", "1.0"))
     bounce_min      = float(os.getenv("BOUNCE_MIN_PCT", "0.15"))
     bounce_drop     = float(os.getenv("BOUNCE_DROP_MIN", "0.30"))

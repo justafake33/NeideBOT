@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 TRADING_ENABLED    = os.getenv("TRADING_ENABLED",         "false").lower() == "true"
 CALIBRATION_AMOUNT = float(os.getenv("CALIBRATION_AMOUNT_USD",  "1.0"))
-CALIBRATION_MAX    = int(os.getenv(  "CALIBRATION_MAX_TRADES",  "50"))
+CALIBRATION_MAX    = int(os.getenv(  "CALIBRATION_MAX_TRADES",  "500"))
 TRADE_SL_PCT       = float(os.getenv("TRADE_SL_PCT",            "0.15"))
 SLIPPAGE_BPS       = int(os.getenv(  "TRADE_SLIPPAGE_BPS",      "500"))  # 5% max slippage
 ORDER_POLL_SEC     = int(os.getenv(  "ORDER_POLL_SEC",           "2"))

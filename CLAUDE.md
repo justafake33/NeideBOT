@@ -235,7 +235,7 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO 2026-05-04)
 >
 > **V1.5 Trade Gate Helius:** o scanner continua gravando `bounce_signals`, mas o executor só chama GMGN se o gate passar: Helius context presente, `h23_window=bottom`, `elapsed_sec <= 300`, `pool_quote_at_signal >= TRADE_MIN_POOL_SOL`, `net_sol_flow > TRADE_MIN_NET_SOL_FLOW`. Trades bloqueados são auditados como `blocked_helius_gate` e não consomem `CALIBRATION_MAX`.
 >
-> **Config recomendada para voltar ao mercado como calibração, não produção:** `TRADING_ENABLED=true`, `CALIBRATION_AMOUNT_USD=1`, `CALIBRATION_MAX_TRADES=20`, `TRADE_GATE_ENABLED=true`, `TRADE_REQUIRE_HELIUS_FEATURES=true`, `TRADE_REQUIRE_H23_BOTTOM=true`, `TRADE_MAX_ELAPSED_SEC=300`, `TRADE_MIN_NET_SOL_FLOW=-5`, `TRADE_MIN_POOL_SOL=40`, `BOUNCE_RECORD_MIN_POOL_SOL=5`.
+> **Config recomendada para voltar ao mercado como calibração, não produção:** `TRADING_ENABLED=true`, `CALIBRATION_AMOUNT_USD=1`, `CALIBRATION_MAX_TRADES=500`, `SOL_USD_FALLBACK=150`, `TRADE_GATE_ENABLED=true`, `TRADE_REQUIRE_HELIUS_FEATURES=true`, `TRADE_REQUIRE_H23_BOTTOM=true`, `TRADE_MAX_ELAPSED_SEC=300`, `TRADE_MIN_NET_SOL_FLOW=-5`, `TRADE_MIN_POOL_SOL=40`, `BOUNCE_RECORD_MIN_POOL_SOL=5`.
 >
 > **V2 Shadow oficial (dry-run):** `/analise/v2-shadow-live` materializa o gate V2.1 a partir de `micro_absorption_snapshots`, sem chamar executor e sem gravar trades. Gate padrão: `scope=mint_first`, `decision_age=10s`, `net_window=live_5s`, `net_min=-2`, `min_pool=10`, `min_events=5`, `bounce=30-50%`. Config por env: `V2_SHADOW_ENABLED`, `V2_DECISION_AGE_SEC`, `V2_NET_WINDOW`, `V2_NET_MIN`, `V2_MIN_POOL_SOL`, `V2_MIN_EVENTS`, `V2_MIN_BOUNCE_PCT`, `V2_MAX_BOUNCE_PCT`, `V2_CANDIDATE_SCOPE`.
 >
@@ -596,13 +596,14 @@ BOTTOM_FRESHNESS_SEC=180     # A.6: máx 3min desde o último mc_min (bloqueia s
 # Fase 6.1 — V1.5 micro-calibração (configuráveis sem redeploy)
 TRADING_ENABLED=true          # true apenas para micro-calibração; V2 pré-bounce continua shadow
 CALIBRATION_AMOUNT_USD=1.0    # tamanho inicial por trade real
-CALIBRATION_MAX_TRADES=20     # hard cap inicial; aumentar para 50 só após revisar fills/slippage/gate
+CALIBRATION_MAX_TRADES=500    # hard cap operacional para não travar após histórico antigo contado
 TRADE_SL_PCT=0.25             # stop loss (25%; 15% disparava em segundos por volatilidade do pAMM)
 TRAILING_ACTIVATION_PCT=75    # trailing: gain% mínimo para ativar (75% = início conservador)
 TRAILING_DRAWDOWN_PCT=30      # trailing: recuo máximo do pico antes de vender (30%)
 TRADE_SLIPPAGE_BPS=500        # slippage máximo em basis points (5%)
 ORDER_POLL_SEC=2              # intervalo de poll do fill (segundos)
 ORDER_TIMEOUT_SEC=60          # timeout do fill (segundos)
+SOL_USD_FALLBACK=150         # fallback se CoinGecko/GMGN falharem antes da compra
 # PERSISTENCE_WAIT_SEC e PERSISTENCE_MIN_TICKS REMOVIDOS — A.4 desativado (hardcoded = 0)
 
 # Runtime heartbeat/IP debug — não entra no caminho do scanner/trade

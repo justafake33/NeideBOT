@@ -163,7 +163,8 @@ Parâmetros recomendados:
 ```
 TRADING_ENABLED=true              # somente para micro-calibração
 CALIBRATION_AMOUNT_USD=1
-CALIBRATION_MAX_TRADES=20
+CALIBRATION_MAX_TRADES=500
+SOL_USD_FALLBACK=150
 BOUNCE_RECORD_MIN_POOL_SOL=5
 RUNTIME_HEARTBEAT_ENABLED=true
 RUNTIME_HEARTBEAT_INTERVAL_SEC=300
@@ -201,7 +202,7 @@ Acompanhar `/analise/v2-shadow-live?days=3`, `/analise/v2-brain-report?days=3`, 
 
 ### [Após 20 trades V1.5] Decisão de aumentar cap
 
-Se fills/slippage/gate estiverem saudáveis, aumentar `CALIBRATION_MAX_TRADES` para 50. Só considerar $10/trade após validação operacional e WR first-touch real.
+Operacional: `CALIBRATION_MAX_TRADES=500` evita travar por histórico antigo; revisar fills/slippage/gate antes de aumentar tamanho por trade. Só considerar $10/trade após validação operacional e WR first-touch real.
 
 Aguardar 20–50 trades para confirmar:
 - auditoria Helius preenchida em todos os trades executados
