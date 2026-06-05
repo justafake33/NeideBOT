@@ -494,7 +494,7 @@ def get_sol_usd() -> Optional[float]:
             price = _sol_usd_value
         if not price:
             try:
-                price = float(os.getenv("SOL_USD_FALLBACK", "150"))
+                price = float(os.getenv("SOL_USD_FALLBACK", "65"))
                 if price <= 0:
                     price = None
             except Exception:
