@@ -25,12 +25,6 @@ init_sentry()
 app = Flask(__name__)
 BRT = timedelta(hours=-3)
 
-try:
-    from runtime_support import install_runtime_routes
-    install_runtime_routes(app)
-except Exception as e:
-    logger.warning("runtime support routes not installed: %s", e)
-
 
 # ==============================================================================
 # Helpers de formatação
