@@ -6663,13 +6663,105 @@ def _executor_status_inner():
 
 @app.route("/debug/my-ip")
 def debug_my_ip():
-    """Retorna o IP de saída do Railway — necessário para whitelist GMGN."""
-    import requests as _req
+    """Retorna o IP de saída deste processo (web ou worker).
+
+    ATENÇÃO: no split web/worker do Railway, o IP do web e do worker podem ser diferentes.
+    O IP relevante para whitelist GMGN é o do WORKER (quem executa os swaps).
+    Use /debug/runtime-ips para ver ambos de uma vez.
+    """
     try:
-        ip = _req.get("https://ifconfig.me/ip", timeout=5).text.strip()
+        import urllib.request
+        with urllib.request.urlopen("https://ifconfig.me/ip", timeout=5) as resp:
+            ip = resp.read().decode().strip()
+    except Exception:
+        try:
+            import urllib.request
+            with urllib.request.urlopen("https://api.ipify.org", timeout=5) as resp:
+                ip = resp.read().decode().strip()
+        except Exception as e:
+            ip = f"erro: {e}"
+
+    import socket, os as _os
+    process_type = "worker" if _os.getenv("RUN_BOT_SERVICES", "0") == "1" else "web"
+    data = {
+        "outbound_ip": ip,
+        "process_type": process_type,
+        "hostname": socket.gethostname(),
+        "pid": _os.getpid(),
+        "note": (
+            "IP do worker é o relevante para whitelist GMGN. "
+            "Use /debug/runtime-ips para comparar web vs worker."
+        ),
+    }
+    if request.args.get("format") == "json":
+        return jsonify(data)
+    return (
+        f"<pre>Processo: {process_type}\n"
+        f"Outbound IP: {ip}\n"
+        f"Hostname: {data['hostname']}  PID: {data['pid']}\n\n"
+        "⚠️  No split web/worker do Railway, web e worker têm IPs diferentes.\n"
+        "O IP para whitelist GMGN é o do WORKER (quem executa os swaps).\n"
+        "Use /debug/runtime-ips para ver os dois IPs lado a lado.\n"
+        "</pre>"
+    )
+
+
+@app.route("/debug/runtime-ips")
+def debug_runtime_ips():
+    """Mostra o IP de saída de todos os processos Railway (web + worker).
+
+    O IP para whitelist GMGN é o do worker (processo que executa swaps).
+    Heartbeats são gravados a cada 60s pelo worker no banco de dados.
+    """
+    try:
+        heartbeats = db.get_runtime_heartbeats()
     except Exception as e:
-        ip = f"erro: {e}"
-    return f"<pre>Railway outbound IP: {ip}\n\nAdicione este IP na whitelist do GMGN OpenAPI.</pre>"
+        heartbeats = []
+        logger.warning("debug_runtime_ips: %s", e)
+
+    if request.args.get("format") == "json":
+        return jsonify({"heartbeats": heartbeats, "count": len(heartbeats)})
+
+    CSS = ("<style>body{background:#0d1117;color:#e6edf3;font:13px/1.5 monospace;padding:20px}"
+           "h2{color:#58a6ff}table{border-collapse:collapse;width:100%;margin-top:12px}"
+           "td,th{padding:6px 10px;border-bottom:1px solid #30363d;text-align:left}"
+           "th{color:#8b949e;background:#161b22}.ip{color:#3fb950;font-weight:bold}"
+           ".warn{color:#d29922}.dim{color:#8b949e}a{color:#58a6ff}"
+           "pre{background:#161b22;padding:8px;border-radius:4px;font-size:11px}"
+           "</style>")
+    h = f"<html><head><meta charset='utf-8'>{CSS}</head><body>"
+    h += "<h2>Runtime IPs — Web &amp; Worker</h2>"
+    h += ("<p class='warn'>⚠️ O IP relevante para whitelist GMGN é o do <b>worker</b> "
+          "(processo que executa os swaps). O web serve apenas dashboards.</p>")
+    h += ("<p><a href='?format=json'>JSON</a> &nbsp;|&nbsp; "
+          "<a href='javascript:location.reload()'>Refresh</a></p>")
+
+    if not heartbeats:
+        h += "<p class='warn'>Nenhum heartbeat encontrado. Worker ainda não enviou heartbeat (aguarde 60s) ou tabela não existe.</p>"
+    else:
+        h += "<table><tr><th>Runtime</th><th>Tipo</th><th>Outbound IP</th><th>Hostname</th><th>PID</th><th>Atualizado</th><th>Metadata</th></tr>"
+        for row in heartbeats:
+            updated = row.get("updated_at")
+            updated_str = updated.strftime("%Y-%m-%d %H:%M:%S UTC") if updated else "—"
+            meta = row.get("metadata") or {}
+            meta_str = ", ".join(f"{k}={v}" for k, v in (meta.items() if isinstance(meta, dict) else []))
+            h += (
+                f"<tr>"
+                f"<td><b>{row.get('runtime_name','?')}</b></td>"
+                f"<td>{row.get('service_type','?')}</td>"
+                f"<td class='ip'>{row.get('outbound_ip','?')}</td>"
+                f"<td class='dim'>{row.get('hostname','?')}</td>"
+                f"<td class='dim'>{row.get('pid','?')}</td>"
+                f"<td class='dim'>{updated_str}</td>"
+                f"<td class='dim'>{meta_str}</td>"
+                f"</tr>"
+            )
+        h += "</table>"
+
+    h += ("<p class='dim' style='margin-top:16px'>Heartbeats enviados pelo worker a cada "
+          f"{os.getenv('RUNTIME_HEARTBEAT_INTERVAL_SEC','60')}s via db.upsert_runtime_heartbeat().</p>")
+    h += "</body></html>"
+    return h
 
 
 @app.route("/debug/sign-test")

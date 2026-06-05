@@ -57,6 +57,10 @@ REQUIRED_RUNTIME_SCHEMA = {
     "token_ticks": {
         "mint", "tick_ts", "mc", "mc_open", "mc_high", "mc_low", "source",
     },
+    "runtime_heartbeats": {
+        "runtime_name", "service_type", "outbound_ip", "hostname", "pid",
+        "metadata", "updated_at",
+    },
 }
 
 
@@ -680,6 +684,20 @@ def _do_init_db():
             "ON sell_exhaustion_candidates (ts_signal DESC)"
         )
 
+        # Runtime heartbeats — rastreia IP de saída de web e worker no Railway.
+        # Coluna primary key é runtime_name (string única: "web", "worker").
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS runtime_heartbeats (
+                runtime_name  TEXT        PRIMARY KEY,
+                service_type  TEXT,
+                outbound_ip   TEXT,
+                hostname      TEXT,
+                pid           INT,
+                metadata      JSONB,
+                updated_at    TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+
     logger.info("DB inicializado")
 
 
@@ -701,6 +719,60 @@ def insert_sell_exhaustion_candidate(data: dict) -> None:
             """, data)
     except Exception as e:
         logger.warning("insert_sell_exhaustion_candidate failed: %s", e)
+
+
+def upsert_runtime_heartbeat(
+    runtime_name: str,
+    service_type: str,
+    outbound_ip: str,
+    hostname: str | None = None,
+    pid: int | None = None,
+    metadata: dict | None = None,
+) -> None:
+    """Atualiza heartbeat do processo Railway (web ou worker). Upsert por runtime_name."""
+    import json as _json
+    meta_json = _json.dumps(metadata) if metadata else None
+    try:
+        with _cursor() as cur:
+            cur.execute("""
+                INSERT INTO runtime_heartbeats
+                    (runtime_name, service_type, outbound_ip, hostname, pid, metadata, updated_at)
+                VALUES
+                    (%(name)s, %(stype)s, %(ip)s, %(host)s, %(pid)s,
+                     %(meta)s::jsonb, NOW())
+                ON CONFLICT (runtime_name) DO UPDATE SET
+                    service_type = EXCLUDED.service_type,
+                    outbound_ip  = EXCLUDED.outbound_ip,
+                    hostname     = EXCLUDED.hostname,
+                    pid          = EXCLUDED.pid,
+                    metadata     = EXCLUDED.metadata,
+                    updated_at   = NOW()
+            """, {
+                "name":  runtime_name,
+                "stype": service_type,
+                "ip":    outbound_ip,
+                "host":  hostname,
+                "pid":   pid,
+                "meta":  meta_json,
+            })
+    except Exception as e:
+        logger.warning("upsert_runtime_heartbeat %s: %s", runtime_name, e)
+
+
+def get_runtime_heartbeats() -> list:
+    """Retorna lista de heartbeats salvos (web + worker)."""
+    try:
+        with _cursor() as cur:
+            cur.execute("""
+                SELECT runtime_name, service_type, outbound_ip, hostname, pid,
+                       metadata, updated_at
+                  FROM runtime_heartbeats
+                 ORDER BY runtime_name
+            """)
+            return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        logger.warning("get_runtime_heartbeats: %s", e)
+        return []
 
 
 def upsert_watchlist(data: dict):
@@ -1849,6 +1921,10 @@ REQUIRED_RUNTIME_SCHEMA = {
     },
     "token_ticks": {
         "mint", "tick_ts", "mc", "mc_open", "mc_high", "mc_low", "source",
+    },
+    "runtime_heartbeats": {
+        "runtime_name", "service_type", "outbound_ip", "hostname", "pid",
+        "metadata", "updated_at",
     },
 }
 
