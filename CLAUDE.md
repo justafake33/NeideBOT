@@ -589,7 +589,7 @@ BOUNCE_MIN_PCT=0.30          # bounce mínimo do fundo para disparar sinal — A
 BOUNCE_DROP_MIN=0.30         # drop mínimo da migração para considerar (30%)
 BOUNCE_TIME_MAX=20.0         # A.5: janela máxima em minutos (100% TPs em ≤20min)
 BOTTOM_FRESHNESS_SEC=180     # A.6: máx 3min desde o último mc_min (bloqueia sinais tardios; reduzido de 300s em 2026-05-28)
-H23_NET_MIN=0                # H23 gate — bloqueia bounce se net_sol_flow < este valor. Sem a var = desativado. 0 = bloqueia qualquer fluxo negativo (negativo → WR 20.2%, positivo → WR 67%, dados limpos n=138 pós-2026-05-26)
+# H23_NET_MIN=0              # H23 gate (DESATIVADO — n insuficiente). Reativar no futuro adicionando esta var no Railway com o threshold desejado (ex: 0 = bloqueia net_flow negativo).
 
 # Fase 6 — Execução de trades (configuráveis sem redeploy)
 TRADING_ENABLED=true         # true para ativar trades reais
@@ -602,7 +602,7 @@ TRADE_SLIPPAGE_BPS=500       # slippage máximo em basis points (5%)
 ORDER_POLL_SEC=2             # intervalo de poll do fill (segundos)
 ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
 # PERSISTENCE_WAIT_SEC e PERSISTENCE_MIN_TICKS REMOVIDOS — A.4 desativado (hardcoded = 0)
-TRADE_MIN_NET_SOL_FLOW=-999  # gate H23 no executor (legado) — substituto pelo H23_NET_MIN no scanner. Setar -999 para desativar o gate do executor quando H23_NET_MIN estiver ativo.
+TRADE_MIN_NET_SOL_FLOW=-999  # gate H23 legado no executor — manter em -999 (desativado)
 
 # Helius RPC (leitura on-chain direta — preenchimento de fill + detecção de posição fechada)
 HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (diferente do WSS para pAMM events)
@@ -839,11 +839,7 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 
 180. **Sell exhaustion detector implementado (2026-06-02, research-only)**: `helius_ws.get_sell_velocity_snapshot(mint, ref_ts=ts_min)` compara SOL vendido em [0-5s] vs [5-15s] antes do fundo. `ratio = sell_5s / sell_5_15s`. `exhausted = ratio < 0.25 AND sell_5_15s ≥ 0.5 SOL`. Nova tabela `sell_exhaustion_candidates` registra snapshots a cada 5s por token durante os 120s após o fundo. `_maybe_record_sell_exhaustion()` em `push_mc()` — thread daemon, nunca bloqueia trading. Endpoint `/debug/sell-exhaustion`. Dados de n=5 tokens (185 registros, 2026-06-02): único token com exhaustion = GROK (ratio=0.15-0.18 no fundo de $11.5k, preço subiu +19.5% em 2min). Tokens sem exhaustion: KEKIUS (sem baseline de sells), RM e AIFUND (sells acelerando, não parando), Magpie (ratio=3.7x no fundo = dump ativo). Mecanismo confirmado: quando sellers param (ratio<0.25), bounce é real; quando sells aceleram (ratio>3), dump continua. Caveats: n=5 tokens insuficiente para gate; GROK teve segunda perna de dump depois (+19% foi ganho da primeira perna apenas). Gate para filtro: n≥30 tokens com outcomes GMGN confirmados via `/debug/sell-recovery`. Commit `b371103`.
 
-181. **H23 análise com dados limpos — sessão 19, 2026-06-06 (138 bounces pós-2026-05-26)**: primeiro resultado confiável do H23 com dados sem phantoms. Descoberta principal: **86% de todos os bounces têm net_sol_flow negativo** (119/138). WR por faixa via token_ticks (outcome 60min, entry=mc_at_signal, TP75/SL25): `negativo (<0)` = 20.2% WR (n=119, abaixo do break-even 25%); `fraco (0–1 SOL)` = 66.7% WR (n=6); `sweet (1–3 SOL)` = 66.7% WR (n=3); `bom (3–10 SOL)` = 25.0% WR (n=4); `sem H23` = 20.0% (n=5). Positivo total (0-10 SOL): n=13, WR ~67%. Break-even TP75/SL25 = 25%. Conclusão: zona negativa é EV negativo garantido; zona positiva tem sinal forte mas n=13 ainda pequeno. Gate implementado (`H23_NET_MIN=0`): bloqueia se net_sol_flow < 0 e dados Helius disponíveis; passa se NULL (sem dados = não bloqueia).
-
-182. **Causa estrutural: bot por design captura bounces com H23 negativo**: quando o sinal dispara (bounce_pct ≥ 30%), os compradores que produziram H23 positivo já absorveram o dump e o token já subiu. O bot chega tarde na zona positiva — ou o sinal dispara muito acima do fundo real ou o token já passou por BOUNCE_MAX_PCT. Essa é a mesma inversão documentada na nota 138. A solução real de longo prazo é detectar a absorção em tempo real e disparar o sinal enquanto o H23 ainda está virando positivo (H22 em tempo real), não após o bounce ter acontecido. Por ora, gate em 0 elimina a zona de perda garantida.
-
-183. **H23 gate — dois pontos de controle, um ativo**: o `TRADE_MIN_NET_SOL_FLOW` no `executor.py` existia desde antes (default -5, bloqueava no momento do trade). O novo `H23_NET_MIN` em `scanner.py` bloqueia antes, na detecção do bounce. Com `H23_NET_MIN=0` ativo, o gate do executor nunca chega a ser testado para sinais negativos. Setar `TRADE_MIN_NET_SOL_FLOW=-999` para desativar o gate legado e ter controle único em `H23_NET_MIN`. Código: `_h23_net_min = os.getenv("H23_NET_MIN")` — sem a var no Railway = desativado (zero risco de quebrar). Gate adicionado entre o cálculo de `net_sol_flow` (linha ~472) e o bloco atômico `bounce_fired` (linha ~498) em `scanner.py`.
+181. **H23 análise com dados limpos — sessão 19, 2026-06-06 (138 bounces pós-2026-05-26)**: primeiro resultado confiável do H23 com dados sem phantoms. Descoberta: **86% dos bounces têm net_sol_flow negativo** (119/138) — estrutural, pois a janela PRE mede os 60s ANTES do fundo, que é o próprio dump. Gate `H23_NET_MIN` implementado no `scanner.py` mas **desativado por falta de dados suficientes** (n=13 positivos, insuficiente para gate). Pode ser reativado no futuro adicionando a env var `H23_NET_MIN=<threshold>` no Railway. Sem a variável = desativado. Dashboard: `/debug/h23-wr?since=2026-05-26`.
 
 184. **`/analise/grid-search` endpoint corrigido — sessão 19**: dois bugs consecutivos corrigidos. (1) `NameError: name 'time' is not defined` — imports estavam na função wrapper `analise_grid_search()` mas a lógica foi movida para `_analise_grid_search_inner()` sem levar os imports. Fix: mover `import itertools, io, time` para dentro do inner. (2) `psycopg2.errors.InvalidDatetimeFormat: invalid input syntax for type timestamp with time zone: ""` — PostgreSQL NÃO faz short-circuit em `OR` com type casts: `('' = '' OR ts >= ''::timestamptz)` falha porque `''::timestamptz` é sempre avaliado, mesmo quando a primeira condição é TRUE. Fix: `NULLIF(%(since)s, '')::timestamptz IS NULL` — NULLIF retorna NULL quando since='', e `NULL IS NULL` é TRUE sem avaliar nenhum cast adicional. Commit `4c02264`.
 
@@ -857,16 +853,13 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 
 ---
 
-## 🔄 Estado Atual: BOT ATIVO — H23 gate ativo (sessão 19, 2026-06-06)
+## 🔄 Estado Atual: BOT ATIVO (sessão 19, 2026-06-06)
 
 ### Situação atual
-Branch `claude/relaxed-planck-H3Qg2` ativo. erpc operacional. H23 gate deployado (2026-06-06).
+Branch `claude/relaxed-planck-H3Qg2` ativo. erpc operacional.
 Bot reativado após 9 dias parado (estava em `TRADING_ENABLED=false` para captação de microdados V2).
 
-**Mudança principal desta sessão:** `H23_NET_MIN=0` no Railway — bloqueia sinais com net_sol_flow negativo.
-- Dados limpos (138 bounces pós-2026-05-26): negativo = 20.2% WR (abaixo break-even 25%), positivo = 67% WR (n=13)
-- Frequência esperada: ~1 sinal válido/dia (vs 13/dia sem gate)
-- Gate de confirmação: n≥30 trades com `H23_NET_MIN=0` ativo, WR≥45%
+**Mudança principal desta sessão:** análise H23 com 138 bounces limpos. Gate `H23_NET_MIN` implementado no código mas **desativado** (n insuficiente). Acumular ~200 bounces limpos antes de qualquer gate de fluxo.
 
 **Marco zero definitivo de dados limpos: 2026-05-26 (sessão 16, phantom fix ativo).**
 - 2026-05-21 a 2026-05-24: erpc operacional mas MIN_POOL_SOL=2 → 43% phantoms. mc_min não confiável.
