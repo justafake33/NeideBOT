@@ -30209,14 +30209,19 @@ def analise_grid_search():
             [r["min_mc"] <= r["entry_mc"] * sl_mult for r in rows],
         )
 
-    # ── Grid search ───────────────────────────────────────────────────────────
+    # ── Grid search com deduplicação por subconjunto real ────────────────────
+    # Iteramos do mais frouxo ao mais restrito. Para cada subconjunto único
+    # de tokens (frozenset de índices), guardamos apenas a última combinação
+    # vista — que tem os parâmetros mais restritivos que ainda produzem
+    # aquele mesmo conjunto. Elimina completamente as linhas redundantes.
     t1 = time.time()
-    results = []
+
+    # seen_subsets[(frozenset_idx, tp, sl)] = (ev, wr, n, nd, ntp, nsl, nf, bounce, elapsed, smart, events, tp, sl)
+    seen_subsets = {}
 
     for nf, bounce, elapsed, smart, events in itertools.product(
         H23_VALUES, BOUNCE_VALUES, ELAPSED_VALUES, SMART_VALUES, EVENTS_VALUES
     ):
-        # máscara base: AND de todas as dimensões
         base_mask = [
             h23_masks[nf][i]
             and bounce_masks[bounce][i]
@@ -30229,7 +30234,8 @@ def analise_grid_search():
         if n_base < MIN_N:
             continue
 
-        idx = [i for i, m in enumerate(base_mask) if m]
+        idx     = tuple(i for i, m in enumerate(base_mask) if m)
+        idx_key = frozenset(idx)
 
         for tp, sl in TP_SL_VALUES:
             tp_hits, sl_hits = tp_sl_masks[(tp, sl)]
@@ -30240,9 +30246,11 @@ def analise_grid_search():
                 continue
             wr = n_tp / n_dec
             ev = wr * tp - (1 - wr) * sl
-            results.append((ev, wr, n_base, n_dec, n_tp, n_sl, nf, bounce, elapsed, smart, events, tp, sl))
+            # sobrescreve: mantém a combinação mais restrita para este subconjunto
+            seen_subsets[(idx_key, tp, sl)] = (ev, wr, n_base, n_dec, n_tp, n_sl,
+                                                nf, bounce, elapsed, smart, events, tp, sl)
 
-    results.sort(key=lambda x: -x[0])
+    results = sorted(seen_subsets.values(), key=lambda x: -x[0])
     t_py = time.time() - t1
 
     total_combos = len(H23_VALUES)*len(BOUNCE_VALUES)*len(ELAPSED_VALUES)*len(SMART_VALUES)*len(EVENTS_VALUES)*len(TP_SL_VALUES)
@@ -30264,9 +30272,10 @@ def analise_grid_search():
     # ── Formato texto puro ────────────────────────────────────────────────────
     if fmt == "text":
         lines = [
-            f"NeideBOT grid-search — {len(results)} combinações válidas de {total_combos} testadas",
+            f"NeideBOT grid-search — {len(results)} subconjuntos únicos (de {total_combos} combinações testadas)",
             f"Dados: {N} bounces · SQL {t_sql:.1f}s · grid {t_py:.1f}s · min_n={MIN_N} · janela 60min",
-            f"Mostrando top {min(TOP, len(results))} por EV",
+            f"Deduplicado por subconjunto real de tokens. Parâmetros mostrados = mais restritivos que produzem aquele subconjunto.",
+            f"Mostrando {min(TOP, len(results))} de {len(results)} por EV decrescente",
             "",
             f"{'#':>4}  {'H23':>14}  {'bounce':>8}  {'elapsed':>9}  {'smart':>7}  {'events':>7}  {'TP/SL':>8}  {'n':>5}  {'dec':>5}  {'TP':>4}  {'SL':>4}  {'WR':>7}  {'EV':>7}",
             "-" * 115,
@@ -30311,8 +30320,9 @@ def analise_grid_search():
 
     H = CSS
     H += "<nav><a href='/analise'>Análise</a><a href='/analise/feature-grid'>Feature Grid</a><a href='/analise/grid-search'>Grid Search</a></nav>"
-    H += "<h2>🔍 Grid Search — busca exaustiva de combinações</h2>"
-    H += f"<p class='sub'>{N} bounces carregados · {total_combos:,} combinações testadas · {len(results)} válidas (n≥{MIN_N}, dec≥{MIN_DEC}) · SQL {t_sql:.1f}s · grid {t_py:.1f}s · janela 60min</p>"
+    H += "<h2>🔍 Grid Search — subconjuntos únicos de tokens</h2>"
+    H += f"<p class='sub'>{N} bounces · {total_combos:,} combinações testadas · <strong>{len(results)} subconjuntos únicos</strong> (n≥{MIN_N}, dec≥{MIN_DEC}) · SQL {t_sql:.1f}s · grid {t_py:.1f}s · janela 60min</p>"
+    H += "<p class='sub'>Deduplicado: combinações que selecionam os mesmos tokens aparecem 1× com os parâmetros mais restritivos.</p>"
 
     # Links de exportação
     base_url = f"/analise/grid-search?min_n={MIN_N}&min_dec={MIN_DEC}&top={TOP}"
@@ -30320,15 +30330,15 @@ def analise_grid_search():
     H += f"<strong>Exportar para colar:</strong> &nbsp;"
     H += f"<a href='{base_url}&format=text'>📋 Texto puro (cole aqui)</a>"
     H += f"<a href='{base_url}&format=csv'>⬇ CSV</a>"
-    H += f"<a href='{base_url}&top=500'>Top 500</a>"
-    H += f"<a href='{base_url}&top=999&min_n=5'>Tudo (n≥5)</a>"
+    H += f"<a href='/analise/grid-search?min_n={MIN_N}&min_dec={MIN_DEC}&top=9999&format=text'>📋 TUDO em texto</a>"
+    H += f"<a href='/analise/grid-search?min_n=5&min_dec=3&top=9999&format=text'>📋 TUDO (n≥5)</a>"
     H += "</div>"
 
     if not top_rows:
         H += "<p>Nenhuma combinação com dados suficientes.</p>"
         return H
 
-    H += f"<p>Mostrando top <strong>{min(TOP, len(results))}</strong> de {len(results)} combinações válidas, ordenadas por EV decrescente.</p>"
+    H += f"<p>Mostrando <strong>{min(TOP, len(results))}</strong> de <strong>{len(results)}</strong> subconjuntos únicos, ordenados por EV decrescente.</p>"
     H += "<table>"
     H += ("<tr><th>#</th><th>H23 ≥</th><th>bounce ≥</th><th>elapsed ≤</th>"
           "<th>smart ≥</th><th>events ≥</th><th>TP/SL</th>"
