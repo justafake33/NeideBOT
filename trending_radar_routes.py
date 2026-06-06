@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from flask import Blueprint, Response, jsonify, request
 
+import db
 import trending_radar_store as store
 
 trending_radar_bp = Blueprint("trending_radar", __name__)
@@ -28,7 +29,7 @@ def _fmt_ratio(v):
 def get_trending_radar_health(hours: int = 24, limit: int = 20) -> dict:
     """Health/readiness local do Trending Radar para o endpoint debug."""
     store.ensure_trending_radar_schema()
-    with store.cursor() as cur:
+    with db._cursor() as cur:
         cur.execute("""
             SELECT COUNT(*) AS snapshots,
                    MAX(ts_snapshot) AS latest_snapshot,
