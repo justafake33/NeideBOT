@@ -430,19 +430,16 @@ class GmgnClient:
         data = result.get("data", {})
         if isinstance(data, list):
             return data
-        for key in ("rank", "list", "items", "data"):
-            rows = data.get(key) if isinstance(data, dict) else None
-            if isinstance(rows, list):
-                return rows
-        inner = data.get("data") if isinstance(data, dict) else None
-        logger.warning(
-            "market/rank envelope inesperado: code=%s data_keys=%s inner_type=%s inner_keys=%s inner_preview=%s",
-            code,
-            list(data.keys()) if isinstance(data, dict) else type(data).__name__,
-            type(inner).__name__,
-            list(inner.keys()) if isinstance(inner, dict) else "—",
-            str(inner)[:200] if inner is not None else "None",
-        )
+        # percorre até 2 níveis de envelopes aninhados
+        for candidate in (data, data.get("data") if isinstance(data, dict) else None):
+            if not isinstance(candidate, dict):
+                continue
+            for key in ("rank", "list", "items"):
+                rows = candidate.get(key)
+                if isinstance(rows, list):
+                    return rows
+        logger.warning("market/rank envelope inesperado: code=%s data_keys=%s",
+                       code, list(data.keys()) if isinstance(data, dict) else type(data).__name__)
         return []
 
     def get_token_kline(self, mint: str, chain: str = "sol",
