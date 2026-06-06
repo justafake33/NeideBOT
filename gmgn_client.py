@@ -430,7 +430,7 @@ class GmgnClient:
         data = result.get("data", {})
         if isinstance(data, list):
             return data
-        for key in ("rank", "list", "items"):
+        for key in ("rank", "list", "items", "data"):
             rows = data.get(key) if isinstance(data, dict) else None
             if isinstance(rows, list):
                 return rows
