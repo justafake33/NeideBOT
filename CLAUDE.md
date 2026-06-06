@@ -993,6 +993,19 @@ PRIORITY_FEE_MICRO_LAMPORTS=1000  # priority fee controlado (não GMGN default)
 
 ---
 
+
+## 🔎 GMGN Trending Radar — pesquisa paralela
+
+Adicionado em 2026-06-06 como **pesquisa paralela/shadow**.
+
+- Arquivo principal: `trending_radar.py`
+- Endpoint de acompanhamento: `/debug/trending-radar?hours=24`
+- JSON: `/debug/trending-radar?hours=24&format=json`
+- Objetivo: captar snapshots do GMGN Trending e medir coverage/WR shadow antes de qualquer adaptação no NeideBOT.
+- Não compra, não vende, não chama executor e não altera o scanner atual.
+- Não é parte do fluxo operacional principal; só roda se executado separadamente.
+- Critério: usar apenas para decidir se vale criar uma Fase 2 de features temporais (`rank_velocity`, `hot_level_delta`, `volume_delta`, etc.).
+
 ## 🎯 KPIs de Sucesso
 
 > 🔴 **ATENÇÃO:** KPIs marcados como ✅ abaixo foram validados com dados históricos corrompidos (mc_bottom fictício, WR do DB não-blockchain). Devem ser tratados como metas a revalidar com dados limpos (pós-2026-05-20), não como conquistas confirmadas.
