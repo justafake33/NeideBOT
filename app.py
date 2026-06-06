@@ -30286,8 +30286,8 @@ def analise_grid_search():
         tp_mult = 1 + tp
         sl_mult = 1 - sl
         tp_sl_masks[(tp, sl)] = (
-            [r["max_mc"] >= r["entry_mc"] * tp_mult for r in rows],
-            [r["min_mc"] <= r["entry_mc"] * sl_mult for r in rows],
+            [r["max_mc"] is not None and r["max_mc"] >= r["entry_mc"] * tp_mult for r in rows],
+            [r["min_mc"] is not None and r["min_mc"] <= r["entry_mc"] * sl_mult for r in rows],
         )
 
     # ── Grid search com deduplicação por subconjunto real ────────────────────
