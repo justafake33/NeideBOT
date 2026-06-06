@@ -103,7 +103,6 @@ Rodando contínuo:
 python trending_radar.py
 ```
 
-
 Configurações úteis:
 
 ```text

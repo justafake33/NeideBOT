@@ -17,13 +17,11 @@ from __future__ import annotations
 
 import logging
 import os
-import time
-from datetime import datetime, timezone
 from typing import Any
 
 import db
-from gmgn_client import GmgnClient, RateLimitError
-from trending_radar_core import collect_trending_interval
+from gmgn_client import GmgnClient
+from trending_radar_core import build_cycle_summary, collect_trending_interval, run_radar_loop
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -72,6 +70,7 @@ def _bool(v: Any) -> bool | None:
 class TrendingRadar:
     def __init__(self, gmgn: GmgnClient):
         self.gmgn = gmgn
+        self.logger = logger
         self.chain = os.getenv("TRENDING_RADAR_CHAIN", "sol")
         self.intervals = _csv("TRENDING_RADAR_INTERVALS", "1m,5m")
         self.order_by = os.getenv("TRENDING_RADAR_ORDER_BY", "default")
@@ -99,54 +98,9 @@ class TrendingRadar:
             "smart_min": int(os.getenv("FILTER_SMART_MIN", "2")),
         }
 
-    def normalize_item(self, item: dict, *, ts_snapshot: datetime,
-                        interval: str, idx: int) -> dict | None:
-        mint = item.get("address") or item.get("token_address") or item.get("mint")
-        if not mint:
-            return None
-        return {
-            "ts_snapshot": ts_snapshot,
-            "chain": self.chain,
-            "interval_label": interval,
-            "order_by": self.order_by,
-            "direction": self.direction,
-            "filters": self.filters,
-            "platforms": self.platforms,
-            "rank_position": _int(item.get("rank")) or idx,
-            "mint": mint,
-            "symbol": item.get("symbol"),
-            "name": item.get("name"),
-            "creator": item.get("creator"),
-            "launchpad_platform": item.get("launchpad_platform"),
-            "exchange": item.get("exchange"),
-            "open_timestamp": _int(item.get("open_timestamp")),
-            "creation_timestamp": _int(item.get("creation_timestamp")),
-            "hot_level": _float(item.get("hot_level")),
-            "price": _float(item.get("price")),
-            "market_cap": _float(item.get("market_cap") or item.get("usd_market_cap")),
-            "liquidity": _float(item.get("liquidity")),
-            "volume": _float(item.get("volume") or item.get("volume_1h") or item.get("volume_24h")),
-            "swaps": _int(item.get("swaps") or item.get("swaps_1h") or item.get("swaps_24h")),
-            "buys": _int(item.get("buys") or item.get("buys_24h")),
-            "sells": _int(item.get("sells") or item.get("sells_24h")),
-            "holder_count": _int(item.get("holder_count")),
-            "smart_degen_count": _int(item.get("smart_degen_count")),
-            "renowned_count": _int(item.get("renowned_count")),
-            "bluechip_owner_percentage": _float(item.get("bluechip_owner_percentage")),
-            "rug_ratio": _float(item.get("rug_ratio")),
-            "is_wash_trading": _bool(item.get("is_wash_trading")),
-            "bundler_rate": _float(item.get("bundler_rate") or item.get("bundler_trader_amount_rate")),
-            "rat_trader_amount_rate": _float(item.get("rat_trader_amount_rate")),
-            "top10_holder_rate": _float(item.get("top_10_holder_rate") or item.get("top10_holder_rate")),
-            "top70_sniper_hold_rate": _float(item.get("top70_sniper_hold_rate")),
-            "sniper_count": _int(item.get("sniper_count")),
-            "bot_degen_rate": _float(item.get("bot_degen_rate")),
-            "dexscr_ad": _bool(item.get("dexscr_ad")),
-            "dexscr_trending_bar": _bool(item.get("dexscr_trending_bar")),
-            "dexscr_boost_fee": _float(item.get("dexscr_boost_fee")),
-            "cto_flag": _bool(item.get("cto_flag")),
-            "raw": item,
-        }
+    to_float = staticmethod(_float)
+    to_int = staticmethod(_int)
+    to_bool = staticmethod(_bool)
 
     def run_once_cycle(self) -> dict:
         all_ids: list[int] = []
@@ -158,34 +112,10 @@ class TrendingRadar:
             totals["rows"] += row_count
             totals["inserted"] += len(ids)
 
-        coverage = db.build_trending_coverage(
-            all_ids,
-            outcome_window_min=self.outcome_window_min,
-            take_profit_pct=self.take_profit_pct,
-            stop_loss_pct=self.stop_loss_pct,
-            cfg=self.coverage_cfg,
-        )
-        summary = {**totals, "coverage": coverage}
-        logger.info("Trending coverage: %s", summary)
-        return summary
+        return build_cycle_summary(self, all_ids, totals)
 
     def start(self) -> None:
-        logger.info(
-            "TrendingRadar iniciado chain=%s intervals=%s limit=%d order_by=%s platforms=%s filters=%s poll=%ds",
-            self.chain, self.intervals, self.limit, self.order_by, self.platforms, self.filters, self.poll_sec,
-        )
-        while True:
-            try:
-                self.run_once_cycle()
-            except RateLimitError as e:
-                wait = max(1.0, e.reset_at - time.time()) + 1
-                logger.warning("GMGN rate limit no TrendingRadar; aguardando %.1fs", wait)
-                time.sleep(wait)
-            except Exception as e:
-                logger.exception("TrendingRadar erro: %s", e)
-            if self.run_once:
-                return
-            time.sleep(self.poll_sec)
+        run_radar_loop(self)
 
 
 def main() -> None:
