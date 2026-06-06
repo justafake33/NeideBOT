@@ -1,7 +1,7 @@
 # NeideBOT — Roadmap
 
 **Atualizado:** 2026-06-06 (sessão 19)
-**Estado:** Bot ATIVO · `TRADING_ENABLED=true` · H23 gate ativo (`H23_NET_MIN=0`) · branch ativo: `claude/relaxed-planck-H3Qg2`
+**Estado:** Bot ATIVO · `TRADING_ENABLED=true` · branch ativo: `claude/relaxed-planck-H3Qg2`
 
 ---
 
@@ -87,7 +87,7 @@
 | **V2 Fase 1 — micro_absorption_snapshots** | 2026-05-30 | Sistema de captação de microdados de fluxo de ordens ao redor do fundo. Tabela `micro_absorption_snapshots` (~97 colunas) com snapshots a cada 2s durante os 60s pós-fundo. Janelas PRE (5/10/15/30s), RISE (1/3/5/10s, com guard de completude), LIVE (5/10s). Concentrações nomeadas por janela (`pre_5s_buy_concentration` etc.). `candidate_flags` JSONB. `_build_window_features()` como utilitário puro sem I/O. `_maybe_record_micro_snapshot()` com rate limit 2s/token. Endpoint `/debug/micro-absorption-snapshots`. Bot parado (`TRADING_ENABLED=false`) para acumulação. Branch `claude/nifty-hamilton-tQORb`. Commits `d368b40` + `c9ae4d7` + `c42ba75`. |
 | **Sell exhaustion data collector** | 2026-06-02 | `helius_ws.get_sell_velocity_snapshot()` compara SOL vendido em [0-5s] vs [5-15s] antes do fundo (ratio<0.25 = sellers pararam). Tabela `sell_exhaustion_candidates` com snapshots a cada 5s durante 120s pós-fundo. `_maybe_record_sell_exhaustion()` em `push_mc()` — research-only, thread daemon. Endpoint `/debug/sell-exhaustion`. Primeiros dados (n=5 tokens): GROK com exhaustion real (ratio=0.15, +19.5% bounce). Gate para filtro: n≥30 tokens com outcomes GMGN. Commit `b371103`. |
 | **H23 análise com dados limpos (138 bounces)** | 2026-06-06 | Primeiro resultado confiável do H23 pós-phantom-fix. 86% dos bounces têm net_sol_flow negativo (WR 20.2%, abaixo break-even 25%). Positivo (0-10 SOL): WR 67% (n=13). Análise via token_ticks 60min, entry=mc_at_signal, TP75/SL25. Endpoint `/debug/h23-wr?since=2026-05-26` com segunda tabela "via token_ticks" e faixas completas. Commits `5bc5e5e`. |
-| **H23 gate implementado (`H23_NET_MIN`)** | 2026-06-06 | Gate em `scanner.py` bloqueia bounce se `net_sol_flow < H23_NET_MIN`. `net_sol_flow is None` (sem dados Helius) → passa. Env var `H23_NET_MIN=0` no Railway + `TRADE_MIN_NET_SOL_FLOW=-999` para desativar gate legado do executor. Frequência esperada: ~1 sinal/dia (vs 13/dia sem gate). Gate de confirmação: n≥30 com WR≥45%. Commit `b07e574`. |
+| **H23 gate implementado (`H23_NET_MIN`) — desativado por falta de dados** | 2026-06-06 | Gate em `scanner.py` bloqueia bounce se `net_sol_flow < H23_NET_MIN`. Código deployado mas gate desativado (n=13 positivos, insuficiente). Reativar no futuro adicionando `H23_NET_MIN=<threshold>` no Railway (sem a var = desativado). `TRADE_MIN_NET_SOL_FLOW=-999` no executor mantido. Commit `b07e574`. |
 | **`/analise/grid-search` corrigido** | 2026-06-06 | Dois bugs: (1) `NameError: time` — imports na wrapper mas lógica no inner. (2) `InvalidDatetimeFormat` — PostgreSQL não faz short-circuit em `OR` com type casts. Fix: `NULLIF(%(since)s, '')::timestamptz IS NULL`. Commits `4c02264` + `fffc7d2`. |
 
 > ⚠️ **WR REAL CORRIGIDO (2026-05-14 sessão 5):** banco tinha dados fictícios — TradeMonitor inferia saídas de MC snapshots, não da blockchain. Auditoria via Helius revelou WR real de **10.1%** (14 TP / 125 SL / 139 trades). WR anterior de 32% era inflado por falsos TPs. `/debug/sell-recovery` executado: 139 correções persistidas.
@@ -100,9 +100,9 @@
 
 ### Estado atual (2026-06-06)
 
-**Bot ATIVO** · `TRADING_ENABLED=true` · Branch: `claude/relaxed-planck-H3Qg2` · H23 gate: `H23_NET_MIN=0`
+**Bot ATIVO** · `TRADING_ENABLED=true` · Branch: `claude/relaxed-planck-H3Qg2`
 
-Bot reativado em 2026-06-06 após 9 dias parado para captação de microdados. Gate H23 implementado: bloqueia sinais com net_sol_flow < 0 (WR 20.2%, abaixo do break-even 25%). Frequência esperada: ~1 sinal/dia com WR esperado ~67% (n=13, dados limpos pós-2026-05-26). Gate de confirmação: n≥30 trades com H23_NET_MIN=0 ativo.
+Bot reativado em 2026-06-06 após 9 dias parado para captação de microdados. Gate H23 implementado no código mas **desativado** (n=13, insuficiente para decisão). Acumular ~200 bounces limpos antes de ativar qualquer gate de fluxo.
 
 A ideia central da V2 continua válida: filtros estáticos (smart count, bounce_pct, elapsed, creator_status) entregam no máximo +7pp de WR. O edge real está em **quem comprou o fundo e com que força** — e só conseguimos responder isso com dados de fluxo de ordens em granularidade de segundos.
 
