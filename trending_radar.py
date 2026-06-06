@@ -147,34 +147,43 @@ class TrendingRadar:
             "raw": item,
         }
 
+    def _collect_interval(self, interval: str) -> tuple[list[int], int]:
+        ts_snapshot = datetime.now(timezone.utc)
+        rows_raw = self.gmgn.get_market_trending(
+            chain=self.chain,
+            interval=interval,
+            limit=self.limit,
+            order_by=self.order_by,
+            direction=self.direction,
+            filters=self.filters or None,
+            platforms=self.platforms or None,
+        )
+        rows = []
+        for idx, item in enumerate(rows_raw, start=1):
+            if not isinstance(item, dict):
+                continue
+            normalized = self._normalize_item(
+                item, ts_snapshot=ts_snapshot, interval=interval, idx=idx
+            )
+            if normalized:
+                rows.append(normalized)
+
+        ids = db.insert_trending_snapshots(rows)
+        logger.info(
+            "Trending %s/%s: rows=%d inserted=%d",
+            self.chain, interval, len(rows), len(ids),
+        )
+        return ids, len(rows)
+
     def run_once_cycle(self) -> dict:
         all_ids: list[int] = []
         totals = {"intervals": 0, "rows": 0, "inserted": 0}
         for interval in self.intervals:
-            ts_snapshot = datetime.now(timezone.utc)
-            rows_raw = self.gmgn.get_market_trending(
-                chain=self.chain,
-                interval=interval,
-                limit=self.limit,
-                order_by=self.order_by,
-                direction=self.direction,
-                filters=self.filters or None,
-                platforms=self.platforms or None,
-            )
-            rows = []
-            for idx, item in enumerate(rows_raw, start=1):
-                if not isinstance(item, dict):
-                    continue
-                normalized = self._normalize_item(item, ts_snapshot=ts_snapshot,
-                                                  interval=interval, idx=idx)
-                if normalized:
-                    rows.append(normalized)
-            ids = db.insert_trending_snapshots(rows)
+            ids, row_count = self._collect_interval(interval)
             all_ids.extend(ids)
             totals["intervals"] += 1
-            totals["rows"] += len(rows)
+            totals["rows"] += row_count
             totals["inserted"] += len(ids)
-            logger.info("Trending %s/%s: rows=%d inserted=%d", self.chain, interval, len(rows), len(ids))
 
         coverage = db.build_trending_coverage(
             all_ids,
