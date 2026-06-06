@@ -103,6 +103,13 @@ Rodando contínuo:
 python trending_radar.py
 ```
 
+Acompanhamento web/JSON:
+
+```text
+/debug/trending-radar?hours=24
+/debug/trending-radar?hours=24&format=json
+```
+
 Configurações úteis:
 
 ```text
@@ -170,26 +177,3 @@ A V1 deveria calcular features temporais:
 - risk drift.
 
 Só depois disso faria sentido discutir realtime seletivo ou execução canary.
-
-## Endpoint de acompanhamento
-
-Dashboard HTML:
-
-```text
-/debug/trending-radar?hours=24
-```
-
-JSON para script/Railway:
-
-```text
-/debug/trending-radar?hours=24&format=json
-```
-
-O endpoint mostra:
-
-- se está captando (`health.capturing`);
-- se campos críticos estão OK (`health.ok`);
-- nulos em `mint`, `rank` e `market_cap`;
-- snapshots recentes;
-- `shadow_wr`, `wins`, `resolved`, `ambiguous`;
-- principais `reject_reasons`.

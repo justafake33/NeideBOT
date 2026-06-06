@@ -1468,13 +1468,46 @@ _signal_ban_until: float = 0.0  # timestamp UTC até quando a conta está banida
 
 
 
+def _get_trending_radar_health(hours: int = 24, limit: int = 20) -> dict:
+    """Health/readiness local do Trending Radar para o endpoint debug."""
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*) AS snapshots,
+                   MAX(ts_snapshot) AS latest_snapshot,
+                   COUNT(*) FILTER (WHERE mint IS NULL OR mint = '') AS null_mint,
+                   COUNT(*) FILTER (WHERE rank_position IS NULL) AS null_rank,
+                   COUNT(*) FILTER (WHERE market_cap IS NULL) AS null_market_cap,
+                   COUNT(*) FILTER (WHERE liquidity IS NULL) AS null_liquidity,
+                   COUNT(*) FILTER (WHERE volume IS NULL) AS null_volume,
+                   COUNT(*) FILTER (WHERE raw_json IS NULL OR raw_json = '{}') AS null_raw_json
+              FROM gmgn_trending_snapshots
+             WHERE ts_snapshot >= NOW() - (%(hours)s || ' hours')::INTERVAL
+        """, {"hours": hours})
+        health = dict(cur.fetchone() or {})
+        cur.execute("""
+            SELECT ts_snapshot, chain, interval_label, rank_position, mint, symbol,
+                   market_cap, liquidity, volume, smart_degen_count, rug_ratio
+              FROM gmgn_trending_snapshots
+             ORDER BY ts_snapshot DESC, rank_position ASC NULLS LAST
+             LIMIT %(limit)s
+        """, {"limit": limit})
+        health["recent"] = [dict(r) for r in cur.fetchall()]
+
+    snapshots = health.get("snapshots") or 0
+    critical_nulls = sum(int(health.get(k) or 0) for k in ("null_mint", "null_rank", "null_market_cap"))
+    health["capturing"] = snapshots > 0
+    health["critical_nulls"] = critical_nulls
+    health["ok"] = snapshots > 0 and critical_nulls == 0
+    return health
+
+
 @app.route("/debug/trending-radar")
 def debug_trending_radar():
     hours = int(request.args.get("hours", "24"))
     fmt = request.args.get("format", "html")
     try:
         summary = db.get_trending_radar_summary(hours=hours)
-        health = db.get_trending_radar_health(hours=hours)
+        health = _get_trending_radar_health(hours=hours)
         payload = {"hours": hours, "health": health, "summary": summary}
     except Exception as e:
         payload = {"hours": hours, "ok": False, "error": str(e)}
