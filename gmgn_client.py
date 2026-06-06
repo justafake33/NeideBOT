@@ -400,9 +400,15 @@ class GmgnClient:
 
     def get_market_trending(self, chain: str = "sol", interval: str = "5m",
                             limit: int = 100, order_by: str = "default",
-                            direction: str = "desc", filters: list = None,
-                            platforms: list = None) -> list:
-        """GET /v1/market/rank — ranking/trending GMGN. Uso: radar passivo de tokens trending."""
+                            direction: str = "desc", filters: list[str] | None = None,
+                            platforms: list[str] | None = None) -> list:
+        """
+        GET /v1/market/rank — ranking/trending GMGN.
+
+        Uso inicial do NeideBOT: radar passivo. O método retorna uma lista
+        tolerante a pequenas variações de envelope da OpenAPI (`data.rank`,
+        `data.list`, `data.items` ou lista direta).
+        """
         params = {
             "chain": chain,
             "interval": interval,
@@ -414,6 +420,7 @@ class GmgnClient:
             params["filter"] = filters
         if platforms:
             params["platform"] = platforms
+
         result = self._get("/v1/market/rank", params)
         data = result.get("data", {})
         if isinstance(data, list):
