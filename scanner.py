@@ -473,6 +473,20 @@ class HotMonitor:
             (absorption_window.get("buy_vol_sol") or 0) -
             (absorption_window.get("sell_vol_sol") or 0)
         ) if absorption_window.get("total_events") else None
+
+        # H23 gate — bloqueia sinal se sellers dominam o fundo (net_sol_flow < H23_NET_MIN).
+        # Se net_sol_flow is None (sem dados Helius), passa: melhor não bloquear do que perder.
+        # Dado: negativo (< 0) → WR 20.2% (abaixo break-even 25%). Positivo → WR 67% (n=9).
+        _h23_net_min = os.getenv("H23_NET_MIN")
+        if _h23_net_min is not None and net_sol_flow is not None:
+            _h23_threshold = float(_h23_net_min)
+            if net_sol_flow < _h23_threshold:
+                logger.info(
+                    "BOUNCE skip %s — H23 gate: net_flow=%+.2f SOL < min=%.1f",
+                    state.get("symbol", mint[:8]), net_sol_flow, _h23_threshold,
+                )
+                return
+
         rise_net_flow = (
             (rise_window.get("buy_vol_sol") or 0) -
             (rise_window.get("sell_vol_sol") or 0)
