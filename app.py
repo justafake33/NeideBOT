@@ -30212,6 +30212,14 @@ def analise_grid_search():
       format=html|text|csv
     """
     import itertools, io, time
+    try:
+        return _analise_grid_search_inner()
+    except Exception as _e:
+        import traceback
+        tb = traceback.format_exc()
+        return f"<pre style='background:#1a0000;color:#ff6b6b;padding:20px;font-size:12px'><b>ERROR in /analise/grid-search:</b>\n\n{tb}</pre>", 500
+
+def _analise_grid_search_inner():
 
     since_str = request.args.get("since", "")
     MIN_N   = int(request.args.get("min_n",   10))
