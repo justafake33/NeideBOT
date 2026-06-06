@@ -11460,15 +11460,20 @@ def debug_h23_wr():
     """WR por faixa de H23 net_sol_flow — trades blockchain verificados.
     Filtra por h23_window para separar absorção real (bottom) de momentum (bounce).
     Aceita qualquer exit_type blockchain (helius_sell_recovery, helius, helius_recovery).
+    ?since=2026-05-26 filtra dados limpos (pós phantom fix).
     """
-    from_id  = int(request.args.get("from_id", 338))
+    from_id    = int(request.args.get("from_id", 338))
     win_filter = request.args.get("window", "all")  # 'bottom', 'bounce', 'all'
+    since_str  = request.args.get("since", "")       # ex: '2026-05-26'
 
     window_clause = ""
     if win_filter == "bottom":
         window_clause = "AND bs.h23_window = 'bottom'"
     elif win_filter == "bounce":
         window_clause = "AND (bs.h23_window = 'bounce' OR bs.h23_window IS NULL)"
+
+    since_clause_trades = ("AND t.ts_signal >= %(since)s" if since_str else "")
+    since_clause_ticks  = ("AND bs.ts_signal >= %(since)s" if since_str else "")
 
     with db._cursor() as cur:
         cur.execute(f"""
@@ -11493,9 +11498,48 @@ def debug_h23_wr():
               AND t.exit_type IN ('helius_sell_recovery', 'helius', 'helius_recovery')
               AND t.status IN ('tp', 'sl')
               {window_clause}
+              {since_clause_trades}
             ORDER BY bs.net_sol_flow NULLS FIRST, t.id
-        """, {"from_id": from_id})
+        """, {"from_id": from_id, "since": since_str or None})
         rows = cur.fetchall()
+
+        # ── Segunda query: todos os bounces via token_ticks (não só trades) ──────
+        cur.execute(f"""
+            WITH base AS (
+                SELECT
+                    bs.mint,
+                    bs.net_sol_flow,
+                    bs.mc_at_signal                         AS entry_mc,
+                    MAX(COALESCE(tt.mc_high, tt.mc))        AS max_mc,
+                    MIN(COALESCE(tt.mc_low,  tt.mc))        AS min_mc,
+                    COUNT(tt.id)                            AS ticks
+                FROM bounce_signals bs
+                JOIN token_ticks tt
+                    ON tt.mint = bs.mint
+                    AND tt.tick_ts > bs.ts_signal
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
+                WHERE bs.mc_at_signal IS NOT NULL
+                  AND bs.mc_at_signal > 0
+                  {since_clause_ticks}
+                GROUP BY bs.mint, bs.net_sol_flow, bs.mc_at_signal
+                HAVING COUNT(tt.id) >= 3
+            )
+            SELECT
+                CASE
+                    WHEN net_sol_flow IS NULL   THEN 'sem H23'
+                    WHEN net_sol_flow < 0       THEN 'negativo  (< 0)'
+                    WHEN net_sol_flow < 1       THEN 'fraco     (0–1)'
+                    WHEN net_sol_flow < 3       THEN 'sweet     (1–3)'
+                    WHEN net_sol_flow < 10      THEN 'bom       (3–10)'
+                    ELSE                             'alto      (> 10)'
+                END AS bucket,
+                net_sol_flow,
+                CASE WHEN max_mc >= entry_mc * 1.75 THEN 1 ELSE 0 END AS tp75,
+                CASE WHEN min_mc <= entry_mc * 0.75 THEN 1 ELSE 0 END AS sl25
+            FROM base
+            ORDER BY net_sol_flow NULLS FIRST
+        """, {"since": since_str or None})
+        ticks_rows = cur.fetchall()
 
     if not rows:
         return (f"<pre>Nenhum trade blockchain verificado encontrado a partir do #{from_id}.\n"
@@ -11719,6 +11763,63 @@ def debug_h23_wr():
                   f"<td class='pos'>{r['pnl_pct_real']:+.1f}%</td>"
                   f"<td>{nf_s}</td><td><code>{r.get('h23_window','?')}</code></td></tr>")
         H += "</table>"
+
+    # ── Tabela via token_ticks (TODOS os bounces, não só trades) ─────────────
+    H += "<hr style='border-color:#30363d;margin:24px 0'>"
+    since_label = since_str if since_str else "todos os dados"
+    H += f"<h2>📈 H23 via token_ticks — todos os bounces ({since_label})</h2>"
+    H += ("<p style='font-size:12px;color:#8b949e'>"
+          "Outcome medido em token_ticks 60min após o sinal (TP75/SL25). "
+          "Independente de ter virado trade. Entry = mc_at_signal.<br>"
+          f"Filtrar dados limpos: "
+          f"<a href='?since=2026-05-26&window={win_filter}&from_id={from_id}' style='color:#3fb950'>?since=2026-05-26</a> &nbsp; "
+          f"<a href='?window={win_filter}&from_id={from_id}' style='color:#8b949e'>ver todos</a></p>")
+
+    from collections import defaultdict as _dd
+    t_buckets = _dd(lambda: {"tp": 0, "sl": 0, "n": 0})
+    for r in ticks_rows:
+        b = r["bucket"]
+        t_buckets[b]["n"]  += 1
+        t_buckets[b]["tp"] += r["tp75"]
+        t_buckets[b]["sl"] += (1 - r["tp75"])
+
+    n_ticks_total = len(ticks_rows)
+    tp_ticks_total = sum(r["tp75"] for r in ticks_rows)
+    wr_ticks_base  = tp_ticks_total / n_ticks_total * 100 if n_ticks_total else 0
+
+    ORDER2 = ['sem H23', 'negativo  (< 0)', 'fraco     (0–1)',
+              'sweet     (1–3)', 'bom       (3–10)', 'alto      (> 10)']
+
+    H += (f"<div class='box'><b>Total bounces com ticks:</b> {n_ticks_total} | "
+          f"{int(tp_ticks_total)} TP | {n_ticks_total - int(tp_ticks_total)} SL | "
+          f"WR base: <b>{wr_ticks_base:.1f}%</b> &nbsp; Break-even: 25%</div>")
+
+    H += ("<table><tr><th>Faixa H23</th><th>n</th><th>TP</th><th>SL</th>"
+          "<th>WR</th><th>vs base</th><th>EV/trade</th></tr>")
+    for b in ORDER2:
+        bd = t_buckets.get(b, {"n": 0, "tp": 0, "sl": 0})
+        n  = bd["n"]; tp = int(bd["tp"]); sl = int(bd["sl"])
+        wr = tp / n * 100 if n else 0
+        ev = wr/100 * 0.75 - (1 - wr/100) * 0.25 if n else 0
+        delta = wr - wr_ticks_base
+        wr_s  = (f"<span class='{'pos' if wr>=25 else 'neg'}'>{wr:.1f}%</span>"
+                 if n >= 3 else f"<span class='dim'>— (n={n})</span>")
+        dlt_s = (f"<span class='{'pos' if delta>0 else 'neg'}'>{delta:+.1f}pp</span>"
+                 if n >= 3 else "—")
+        ev_s  = (f"<span class='{'pos' if ev>0 else 'neg'}'>{ev:+.1%}</span>"
+                 if n >= 3 else "—")
+        cls   = " class='hi'" if (n>=3 and delta>=10) else " class='lo'" if (n>=3 and delta<=-10) else ""
+        H += (f"<tr{cls}><td><b>{b}</b></td><td>{n}</td>"
+              f"<td class='tp'>{tp}</td><td class='sl'>{sl}</td>"
+              f"<td>{wr_s}</td><td>{dlt_s}</td><td>{ev_s}</td></tr>")
+    H += (f"<tr style='border-top:2px solid #30363d'><td><b>TOTAL</b></td>"
+          f"<td>{n_ticks_total}</td>"
+          f"<td class='tp'>{int(tp_ticks_total)}</td>"
+          f"<td class='sl'>{n_ticks_total - int(tp_ticks_total)}</td>"
+          f"<td><b>{wr_ticks_base:.1f}%</b></td><td>base</td>"
+          f"<td><span class='{'pos' if wr_ticks_base>=25 else 'neg'}'>"
+          f"{wr_ticks_base/100*0.75-(1-wr_ticks_base/100)*0.25:+.1%}</span></td></tr>")
+    H += "</table>"
 
     H += "</body></html>"
     return H
