@@ -31820,10 +31820,10 @@ def _analise_h24_h25_inner(conn, cur, since="2026-05-26"):
     os_rows = run_query(f"""
         SELECT
             CASE
-                WHEN bs.mc_at_signal / NULLIF(m.mc_peak,0) >= 0.7 THEN '≥70% do pico  (overhead alto)'
-                WHEN bs.mc_at_signal / NULLIF(m.mc_peak,0) >= 0.5 THEN '50-70% do pico'
-                WHEN bs.mc_at_signal / NULLIF(m.mc_peak,0) >= 0.3 THEN '30-50% do pico'
-                ELSE                                                     '<30% do pico  (overhead baixo)'
+                WHEN bs.mc_at_signal / NULLIF(m.mc_peak,0) >= 0.7 THEN '≥70%% do pico  (overhead alto)'
+                WHEN bs.mc_at_signal / NULLIF(m.mc_peak,0) >= 0.5 THEN '50-70%% do pico'
+                WHEN bs.mc_at_signal / NULLIF(m.mc_peak,0) >= 0.3 THEN '30-50%% do pico'
+                ELSE                                                     '<30%% do pico  (overhead baixo)'
             END                                                        AS faixa,
             COUNT(*)                                                    AS n_all,
             COUNT(t.status)                                             AS n_trd,
