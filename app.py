@@ -30118,6 +30118,84 @@ def analise_intersecao_v2():
 
 
 # ==============================================================================
+# /debug/bounce-stats — distribuição temporal dos bounce_signals
+# ==============================================================================
+@app.route("/debug/bounce-stats")
+def debug_bounce_stats():
+    with db._cursor() as cur:
+        cur.execute("""
+            SELECT
+                COUNT(*)                                                        AS total,
+                MIN(ts_signal)                                                  AS primeiro,
+                MAX(ts_signal)                                                  AS ultimo,
+                COUNT(*) FILTER (WHERE ts_signal >= '2026-05-26')              AS pos_phantom_fix,
+                COUNT(*) FILTER (WHERE net_sol_flow IS NOT NULL)               AS com_h23,
+                COUNT(*) FILTER (WHERE ts_signal >= '2026-05-26'
+                                   AND net_sol_flow IS NOT NULL)               AS limpos_com_h23,
+                COUNT(*) FILTER (WHERE ts_signal >= '2026-05-21')              AS pos_erpc,
+                COUNT(*) FILTER (WHERE ts_signal >= '2026-05-21'
+                                   AND net_sol_flow IS NOT NULL)               AS erpc_com_h23,
+                ROUND(COUNT(*) FILTER (WHERE ts_signal >= '2026-05-26') * 1.0 /
+                    GREATEST(EXTRACT(EPOCH FROM
+                        (MAX(ts_signal) - '2026-05-26 00:00:00'::timestamptz)
+                    ) / 86400.0, 1), 1)                                        AS limpos_por_dia
+            FROM bounce_signals
+            WHERE mc_at_signal IS NOT NULL AND bounce_pct IS NOT NULL
+        """)
+        r = dict(cur.fetchone())
+
+        # por semana
+        cur.execute("""
+            SELECT
+                DATE_TRUNC('week', ts_signal AT TIME ZONE 'UTC')::date         AS semana,
+                COUNT(*)                                                        AS total,
+                COUNT(*) FILTER (WHERE net_sol_flow IS NOT NULL)               AS com_h23,
+                COUNT(*) FILTER (WHERE net_sol_flow >= 3)                      AS h23_gte3,
+                COUNT(*) FILTER (WHERE net_sol_flow >= 5)                      AS h23_gte5,
+                COUNT(*) FILTER (WHERE net_sol_flow >= 10)                     AS h23_gte10
+            FROM bounce_signals
+            WHERE mc_at_signal IS NOT NULL AND bounce_pct IS NOT NULL
+            GROUP BY 1 ORDER BY 1
+        """)
+        semanas = [dict(s) for s in cur.fetchall()]
+
+    CSS = "<style>body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}table{border-collapse:collapse;margin-top:16px}th{background:#161b22;color:#8b949e;padding:6px 12px;border:1px solid #30363d;text-align:right}th:first-child{text-align:left}td{padding:4px 12px;border:1px solid #21262d;text-align:right}td:first-child{text-align:left}h2{color:#58a6ff}h3{color:#79c0ff;margin-top:24px}.hi{color:#3fb950;font-weight:bold}.lo{color:#f85149}.warn{background:#2d1f00;border:1px solid #9a6700;padding:10px;margin:10px 0;border-radius:4px}</style>"
+    H = CSS + "<h2>📊 Bounce Signals — distribuição temporal</h2>"
+
+    H += "<h3>Resumo geral</h3><table>"
+    H += "<tr><th>Métrica</th><th>Valor</th></tr>"
+    H += f"<tr><td>Total (com mc_at_signal)</td><td>{r['total']}</td></tr>"
+    H += f"<tr><td>Primeiro sinal</td><td>{r['primeiro']}</td></tr>"
+    H += f"<tr><td>Último sinal</td><td>{r['ultimo']}</td></tr>"
+    H += f"<tr><td>Pós erpc (≥2026-05-21)</td><td>{r['pos_erpc']}</td></tr>"
+    H += f"<tr><td>Pós phantom fix (≥2026-05-26)</td><td class='hi'>{r['pos_phantom_fix']}</td></tr>"
+    H += f"<tr><td>Pós phantom fix, com H23</td><td class='hi'>{r['limpos_com_h23']}</td></tr>"
+    H += f"<tr><td>Sinais limpos/dia (pós-26/05)</td><td class='hi'>{r['limpos_por_dia']}</td></tr>"
+    H += f"<tr><td>Total com H23 (qualquer data)</td><td>{r['com_h23']}</td></tr>"
+    pct_limpos = r['pos_phantom_fix'] / r['total'] * 100 if r['total'] else 0
+    pct_h23 = r['limpos_com_h23'] / r['pos_phantom_fix'] * 100 if r['pos_phantom_fix'] else 0
+    H += f"<tr><td>% limpos do total</td><td>{pct_limpos:.1f}%</td></tr>"
+    H += f"<tr><td>% limpos com H23</td><td>{pct_h23:.1f}%</td></tr>"
+    H += "</table>"
+
+    if pct_limpos < 30:
+        H += f"<div class='warn'>⚠️ Apenas {pct_limpos:.1f}% dos dados são pós-phantom-fix. O grid-search está sendo dominado por dados históricos potencialmente corrompidos.</div>"
+
+    H += "<h3>Por semana</h3><table>"
+    H += "<tr><th>Semana</th><th>total</th><th>com H23</th><th>H23≥3</th><th>H23≥5</th><th>H23≥10</th><th>% H23</th></tr>"
+    for s in semanas:
+        pct = s['com_h23'] / s['total'] * 100 if s['total'] else 0
+        limpo = "✅" if str(s['semana']) >= "2026-05-26" else ("🟡" if str(s['semana']) >= "2026-05-21" else "🔴")
+        H += (f"<tr><td>{limpo} {s['semana']}</td><td>{s['total']}</td>"
+              f"<td>{s['com_h23']}</td><td>{s['h23_gte3']}</td>"
+              f"<td>{s['h23_gte5']}</td><td>{s['h23_gte10']}</td>"
+              f"<td>{pct:.0f}%</td></tr>")
+    H += "</table>"
+    H += "<p style='color:#8b949e;font-size:11px'>🔴 pré-erpc · 🟡 erpc ativo, phantom pode existir · ✅ phantom fix ativo</p>"
+    return H
+
+
+# ==============================================================================
 # /analise/grid-search — busca exaustiva de todas as combinações de filtros
 # ==============================================================================
 @app.route("/analise/grid-search")
