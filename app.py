@@ -30118,6 +30118,250 @@ def analise_intersecao_v2():
 
 
 # ==============================================================================
+# /analise/grid-search — busca exaustiva de todas as combinações de filtros
+# ==============================================================================
+@app.route("/analise/grid-search")
+def analise_grid_search():
+    """
+    Roda ~27.000 combinações de filtros em Python (dados carregados 1x do banco).
+    Ordena por EV decrescente. Exporta como HTML, texto ou CSV.
+
+    Params:
+      min_n=10      mínimo de bounces no subconjunto
+      min_dec=5     mínimo de decididos (TP ou SL)
+      top=200       quantas linhas mostrar
+      format=html|text|csv
+    """
+    import itertools, io, time
+
+    MIN_N   = int(request.args.get("min_n",   10))
+    MIN_DEC = int(request.args.get("min_dec",  5))
+    TOP     = int(request.args.get("top",    200))
+    MIN_TICKS = 3
+    fmt     = request.args.get("format", "html")
+
+    # ── Dimensões do grid ─────────────────────────────────────────────────────
+    H23_VALUES    = [-999.0, -5.0, 0.0, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0]
+    BOUNCE_VALUES = [0.0, 0.30, 0.40, 0.55, 0.70, 1.00]
+    ELAPSED_VALUES= [5.0, 8.0, 10.0, 15.0, 20.0]
+    SMART_VALUES  = [0, 1, 2, 3, 5]
+    EVENTS_VALUES = [0, 10, 50, 100, 150]
+    TP_SL_VALUES  = [(0.75, 0.25), (1.00, 0.25), (0.50, 0.25), (0.75, 0.15)]
+
+    # ── Carregar dados do banco 1× ────────────────────────────────────────────
+    t0 = time.time()
+    with db._cursor() as cur:
+        cur.execute("""
+            WITH base AS (
+                SELECT
+                    bs.mint,
+                    bs.bounce_pct,
+                    bs.drop_from_mig,
+                    bs.elapsed_sec / 60.0          AS elapsed_min,
+                    COALESCE(bs.absorption_events, 0) AS events,
+                    bs.net_sol_flow,
+                    bs.mc_at_signal                AS entry_mc,
+                    COALESCE(m.smart_wallets, 0)   AS smart,
+                    MAX(COALESCE(tt.mc_high, tt.mc)) AS max_mc,
+                    MIN(COALESCE(tt.mc_low,  tt.mc)) AS min_mc,
+                    COUNT(tt.id)                     AS tick_count
+                FROM bounce_signals bs
+                JOIN token_ticks tt ON tt.mint = bs.mint
+                    AND tt.tick_ts > bs.ts_signal
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
+                LEFT JOIN migrations m ON m.mint = bs.mint
+                WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+                  AND bs.bounce_pct   IS NOT NULL
+                GROUP BY bs.mint, bs.bounce_pct, bs.drop_from_mig, bs.elapsed_sec,
+                         bs.absorption_events, bs.net_sol_flow, bs.mc_at_signal,
+                         m.smart_wallets
+                HAVING COUNT(tt.id) >= %(min_ticks)s
+            )
+            SELECT * FROM base
+        """, {"min_ticks": MIN_TICKS})
+        rows = [dict(r) for r in cur.fetchall()]
+    t_sql = time.time() - t0
+
+    N = len(rows)
+    if N == 0:
+        return "Sem dados suficientes.", 200
+
+    # ── Pré-computar máscaras booleanas por dimensão ──────────────────────────
+    # H23: -999 = sem filtro (aceita NULL); outro valor = rejeita NULL
+    def h23_mask(nf):
+        if nf <= -999:
+            return [True] * N
+        return [r["net_sol_flow"] is not None and r["net_sol_flow"] >= nf for r in rows]
+
+    bounce_masks  = {b: [( r["bounce_pct"] or 0) >= b          for r in rows] for b in BOUNCE_VALUES}
+    elapsed_masks = {e: [( r["elapsed_min"] or 0) <= e         for r in rows] for e in ELAPSED_VALUES}
+    smart_masks   = {s: [( r["smart"] or 0) >= s               for r in rows] for s in SMART_VALUES}
+    events_masks  = {ev:[( r["events"] or 0) >= ev             for r in rows] for ev in EVENTS_VALUES}
+    h23_masks     = {nf: h23_mask(nf)                                          for nf in H23_VALUES}
+
+    # TP/SL hit por linha
+    tp_sl_masks = {}
+    for tp, sl in TP_SL_VALUES:
+        tp_mult = 1 + tp
+        sl_mult = 1 - sl
+        tp_sl_masks[(tp, sl)] = (
+            [r["max_mc"] >= r["entry_mc"] * tp_mult for r in rows],
+            [r["min_mc"] <= r["entry_mc"] * sl_mult for r in rows],
+        )
+
+    # ── Grid search ───────────────────────────────────────────────────────────
+    t1 = time.time()
+    results = []
+
+    for nf, bounce, elapsed, smart, events in itertools.product(
+        H23_VALUES, BOUNCE_VALUES, ELAPSED_VALUES, SMART_VALUES, EVENTS_VALUES
+    ):
+        # máscara base: AND de todas as dimensões
+        base_mask = [
+            h23_masks[nf][i]
+            and bounce_masks[bounce][i]
+            and elapsed_masks[elapsed][i]
+            and smart_masks[smart][i]
+            and events_masks[events][i]
+            for i in range(N)
+        ]
+        n_base = sum(base_mask)
+        if n_base < MIN_N:
+            continue
+
+        idx = [i for i, m in enumerate(base_mask) if m]
+
+        for tp, sl in TP_SL_VALUES:
+            tp_hits, sl_hits = tp_sl_masks[(tp, sl)]
+            n_tp  = sum(1 for i in idx if tp_hits[i])
+            n_sl  = sum(1 for i in idx if sl_hits[i] and not tp_hits[i])
+            n_dec = n_tp + n_sl
+            if n_dec < MIN_DEC:
+                continue
+            wr = n_tp / n_dec
+            ev = wr * tp - (1 - wr) * sl
+            results.append((ev, wr, n_base, n_dec, n_tp, n_sl, nf, bounce, elapsed, smart, events, tp, sl))
+
+    results.sort(key=lambda x: -x[0])
+    t_py = time.time() - t1
+
+    total_combos = len(H23_VALUES)*len(BOUNCE_VALUES)*len(ELAPSED_VALUES)*len(SMART_VALUES)*len(EVENTS_VALUES)*len(TP_SL_VALUES)
+    be_label = {(0.75,0.25):"25.0%",(1.00,0.25):"20.0%",(0.50,0.25):"33.3%",(0.75,0.15):"16.7%"}
+
+    def nf_label(v):
+        return "desativado" if v <= -999 else f"≥{v:+.1f} SOL"
+
+    def row_text(r):
+        ev, wr, n, nd, ntp, nsl, nf, bounce, elapsed, smart, events, tp, sl = r
+        return (f"H23{nf_label(nf):>12} | bounce≥{bounce:.0%} | elapsed≤{elapsed:.0f}m"
+                f" | smart≥{smart} | ev≥{events:>3}"
+                f" | TP{tp:.0%}/SL{sl:.0%}"
+                f" | n={n:>4} | dec={nd:>4} | TP={ntp:>3} SL={nsl:>3}"
+                f" | WR={wr:.1%} | EV={ev:+.1%}")
+
+    top_rows = results[:TOP]
+
+    # ── Formato texto puro ────────────────────────────────────────────────────
+    if fmt == "text":
+        lines = [
+            f"NeideBOT grid-search — {len(results)} combinações válidas de {total_combos} testadas",
+            f"Dados: {N} bounces · SQL {t_sql:.1f}s · grid {t_py:.1f}s · min_n={MIN_N} · janela 60min",
+            f"Mostrando top {min(TOP, len(results))} por EV",
+            "",
+            f"{'#':>4}  {'H23':>14}  {'bounce':>8}  {'elapsed':>9}  {'smart':>7}  {'events':>7}  {'TP/SL':>8}  {'n':>5}  {'dec':>5}  {'TP':>4}  {'SL':>4}  {'WR':>7}  {'EV':>7}",
+            "-" * 115,
+        ]
+        for rank, r in enumerate(top_rows, 1):
+            ev, wr, n, nd, ntp, nsl, nf, bounce, elapsed, smart, events, tp, sl = r
+            lines.append(
+                f"{rank:>4}  {nf_label(nf):>14}  {bounce:>7.0%}  ≤{elapsed:>6.0f}m"
+                f"  ≥{smart:>5}  ≥{events:>5}"
+                f"  {tp:.0%}/{sl:.0%}"
+                f"  {n:>5}  {nd:>5}  {ntp:>4}  {nsl:>4}  {wr:>6.1%}  {ev:>+6.1%}"
+            )
+        return "<pre style='font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px'>" + "\n".join(lines) + "</pre>"
+
+    # ── Formato CSV ───────────────────────────────────────────────────────────
+    if fmt == "csv":
+        buf = io.StringIO()
+        buf.write("rank,h23,bounce,elapsed,smart,events,tp,sl,n,decided,tp_hits,sl_hits,wr,ev\n")
+        for rank, r in enumerate(top_rows, 1):
+            ev, wr, n, nd, ntp, nsl, nf, bounce, elapsed, smart, events, tp, sl = r
+            buf.write(f"{rank},{nf},{bounce},{elapsed},{smart},{events},{tp},{sl},{n},{nd},{ntp},{nsl},{wr:.4f},{ev:.4f}\n")
+        from flask import Response
+        return Response(buf.getvalue(), mimetype="text/csv",
+                        headers={"Content-Disposition": "attachment; filename=grid_search.csv"})
+
+    # ── HTML ──────────────────────────────────────────────────────────────────
+    CSS = """<style>
+    body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:12px}
+    h2{color:#58a6ff}p.sub{color:#8b949e;font-size:11px;margin:2px 0 10px}
+    table{border-collapse:collapse;width:100%;margin-bottom:20px}
+    th{background:#161b22;color:#8b949e;padding:5px 8px;border:1px solid #30363d;text-align:right;font-size:11px}
+    th:first-child{text-align:left}
+    td{padding:3px 8px;border:1px solid #21262d;text-align:right;font-size:11px;white-space:nowrap}
+    td:first-child{text-align:left;color:#8b949e}
+    .tp{color:#3fb950;font-weight:bold}.sl{color:#f85149}
+    .pos{color:#3fb950;font-weight:bold}.neg{color:#f85149}
+    .hi{background:#1a2f1a}.lo{background:#2f1a1a}
+    .export{background:#161b22;border:1px solid #30363d;padding:10px;margin-bottom:16px;border-radius:6px}
+    .export a{color:#58a6ff;margin-right:16px;text-decoration:none;font-size:12px}
+    nav a{color:#58a6ff;margin-right:12px;font-size:12px;text-decoration:none}
+    </style>"""
+
+    H = CSS
+    H += "<nav><a href='/analise'>Análise</a><a href='/analise/feature-grid'>Feature Grid</a><a href='/analise/grid-search'>Grid Search</a></nav>"
+    H += "<h2>🔍 Grid Search — busca exaustiva de combinações</h2>"
+    H += f"<p class='sub'>{N} bounces carregados · {total_combos:,} combinações testadas · {len(results)} válidas (n≥{MIN_N}, dec≥{MIN_DEC}) · SQL {t_sql:.1f}s · grid {t_py:.1f}s · janela 60min</p>"
+
+    # Links de exportação
+    base_url = f"/analise/grid-search?min_n={MIN_N}&min_dec={MIN_DEC}&top={TOP}"
+    H += f"<div class='export'>"
+    H += f"<strong>Exportar para colar:</strong> &nbsp;"
+    H += f"<a href='{base_url}&format=text'>📋 Texto puro (cole aqui)</a>"
+    H += f"<a href='{base_url}&format=csv'>⬇ CSV</a>"
+    H += f"<a href='{base_url}&top=500'>Top 500</a>"
+    H += f"<a href='{base_url}&top=999&min_n=5'>Tudo (n≥5)</a>"
+    H += "</div>"
+
+    if not top_rows:
+        H += "<p>Nenhuma combinação com dados suficientes.</p>"
+        return H
+
+    H += f"<p>Mostrando top <strong>{min(TOP, len(results))}</strong> de {len(results)} combinações válidas, ordenadas por EV decrescente.</p>"
+    H += "<table>"
+    H += ("<tr><th>#</th><th>H23 ≥</th><th>bounce ≥</th><th>elapsed ≤</th>"
+          "<th>smart ≥</th><th>events ≥</th><th>TP/SL</th>"
+          "<th>n</th><th>dec</th><th>TP</th><th>SL</th><th>WR</th><th>EV</th></tr>")
+
+    be_map = {(0.75,0.25): 0.25/(0.75+0.25), (1.00,0.25): 0.25/(1.00+0.25),
+              (0.50,0.25): 0.25/(0.50+0.25), (0.75,0.15): 0.15/(0.75+0.15)}
+
+    for rank, r in enumerate(top_rows, 1):
+        ev, wr, n, nd, ntp, nsl, nf, bounce, elapsed, smart, events, tp, sl = r
+        be = be_map.get((tp, sl), 0.25)
+        ev_cls = "pos" if ev > 0 else "neg"
+        wr_cls = "tp" if wr >= be else ("sl" if wr < be * 0.8 else "")
+        row_cls = "hi" if ev >= 0.20 else ("lo" if ev < 0 else "")
+        H += (f"<tr class='{row_cls}'>"
+              f"<td>{rank}</td>"
+              f"<td>{nf_label(nf)}</td>"
+              f"<td>{bounce:.0%}</td>"
+              f"<td>≤{elapsed:.0f}m</td>"
+              f"<td>≥{smart}</td>"
+              f"<td>≥{events}</td>"
+              f"<td>{tp:.0%}/{sl:.0%}</td>"
+              f"<td>{n}</td><td>{nd}</td>"
+              f"<td class='tp'>{ntp}</td><td class='sl'>{nsl}</td>"
+              f"<td class='{wr_cls}'>{wr:.1%}</td>"
+              f"<td class='{ev_cls}'>{ev:+.1%}</td>"
+              f"</tr>")
+    H += "</table>"
+    H += f"<p class='sub'>Dados: bounce_signals + token_ticks (60min) · entry=mc_at_signal · break-even por TP/SL: TP75/SL25={be_label[(0.75,0.25)]} · TP100/SL25={be_label[(1.00,0.25)]} · TP50/SL25={be_label[(0.50,0.25)]} · TP75/SL15={be_label[(0.75,0.15)]}</p>"
+    return H
+
+
+# ==============================================================================
 # /analise/feature-grid — grid multidimensional de features com base H23
 # ==============================================================================
 @app.route("/analise/feature-grid")
