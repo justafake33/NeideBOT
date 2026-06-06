@@ -30117,6 +30117,489 @@ def analise_intersecao_v2():
     return H
 
 
+# ==============================================================================
+# /analise/feature-grid — grid multidimensional de features com base H23
+# ==============================================================================
+@app.route("/analise/feature-grid")
+def analise_feature_grid():
+    """
+    Grid interativo: aplica um filtro base (padrão H23 ≥ 1 SOL) e mostra WR
+    de cada feature adicional dentro desse subconjunto, usando metodologia
+    tick-based (entry=mc_at_signal, TP+75%, SL-25%, janela 20min).
+
+    Parâmetros URL (todos opcionais):
+      nf=1.0        — net_sol_flow mínimo (base filter)
+      bounce=0.30   — bounce_pct mínimo
+      elapsed=20    — elapsed_min máximo
+      drop=0.00     — drop_from_mig mínimo
+      smart=0       — smart_wallets mínimo
+      events=0      — absorption_events mínimo
+      pool=0        — pool_quote_at_signal mínimo (SOL)
+      tp=0.75       — TP multiplier
+      sl=0.75       — SL multiplier (aplicado como 1-sl, ex: 0.25 → SL em -25%)
+    """
+    # ── Parâmetros ─────────────────────────────────────────────────────────────
+    nf_min      = float(request.args.get("nf",      1.0))
+    bounce_min  = float(request.args.get("bounce",  0.30))
+    elapsed_max = float(request.args.get("elapsed", 20.0))
+    drop_min    = float(request.args.get("drop",    0.00))
+    smart_min   = int(request.args.get("smart",     0))
+    events_min  = int(request.args.get("events",    0))
+    pool_min    = float(request.args.get("pool",    0.0))
+    TP_MULT     = 1.0 + float(request.args.get("tp", 0.75))
+    SL_MULT     = 1.0 - float(request.args.get("sl", 0.25))
+    MIN_TICKS   = 3
+
+    CSS = """<style>
+    body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+    h2{color:#58a6ff;margin-bottom:4px}h3{color:#79c0ff;margin-top:26px}
+    p.sub{color:#8b949e;font-size:11px;margin:2px 0 10px}
+    table{border-collapse:collapse;width:100%;margin-bottom:10px}
+    th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:right;font-size:11px}
+    th:first-child,th:nth-child(2){text-align:left}
+    td{padding:4px 10px;border:1px solid #21262d;text-align:right;font-size:12px;white-space:nowrap}
+    td:first-child,td:nth-child(2){text-align:left}
+    .tp{color:#3fb950;font-weight:bold}.sl{color:#f85149}
+    .pos{color:#3fb950;font-weight:bold}.neg{color:#f85149}.dim{color:#484f58}
+    .hi{background:#1a2f1a}.lo{background:#2f1a1a}.neu{background:#161b22}
+    .box{background:#161b22;border:1px solid #30363d;padding:10px 14px;margin:4px 0 14px 0;border-radius:6px}
+    .ctrl{background:#0d1f2d;border:1px solid #1f4a6e;padding:12px 16px;margin-bottom:18px;border-radius:6px}
+    .ctrl a{color:#58a6ff;text-decoration:none;padding:2px 8px;background:#1a2d40;border-radius:4px;margin:2px;display:inline-block;font-size:11px}
+    .ctrl a:hover{background:#1f3a55}
+    .ctrl a.active{background:#1f4a8a;color:#fff;font-weight:bold}
+    .ctrl label{color:#8b949e;font-size:11px;margin-right:6px}
+    .warn{background:#2d1f00;border:1px solid #9a6700;padding:8px 12px;margin-bottom:10px;border-radius:4px;font-size:12px}
+    .ok{background:#1f2d1f;border:1px solid #3fb950;padding:8px 12px;margin-bottom:10px;border-radius:4px;font-size:12px}
+    .be{background:#1f1f2d;border:1px solid #6e40c9;padding:8px 12px;margin-bottom:10px;border-radius:4px;font-size:12px}
+    nav a{color:#58a6ff;margin-right:12px;font-size:12px;text-decoration:none}
+    .feat-label{font-weight:bold;color:#e6edf3}
+    .faixa{color:#8b949e;font-size:11px}
+    </style>"""
+
+    # ── Query: bounce_signals + token_ticks + migrations ───────────────────────
+    with db._cursor() as cur:
+        cur.execute("""
+            WITH outcomes AS (
+                SELECT
+                    bs.mint,
+                    bs.bounce_pct,
+                    bs.drop_from_mig,
+                    bs.elapsed_sec / 60.0          AS elapsed_min,
+                    bs.absorption_events,
+                    bs.net_sol_flow,
+                    bs.pool_quote_at_signal,
+                    bs.mc_at_signal                AS entry_mc,
+                    m.smart_wallets,
+                    m.renowned_wallets,
+                    m.creator_token_status,
+                    m.cto_flag,
+                    m.top10_holder_rate,
+                    m.rat_trader_rate,
+                    MAX(COALESCE(tt.mc_high, tt.mc)) AS max_mc,
+                    MIN(COALESCE(tt.mc_low,  tt.mc)) AS min_mc,
+                    COUNT(tt.id)                     AS tick_count
+                FROM bounce_signals bs
+                JOIN token_ticks tt ON tt.mint = bs.mint
+                    AND tt.tick_ts > bs.ts_signal
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '20 minutes'
+                LEFT JOIN migrations m ON m.mint = bs.mint
+                WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+                  AND bs.bounce_pct   IS NOT NULL
+                GROUP BY bs.mint, bs.bounce_pct, bs.drop_from_mig, bs.elapsed_sec,
+                         bs.absorption_events, bs.net_sol_flow, bs.pool_quote_at_signal,
+                         bs.mc_at_signal,
+                         m.smart_wallets, m.renowned_wallets, m.creator_token_status,
+                         m.cto_flag, m.top10_holder_rate, m.rat_trader_rate
+                HAVING COUNT(tt.id) >= %(min_ticks)s
+            )
+            SELECT *,
+                (max_mc >= entry_mc * %(tp)s) AS tp_hit,
+                (min_mc <= entry_mc * %(sl)s) AS sl_hit
+            FROM outcomes
+        """, {"tp": TP_MULT, "sl": SL_MULT, "min_ticks": MIN_TICKS})
+        all_rows = [dict(r) for r in cur.fetchall()]
+
+    # ── Helpers ────────────────────────────────────────────────────────────────
+    def wr_ev(subset):
+        decided = [r for r in subset if r["tp_hit"] or r["sl_hit"]]
+        if not decided:
+            return 0, 0.0, 0, 0, len(subset)
+        tp = sum(1 for r in decided if r["tp_hit"])
+        sl = len(decided) - tp
+        wr = tp / len(decided)
+        ev = wr * (TP_MULT - 1) - (1 - wr) * (1 - SL_MULT)
+        return wr, ev, tp, sl, len(subset)
+
+    def ev_fmt(ev):
+        col = "#3fb950" if ev > 0 else ("#f85149" if ev < 0 else "#8b949e")
+        return f"<span style='color:{col}'>{ev:+.1%}</span>"
+
+    def wr_fmt(wr, n):
+        be = 1 - SL_MULT  # break-even WR
+        be_val = be / ((TP_MULT - 1) + be)
+        col = "#3fb950" if wr >= be_val else ("#e3b341" if wr >= be_val * 0.85 else "#f85149")
+        flag = " ✅" if wr >= be_val else ""
+        return f"<span style='color:{col}'>{wr:.1%}{flag}</span>"
+
+    def url_with(**kwargs):
+        params = {
+            "nf": nf_min, "bounce": bounce_min, "elapsed": elapsed_max,
+            "drop": drop_min, "smart": smart_min, "events": events_min,
+            "pool": pool_min,
+            "tp": TP_MULT - 1, "sl": 1 - SL_MULT,
+        }
+        params.update(kwargs)
+        return "/analise/feature-grid?" + "&".join(f"{k}={v}" for k, v in params.items())
+
+    # ── Aplicar filtros base ───────────────────────────────────────────────────
+    def apply_base(rows):
+        out = []
+        for r in rows:
+            nf = r.get("net_sol_flow")
+            bp = r.get("bounce_pct") or 0
+            el = r.get("elapsed_min") or 0
+            dr = r.get("drop_from_mig") or 0
+            sm = r.get("smart_wallets") or 0
+            ev = r.get("absorption_events") or 0
+            pq = r.get("pool_quote_at_signal") or 0
+            if nf is None:            continue
+            if nf < nf_min:           continue
+            if bp < bounce_min:       continue
+            if el > elapsed_max:      continue
+            if dr < drop_min:         continue
+            if sm < smart_min:        continue
+            if ev < events_min:       continue
+            if pq < pool_min:         continue
+            out.append(r)
+        return out
+
+    base = apply_base(all_rows)
+    wr_base, ev_base, tp_base, sl_base, n_base = wr_ev(base)
+
+    # Break-even WR
+    be_wr = (1 - SL_MULT) / ((TP_MULT - 1) + (1 - SL_MULT))
+
+    # ── Definição das features a cruzar ───────────────────────────────────────
+    FEATURES = [
+        {
+            "nome": "H23 net_sol_flow",
+            "desc": "SOL líquido (compra − venda) nos 60s antes do fundo",
+            "faixas": [
+                ("≥ 1 SOL",   lambda r: (r.get("net_sol_flow") or 0) >= 1.0),
+                ("≥ 3 SOL",   lambda r: (r.get("net_sol_flow") or 0) >= 3.0),
+                ("≥ 5 SOL",   lambda r: (r.get("net_sol_flow") or 0) >= 5.0),
+                ("≥ 10 SOL",  lambda r: (r.get("net_sol_flow") or 0) >= 10.0),
+                ("0–1 SOL",   lambda r: 0 <= (r.get("net_sol_flow") or -999) < 1.0),
+                ("< 0 SOL",   lambda r: (r.get("net_sol_flow") or 0) < 0),
+            ],
+        },
+        {
+            "nome": "Bounce % do fundo",
+            "desc": "Quanto o preço subiu do fundo até o sinal",
+            "faixas": [
+                ("30–55%",   lambda r: 0.30 <= (r.get("bounce_pct") or 0) < 0.55),
+                ("55–80%",   lambda r: 0.55 <= (r.get("bounce_pct") or 0) < 0.80),
+                ("80–100%",  lambda r: 0.80 <= (r.get("bounce_pct") or 0) < 1.00),
+                ("> 100%",   lambda r: (r.get("bounce_pct") or 0) >= 1.00),
+                ("≤ 80%",    lambda r: (r.get("bounce_pct") or 0) <= 0.80),
+            ],
+        },
+        {
+            "nome": "Elapsed (migração → sinal)",
+            "desc": "Minutos desde a migração até o sinal de bounce",
+            "faixas": [
+                ("0–3 min",   lambda r: (r.get("elapsed_min") or 0) < 3.0),
+                ("3–6 min",   lambda r: 3.0 <= (r.get("elapsed_min") or 0) < 6.0),
+                ("6–10 min",  lambda r: 6.0 <= (r.get("elapsed_min") or 0) < 10.0),
+                ("≤ 5 min",   lambda r: (r.get("elapsed_min") or 0) <= 5.0),
+                ("≤ 10 min",  lambda r: (r.get("elapsed_min") or 0) <= 10.0),
+            ],
+        },
+        {
+            "nome": "Drop desde migração",
+            "desc": "Queda do MC de migração até o fundo",
+            "faixas": [
+                ("30–45%",   lambda r: 0.30 <= (r.get("drop_from_mig") or 0) < 0.45),
+                ("45–60%",   lambda r: 0.45 <= (r.get("drop_from_mig") or 0) < 0.60),
+                ("60–75%",   lambda r: 0.60 <= (r.get("drop_from_mig") or 0) < 0.75),
+                ("> 75%",    lambda r: (r.get("drop_from_mig") or 0) >= 0.75),
+                ("> 50%",    lambda r: (r.get("drop_from_mig") or 0) >= 0.50),
+            ],
+        },
+        {
+            "nome": "Eventos Helius (H22)",
+            "desc": "Total de transações pAMM detectadas nos 60s antes do sinal",
+            "faixas": [
+                ("1–50",     lambda r: 1 <= (r.get("absorption_events") or 0) < 50),
+                ("50–150",   lambda r: 50 <= (r.get("absorption_events") or 0) < 150),
+                ("150–299",  lambda r: 150 <= (r.get("absorption_events") or 0) < 299),
+                ("= 300",    lambda r: (r.get("absorption_events") or 0) >= 299),
+                ("> 100",    lambda r: (r.get("absorption_events") or 0) > 100),
+            ],
+        },
+        {
+            "nome": "Smart wallets",
+            "desc": "Carteiras reconhecidas com posição no momento da migração",
+            "faixas": [
+                ("1–2",      lambda r: 1 <= (r.get("smart_wallets") or 0) <= 2),
+                ("3–5",      lambda r: 3 <= (r.get("smart_wallets") or 0) <= 5),
+                ("6–10",     lambda r: 6 <= (r.get("smart_wallets") or 0) <= 10),
+                ("> 10",     lambda r: (r.get("smart_wallets") or 0) > 10),
+                ("≥ 3",      lambda r: (r.get("smart_wallets") or 0) >= 3),
+            ],
+        },
+        {
+            "nome": "Status do dev",
+            "desc": "Se o desenvolvedor ainda segura tokens",
+            "faixas": [
+                ("Dev saiu",  lambda r: r.get("creator_token_status") == "creator_close"),
+                ("Dev segura",lambda r: r.get("creator_token_status") == "creator_hold"),
+            ],
+        },
+        {
+            "nome": "CTO (comunidade assumiu)",
+            "desc": "cto_flag=1: comunidade tomou conta do projeto",
+            "faixas": [
+                ("CTO = sim", lambda r: (r.get("cto_flag") or 0) == 1),
+                ("CTO = não", lambda r: (r.get("cto_flag") or 0) == 0),
+            ],
+        },
+        {
+            "nome": "Pool depth no sinal",
+            "desc": "Liquidez da pool pAMM no momento do bounce (SOL)",
+            "faixas": [
+                ("10–30 SOL", lambda r: 10 <= (r.get("pool_quote_at_signal") or 0) < 30),
+                ("30–60 SOL", lambda r: 30 <= (r.get("pool_quote_at_signal") or 0) < 60),
+                ("60–100 SOL",lambda r: 60 <= (r.get("pool_quote_at_signal") or 0) < 100),
+                ("> 100 SOL", lambda r: (r.get("pool_quote_at_signal") or 0) >= 100),
+                ("> 40 SOL",  lambda r: (r.get("pool_quote_at_signal") or 0) >= 40),
+            ],
+        },
+    ]
+
+    # ── Montar HTML ────────────────────────────────────────────────────────────
+    H = CSS
+    H += "<nav>"
+    H += "<a href='/analise/sinal-puro'>Sinal Puro</a>"
+    H += "<a href='/analise/h23-sim'>H23 Sim</a>"
+    H += "<a href='/analise/h23-deep'>H23 Deep</a>"
+    H += "<a href='/analise/feature-grid'>Feature Grid</a>"
+    H += "</nav>"
+    H += "<h2>🔬 Feature Grid — interseção multidimensional com filtro base</h2>"
+    H += "<p class='sub'>Metodologia: entry=mc_at_signal · TP=+{:.0f}% · SL=-{:.0f}% · janela 20min · mín {} ticks</p>".format(
+        (TP_MULT-1)*100, (1-SL_MULT)*100, MIN_TICKS)
+
+    # ── Controles interativos ──────────────────────────────────────────────────
+    H += "<div class='ctrl'>"
+    H += "<b style='color:#e6edf3'>Filtro base ativo — clique para modificar:</b><br><br>"
+
+    # H23 threshold
+    H += "<label>H23 net_sol_flow ≥</label>"
+    for v in [-999, -5, 0, 0.5, 1, 2, 3, 5, 10]:
+        label = "desativado" if v == -999 else f"{v:+g} SOL"
+        cls = "active" if abs(nf_min - v) < 0.01 else ""
+        H += f"<a href='{url_with(nf=v)}' class='{cls}'>{label}</a>"
+    H += "<br><br>"
+
+    # Bounce min
+    H += "<label>Bounce mínimo ≥</label>"
+    for v in [0.0, 0.30, 0.40, 0.55, 0.70, 1.00]:
+        label = "sem filtro" if v == 0 else f"{v:.0%}"
+        cls = "active" if abs(bounce_min - v) < 0.01 else ""
+        H += f"<a href='{url_with(bounce=v)}' class='{cls}'>{label}</a>"
+    H += "<br><br>"
+
+    # Elapsed max
+    H += "<label>Elapsed máximo ≤</label>"
+    for v in [5, 8, 10, 15, 20]:
+        cls = "active" if abs(elapsed_max - v) < 0.1 else ""
+        H += f"<a href='{url_with(elapsed=v)}' class='{cls}'>{v} min</a>"
+    H += "<br><br>"
+
+    # Smart min
+    H += "<label>Smart wallets ≥</label>"
+    for v in [0, 1, 2, 3, 5]:
+        label = "sem filtro" if v == 0 else str(v)
+        cls = "active" if smart_min == v else ""
+        H += f"<a href='{url_with(smart=v)}' class='{cls}'>{label}</a>"
+    H += "<br><br>"
+
+    # Events min
+    H += "<label>Eventos Helius ≥</label>"
+    for v in [0, 10, 50, 100, 150]:
+        label = "sem filtro" if v == 0 else str(v)
+        cls = "active" if events_min == v else ""
+        H += f"<a href='{url_with(events=v)}' class='{cls}'>{label}</a>"
+    H += "<br><br>"
+
+    # TP/SL
+    H += "<label>TP/SL:</label>"
+    for tp_v, sl_v, lbl in [(0.75, 0.25, "TP75/SL25"), (1.00, 0.25, "TP100/SL25"), (0.50, 0.25, "TP50/SL25"), (0.75, 0.15, "TP75/SL15")]:
+        cls = "active" if abs((TP_MULT-1) - tp_v) < 0.01 and abs((1-SL_MULT) - sl_v) < 0.01 else ""
+        H += f"<a href='{url_with(tp=tp_v, sl=sl_v)}' class='{cls}'>{lbl}</a>"
+    H += "</div>"
+
+    # ── Resumo do filtro base ──────────────────────────────────────────────────
+    status_cls = "ok" if ev_base > 0 else ("be" if ev_base >= -0.02 else "warn")
+    H += f"<div class='{status_cls}'>"
+    H += f"<b>Filtro base atual:</b> "
+    parts = []
+    if nf_min > -999: parts.append(f"H23 ≥ {nf_min:+g} SOL")
+    if bounce_min > 0: parts.append(f"bounce ≥ {bounce_min:.0%}")
+    if elapsed_max < 20: parts.append(f"elapsed ≤ {elapsed_max:.0f}min")
+    if drop_min > 0: parts.append(f"drop ≥ {drop_min:.0%}")
+    if smart_min > 0: parts.append(f"smart ≥ {smart_min}")
+    if events_min > 0: parts.append(f"eventos ≥ {events_min}")
+    if pool_min > 0: parts.append(f"pool ≥ {pool_min:.0f} SOL")
+    H += (" · ".join(parts) if parts else "sem filtro") + "<br>"
+    H += f"<b>n={n_base}</b> bounces · <b>WR={wr_fmt(wr_base, n_base)}</b> · "
+    H += f"EV={ev_fmt(ev_base)} · TP={tp_base} · SL={sl_base} · "
+    H += f"break-even={be_wr:.1%}"
+    H += "</div>"
+
+    if n_base < 10:
+        H += "<div class='warn'>⚠ n muito pequeno — resultado estatisticamente irrelevante.</div>"
+
+    # ── Grid de features ───────────────────────────────────────────────────────
+    H += "<h3>📊 Impacto de cada feature adicional no subconjunto filtrado</h3>"
+    H += "<p class='sub'>Para cada faixa: WR e EV calculados sobre os bounces do filtro base que também satisfazem aquela condição. "
+    H += "Ordenado por EV decrescente dentro de cada feature. "
+    H += f"Base: WR={wr_base:.1%} · EV={ev_base:+.1%}</p>"
+
+    # Coletar todas as linhas para ordenação global por EV
+    all_rows_feat = []
+
+    for feat in FEATURES:
+        rows_feat = []
+        for label, fn in feat["faixas"]:
+            subset = [r for r in base if fn(r)]
+            wr_f, ev_f, tp_f, sl_f, n_f = wr_ev(subset)
+            decided = tp_f + sl_f
+            delta_wr = wr_f - wr_base
+            delta_ev = ev_f - ev_base
+            rows_feat.append({
+                "feat_nome": feat["nome"],
+                "feat_desc": feat["desc"],
+                "label": label,
+                "n": n_f,
+                "decided": decided,
+                "tp": tp_f,
+                "sl": sl_f,
+                "wr": wr_f,
+                "ev": ev_f,
+                "delta_wr": delta_wr,
+                "delta_ev": delta_ev,
+            })
+        rows_feat.sort(key=lambda x: x["ev"], reverse=True)
+        all_rows_feat.append((feat, rows_feat))
+
+    for feat, rows_feat in all_rows_feat:
+        H += f"<h3 style='margin-top:22px'>{feat['nome']}</h3>"
+        H += f"<p class='sub'>{feat['desc']}</p>"
+        H += "<table><tr>"
+        H += "<th style='text-align:left'>Faixa</th><th>n</th><th>decididos</th>"
+        H += "<th>TP</th><th>SL</th><th>WR</th><th>vs base</th><th>EV/trade</th><th>vs base</th>"
+        H += "</tr>"
+        for row in rows_feat:
+            n_f    = row["n"]
+            dec    = row["decided"]
+            tp_f   = row["tp"]
+            sl_f   = row["sl"]
+            wr_f   = row["wr"]
+            ev_f   = row["ev"]
+            d_wr   = row["delta_wr"]
+            d_ev   = row["delta_ev"]
+            if n_f < 5:
+                tr_cls = ""
+            elif ev_f > 0:
+                tr_cls = " class='hi'"
+            elif ev_f < -0.05:
+                tr_cls = " class='lo'"
+            else:
+                tr_cls = ""
+
+            d_wr_s = f"<span style='color:{'#3fb950' if d_wr>0.005 else ('#f85149' if d_wr<-0.005 else '#8b949e')}'>{d_wr:+.1%}</span>"
+            d_ev_s = f"<span style='color:{'#3fb950' if d_ev>0.005 else ('#f85149' if d_ev<-0.005 else '#8b949e')}'>{d_ev:+.1%}</span>"
+            dim = " class='dim'" if n_f < 5 else ""
+            H += f"<tr{tr_cls}>"
+            H += f"<td{dim} class='feat-label'>{row['label']}</td>"
+            H += f"<td{dim}>{n_f}</td>"
+            H += f"<td{dim}>{dec}</td>"
+            H += f"<td class='tp'>{tp_f}</td>"
+            H += f"<td class='sl'>{sl_f}</td>"
+            if n_f >= 5:
+                H += f"<td>{wr_fmt(wr_f, n_f)}</td>"
+                H += f"<td>{d_wr_s}</td>"
+                H += f"<td>{ev_fmt(ev_f)}</td>"
+                H += f"<td>{d_ev_s}</td>"
+            else:
+                H += f"<td class='dim' colspan='4'>n insuficiente</td>"
+            H += "</tr>"
+        H += "</table>"
+
+    # ── Top combinações de 2 features ─────────────────────────────────────────
+    H += "<h3>🏆 Top combinações de 2 features (no filtro base)</h3>"
+    H += "<p class='sub'>Cruza todas as faixas de features disponíveis duas a duas. Mínimo n=10 e n_decided≥5.</p>"
+
+    combos = []
+    flat_faixas = []
+    for feat in FEATURES:
+        for label, fn in feat["faixas"]:
+            flat_faixas.append((feat["nome"], label, fn))
+
+    for i in range(len(flat_faixas)):
+        for j in range(i+1, len(flat_faixas)):
+            fn1, fn2 = flat_faixas[i][2], flat_faixas[j][2]
+            # Evitar combinar faixas da mesma feature (redundante)
+            if flat_faixas[i][0] == flat_faixas[j][0]:
+                continue
+            subset = [r for r in base if fn1(r) and fn2(r)]
+            wr_f, ev_f, tp_f, sl_f, n_f = wr_ev(subset)
+            decided = tp_f + sl_f
+            if n_f < 10 or decided < 5:
+                continue
+            combos.append({
+                "feat1": flat_faixas[i][0],
+                "label1": flat_faixas[i][1],
+                "feat2": flat_faixas[j][0],
+                "label2": flat_faixas[j][1],
+                "n": n_f,
+                "decided": decided,
+                "tp": tp_f,
+                "sl": sl_f,
+                "wr": wr_f,
+                "ev": ev_f,
+                "delta_ev": ev_f - ev_base,
+            })
+
+    combos.sort(key=lambda x: x["ev"], reverse=True)
+
+    H += "<table><tr>"
+    H += "<th style='text-align:left'>Feature 1</th><th style='text-align:left'>Feature 2</th>"
+    H += "<th>n</th><th>TP</th><th>SL</th><th>WR</th><th>EV/trade</th><th>vs base</th>"
+    H += "</tr>"
+    for c in combos[:30]:
+        tr_cls = " class='hi'" if c["ev"] > 0 else (" class='lo'" if c["ev"] < -0.05 else "")
+        d_ev_s = f"<span style='color:{'#3fb950' if c['delta_ev']>0.005 else ('#f85149' if c['delta_ev']<-0.005 else '#8b949e')}'>{c['delta_ev']:+.1%}</span>"
+        H += f"<tr{tr_cls}>"
+        H += f"<td><span class='feat-label'>{c['label1']}</span> <span class='faixa'>({c['feat1']})</span></td>"
+        H += f"<td><span class='feat-label'>{c['label2']}</span> <span class='faixa'>({c['feat2']})</span></td>"
+        H += f"<td>{c['n']}</td>"
+        H += f"<td class='tp'>{c['tp']}</td>"
+        H += f"<td class='sl'>{c['sl']}</td>"
+        H += f"<td>{wr_fmt(c['wr'], c['n'])}</td>"
+        H += f"<td>{ev_fmt(c['ev'])}</td>"
+        H += f"<td>{d_ev_s}</td>"
+        H += "</tr>"
+    if not combos:
+        H += "<tr><td colspan='8' class='dim'>Nenhuma combinação com n≥10 e decididos≥5.</td></tr>"
+    H += "</table>"
+
+    H += "<p class='sub' style='margin-top:20px'>Dados: bounce_signals + token_ticks · entry=mc_at_signal · TP={:.0f}% · SL={:.0f}%</p>".format(
+        (TP_MULT-1)*100, (1-SL_MULT)*100)
+    return H
+
+
 @app.route("/analise/h23-deep")
 def analise_h23_deep():
     """H23 Deep — análise completa de todos os tokens com net_sol_flow.
