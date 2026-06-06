@@ -30125,7 +30125,7 @@ def analise_feature_grid():
     """
     Grid interativo: aplica um filtro base (padrão H23 ≥ 1 SOL) e mostra WR
     de cada feature adicional dentro desse subconjunto, usando metodologia
-    tick-based (entry=mc_at_signal, TP+75%, SL-25%, janela 20min).
+    tick-based (entry=mc_at_signal, TP+75%, SL-25%, janela 60min).
 
     Parâmetros URL (todos opcionais):
       nf=1.0        — net_sol_flow mínimo (base filter)
@@ -30201,7 +30201,7 @@ def analise_feature_grid():
                 FROM bounce_signals bs
                 JOIN token_ticks tt ON tt.mint = bs.mint
                     AND tt.tick_ts > bs.ts_signal
-                    AND tt.tick_ts < bs.ts_signal + INTERVAL '20 minutes'
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
                 LEFT JOIN migrations m ON m.mint = bs.mint
                 WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
                   AND bs.bounce_pct   IS NOT NULL
@@ -30386,7 +30386,7 @@ def analise_feature_grid():
     H += "<a href='/analise/feature-grid'>Feature Grid</a>"
     H += "</nav>"
     H += "<h2>🔬 Feature Grid — interseção multidimensional com filtro base</h2>"
-    H += "<p class='sub'>Metodologia: entry=mc_at_signal · TP=+{:.0f}% · SL=-{:.0f}% · janela 20min · mín {} ticks</p>".format(
+    H += "<p class='sub'>Metodologia: entry=mc_at_signal · TP=+{:.0f}% · SL=-{:.0f}% · janela 60min · mín {} ticks</p>".format(
         (TP_MULT-1)*100, (1-SL_MULT)*100, MIN_TICKS)
 
     # ── Controles interativos ──────────────────────────────────────────────────
