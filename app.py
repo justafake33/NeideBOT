@@ -30205,13 +30205,15 @@ def analise_grid_search():
     Ordena por EV decrescente. Exporta como HTML, texto ou CSV.
 
     Params:
-      min_n=10      mínimo de bounces no subconjunto
-      min_dec=5     mínimo de decididos (TP ou SL)
-      top=200       quantas linhas mostrar
+      since=YYYY-MM-DD  filtrar bounces a partir desta data (padrão: sem filtro)
+      min_n=10          mínimo de bounces no subconjunto
+      min_dec=5         mínimo de decididos (TP ou SL)
+      top=200           quantas linhas mostrar
       format=html|text|csv
     """
     import itertools, io, time
 
+    since_str = request.args.get("since", "")
     MIN_N   = int(request.args.get("min_n",   10))
     MIN_DEC = int(request.args.get("min_dec",  5))
     TOP     = int(request.args.get("top",    200))
@@ -30250,13 +30252,14 @@ def analise_grid_search():
                 LEFT JOIN migrations m ON m.mint = bs.mint
                 WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
                   AND bs.bounce_pct   IS NOT NULL
+                  AND (%(since)s = '' OR bs.ts_signal >= %(since)s::timestamptz)
                 GROUP BY bs.mint, bs.bounce_pct, bs.drop_from_mig, bs.elapsed_sec,
                          bs.absorption_events, bs.net_sol_flow, bs.mc_at_signal,
                          m.smart_wallets
                 HAVING COUNT(tt.id) >= %(min_ticks)s
             )
             SELECT * FROM base
-        """, {"min_ticks": MIN_TICKS})
+        """, {"min_ticks": MIN_TICKS, "since": since_str})
         rows = [dict(r) for r in cur.fetchall()]
     t_sql = time.time() - t0
 
@@ -30396,20 +30399,30 @@ def analise_grid_search():
     nav a{color:#58a6ff;margin-right:12px;font-size:12px;text-decoration:none}
     </style>"""
 
+    since_label = f"desde {since_str}" if since_str else "todos os dados (sem filtro de data)"
+    data_flag = "✅ dados limpos (pós-phantom-fix)" if since_str >= "2026-05-26" else ("⚠️ inclui dados com phantom possível" if since_str >= "2026-05-21" else "🔴 inclui dados históricos corrompidos")
+    if not since_str:
+        data_flag = "🔴 88.5% dos dados são pré-phantom-fix — resultados não confiáveis"
+
     H = CSS
-    H += "<nav><a href='/analise'>Análise</a><a href='/analise/feature-grid'>Feature Grid</a><a href='/analise/grid-search'>Grid Search</a></nav>"
+    H += "<nav><a href='/analise'>Análise</a><a href='/analise/feature-grid'>Feature Grid</a><a href='/analise/grid-search'>Grid Search</a><a href='/debug/bounce-stats'>Bounce Stats</a></nav>"
     H += "<h2>🔍 Grid Search — subconjuntos únicos de tokens</h2>"
-    H += f"<p class='sub'>{N} bounces · {total_combos:,} combinações testadas · <strong>{len(results)} subconjuntos únicos</strong> (n≥{MIN_N}, dec≥{MIN_DEC}) · SQL {t_sql:.1f}s · grid {t_py:.1f}s · janela 60min</p>"
+    H += f"<p class='sub'><strong>{data_flag}</strong> · {since_label}</p>"
+    H += f"<p class='sub'>{N} bounces · {total_combos:,} combinações · <strong>{len(results)} subconjuntos únicos</strong> (n≥{MIN_N}, dec≥{MIN_DEC}) · SQL {t_sql:.1f}s · grid {t_py:.1f}s · janela 60min</p>"
     H += "<p class='sub'>Deduplicado: combinações que selecionam os mesmos tokens aparecem 1× com os parâmetros mais restritivos.</p>"
 
-    # Links de exportação
-    base_url = f"/analise/grid-search?min_n={MIN_N}&min_dec={MIN_DEC}&top={TOP}"
+    # Links de exportação e filtro de data
+    s_param = f"&since={since_str}" if since_str else ""
+    base_url = f"/analise/grid-search?min_n={MIN_N}&min_dec={MIN_DEC}&top={TOP}{s_param}"
     H += f"<div class='export'>"
-    H += f"<strong>Exportar para colar:</strong> &nbsp;"
-    H += f"<a href='{base_url}&format=text'>📋 Texto puro (cole aqui)</a>"
+    H += f"<strong>Filtro de data:</strong> &nbsp;"
+    H += f"<a href='/analise/grid-search?since=2026-05-26&min_n=5&min_dec=3&top=9999'>✅ Só limpos (≥26/05)</a>"
+    H += f"<a href='/analise/grid-search?since=2026-05-21&min_n=5&min_dec=3&top=9999'>🟡 Pós-erpc (≥21/05)</a>"
+    H += f"<a href='/analise/grid-search?min_n={MIN_N}&min_dec={MIN_DEC}&top={TOP}'>🔴 Todos (histórico)</a>"
+    H += f"&nbsp;&nbsp;<strong>Exportar:</strong> &nbsp;"
+    H += f"<a href='{base_url}&format=text'>📋 Texto puro</a>"
     H += f"<a href='{base_url}&format=csv'>⬇ CSV</a>"
-    H += f"<a href='/analise/grid-search?min_n={MIN_N}&min_dec={MIN_DEC}&top=9999&format=text'>📋 TUDO em texto</a>"
-    H += f"<a href='/analise/grid-search?min_n=5&min_dec=3&top=9999&format=text'>📋 TUDO (n≥5)</a>"
+    H += f"<a href='/analise/grid-search?min_n=5&min_dec=3&top=9999{s_param}&format=text'>📋 TUDO (n≥5)</a>"
     H += "</div>"
 
     if not top_rows:
