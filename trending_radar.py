@@ -21,7 +21,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-import db
+import trending_radar_store as store
 from gmgn_client import GmgnClient, RateLimitError
 
 logging.basicConfig(
@@ -169,14 +169,14 @@ class TrendingRadar:
                                                   interval=interval, idx=idx)
                 if normalized:
                     rows.append(normalized)
-            ids = db.insert_trending_snapshots(rows)
+            ids = store.insert_trending_snapshots(rows)
             all_ids.extend(ids)
             totals["intervals"] += 1
             totals["rows"] += len(rows)
             totals["inserted"] += len(ids)
             logger.info("Trending %s/%s: rows=%d inserted=%d", self.chain, interval, len(rows), len(ids))
 
-        coverage = db.build_trending_coverage(
+        coverage = store.build_trending_coverage(
             all_ids,
             outcome_window_min=self.outcome_window_min,
             take_profit_pct=self.take_profit_pct,
@@ -207,7 +207,7 @@ class TrendingRadar:
 
 
 def main() -> None:
-    db.ensure_trending_radar_schema()
+    store.ensure_trending_radar_schema()
     radar = TrendingRadar(GmgnClient())
     radar.start()
 
