@@ -68,6 +68,35 @@ def _bool(v: Any) -> bool | None:
     return bool(v)
 
 
+def _collect_trending_interval(radar, interval: str) -> tuple[list[int], int]:
+    ts_snapshot = datetime.now(timezone.utc)
+    rows_raw = radar.gmgn.get_market_trending(
+        chain=radar.chain,
+        interval=interval,
+        limit=radar.limit,
+        order_by=radar.order_by,
+        direction=radar.direction,
+        filters=radar.filters or None,
+        platforms=radar.platforms or None,
+    )
+    rows = []
+    for idx, item in enumerate(rows_raw, start=1):
+        if not isinstance(item, dict):
+            continue
+        normalized = radar._normalize_item(
+            item, ts_snapshot=ts_snapshot, interval=interval, idx=idx
+        )
+        if normalized:
+            rows.append(normalized)
+
+    ids = db.insert_trending_snapshots(rows)
+    logger.info(
+        "Trending %s/%s: rows=%d inserted=%d",
+        radar.chain, interval, len(rows), len(ids),
+    )
+    return ids, len(rows)
+
+
 class TrendingRadar:
     def __init__(self, gmgn: GmgnClient):
         self.gmgn = gmgn
@@ -147,39 +176,11 @@ class TrendingRadar:
             "raw": item,
         }
 
-    def _collect_interval(self, interval: str) -> tuple[list[int], int]:
-        ts_snapshot = datetime.now(timezone.utc)
-        rows_raw = self.gmgn.get_market_trending(
-            chain=self.chain,
-            interval=interval,
-            limit=self.limit,
-            order_by=self.order_by,
-            direction=self.direction,
-            filters=self.filters or None,
-            platforms=self.platforms or None,
-        )
-        rows = []
-        for idx, item in enumerate(rows_raw, start=1):
-            if not isinstance(item, dict):
-                continue
-            normalized = self._normalize_item(
-                item, ts_snapshot=ts_snapshot, interval=interval, idx=idx
-            )
-            if normalized:
-                rows.append(normalized)
-
-        ids = db.insert_trending_snapshots(rows)
-        logger.info(
-            "Trending %s/%s: rows=%d inserted=%d",
-            self.chain, interval, len(rows), len(ids),
-        )
-        return ids, len(rows)
-
     def run_once_cycle(self) -> dict:
         all_ids: list[int] = []
         totals = {"intervals": 0, "rows": 0, "inserted": 0}
         for interval in self.intervals:
-            ids, row_count = self._collect_interval(interval)
+            ids, row_count = _collect_trending_interval(self, interval)
             all_ids.extend(ids)
             totals["intervals"] += 1
             totals["rows"] += row_count

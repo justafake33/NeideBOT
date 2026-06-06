@@ -103,12 +103,6 @@ Rodando contínuo:
 python trending_radar.py
 ```
 
-Acompanhamento web/JSON:
-
-```text
-/debug/trending-radar?hours=24
-/debug/trending-radar?hours=24&format=json
-```
 
 Configurações úteis:
 
@@ -177,3 +171,7 @@ A V1 deveria calcular features temporais:
 - risk drift.
 
 Só depois disso faria sentido discutir realtime seletivo ou execução canary.
+
+## Endpoint
+
+Endpoint: `/debug/trending-radar?hours=24` (`&format=json` para JSON).
