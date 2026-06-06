@@ -398,6 +398,34 @@ class GmgnClient:
         result = self._post("/v1/trenches", body, extra_params={"chain": chain})
         return result.get("data", {})
 
+    def get_market_trending(self, chain: str = "sol", interval: str = "5m",
+                            limit: int = 100, order_by: str = "default",
+                            direction: str = "desc", filters: list = None,
+                            platforms: list = None) -> list:
+        """GET /v1/market/rank — ranking/trending GMGN. Uso: radar passivo de tokens trending."""
+        params = {
+            "chain": chain,
+            "interval": interval,
+            "limit": max(1, min(int(limit or 100), 100)),
+            "order_by": order_by,
+            "direction": direction,
+        }
+        if filters:
+            params["filter"] = filters
+        if platforms:
+            params["platform"] = platforms
+        result = self._get("/v1/market/rank", params)
+        data = result.get("data", {})
+        if isinstance(data, list):
+            return data
+        for key in ("rank", "list", "items"):
+            rows = data.get(key) if isinstance(data, dict) else None
+            if isinstance(rows, list):
+                return rows
+        logger.warning("market/rank envelope inesperado: keys=%s",
+                       list(data.keys()) if isinstance(data, dict) else type(data).__name__)
+        return []
+
     def get_token_kline(self, mint: str, chain: str = "sol",
                         resolution: str = "1m",
                         from_ts: int = None, to_ts: int = None) -> list:

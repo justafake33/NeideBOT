@@ -13,6 +13,7 @@ from gmgn_client import GmgnClient, get_sol_usd as _get_sol_usd
 from scheduler import HeapScheduler
 from scanner import Scanner, HotMonitor
 from executor import TradeExecutor, TradeMonitor
+from trending_radar_routes import trending_radar_bp
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 init_sentry()
 
 app = Flask(__name__)
+app.register_blueprint(trending_radar_bp)
 BRT = timedelta(hours=-3)
 
 
