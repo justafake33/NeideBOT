@@ -31585,12 +31585,13 @@ def analise_h23_deep():
 @app.route("/analise/h24-h25")
 def analise_h24_h25():
     """
-    Correlação H24 (seller concentration) + H25 (pool depth) + H23 (net flow bottom)
-    vs outcomes blockchain-verificados.
+    Correlação H24 (seller concentration) + H25 (pool depth) + H26 (buyer concentration)
+    + H23 (net flow bottom) vs outcomes blockchain-verificados.
     """
     import psycopg2, traceback
     from db import DATABASE_URL
 
+    since = request.args.get("since", "2026-05-26")
     try:
      conn = psycopg2.connect(DATABASE_URL)
      cur  = conn.cursor()
@@ -31598,12 +31599,12 @@ def analise_h24_h25():
         return f"<pre>DB connect error: {e}</pre>", 500
 
     try:
-     return _analise_h24_h25_inner(conn, cur)
+     return _analise_h24_h25_inner(conn, cur, since=since)
     except Exception as e:
         conn.close()
         return f"<pre style='color:red'>{traceback.format_exc()}</pre>", 500
 
-def _analise_h24_h25_inner(conn, cur):
+def _analise_h24_h25_inner(conn, cur, since="2026-05-26"):
     # LEFT JOIN — bounces sem trade aparecem com t.status = NULL (não tradado)
     # Inclui todos os exit_types blockchain-verificados:
     #   helius_sell_recovery = auditoria retroativa (sessão 5, 139 trades)
@@ -31620,23 +31621,29 @@ def _analise_h24_h25_inner(conn, cur):
         ) t ON true
     """
 
-    # cobertura geral: quantos bounces têm dados H24/H25/H23, e quantos foram tradados
+    since_cond = "AND bs.ts_signal >= %(since)s::timestamptz" if since else ""
+    since_p    = {"since": since} if since else {}
+
+    # cobertura geral: quantos bounces têm dados H24/H25/H23/H26, e quantos foram tradados
     cur.execute(f"""
         SELECT
             COUNT(*) FILTER (WHERE bs.dump_seller_hhi IS NOT NULL)                          AS n_h24,
             COUNT(*) FILTER (WHERE bs.pool_quote_at_signal IS NOT NULL)                      AS n_h25,
             COUNT(*) FILTER (WHERE bs.net_sol_flow IS NOT NULL AND bs.h23_window='bottom')   AS n_h23,
+            COUNT(*) FILTER (WHERE bs.buy_concentration IS NOT NULL)                         AS n_h26,
             COUNT(*) FILTER (WHERE t.status IS NOT NULL)                                     AS n_traded,
             COUNT(*) FILTER (WHERE t.status = 'tp')                                          AS n_tp,
             COUNT(*) FILTER (WHERE t.status = 'sl')                                          AS n_sl
         FROM bounce_signals bs {TRADE_JOIN}
-        WHERE bs.dump_seller_hhi IS NOT NULL
+        WHERE (bs.dump_seller_hhi IS NOT NULL
            OR bs.pool_quote_at_signal IS NOT NULL
            OR (bs.net_sol_flow IS NOT NULL AND bs.h23_window = 'bottom')
-    """)
+           OR bs.buy_concentration IS NOT NULL)
+          {since_cond}
+    """, since_p)
     cov = cur.fetchone()
-    base_n  = cov[3] or 0
-    base_tp = cov[4] or 0
+    base_n  = cov[4] or 0
+    base_tp = cov[5] or 0
     base_wr = round(base_tp / base_n * 100, 1) if base_n else 0
 
     CSS = """<style>
@@ -31685,7 +31692,7 @@ def _analise_h24_h25_inner(conn, cur):
         return f"<h2>{title}</h2>{note_html}<table><tr>{ths}</tr>{body}</table>"
 
     def run_query(sql):
-        cur.execute(sql)
+        cur.execute(sql, since_p)
         rows = []
         for faixa, n_all, n_trd, tp, sl, pnl in cur.fetchall():
             tp    = tp or 0
@@ -31712,6 +31719,7 @@ def _analise_h24_h25_inner(conn, cur):
             AVG(t.pnl_pct_real)                                        AS pnl
         FROM bounce_signals bs {TRADE_JOIN}
         WHERE bs.dump_seller_hhi IS NOT NULL
+          {since_cond}
         GROUP BY 1 ORDER BY MIN(bs.dump_seller_hhi) DESC
     """)
 
@@ -31731,7 +31739,28 @@ def _analise_h24_h25_inner(conn, cur):
             AVG(t.pnl_pct_real)                                        AS pnl
         FROM bounce_signals bs {TRADE_JOIN}
         WHERE bs.pool_quote_at_signal IS NOT NULL
+          {since_cond}
         GROUP BY 1 ORDER BY MIN(bs.pool_quote_at_signal) DESC
+    """)
+
+    # ── H26 — buyer concentration na RISE window ─────────────────────────────
+    h26_rows = run_query(f"""
+        SELECT
+            CASE
+                WHEN bs.buy_concentration >= 0.75 THEN '≥0.75  (1 buyer domina o bounce)'
+                WHEN bs.buy_concentration >= 0.50 THEN '0.50-0.75  (concentrado)'
+                WHEN bs.buy_concentration >= 0.25 THEN '0.25-0.50  (alguns buyers)'
+                ELSE                                   '<0.25  (muitos buyers pequenos)'
+            END                                                        AS faixa,
+            COUNT(*)                                                    AS n_all,
+            COUNT(t.status)                                             AS n_trd,
+            SUM(CASE WHEN t.status='tp' THEN 1 ELSE 0 END)             AS tp,
+            SUM(CASE WHEN t.status='sl' THEN 1 ELSE 0 END)             AS sl,
+            AVG(t.pnl_pct_real)                                        AS pnl
+        FROM bounce_signals bs {TRADE_JOIN}
+        WHERE bs.buy_concentration IS NOT NULL
+          {since_cond}
+        GROUP BY 1 ORDER BY MIN(bs.buy_concentration) DESC
     """)
 
     # ── H23 bottom window ─────────────────────────────────────────────────────
@@ -31750,6 +31779,7 @@ def _analise_h24_h25_inner(conn, cur):
             AVG(t.pnl_pct_real)                                        AS pnl
         FROM bounce_signals bs {TRADE_JOIN}
         WHERE bs.net_sol_flow IS NOT NULL AND bs.h23_window = 'bottom'
+          {since_cond}
         GROUP BY 1 ORDER BY MIN(bs.net_sol_flow) DESC
     """)
 
@@ -31777,6 +31807,7 @@ def _analise_h24_h25_inner(conn, cur):
         FROM bounce_signals bs {TRADE_JOIN}
         WHERE bs.absorption_events > 0
           AND bs.absorption_buy_vol IS NOT NULL
+          {since_cond}
         GROUP BY 1
         ORDER BY
             MIN(CASE
@@ -31803,12 +31834,14 @@ def _analise_h24_h25_inner(conn, cur):
         JOIN migrations m ON m.mint = bs.mint
         {TRADE_JOIN}
         WHERE m.mc_peak > 0 AND bs.mc_at_signal IS NOT NULL
+          {since_cond}
         GROUP BY 1 ORDER BY MIN(bs.mc_at_signal / NULLIF(m.mc_peak,0)) DESC
     """)
 
     conn.close()
 
-    n_h24, n_h25, n_h23 = cov[0], cov[1], cov[2]
+    n_h24, n_h25, n_h23, n_h26 = cov[0], cov[1], cov[2], cov[3]
+    since_label = f" | desde {since}" if since else " | todos os dados"
 
     h24_html = table_html(
         f"H24 — Concentração de Sellers no Dump (n_bounces={n_h24}, n_tradados={base_n})",
@@ -31819,6 +31852,11 @@ def _analise_h24_h25_inner(conn, cur):
         f"H25 — Profundidade do Pool no Sinal (n_bounces={n_h25})",
         "Pool fino (<20 SOL): qualquer compra move o preço muito → spikes artificiais → SL disparado por ruído, não por direção real.",
         h25_rows) if h25_rows else "<p class='note'>Sem dados H25 ainda</p>"
+
+    h26_html = table_html(
+        f"H26 — Concentração de Buyers na Rise [ts_min → ts_signal] (n_bounces={n_h26})",
+        "buy_concentration = largest_buy / total_buy_vol. Alto (≥0.75) = 1 buyer grande puxou o bounce (demanda concentrada real vs bots de 0.1 SOL).",
+        h26_rows) if h26_rows else "<p class='note'>Sem dados H26 ainda</p>"
 
     h23_html = table_html(
         f"H23 — Net SOL Flow no Fundo / janela bottom (n_bounces={n_h23})",
@@ -31836,21 +31874,27 @@ def _analise_h24_h25_inner(conn, cur):
         os_rows) if os_rows else ""
 
     return f"""<!DOCTYPE html><html><head>
-    <meta charset='utf-8'><title>H22/H23/H24/H25 vs Outcomes</title>
+    <meta charset='utf-8'><title>H22-H26 vs Outcomes</title>
     {CSS}</head><body>
-    <h1>H22 / H23 / H24 / H25 — Correlação com Outcomes</h1>
+    <h1>H22 / H23 / H24 / H25 / H26 — Correlação com Outcomes</h1>
     <div class='box'>
       Baseline: {base_n} trades blockchain-verificados (helius_sell_recovery) |
       {base_tp} TP | {base_n - base_tp} SL | WR base = <b>{base_wr}%</b><br>
-      n_h24={n_h24} bounces | n_h25={n_h25} | n_h23={n_h23} (bottom-window)
+      n_h24={n_h24} | n_h25={n_h25} | n_h23={n_h23} (bottom-window) | n_h26={n_h26}{since_label}
     </div>
-    <p><a href='/analise/h22-correlation'>H22 Correlation</a> &nbsp;|&nbsp;
+    <p>
+      Filtrar: <a href='/analise/h24-h25?since=2026-05-26'>desde 2026-05-26</a> (phantom fix) &nbsp;|&nbsp;
+      <a href='/analise/h24-h25?since=2026-06-01'>desde 2026-06-01</a> &nbsp;|&nbsp;
+      <a href='/analise/h24-h25?since='>todos</a>
+    </p>
+    <p><a href='/analise/h22-h25-ticks?since={since}'>Versão token_ticks →</a> &nbsp;|&nbsp;
        <a href='/debug/h23-wr?window=bottom'>H23 WR Debug</a> &nbsp;|&nbsp;
        <a href='/analise/sinal-puro'>Sinal Puro</a></p>
     {h22_html}
     {h23_html}
     {h24_html}
     {h25_html}
+    {h26_html}
     {os_html}
     </body></html>"""
 
@@ -35086,12 +35130,15 @@ def analise_h22_h25_ticks():
     MIN_TICKS  = 3
     WINDOW_MIN = 60   # 60min = janela completa do HotMonitor (não 20min que é nossa janela de trade)
 
+    since = request.args.get("since", "2026-05-26")
+    since_cond = "AND bs.ts_signal >= %(since)s::timestamptz" if since else ""
+
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-        # Dataset: bounce_signals com H22/H23/H24/H25 + token_ticks nos 60min após sinal
-        cur.execute("""
+        # Dataset: bounce_signals com H22/H23/H24/H25/H26 + token_ticks nos 60min após sinal
+        cur.execute(f"""
             WITH outcomes AS (
                 SELECT
                     bs.mint,
@@ -35110,6 +35157,8 @@ def analise_h22_h25_ticks():
                     bs.dump_seller_count,
                     -- H25
                     bs.pool_quote_at_signal,
+                    -- H26
+                    bs.buy_concentration,
                     -- token outcome via ticks (janela 60min = HotMonitor completo)
                     MAX(COALESCE(tt.mc_high, tt.mc))                      AS max_mc,
                     MIN(COALESCE(tt.mc_low,  tt.mc))                      AS min_mc,
@@ -35121,18 +35170,19 @@ def analise_h22_h25_ticks():
                     AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
                 WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
                   AND bs.bounce_pct   IS NOT NULL
+                  {since_cond}
                 GROUP BY bs.mint, bs.mc_at_signal, bs.bounce_pct, bs.elapsed_sec,
                          bs.absorption_buy_vol, bs.absorption_sell_vol, bs.absorption_events,
                          bs.net_sol_flow, bs.h23_window,
                          bs.dump_seller_hhi, bs.dump_seller_count,
-                         bs.pool_quote_at_signal
+                         bs.pool_quote_at_signal, bs.buy_concentration
                 HAVING COUNT(tt.id) >= %(min_ticks)s
             )
             SELECT *,
                 (max_mc >= entry_mc * %(tp)s)  AS tp_hit,
                 (min_mc <= entry_mc * %(sl)s)  AS sl_hit
             FROM outcomes
-        """, {"tp": TP_MULT, "sl": SL_MULT, "min_ticks": MIN_TICKS})
+        """, {"tp": TP_MULT, "sl": SL_MULT, "min_ticks": MIN_TICKS, "since": since or "1970-01-01"})
         rows = cur.fetchall()
         conn.close()
 
@@ -35204,6 +35254,15 @@ def analise_h22_h25_ticks():
         ("sem dados H25",                 lambda r: r["pool_quote_at_signal"] is None),
     ]
 
+    # H26 buyer concentration bins
+    H26_BINS = [
+        ("≥0.75  (1 buyer domina o bounce)", lambda r: r["buy_concentration"] is not None and r["buy_concentration"] >= 0.75),
+        ("0.50–0.75  (concentrado)",         lambda r: r["buy_concentration"] is not None and 0.50 <= r["buy_concentration"] < 0.75),
+        ("0.25–0.50  (alguns buyers)",       lambda r: r["buy_concentration"] is not None and 0.25 <= r["buy_concentration"] < 0.50),
+        ("<0.25  (muitos buyers pequenos)",  lambda r: r["buy_concentration"] is not None and r["buy_concentration"] < 0.25),
+        ("sem dados H26",                    lambda r: r["buy_concentration"] is None),
+    ]
+
     # ── HTML helpers ──────────────────────────────────────────────────────────
     def wr_col(wr):
         if wr is None: return "—", "#8b949e"
@@ -35273,14 +35332,21 @@ def analise_h22_h25_ticks():
         "Pool fino (<20 SOL): compra de $300 move preço 25% → spike artificial → SL por ruído.",
         H25_BINS, None)
 
+    h26_html = table_html(
+        "H26 — Concentração de Buyers na Rise [ts_min → ts_signal] — outcome via token_ticks",
+        "buy_concentration = largest_buy / total_buy_vol. Alto (≥0.75) = 1 buyer grande puxou o bounce. Distribuído (<0.25) = muitos bots de 0.1 SOL.",
+        H26_BINS, None)
+
     # Cobertura info
     n_h22 = sum(1 for r in rows if (r["absorption_events"] or 0) > 0)
     n_h23 = sum(1 for r in rows if r["h23_window"] == "bottom" and r["net_sol_flow"] is not None)
     n_h24 = sum(1 for r in rows if r["dump_seller_hhi"] is not None)
     n_h25 = sum(1 for r in rows if r["pool_quote_at_signal"] is not None)
+    n_h26 = sum(1 for r in rows if r["buy_concentration"] is not None)
 
+    since_label = f" | desde {since}" if since else " | todos os dados"
     html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
-    <title>H22-H25 Ticks</title>
+    <title>H22-H26 Ticks</title>
     <style>
       body{{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}}
       h1{{color:#58a6ff}}h2{{color:#79c0ff;margin-top:28px}}
@@ -35292,7 +35358,7 @@ def analise_h22_h25_ticks():
       .box{{background:#161b22;border:1px solid #30363d;padding:10px 14px;border-radius:4px;margin:10px 0;font-size:12px}}
       a{{color:#58a6ff}}
     </style></head><body>
-    <h1>H22 / H23 / H24 / H25 — Outcome via token_ticks</h1>
+    <h1>H22 / H23 / H24 / H25 / H26 — Outcome via token_ticks</h1>
     <p class='note'>
       Métrica: token_ticks nos <b>60min</b> após ts_signal (janela completa do HotMonitor).
       Entry = mc_at_signal. TP = +75% | SL = -25%. Independente de filtros de execução do bot.<br>
@@ -35300,15 +35366,21 @@ def analise_h22_h25_ticks():
     </p>
     <div class='box'>
       Baseline: {n_total} bounces com ≥{MIN_TICKS} ticks | {base_tp} TP | {n_total-base_tp} não-TP | WR base = <b>{BASE_WR}%</b><br>
-      Cobertura: H22={n_h22} | H23 bottom={n_h23} | H24={n_h24} | H25={n_h25}
+      Cobertura: H22={n_h22} | H23 bottom={n_h23} | H24={n_h24} | H25={n_h25} | H26={n_h26}{since_label}
     </div>
-    <p><a href='/analise/h24-h25'>← Versão trades</a> &nbsp;|&nbsp;
+    <p>
+      Filtrar: <a href='/analise/h22-h25-ticks?since=2026-05-26'>desde 2026-05-26</a> (phantom fix) &nbsp;|&nbsp;
+      <a href='/analise/h22-h25-ticks?since=2026-06-01'>desde 2026-06-01</a> &nbsp;|&nbsp;
+      <a href='/analise/h22-h25-ticks?since='>todos</a>
+    </p>
+    <p><a href='/analise/h24-h25?since={since}'>← Versão trades</a> &nbsp;|&nbsp;
        <a href='/analise/sinal-puro'>Sinal Puro</a> &nbsp;|&nbsp;
        <a href='/analise/h22-correlation'>H22 Correlation</a></p>
     {h22_html}
     {h23_html}
     {h24_html}
     {h25_html}
+    {h26_html}
     </body></html>"""
 
     return html
