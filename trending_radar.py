@@ -23,6 +23,7 @@ from typing import Any
 
 import db
 from gmgn_client import GmgnClient, RateLimitError
+from trending_radar_core import collect_trending_interval
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -68,35 +69,6 @@ def _bool(v: Any) -> bool | None:
     return bool(v)
 
 
-def _collect_trending_interval(radar, interval: str) -> tuple[list[int], int]:
-    ts_snapshot = datetime.now(timezone.utc)
-    rows_raw = radar.gmgn.get_market_trending(
-        chain=radar.chain,
-        interval=interval,
-        limit=radar.limit,
-        order_by=radar.order_by,
-        direction=radar.direction,
-        filters=radar.filters or None,
-        platforms=radar.platforms or None,
-    )
-    rows = []
-    for idx, item in enumerate(rows_raw, start=1):
-        if not isinstance(item, dict):
-            continue
-        normalized = radar._normalize_item(
-            item, ts_snapshot=ts_snapshot, interval=interval, idx=idx
-        )
-        if normalized:
-            rows.append(normalized)
-
-    ids = db.insert_trending_snapshots(rows)
-    logger.info(
-        "Trending %s/%s: rows=%d inserted=%d",
-        radar.chain, interval, len(rows), len(ids),
-    )
-    return ids, len(rows)
-
-
 class TrendingRadar:
     def __init__(self, gmgn: GmgnClient):
         self.gmgn = gmgn
@@ -127,7 +99,7 @@ class TrendingRadar:
             "smart_min": int(os.getenv("FILTER_SMART_MIN", "2")),
         }
 
-    def _normalize_item(self, item: dict, *, ts_snapshot: datetime,
+    def normalize_item(self, item: dict, *, ts_snapshot: datetime,
                         interval: str, idx: int) -> dict | None:
         mint = item.get("address") or item.get("token_address") or item.get("mint")
         if not mint:
@@ -180,7 +152,7 @@ class TrendingRadar:
         all_ids: list[int] = []
         totals = {"intervals": 0, "rows": 0, "inserted": 0}
         for interval in self.intervals:
-            ids, row_count = _collect_trending_interval(self, interval)
+            ids, row_count = collect_trending_interval(self, interval)
             all_ids.extend(ids)
             totals["intervals"] += 1
             totals["rows"] += row_count
