@@ -422,6 +422,11 @@ class GmgnClient:
             params["platform"] = platforms
 
         result = self._get("/v1/market/rank", params)
+        code = result.get("code")
+        if code is not None and str(code) not in ("0", "200"):
+            logger.warning("market/rank erro API: code=%s message=%s reason=%s",
+                           code, result.get("message"), result.get("reason"))
+            return []
         data = result.get("data", {})
         if isinstance(data, list):
             return data
@@ -429,7 +434,8 @@ class GmgnClient:
             rows = data.get(key) if isinstance(data, dict) else None
             if isinstance(rows, list):
                 return rows
-        logger.warning("market/rank envelope inesperado: keys=%s",
+        logger.warning("market/rank envelope inesperado: code=%s message=%s data_keys=%s",
+                       code, result.get("message"),
                        list(data.keys()) if isinstance(data, dict) else type(data).__name__)
         return []
 
