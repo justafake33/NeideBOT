@@ -11541,6 +11541,44 @@ def debug_h23_wr():
         """, {"since": since_str or None})
         ticks_rows = cur.fetchall()
 
+        # ── Quarta query: rise_net_flow via token_ticks (janela RISE: fundo→sinal) ──
+        cur.execute(f"""
+            WITH base AS (
+                SELECT
+                    bs.mint,
+                    bs.rise_net_flow,
+                    bs.mc_at_signal                         AS entry_mc,
+                    MAX(COALESCE(tt.mc_high, tt.mc))        AS max_mc,
+                    MIN(COALESCE(tt.mc_low,  tt.mc))        AS min_mc,
+                    COUNT(tt.id)                            AS ticks
+                FROM bounce_signals bs
+                JOIN token_ticks tt
+                    ON tt.mint = bs.mint
+                    AND tt.tick_ts > bs.ts_signal
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
+                WHERE bs.mc_at_signal IS NOT NULL
+                  AND bs.mc_at_signal > 0
+                  AND bs.rise_net_flow IS NOT NULL
+                  {since_clause_ticks}
+                GROUP BY bs.mint, bs.rise_net_flow, bs.mc_at_signal
+                HAVING COUNT(tt.id) >= 3
+            )
+            SELECT
+                CASE
+                    WHEN rise_net_flow < 0      THEN 'negativo  (< 0)'
+                    WHEN rise_net_flow < 1      THEN 'fraco     (0–1)'
+                    WHEN rise_net_flow < 3      THEN 'sweet     (1–3)'
+                    WHEN rise_net_flow < 10     THEN 'bom       (3–10)'
+                    ELSE                             'alto      (> 10)'
+                END AS bucket,
+                rise_net_flow,
+                CASE WHEN max_mc >= entry_mc * 1.75 THEN 1 ELSE 0 END AS tp75,
+                CASE WHEN min_mc <= entry_mc * 0.75 THEN 1 ELSE 0 END AS sl25
+            FROM base
+            ORDER BY rise_net_flow
+        """, {"since": since_str or None})
+        rise_rows = cur.fetchall()
+
     if not rows:
         return (f"<pre>Nenhum trade blockchain verificado encontrado a partir do #{from_id}.\n"
                 f"Execute /debug/sell-recovery para classificar trades recentes.</pre>")
@@ -11820,6 +11858,61 @@ def debug_h23_wr():
           f"<td><span class='{'pos' if wr_ticks_base>=25 else 'neg'}'>"
           f"{wr_ticks_base/100*0.75-(1-wr_ticks_base/100)*0.25:+.1%}</span></td></tr>")
     H += "</table>"
+
+    # ── Tabela rise_net_flow via token_ticks (janela RISE: fundo → sinal) ────
+    H += "<hr style='border-color:#30363d;margin:24px 0'>"
+    H += f"<h2>📈 rise_net_flow via token_ticks — janela RISE: fundo→sinal ({since_label})</h2>"
+    H += ("<p style='font-size:12px;color:#8b949e'>"
+          "SOL comprado − SOL vendido <b>entre o fundo e o sinal de bounce</b>. "
+          "Mede quem comprou durante a subida — força real da demanda.<br>"
+          "Contraste com net_sol_flow (janela PRE) que captura o dump em si.</p>")
+
+    ORDER3 = ['negativo  (< 0)', 'fraco     (0–1)', 'sweet     (1–3)',
+              'bom       (3–10)', 'alto      (> 10)']
+    r_buckets = _dd(lambda: {"tp": 0, "sl": 0, "n": 0})
+    for r in rise_rows:
+        b = r["bucket"]
+        r_buckets[b]["n"]  += 1
+        r_buckets[b]["tp"] += r["tp75"]
+        r_buckets[b]["sl"] += (1 - r["tp75"])
+
+    n_rise_total = len(rise_rows)
+    tp_rise_total = sum(r["tp75"] for r in rise_rows)
+    wr_rise_base  = tp_rise_total / n_rise_total * 100 if n_rise_total else 0
+
+    if n_rise_total == 0:
+        H += "<div class='box dim'>Sem dados de rise_net_flow no período selecionado.</div>"
+    else:
+        H += (f"<div class='box'><b>Total bounces com rise_net_flow:</b> {n_rise_total} | "
+              f"{int(tp_rise_total)} TP | {n_rise_total - int(tp_rise_total)} SL | "
+              f"WR base: <b>{wr_rise_base:.1f}%</b> &nbsp; Break-even: 25%</div>")
+
+        H += ("<table><tr><th>Faixa rise_net_flow</th><th>n</th><th>TP</th><th>SL</th>"
+              "<th>WR</th><th>vs base</th><th>EV/trade</th></tr>")
+        for b in ORDER3:
+            bd = r_buckets.get(b, {"n": 0, "tp": 0, "sl": 0})
+            n  = bd["n"]; tp = int(bd["tp"]); sl = int(bd["sl"])
+            wr = tp / n * 100 if n else 0
+            ev = wr/100 * 0.75 - (1 - wr/100) * 0.25 if n else 0
+            delta = wr - wr_rise_base
+            wr_s  = (f"<span class='{'pos' if wr>=25 else 'neg'}'>{wr:.1f}%</span>"
+                     if n >= 3 else f"<span class='dim'>— (n={n})</span>")
+            dlt_s = (f"<span class='{'pos' if delta>0 else 'neg'}'>{delta:+.1f}pp</span>"
+                     if n >= 3 else "—")
+            ev_s  = (f"<span class='{'pos' if ev>0 else 'neg'}'>{ev:+.1%}</span>"
+                     if n >= 3 else "—")
+            cls   = " class='hi'" if (n>=3 and delta>=10) else " class='lo'" if (n>=3 and delta<=-10) else ""
+            H += (f"<tr{cls}><td><b>{b}</b></td><td>{n}</td>"
+                  f"<td class='tp'>{tp}</td><td class='sl'>{sl}</td>"
+                  f"<td>{wr_s}</td><td>{dlt_s}</td><td>{ev_s}</td></tr>")
+        H += (f"<tr style='border-top:2px solid #30363d'><td><b>TOTAL</b></td>"
+              f"<td>{n_rise_total}</td>"
+              f"<td class='tp'>{int(tp_rise_total)}</td>"
+              f"<td class='sl'>{n_rise_total - int(tp_rise_total)}</td>"
+              f"<td><b>{wr_rise_base:.1f}%</b></td><td>base</td>"
+              f"<td><span class='{'pos' if wr_rise_base>=25 else 'neg'}'>"
+              f"{wr_rise_base/100*0.75-(1-wr_rise_base/100)*0.25:+.1%}</span></td></tr>")
+        H += "</table>"
 
     H += "</body></html>"
     return H
