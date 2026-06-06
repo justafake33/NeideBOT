@@ -434,9 +434,15 @@ class GmgnClient:
             rows = data.get(key) if isinstance(data, dict) else None
             if isinstance(rows, list):
                 return rows
-        logger.warning("market/rank envelope inesperado: code=%s message=%s data_keys=%s",
-                       code, result.get("message"),
-                       list(data.keys()) if isinstance(data, dict) else type(data).__name__)
+        inner = data.get("data") if isinstance(data, dict) else None
+        logger.warning(
+            "market/rank envelope inesperado: code=%s data_keys=%s inner_type=%s inner_keys=%s inner_preview=%s",
+            code,
+            list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+            type(inner).__name__,
+            list(inner.keys()) if isinstance(inner, dict) else "—",
+            str(inner)[:200] if inner is not None else "None",
+        )
         return []
 
     def get_token_kline(self, mint: str, chain: str = "sol",
