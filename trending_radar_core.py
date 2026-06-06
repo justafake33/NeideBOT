@@ -5,12 +5,50 @@ Mantém `trending_radar.py` pequeno e reduz conflitos no worker.
 
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any
 
 import db
 from gmgn_client import RateLimitError
+
+
+def csv_env(name: str, default: str = "") -> list[str]:
+    raw = os.getenv(name, default).strip()
+    if not raw:
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def coerce_float(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def coerce_int(value: Any) -> int | None:
+    try:
+        if value is None or value == "":
+            return None
+        return int(float(value))
+    except Exception:
+        return None
+
+
+def coerce_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "sim"}
+    return bool(value)
 
 
 def normalize_trending_item(radar, item: dict, *, ts_snapshot: datetime,

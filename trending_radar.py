@@ -17,11 +17,18 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
 
 import db
 from gmgn_client import GmgnClient
-from trending_radar_core import build_cycle_summary, collect_trending_interval, run_radar_loop
+from trending_radar_core import (
+    build_cycle_summary,
+    collect_trending_interval,
+    coerce_bool,
+    coerce_float,
+    coerce_int,
+    csv_env,
+    run_radar_loop,
+)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -30,55 +37,18 @@ logging.basicConfig(
 logger = logging.getLogger("trending_radar")
 
 
-def _csv(name: str, default: str = "") -> list[str]:
-    raw = os.getenv(name, default).strip()
-    if not raw:
-        return []
-    return [part.strip() for part in raw.split(",") if part.strip()]
-
-
-def _float(v: Any) -> float | None:
-    try:
-        if v is None or v == "":
-            return None
-        return float(v)
-    except Exception:
-        return None
-
-
-def _int(v: Any) -> int | None:
-    try:
-        if v is None or v == "":
-            return None
-        return int(float(v))
-    except Exception:
-        return None
-
-
-def _bool(v: Any) -> bool | None:
-    if v is None:
-        return None
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return bool(v)
-    if isinstance(v, str):
-        return v.strip().lower() in {"1", "true", "yes", "y", "sim"}
-    return bool(v)
-
-
 class TrendingRadar:
     def __init__(self, gmgn: GmgnClient):
         self.gmgn = gmgn
         self.logger = logger
         self.chain = os.getenv("TRENDING_RADAR_CHAIN", "sol")
-        self.intervals = _csv("TRENDING_RADAR_INTERVALS", "1m,5m")
+        self.intervals = csv_env("TRENDING_RADAR_INTERVALS", "1m,5m")
         self.order_by = os.getenv("TRENDING_RADAR_ORDER_BY", "default")
         self.direction = os.getenv("TRENDING_RADAR_DIRECTION", "desc")
         self.limit = int(os.getenv("TRENDING_RADAR_LIMIT", "100"))
         self.poll_sec = int(os.getenv("TRENDING_RADAR_POLL_SEC", "60"))
-        self.filters = _csv("TRENDING_RADAR_FILTERS")
-        self.platforms = _csv("TRENDING_RADAR_PLATFORMS")
+        self.filters = csv_env("TRENDING_RADAR_FILTERS")
+        self.platforms = csv_env("TRENDING_RADAR_PLATFORMS")
         self.outcome_window_min = int(os.getenv("TRENDING_RADAR_OUTCOME_WINDOW_MIN", "60"))
         self.take_profit_pct = float(os.getenv("TRENDING_RADAR_TP_PCT", "0.75"))
         self.stop_loss_pct = float(os.getenv("TRENDING_RADAR_SL_PCT", "0.25"))
@@ -98,9 +68,9 @@ class TrendingRadar:
             "smart_min": int(os.getenv("FILTER_SMART_MIN", "2")),
         }
 
-    to_float = staticmethod(_float)
-    to_int = staticmethod(_int)
-    to_bool = staticmethod(_bool)
+    to_float = staticmethod(coerce_float)
+    to_int = staticmethod(coerce_int)
+    to_bool = staticmethod(coerce_bool)
 
     def run_once_cycle(self) -> dict:
         all_ids: list[int] = []
