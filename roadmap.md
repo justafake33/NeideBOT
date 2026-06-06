@@ -200,6 +200,16 @@ WR ≥ 20% E avg_gain > 100%?
                 └── A.6 bloqueando válidos?              → aumentar BOTTOM_FRESHNESS_SEC para 480s
 ```
 
+
+### [Paralelo] GMGN Trending Radar — pesquisa, sem impacto operacional
+
+- Sistema novo: `trending_radar.py`
+- Endpoint: `/debug/trending-radar?hours=24` (`&format=json` para script/Railway)
+- Objetivo: coletar GMGN Trending em paralelo e medir se existe edge antes de adaptar o NeideBOT.
+- Status: research-only/shadow. Não executa trades, não muda scanner, não muda executor e não interfere no fluxo atual.
+- Métricas iniciais: snapshots captados, nulos críticos, coverage, `shadow_wr`, `ambiguous`, `reject_reasons`.
+- Só vira Fase 2 se os dados mostrarem valor claro em coverage/runup/WR ou relação com H26.
+
 ### [Paralelo] H9 — Smart Money Signal
 
 - Threshold: `trigger_mc < mc_migration × 0.80`

@@ -1466,6 +1466,48 @@ def health():
 
 _signal_ban_until: float = 0.0  # timestamp UTC até quando a conta está banida
 
+
+
+@app.route("/debug/trending-radar")
+def debug_trending_radar():
+    hours = int(request.args.get("hours", "24"))
+    fmt = request.args.get("format", "html")
+    try:
+        summary = db.get_trending_radar_summary(hours=hours)
+        health = db.get_trending_radar_health(hours=hours)
+        payload = {"hours": hours, "health": health, "summary": summary}
+    except Exception as e:
+        payload = {"hours": hours, "ok": False, "error": str(e)}
+        if fmt == "json":
+            return jsonify(payload), 500
+        return Response(f"<pre>Trending Radar erro: {e}</pre>", status=500, mimetype="text/html")
+
+    if fmt == "json":
+        return jsonify(payload)
+
+    h = "<html><body style='font-family:monospace;background:#0d1117;color:#c9d1d9;padding:16px'>"
+    h += "<h2 style='color:#58a6ff'>GMGN Trending Radar</h2>"
+    h += f"<p><a style='color:#58a6ff' href='/debug/trending-radar?hours={hours}&format=json'>JSON</a></p>"
+    h += f"<p>Janela: {hours}h | Captando: {health.get('capturing')} | OK dados críticos: {health.get('ok')}</p>"
+    h += f"<p>Snapshots: {summary.get('snapshots') or 0} | Latest: {health.get('latest_snapshot') or '—'}</p>"
+    h += f"<p>Resolved: {summary.get('resolved') or 0} | Wins: {summary.get('wins') or 0} | WR shadow: {((summary.get('shadow_wr') or 0)*100):.1f}% | Ambiguous: {summary.get('ambiguous') or 0}</p>"
+    h += f"<p>Nulls críticos: mint={health.get('null_mint') or 0}, rank={health.get('null_rank') or 0}, mc={health.get('null_market_cap') or 0}</p>"
+    h += "<h3>Reject reasons</h3><ul>"
+    for r in summary.get("reject_reasons", []):
+        h += f"<li>{r.get('reject_reason')}: {r.get('n')}</li>"
+    h += "</ul><h3>Recent snapshots</h3><table border='1' cellpadding='4' style='border-collapse:collapse;color:#c9d1d9'>"
+    h += "<tr><th>ts</th><th>int</th><th>rank</th><th>symbol</th><th>mint</th><th>MC</th><th>Liq</th><th>Vol</th><th>Smart</th><th>Rug</th></tr>"
+    for r in health.get("recent", []):
+        h += "<tr>"
+        h += f"<td>{r.get('ts_snapshot')}</td><td>{r.get('interval_label')}</td><td>{r.get('rank_position')}</td>"
+        h += f"<td>{r.get('symbol') or '—'}</td><td>{(r.get('mint') or '')[:10]}…</td>"
+        h += f"<td>{fmt_mc(r.get('market_cap'))}</td><td>{fmt_mc(r.get('liquidity'))}</td><td>{fmt_mc(r.get('volume'))}</td>"
+        h += f"<td>{r.get('smart_degen_count') if r.get('smart_degen_count') is not None else '—'}</td><td>{fmt_ratio(r.get('rug_ratio'))}</td>"
+        h += "</tr>"
+    h += "</table></body></html>"
+    return h
+
+
 @app.route("/debug/signal")
 def debug_signal():
     """
