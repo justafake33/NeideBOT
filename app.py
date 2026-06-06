@@ -30260,7 +30260,7 @@ def _analise_grid_search_inner():
                 LEFT JOIN migrations m ON m.mint = bs.mint
                 WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
                   AND bs.bounce_pct   IS NOT NULL
-                  AND (%(since)s = '' OR bs.ts_signal >= %(since)s::timestamptz)
+                  AND (NULLIF(%(since)s, '')::timestamptz IS NULL OR bs.ts_signal >= NULLIF(%(since)s, '')::timestamptz)
                 GROUP BY bs.mint, bs.bounce_pct, bs.drop_from_mig, bs.elapsed_sec,
                          bs.absorption_events, bs.net_sol_flow, bs.mc_at_signal,
                          m.smart_wallets
