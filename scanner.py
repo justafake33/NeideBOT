@@ -955,12 +955,17 @@ class HotMonitor:
         """
         time.sleep(5)  # aguarda scheduler e conexões estabilizarem
 
-        # Backfill histórico: tokens mortos antes do checkpoint de 1h
-        n_fixed = db.backfill_recovery_false()
-        if n_fixed:
-            logger.info("Backfill recovery=FALSE: %d tokens sem mc_1h marcados como não recuperados", n_fixed)
+        try:
+            # Backfill histórico: tokens mortos antes do checkpoint de 1h
+            n_fixed = db.backfill_recovery_false()
+            if n_fixed:
+                logger.info("Backfill recovery=FALSE: %d tokens sem mc_1h marcados como não recuperados", n_fixed)
 
-        tokens = db.get_tokens_for_backfill()
+            tokens = db.get_tokens_for_backfill()
+        except Exception as e:
+            logger.warning("startup_backfill: DB indisponível, pulando backfill (%s)", e)
+            return
+
         if not tokens:
             logger.info("Backfill startup: nenhum token pendente")
             return
