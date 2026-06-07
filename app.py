@@ -6321,11 +6321,15 @@ def _start_services():
         import threading as _threading
         from trending_radar import TrendingRadar
         import trending_radar_store as _tr_store
-        _tr_store.ensure_trending_radar_schema()
-        _tr = TrendingRadar(gmgn)
-        _tr_thread = _threading.Thread(target=_tr.start, daemon=True, name="trending-radar")
-        _tr_thread.start()
-        logger.info("TrendingRadar iniciado (poll=%ds)", _tr.poll_sec)
+        try:
+            _tr_store.ensure_trending_radar_schema()
+        except Exception as _e:
+            logger.warning("TrendingRadar schema indisponível (DB em recovery?): %s — TrendingRadar desativado", _e)
+        else:
+            _tr = TrendingRadar(gmgn)
+            _tr_thread = _threading.Thread(target=_tr.start, daemon=True, name="trending-radar")
+            _tr_thread.start()
+            logger.info("TrendingRadar iniciado (poll=%ds)", _tr.poll_sec)
     logger.info("Todos os serviços iniciados")
 
 
