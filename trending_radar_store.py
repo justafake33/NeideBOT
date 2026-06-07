@@ -98,7 +98,6 @@ def ensure_trending_radar_schema() -> None:
 
 def insert_trending_snapshots(rows: list[dict]) -> list[int]:
     """Insere snapshot de trending e retorna ids criados."""
-    ensure_trending_radar_schema()
     if not rows:
         return []
     import json as _json
