@@ -46261,6 +46261,15 @@ windows: {', '.join(available_windows)}</p>
 
 
 
+@app.route("/debug/env-check")
+def debug_env_check():
+    """Mostra variáveis de ambiente relevantes do processo atual."""
+    import os as _os
+    keys = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT", "DATABASE_URL", "RAILWAY_SERVICE_NAME",
+            "RAILWAY_ENVIRONMENT", "RAILWAY_GIT_BRANCH", "RUN_BOT_SERVICES"]
+    return jsonify({k: (_os.getenv(k, "NÃO DEFINIDA")[:20] + "..." if _os.getenv(k) and len(_os.getenv(k)) > 20 else _os.getenv(k, "NÃO DEFINIDA")) for k in keys})
+
+
 @app.route("/debug/test-telegram")
 def debug_test_telegram():
     """Envia mensagem de teste e retorna a resposta real do Telegram para diagnóstico."""
