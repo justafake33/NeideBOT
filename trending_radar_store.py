@@ -96,32 +96,64 @@ def ensure_trending_radar_schema() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_gmgn_trending_coverage_status ON gmgn_trending_coverage (scanner_status, reject_reason)")
 
 
+def _is_trajectory_token(row: dict) -> bool:
+    """Retorna True se o token deve ser salvo em toda poll (trajetória completa).
+
+    Critérios (configuráveis por env var):
+    - smart_degen_count >= TRENDING_TRAJECTORY_SMART_MIN  (default 3)
+    - rank_position    <= TRENDING_TRAJECTORY_RANK_MAX    (default 20)
+    Tokens que NÃO satisfazem ficam com dedup 1x/hora (registro de entrada apenas).
+    """
+    import os
+    smart_min = int(os.getenv("TRENDING_TRAJECTORY_SMART_MIN", "3"))
+    rank_max = int(os.getenv("TRENDING_TRAJECTORY_RANK_MAX", "20"))
+    smart = row.get("smart_degen_count") or 0
+    rank = row.get("rank_position")
+    if smart >= smart_min:
+        return True
+    if rank is not None and rank <= rank_max:
+        return True
+    return False
+
+
 def insert_trending_snapshots(rows: list[dict]) -> list[int]:
-    """Insere snapshot de trending, deduplicando por mint+interval por hora. Retorna ids criados."""
+    """Insere snapshot de trending com estratégia seletiva:
+
+    - Tokens que passam em _is_trajectory_token(): salvo em TODA poll (trajetória completa).
+    - Demais tokens: dedup 1x/hora (registro apenas da primeira aparição por hora).
+
+    Retorna ids criados.
+    """
     if not rows:
         return []
     import json as _json
 
-    # Deduplica: só insere se o mint não apareceu neste interval_label na última hora.
-    # Objetivo: registar quando cada token entrou no trending, sem repetir 60×/hora.
-    mints_by_interval: dict[str, list[str]] = {}
-    for r in rows:
-        key = r.get("interval_label", "")
-        mints_by_interval.setdefault(key, []).append(r["mint"])
+    # Separa tokens de trajetória (sempre salvar) dos demais (dedup 1h).
+    trajectory_rows = [r for r in rows if _is_trajectory_token(r)]
+    dedup_candidates = [r for r in rows if not _is_trajectory_token(r)]
 
-    seen: set[tuple[str, str]] = set()
-    with db._cursor() as cur:
-        for interval, mints in mints_by_interval.items():
-            cur.execute("""
-                SELECT DISTINCT mint FROM gmgn_trending_snapshots
-                WHERE interval_label = %s
-                  AND mint = ANY(%s)
-                  AND ts_snapshot >= NOW() - INTERVAL '1 hour'
-            """, (interval, mints))
-            for r2 in cur.fetchall():
-                seen.add((r2["mint"], interval))
+    # Para tokens de dedup: só insere se não apareceu na última hora neste interval.
+    dedup_rows: list[dict] = []
+    if dedup_candidates:
+        mints_by_interval: dict[str, list[str]] = {}
+        for r in dedup_candidates:
+            key = r.get("interval_label", "")
+            mints_by_interval.setdefault(key, []).append(r["mint"])
 
-    rows = [r for r in rows if (r["mint"], r.get("interval_label", "")) not in seen]
+        seen: set[tuple[str, str]] = set()
+        with db._cursor() as cur:
+            for interval, mints in mints_by_interval.items():
+                cur.execute("""
+                    SELECT DISTINCT mint FROM gmgn_trending_snapshots
+                    WHERE interval_label = %s
+                      AND mint = ANY(%s)
+                      AND ts_snapshot >= NOW() - INTERVAL '1 hour'
+                """, (interval, mints))
+                for r2 in cur.fetchall():
+                    seen.add((r2["mint"], interval))
+        dedup_rows = [r for r in dedup_candidates if (r["mint"], r.get("interval_label", "")) not in seen]
+
+    rows = trajectory_rows + dedup_rows
     if not rows:
         return []
 
