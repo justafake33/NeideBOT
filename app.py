@@ -6330,6 +6330,11 @@ def _start_services():
             _tr_thread = _threading.Thread(target=_tr.start, daemon=True, name="trending-radar")
             _tr_thread.start()
             logger.info("TrendingRadar iniciado (poll=%ds)", _tr.poll_sec)
+    # Retenção automática de dados — roda a cada 6h, alerta no Telegram antes de deletar
+    from db_retention import run_retention, INTERVAL_SEC as _RETENTION_INTERVAL
+    scheduler.schedule(_RETENTION_INTERVAL, run_retention, scheduler)
+    logger.info("db_retention: job agendado (primeira execução em 6h)")
+
     logger.info("Todos os serviços iniciados")
 
 
@@ -46254,6 +46259,25 @@ windows: {', '.join(available_windows)}</p>
         import traceback
         return f"<pre>Erro: {e}\n\n{traceback.format_exc()}</pre>", 500
 
+
+
+@app.route("/debug/test-telegram")
+def debug_test_telegram():
+    """Envia mensagem de teste no Telegram para confirmar que está configurado."""
+    from telegram_bot import send_alert, TELEGRAM_TOKEN, TELEGRAM_CHAT
+    from datetime import datetime, timezone
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
+        return jsonify({"ok": False, "error": "TELEGRAM_TOKEN ou TELEGRAM_CHAT não configurados"}), 400
+    try:
+        now = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+        send_alert(
+            f"✅ *NeideBOT — Telegram configurado com sucesso!*\n\n"
+            f"Alertas de retenção de dados e disco cheio estão ativos.\n"
+            f"_{now}_"
+        )
+        return jsonify({"ok": True, "message": "Mensagem enviada — verifica o Telegram"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/debug/schema")
