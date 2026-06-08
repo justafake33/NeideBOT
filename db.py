@@ -267,15 +267,6 @@ def _do_init_db():
         ]:
             cur.execute(f"ALTER TABLE migrations {col}")
 
-        # token_ticks — colunas OHLC e source (adicionadas para kline ticks)
-        for col in [
-            "ADD COLUMN IF NOT EXISTS mc_open   FLOAT",
-            "ADD COLUMN IF NOT EXISTS mc_high   FLOAT",
-            "ADD COLUMN IF NOT EXISTS mc_low    FLOAT",
-            "ADD COLUMN IF NOT EXISTS source    TEXT NOT NULL DEFAULT 'trenches'",
-        ]:
-            cur.execute(f"ALTER TABLE token_ticks {col}")
-
         # Série temporal — ticks a cada 5s durante os 60min de monitoramento
         cur.execute("""
             CREATE TABLE IF NOT EXISTS token_ticks (
@@ -300,6 +291,14 @@ def _do_init_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_token_ticks_mint    ON token_ticks (mint)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_token_ticks_mint_ts ON token_ticks (mint, tick_ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_token_ticks_elapsed ON token_ticks (mint, elapsed_sec)")
+        # token_ticks — colunas OHLC e source (migração para bancos existentes)
+        for col in [
+            "ADD COLUMN IF NOT EXISTS mc_open   FLOAT",
+            "ADD COLUMN IF NOT EXISTS mc_high   FLOAT",
+            "ADD COLUMN IF NOT EXISTS mc_low    FLOAT",
+            "ADD COLUMN IF NOT EXISTS source    TEXT NOT NULL DEFAULT 'trenches'",
+        ]:
+            cur.execute(f"ALTER TABLE token_ticks {col}")
 
         # Sinais type 12 (SmartDegenBuy) — Fase 2
         cur.execute("""
