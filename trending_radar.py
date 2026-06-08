@@ -147,9 +147,36 @@ class TrendingRadar:
             "raw": item,
         }
 
+    def _quality_reject(self, row: dict) -> str | None:
+        """Retorna motivo de rejeição se o token não tem DNA legítimo, None se aprovado.
+
+        Filtros:
+        1. TRENDING_FILTER_PUMP_ONLY (default true): rejeita tokens que não vieram
+           do pump.fun (launchpad_platform não contém "pump"). Filtra tokens nativos
+           de DEX que nunca passaram pela bonding curve.
+        2. TRENDING_FILTER_MIN_BC_SEC (default 120): rejeita tokens que migraram em
+           menos de N segundos de vida (flash migration = pump coordenado, candle único).
+        """
+        pump_only = os.getenv("TRENDING_FILTER_PUMP_ONLY", "true").lower() == "true"
+        min_bc_sec = int(os.getenv("TRENDING_FILTER_MIN_BC_SEC", "120"))
+
+        lp = (row.get("launchpad_platform") or "").lower()
+        if pump_only and lp and "pump" not in lp:
+            return "not_pump_launchpad"
+
+        open_ts = row.get("open_timestamp")
+        create_ts = row.get("creation_timestamp")
+        if open_ts and create_ts and open_ts > create_ts:
+            bc_sec = open_ts - create_ts
+            if bc_sec < min_bc_sec:
+                return f"flash_migration_{bc_sec}s"
+
+        return None
+
     def run_once_cycle(self) -> dict:
         all_ids: list[int] = []
-        totals = {"intervals": 0, "rows": 0, "inserted": 0}
+        totals = {"intervals": 0, "rows": 0, "inserted": 0, "rejected": 0}
+        reject_counts: dict[str, int] = {}
         for interval in self.intervals:
             ts_snapshot = datetime.now(timezone.utc)
             rows_raw = self.gmgn.get_market_trending(
@@ -167,14 +194,25 @@ class TrendingRadar:
                     continue
                 normalized = self._normalize_item(item, ts_snapshot=ts_snapshot,
                                                   interval=interval, idx=idx)
-                if normalized:
-                    rows.append(normalized)
+                if not normalized:
+                    continue
+                reason = self._quality_reject(normalized)
+                if reason:
+                    base_reason = reason.split("_")[0] + ("_flash" if "flash" in reason else "_launchpad")
+                    reject_counts[reason[:30]] = reject_counts.get(reason[:30], 0) + 1
+                    totals["rejected"] += 1
+                    continue
+                rows.append(normalized)
             ids = store.insert_trending_snapshots(rows)
             all_ids.extend(ids)
             totals["intervals"] += 1
             totals["rows"] += len(rows)
             totals["inserted"] += len(ids)
-            logger.info("Trending %s/%s: rows=%d inserted=%d", self.chain, interval, len(rows), len(ids))
+            logger.info("Trending %s/%s: rows=%d inserted=%d rejected=%d",
+                        self.chain, interval, len(rows), len(ids),
+                        sum(reject_counts.values()))
+        if reject_counts:
+            logger.info("Trending rejeições: %s", reject_counts)
 
         coverage = store.build_trending_coverage(
             all_ids,
