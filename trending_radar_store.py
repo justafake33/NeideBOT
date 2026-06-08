@@ -97,10 +97,22 @@ def ensure_trending_radar_schema() -> None:
 
 
 def insert_trending_snapshots(rows: list[dict]) -> list[int]:
-    """Insere snapshot de trending e retorna ids criados."""
+    """Insere snapshot de trending apenas para tokens já em migrations. Retorna ids criados."""
     if not rows:
         return []
     import json as _json
+
+    # Filtra: só guarda tokens que o NeideBOT já detectou (estão em migrations)
+    mints = [r["mint"] for r in rows if r.get("mint")]
+    if not mints:
+        return []
+    with db._cursor() as cur:
+        cur.execute("SELECT mint FROM migrations WHERE mint = ANY(%s)", (mints,))
+        known = {r["mint"] for r in cur.fetchall()}
+    rows = [r for r in rows if r.get("mint") in known]
+    if not rows:
+        return []
+
     payload = []
     for r in rows:
         payload.append({
