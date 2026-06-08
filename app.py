@@ -46264,22 +46264,27 @@ windows: {', '.join(available_windows)}</p>
 @app.route("/debug/test-telegram")
 def debug_test_telegram():
     """Envia mensagem de teste e retorna a resposta real do Telegram para diagnóstico."""
-    from telegram_bot import send_alert_check, TELEGRAM_TOKEN, TELEGRAM_CHAT
+    import os as _os
+    import requests as _requests
     from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
-    result = send_alert_check(
-        f"✅ *NeideBOT — Telegram configurado com sucesso!*\n\n"
-        f"Alertas de retenção de dados e disco cheio estão ativos.\n"
-        f"_{now}_"
-    )
-    status = 200 if result.get("ok") else 400
-    return jsonify({
-        "telegram_response": result,
-        "token_configured": bool(TELEGRAM_TOKEN),
-        "chat_configured": bool(TELEGRAM_CHAT),
-        "token_preview": TELEGRAM_TOKEN[:10] + "..." if TELEGRAM_TOKEN else "vazio",
-        "chat_id": TELEGRAM_CHAT or "vazio",
-    }), status
+    token = _os.getenv("TELEGRAM_TOKEN", "")
+    chat  = _os.getenv("TELEGRAM_CHAT", "")
+    now   = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+    if not token or not chat:
+        return jsonify({"ok": False, "error": "variáveis não encontradas", "token": bool(token), "chat": bool(chat)}), 400
+    try:
+        resp = _requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat, "text": f"✅ *NeideBOT — Telegram OK!* _{now}_", "parse_mode": "Markdown"},
+            timeout=10,
+        )
+        return jsonify({
+            "telegram_response": resp.json(),
+            "token_preview": token[:10] + "...",
+            "chat_id": chat,
+        }), 200 if resp.ok else 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/debug/schema")
