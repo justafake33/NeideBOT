@@ -97,10 +97,34 @@ def ensure_trending_radar_schema() -> None:
 
 
 def insert_trending_snapshots(rows: list[dict]) -> list[int]:
-    """Insere snapshot de trending e retorna ids criados."""
+    """Insere snapshot de trending, deduplicando por mint+interval por hora. Retorna ids criados."""
     if not rows:
         return []
     import json as _json
+
+    # Deduplica: só insere se o mint não apareceu neste interval_label na última hora.
+    # Objetivo: registar quando cada token entrou no trending, sem repetir 60×/hora.
+    mints_by_interval: dict[str, list[str]] = {}
+    for r in rows:
+        key = r.get("interval_label", "")
+        mints_by_interval.setdefault(key, []).append(r["mint"])
+
+    seen: set[tuple[str, str]] = set()
+    with db._cursor() as cur:
+        for interval, mints in mints_by_interval.items():
+            cur.execute("""
+                SELECT DISTINCT mint FROM gmgn_trending_snapshots
+                WHERE interval_label = %s
+                  AND mint = ANY(%s)
+                  AND ts_snapshot >= NOW() - INTERVAL '1 hour'
+            """, (interval, mints))
+            for r2 in cur.fetchall():
+                seen.add((r2["mint"], interval))
+
+    rows = [r for r in rows if (r["mint"], r.get("interval_label", "")) not in seen]
+    if not rows:
+        return []
+
     payload = []
     for r in rows:
         payload.append({
