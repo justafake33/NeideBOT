@@ -1,6 +1,6 @@
 # NeideBOT — Roadmap
 
-**Atualizado:** 2026-06-06 (sessão 19)
+**Atualizado:** 2026-06-08 (sessão 20)
 **Estado:** Bot ATIVO · `TRADING_ENABLED=true` · branch ativo: `claude/relaxed-planck-H3Qg2`
 
 ---
@@ -89,6 +89,9 @@
 | **H23 análise com dados limpos (138 bounces)** | 2026-06-06 | Primeiro resultado confiável do H23 pós-phantom-fix. 86% dos bounces têm net_sol_flow negativo (WR 20.2%, abaixo break-even 25%). Positivo (0-10 SOL): WR 67% (n=13). Análise via token_ticks 60min, entry=mc_at_signal, TP75/SL25. Endpoint `/debug/h23-wr?since=2026-05-26` com segunda tabela "via token_ticks" e faixas completas. Commits `5bc5e5e`. |
 | **H23 gate implementado (`H23_NET_MIN`) — desativado por falta de dados** | 2026-06-06 | Gate em `scanner.py` bloqueia bounce se `net_sol_flow < H23_NET_MIN`. Código deployado mas gate desativado (n=13 positivos, insuficiente). Reativar no futuro adicionando `H23_NET_MIN=<threshold>` no Railway (sem a var = desativado). `TRADE_MIN_NET_SOL_FLOW=-999` no executor mantido. Commit `b07e574`. |
 | **`/analise/grid-search` corrigido** | 2026-06-06 | Dois bugs: (1) `NameError: time` — imports na wrapper mas lógica no inner. (2) `InvalidDatetimeFormat` — PostgreSQL não faz short-circuit em `OR` com type casts. Fix: `NULLIF(%(since)s, '')::timestamptz IS NULL`. Commits `4c02264` + `fffc7d2`. |
+| **Railway nova DB + fix `db.py`** | 2026-06-08 | Banco `beautiful-heart` com disco 100% full → loop PANIC. Novo PostgreSQL criado em `intelligent-spirit` (mesmo projeto web+worker). `beautiful-heart` preservado com dados históricos de carteiras (`cozy-growth`). Fix `db.py`: ALTER TABLE antes de CREATE TABLE em fresh DB → ordem invertida. Commit `b93b13c`. Nota: `postgres.railway.internal` só funciona dentro do mesmo projeto — cross-project usa URL `rlwy.net`. |
+| **`db_retention.py` — retenção automática com alertas Telegram** | 2026-06-08 | Roda a cada 6h via HeapScheduler. Alerta Telegram ANTES de deletar (preview + espaço) + confirmação APÓS. Nunca deleta `migrations`/`bounce_signals`/`trades`. Retenção configurável: `token_ticks` (30d), `micro_absorption_snapshots` (60d), `gmgn_trending_*` (14d). `RETENTION_DRY_RUN=true` para simular. |
+| **TrendingRadar: dedup 1h + filtro de qualidade** | 2026-06-08 | Dedup 1x/hora por mint+interval (de ~12k para ~200 rows/hora). `_quality_reject()` rejeita `not_pump_launchpad` e `flash_migration_<120s`. Defaults: `TRENDING_FILTER_PUMP_ONLY=true`, `TRENDING_FILTER_MIN_BC_SEC=120`. Roda no worker. Commit `47e09b3`. |
 
 > ⚠️ **WR REAL CORRIGIDO (2026-05-14 sessão 5):** banco tinha dados fictícios — TradeMonitor inferia saídas de MC snapshots, não da blockchain. Auditoria via Helius revelou WR real de **10.1%** (14 TP / 125 SL / 139 trades). WR anterior de 32% era inflado por falsos TPs. `/debug/sell-recovery` executado: 139 correções persistidas.
 > ⚠️ **DADOS HISTÓRICOS SUSPEITOS (sessão 9):** mc_min de todos os tokens antes do fix (elapsed_sec < 90) pode estar corrompido pelo candle de transição. Análises de WR baseadas em `mc_min` histórico (bounce_pct, entry_ratio, drop_from_mig) devem ser tratadas com cautela.
