@@ -6330,6 +6330,11 @@ def _start_services():
             _tr_thread = _threading.Thread(target=_tr.start, daemon=True, name="trending-radar")
             _tr_thread.start()
             logger.info("TrendingRadar iniciado (poll=%ds)", _tr.poll_sec)
+    # Retenção automática de dados — roda a cada 6h, alerta no Telegram antes de deletar
+    from db_retention import run_retention, INTERVAL_SEC as _RETENTION_INTERVAL
+    scheduler.schedule(_RETENTION_INTERVAL, run_retention, scheduler)
+    logger.info("db_retention: job agendado (primeira execução em 6h)")
+
     logger.info("Todos os serviços iniciados")
 
 
