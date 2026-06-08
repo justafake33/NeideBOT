@@ -46263,21 +46263,23 @@ windows: {', '.join(available_windows)}</p>
 
 @app.route("/debug/test-telegram")
 def debug_test_telegram():
-    """Envia mensagem de teste no Telegram para confirmar que está configurado."""
-    from telegram_bot import send_alert, TELEGRAM_TOKEN, TELEGRAM_CHAT
+    """Envia mensagem de teste e retorna a resposta real do Telegram para diagnóstico."""
+    from telegram_bot import send_alert_check, TELEGRAM_TOKEN, TELEGRAM_CHAT
     from datetime import datetime, timezone
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
-        return jsonify({"ok": False, "error": "TELEGRAM_TOKEN ou TELEGRAM_CHAT não configurados"}), 400
-    try:
-        now = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
-        send_alert(
-            f"✅ *NeideBOT — Telegram configurado com sucesso!*\n\n"
-            f"Alertas de retenção de dados e disco cheio estão ativos.\n"
-            f"_{now}_"
-        )
-        return jsonify({"ok": True, "message": "Mensagem enviada — verifica o Telegram"})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    now = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+    result = send_alert_check(
+        f"✅ *NeideBOT — Telegram configurado com sucesso!*\n\n"
+        f"Alertas de retenção de dados e disco cheio estão ativos.\n"
+        f"_{now}_"
+    )
+    status = 200 if result.get("ok") else 400
+    return jsonify({
+        "telegram_response": result,
+        "token_configured": bool(TELEGRAM_TOKEN),
+        "chat_configured": bool(TELEGRAM_CHAT),
+        "token_preview": TELEGRAM_TOKEN[:10] + "..." if TELEGRAM_TOKEN else "vazio",
+        "chat_id": TELEGRAM_CHAT or "vazio",
+    }), status
 
 
 @app.route("/debug/schema")
