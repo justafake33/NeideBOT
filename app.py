@@ -47761,7 +47761,7 @@ def analise_filter_impact():  # noqa: C901
                     m.mc_migration, m.ts_migration, m.total_fee_sol, m.liq_migration
                 FROM token_ticks tt
                 JOIN migrations m ON m.mint = tt.mint
-                WHERE m.ts_migration >= %(s)s::timestamptz
+                WHERE m.ts_migration >= %s::timestamptz
                   AND tt.tick_ts > m.ts_migration + INTERVAL '90 seconds'
                   AND tt.tick_ts < m.ts_migration + INTERVAL '60 minutes'
             ),
@@ -47773,7 +47773,6 @@ def analise_filter_impact():  # noqa: C901
                 ORDER BY mint, mc ASC, elapsed_sec ASC
             ),
             time_to_30pct AS (
-                -- Primeiro tick apos o fundo onde bounce >= 30pct (proxy para quando o sinal dispararia)
                 SELECT DISTINCT ON (tw.mint)
                     tw.mint,
                     tw.elapsed_sec AS elapsed_at_bounce30,
@@ -47813,7 +47812,7 @@ def analise_filter_impact():  # noqa: C901
             LEFT JOIN max_after_bottom mab ON mab.mint = bp.mint
             LEFT JOIN time_to_30pct t30 ON t30.mint = bp.mint
             WHERE bp.mc_bottom IS NOT NULL AND bp.mc_bottom > 0
-        """, {"s": since_ts})
+        """, (since_ts,))
         rows = cur.fetchall()
 
         n_total  = len(rows)
@@ -47942,8 +47941,8 @@ def analise_filter_impact():  # noqa: C901
                 SUM(CASE WHEN pool_quote_at_signal IS NOT NULL
                           AND net_sol_flow IS NOT NULL THEN 1 ELSE 0 END) AS com_ambos
             FROM bounce_signals
-            WHERE ts_signal >= %(s)s::timestamptz
-        """, {"s": since_ts})
+            WHERE ts_signal >= %s::timestamptz
+        """, (since_ts,))
         bs = cur.fetchone()
         total_bs = bs["total"] or 1
         h += "<table><tr><th>Métrica</th><th>Valor</th><th>Impacto</th></tr>"
