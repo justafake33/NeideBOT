@@ -6317,7 +6317,7 @@ def _start_services():
     monitor.set_helius(hot._helius)   # injeta helius para coleta de absorção durante holding
     executor.set_helius(hot._helius)  # injeta helius no executor (C3: gate de pool depth no bounce)
     monitor.start()
-    if os.getenv("TRENDING_RADAR_ENABLED", "true").lower() == "true":
+    if os.getenv("TRENDING_RADAR_ENABLED", "false").lower() == "true":
         import threading as _threading
         from trending_radar import TrendingRadar
         import trending_radar_store as _tr_store
