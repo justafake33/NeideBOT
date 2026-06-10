@@ -46415,5 +46415,475 @@ def debug_db_locks():
     return h
 
 
+@app.route("/analise/bounce-funnel")
+def analise_bounce_funnel():  # noqa: C901
+    """Diagnóstico completo do funil de trading — por que temos ~2 trades/dia?"""
+    import psycopg2.extras
+    since_default = "2026-05-26"
+    since = request.args.get("since", since_default)
+    try:
+        since_ts = since if since else since_default
+    except Exception:
+        since_ts = since_default
+
+    CSS = (
+        "<style>"
+        "body{background:#0d1117;color:#e6edf3;font:12px/1.6 monospace;padding:20px}"
+        "h2{color:#58a6ff;margin-top:24px;border-bottom:1px solid #30363d;padding-bottom:6px}"
+        "h3{color:#79c0ff;margin-top:16px}"
+        "table{border-collapse:collapse;width:100%;margin-bottom:16px}"
+        "th{background:#161b22;padding:6px 10px;text-align:left;font-size:11px;color:#8b949e;border-bottom:2px solid #30363d}"
+        "td{padding:4px 10px;border-bottom:1px solid #21262d;font-size:11px;vertical-align:top}"
+        ".good{color:#3fb950}.warn{color:#f0883e}.bad{color:#f85149}"
+        ".dim{color:#8b949e}.hi{color:#e6edf3;font-weight:bold}"
+        ".bar{display:inline-block;background:#238636;height:10px;vertical-align:middle}"
+        "a{color:#58a6ff}"
+        "</style>"
+    )
+
+    h = f"<html><head><meta charset='utf-8'>{CSS}</head><body>"
+    h += "<h2>🔍 Bounce Funnel — Diagnóstico Completo</h2>"
+    h += f"<p class='dim'>Dados desde <b>{since_ts}</b> (phantom fix). "
+    h += f"<a href='?since=2026-05-21'>Desde 21/mai</a> &nbsp;|&nbsp; "
+    h += f"<a href='?since=2026-05-26'>Desde 26/mai (limpo)</a> &nbsp;|&nbsp; "
+    h += f"<a href='?since=2026-06-01'>Desde 01/jun</a> &nbsp;|&nbsp; "
+    h += "<a href='javascript:location.reload()'>↻ Refresh</a></p>"
+
+    try:
+        conn = psycopg2.connect(db.DATABASE_URL)
+        conn.autocommit = True
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # ── SEÇÃO 1: FUNIL ────────────────────────────────────────────────────────
+        h += "<h2>1 · Funil de Conversão</h2>"
+
+        cur.execute("""
+            SELECT COUNT(*) AS n FROM migrations
+            WHERE ts_migration >= %(s)s::timestamptz
+        """, {"s": since_ts})
+        n_mig = cur.fetchone()["n"]
+
+        cur.execute("""
+            SELECT COUNT(*) AS n FROM migrations
+            WHERE ts_migration >= %(s)s::timestamptz
+              AND mc_bottom IS NOT NULL
+        """, {"s": since_ts})
+        n_with_bottom = cur.fetchone()["n"]
+
+        cur.execute("""
+            SELECT COUNT(*) AS n FROM bounce_signals
+            WHERE ts_signal >= %(s)s::timestamptz
+        """, {"s": since_ts})
+        n_bounces = cur.fetchone()["n"]
+
+        cur.execute("""
+            SELECT COUNT(*) AS n FROM trades
+            WHERE ts_signal >= %(s)s::timestamptz
+        """, {"s": since_ts})
+        n_trades = cur.fetchone()["n"]
+
+        cur.execute("""
+            SELECT
+                SUM(CASE WHEN status IN ('tp','trailing_active') THEN 1 ELSE 0 END) AS tp,
+                SUM(CASE WHEN status = 'sl' THEN 1 ELSE 0 END) AS sl
+            FROM trades
+            WHERE ts_signal >= %(s)s::timestamptz
+              AND status IN ('tp','trailing_active','sl')
+        """, {"s": since_ts})
+        r = cur.fetchone()
+        n_tp = r["tp"] or 0
+        n_sl = r["sl"] or 0
+
+        def pct(a, b):
+            return f"{100*a/b:.0f}%" if b else "—"
+
+        funnel = [
+            ("Migrações detectadas", n_mig, "100%", "#58a6ff"),
+            ("Com mc_bottom (fundo confirmado)", n_with_bottom, pct(n_with_bottom, n_mig), "#79c0ff"),
+            ("Bounce signals disparados", n_bounces, pct(n_bounces, n_mig), "#f0883e"),
+            ("Trades executados", n_trades, pct(n_trades, n_bounces), "#3fb950"),
+            ("TPs confirmados", n_tp, pct(n_tp, n_trades), "#3fb950"),
+            ("SLs", n_sl, pct(n_sl, n_trades), "#f85149"),
+        ]
+
+        h += "<table><tr><th>Etapa</th><th>N</th><th>Taxa</th><th>Barra</th></tr>"
+        max_n = max(n_mig, 1)
+        for label, n, rate, color in funnel:
+            bar_w = max(1, int(300 * n / max_n))
+            h += f"<tr><td class='hi'>{label}</td><td>{n}</td><td style='color:{color}'>{rate}</td>"
+            h += f"<td><span class='bar' style='width:{bar_w}px;background:{color}'></span></td></tr>"
+        h += "</table>"
+
+        # ── SEÇÃO 2: DISTRIBUIÇÃO BOUNCE_PCT ──────────────────────────────────────
+        h += "<h2>2 · Distribuição de bounce_pct nos Bounce Signals</h2>"
+        h += "<p class='dim'>Onde os sinais que PASSARAM todos os filtros caem na distribuição?</p>"
+
+        cur.execute("""
+            SELECT
+                width_bucket(bounce_pct * 100, 0, 300, 30) AS bucket,
+                MIN(bounce_pct * 100) AS lo,
+                MAX(bounce_pct * 100) AS hi,
+                COUNT(*) AS n,
+                AVG(bounce_pct * 100) AS avg_pct
+            FROM bounce_signals
+            WHERE ts_signal >= %(s)s::timestamptz
+              AND bounce_pct IS NOT NULL
+            GROUP BY bucket
+            ORDER BY bucket
+        """, {"s": since_ts})
+        dist_rows = cur.fetchall()
+
+        if dist_rows:
+            max_dist = max(r["n"] for r in dist_rows)
+            h += "<table><tr><th>Faixa bounce_pct</th><th>N sinais</th><th>Barra</th></tr>"
+            for r in dist_rows:
+                bar_w = max(1, int(200 * r["n"] / max_dist))
+                lo = r["lo"] or 0
+                hi = r["hi"] or 0
+                color = "#3fb950" if lo >= 30 else "#f0883e"
+                h += f"<tr><td>{lo:.0f}% – {hi:.0f}%</td><td>{r['n']}</td>"
+                h += f"<td><span class='bar' style='width:{bar_w}px;background:{color}'></span> {r['n']}</td></tr>"
+            h += "</table>"
+        else:
+            h += "<p class='warn'>Sem dados de bounce_pct no período.</p>"
+
+        # Distribuição de drop_from_mig também
+        h += "<h3>Distribuição de drop_from_mig (queda da migração → fundo)</h3>"
+        cur.execute("""
+            SELECT
+                width_bucket(drop_from_mig * 100, 0, 100, 10) AS bucket,
+                MIN(drop_from_mig * 100) AS lo,
+                MAX(drop_from_mig * 100) AS hi,
+                COUNT(*) AS n
+            FROM bounce_signals
+            WHERE ts_signal >= %(s)s::timestamptz
+              AND drop_from_mig IS NOT NULL
+            GROUP BY bucket
+            ORDER BY bucket
+        """, {"s": since_ts})
+        drop_rows = cur.fetchall()
+
+        if drop_rows:
+            max_drop = max(r["n"] for r in drop_rows)
+            h += "<table><tr><th>Drop da migração</th><th>N</th><th>Barra</th></tr>"
+            for r in drop_rows:
+                bar_w = max(1, int(200 * r["n"] / max_drop))
+                lo = r["lo"] or 0
+                color = "#3fb950" if lo >= 30 else "#f0883e"
+                h += f"<tr><td>-{lo:.0f}% → -{r['hi'] or 0:.0f}%</td><td>{r['n']}</td>"
+                h += f"<td><span class='bar' style='width:{bar_w}px;background:{color}'></span></td></tr>"
+            h += "</table>"
+
+        # ── SEÇÃO 3: SENSIBILIDADE DOS FILTROS ────────────────────────────────────
+        h += "<h2>3 · Sensibilidade de Thresholds — Quantos Sinais com Cada Corte?</h2>"
+        h += "<p class='dim'>Simula o impacto de mudar BOUNCE_MIN_PCT no volume de sinais. "
+        h += "Usa bounce_signals (que já passaram A.5/A.6/C3) como base.</p>"
+
+        # Distribuição cumulativa de bounce_pct nos bounce_signals
+        cur.execute("""
+            SELECT bounce_pct FROM bounce_signals
+            WHERE ts_signal >= %(s)s::timestamptz AND bounce_pct IS NOT NULL
+            ORDER BY bounce_pct
+        """, {"s": since_ts})
+        all_bp = [r["bounce_pct"] for r in cur.fetchall()]
+
+        thresholds = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50, 0.60, 0.75, 1.00]
+        h += "<table><tr><th>BOUNCE_MIN_PCT</th><th>Sinais ≥ threshold</th><th>% do total</th>"
+        h += "<th>Sinal/dia (estimado)</th><th>Nota</th></tr>"
+        total_bp = len(all_bp)
+        # date range
+        if since_ts:
+            from datetime import date
+            try:
+                d0 = date.fromisoformat(since_ts)
+                n_days = max(1, (date.today() - d0).days)
+            except Exception:
+                n_days = 14
+        else:
+            n_days = 14
+
+        current_threshold = 0.30
+        for thr in thresholds:
+            count = sum(1 for bp in all_bp if bp >= thr)
+            rate = f"{100*count/total_bp:.0f}%" if total_bp else "—"
+            per_day = f"{count/n_days:.1f}" if n_days else "—"
+            is_current = abs(thr - current_threshold) < 0.001
+            note = "← ATUAL" if is_current else ""
+            row_style = " style='background:#1a2a1a'" if is_current else ""
+            h += f"<tr{row_style}><td class='hi'>{thr:.0%}</td><td>{count}</td>"
+            h += f"<td>{rate}</td><td>{per_day}</td><td class='dim'>{note}</td></tr>"
+        h += "</table>"
+
+        # Tokens que chegaram com bottom mas bounce < threshold (mísseis perdidos)
+        h += "<h3>Tokens migrados com fundo detectado mas bounce < 30% (sinais perdidos)</h3>"
+        cur.execute("""
+            SELECT
+                COUNT(*) AS n_total,
+                SUM(CASE WHEN (mc_at_signal - mc_bottom) / NULLIF(mc_bottom, 0) < 0.10 THEN 1 ELSE 0 END) AS lt10,
+                SUM(CASE WHEN (mc_at_signal - mc_bottom) / NULLIF(mc_bottom, 0) BETWEEN 0.10 AND 0.20 THEN 1 ELSE 0 END) AS b10_20,
+                SUM(CASE WHEN (mc_at_signal - mc_bottom) / NULLIF(mc_bottom, 0) BETWEEN 0.20 AND 0.30 THEN 1 ELSE 0 END) AS b20_30,
+                SUM(CASE WHEN (mc_at_signal - mc_bottom) / NULLIF(mc_bottom, 0) >= 0.30 THEN 1 ELSE 0 END) AS gte30,
+                AVG((mc_at_signal - mc_bottom) / NULLIF(mc_bottom, 0)) AS avg_bp
+            FROM (
+                SELECT
+                    b.mc_bottom,
+                    -- usa o token_ticks ou mc_at_signal da bounce_signal se existir
+                    -- aqui estimamos o "bounce final" de cada token com fundo
+                    COALESCE(
+                        (SELECT MAX(mc) FROM token_ticks tt WHERE tt.mint = b.mint
+                         AND tt.ts > b.ts_detected + INTERVAL '2 min'
+                         AND tt.ts < b.ts_detected + INTERVAL '60 min'),
+                        b.mc_1h
+                    ) AS mc_at_signal,
+                    b.ts_migration AS ts_m
+                FROM migrations b
+                WHERE b.ts_migration >= %(s)s::timestamptz
+                  AND b.mc_bottom IS NOT NULL
+                  AND b.mc_bottom > 0
+            ) sub
+            WHERE mc_at_signal IS NOT NULL
+        """, {"s": since_ts})
+        r = cur.fetchone()
+        if r and r["n_total"]:
+            h += "<table><tr><th>Faixa de bounce estimado</th><th>N tokens</th><th>%</th></tr>"
+            n_tot = r["n_total"] or 1
+            for label, val in [("<10%", r["lt10"]), ("10–20%", r["b10_20"]), ("20–30%", r["b20_30"]), ("≥30%", r["gte30"])]:
+                v = val or 0
+                color = "#3fb950" if label == "≥30%" else "#f85149" if label == "<10%" else "#f0883e"
+                h += f"<tr><td>{label}</td><td>{v}</td><td style='color:{color}'>{100*v/n_tot:.0f}%</td></tr>"
+            avg_bp = r["avg_bp"] or 0
+            h += f"<tr><td><b>Bounce médio estimado</b></td><td colspan='2'>{avg_bp*100:.1f}%</td></tr>"
+            h += "</table>"
+
+        # ── SEÇÃO 4: TABELA DETALHADA DE BOUNCE SIGNALS ───────────────────────────
+        h += "<h2>4 · Tabela Detalhada — Cada Bounce Signal com Métricas</h2>"
+        h += "<p class='dim'>Últimos 200 bounce_signals com todos os dados disponíveis.</p>"
+
+        cur.execute("""
+            SELECT
+                bs.id,
+                bs.symbol,
+                bs.mint,
+                bs.ts_signal,
+                bs.elapsed_sec,
+                bs.mc_migration,
+                bs.mc_min,
+                bs.mc_at_signal,
+                bs.drop_from_mig,
+                bs.bounce_pct,
+                bs.pool_quote_at_signal,
+                bs.net_sol_flow,
+                bs.rise_buy_vol,
+                bs.rise_sell_vol,
+                bs.rise_net_flow,
+                bs.rise_events,
+                bs.absorption_buy_vol,
+                bs.absorption_sell_vol,
+                bs.absorption_events,
+                bs.buy_concentration,
+                bs.dump_seller_count,
+                bs.dump_seller_hhi,
+                bs.data_quality,
+                t.status AS trade_status,
+                t.pnl_pct_real
+            FROM bounce_signals bs
+            LEFT JOIN trades t ON t.mint = bs.mint
+                AND t.ts_signal >= bs.ts_signal - INTERVAL '30 seconds'
+                AND t.ts_signal <= bs.ts_signal + INTERVAL '30 seconds'
+            WHERE bs.ts_signal >= %(s)s::timestamptz
+            ORDER BY bs.ts_signal DESC
+            LIMIT 200
+        """, {"s": since_ts})
+        detail_rows = cur.fetchall()
+
+        h += ("<table><tr>"
+              "<th>#</th><th>Símbolo</th><th>Data/hora</th>"
+              "<th>elapsed</th><th>mc_mig</th><th>mc_min</th><th>mc_signal</th>"
+              "<th>drop%</th><th>bounce%</th>"
+              "<th>pool SOL</th><th>net_flow</th>"
+              "<th>rise_buy</th><th>rise_sell</th><th>rise_ev</th>"
+              "<th>abs_buy</th><th>abs_sell</th><th>abs_ev</th>"
+              "<th>buy_conc</th><th>quality</th><th>trade</th>"
+              "</tr>")
+
+        for r in detail_rows:
+            bp = (r["bounce_pct"] or 0) * 100
+            drop = (r["drop_from_mig"] or 0) * 100
+            elapsed = r["elapsed_sec"] or 0
+            pool = r["pool_quote_at_signal"]
+            net = r["net_sol_flow"]
+            ts_str = r["ts_signal"].strftime("%m/%d %H:%M") if r["ts_signal"] else "—"
+            sym = r["symbol"] or r["mint"][:8] if r["mint"] else "?"
+
+            bp_color = "#3fb950" if bp >= 30 else "#f85149" if bp < 15 else "#f0883e"
+            elapsed_color = "#f85149" if elapsed > 1200 else "#3fb950"
+            pool_color = "#3fb950" if pool and pool >= 15 else "#f0883e" if pool else "#8b949e"
+            net_color = "#3fb950" if net and net > 1 else "#f85149" if net and net < -5 else "#8b949e"
+
+            quality = r["data_quality"] or "?"
+            q_color = "#3fb950" if quality == "good" else "#f0883e" if quality == "ok" else "#f85149"
+
+            trade_str = "—"
+            if r["trade_status"]:
+                pnl = r["pnl_pct_real"]
+                pnl_str = f"{pnl*100:+.0f}%" if pnl is not None else ""
+                t_color = "#3fb950" if r["trade_status"] in ("tp", "trailing_active") else "#f85149" if r["trade_status"] == "sl" else "#8b949e"
+                trade_str = f"<span style='color:{t_color}'>{r['trade_status']} {pnl_str}</span>"
+
+            dex_url = f"https://dexscreener.com/solana/{r['mint']}" if r["mint"] else "#"
+
+            h += (f"<tr>"
+                  f"<td class='dim'>{r['id']}</td>"
+                  f"<td><a href='{dex_url}' target='_blank'>{sym}</a></td>"
+                  f"<td class='dim'>{ts_str}</td>"
+                  f"<td style='color:{elapsed_color}'>{elapsed//60}m{elapsed%60}s</td>"
+                  f"<td class='dim'>${(r['mc_migration'] or 0)/1000:.0f}k</td>"
+                  f"<td class='dim'>${(r['mc_min'] or 0)/1000:.0f}k</td>"
+                  f"<td class='dim'>${(r['mc_at_signal'] or 0)/1000:.0f}k</td>"
+                  f"<td class='warn'>-{drop:.0f}%</td>"
+                  f"<td style='color:{bp_color}'><b>{bp:.0f}%</b></td>"
+                  f"<td style='color:{pool_color}'>{'{:.1f}'.format(pool) if pool else '—'}</td>"
+                  f"<td style='color:{net_color}'>{'{:+.2f}'.format(net) if net is not None else '—'}</td>"
+                  f"<td>{'{:.2f}'.format(r['rise_buy_vol']) if r['rise_buy_vol'] else '—'}</td>"
+                  f"<td>{'{:.2f}'.format(r['rise_sell_vol']) if r['rise_sell_vol'] else '—'}</td>"
+                  f"<td class='dim'>{r['rise_events'] or '—'}</td>"
+                  f"<td>{'{:.2f}'.format(r['absorption_buy_vol']) if r['absorption_buy_vol'] else '—'}</td>"
+                  f"<td>{'{:.2f}'.format(r['absorption_sell_vol']) if r['absorption_sell_vol'] else '—'}</td>"
+                  f"<td class='dim'>{r['absorption_events'] or '—'}</td>"
+                  f"<td class='dim'>{'{:.2f}'.format(r['buy_concentration']) if r['buy_concentration'] else '—'}</td>"
+                  f"<td style='color:{q_color}'>{quality}</td>"
+                  f"<td>{trade_str}</td>"
+                  f"</tr>")
+        h += "</table>"
+
+        # ── SEÇÃO 5: DIAGNÓSTICO DE FILTROS ───────────────────────────────────────
+        h += "<h2>5 · Por Que Estamos Perdendo Sinais? (Diagnóstico Direto)</h2>"
+
+        # Estatísticas dos bounce_signals — quais % falhariam com cada filtro
+        cur.execute("""
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN bounce_pct < 0.30 THEN 1 ELSE 0 END) AS fail_bounce_30,
+                SUM(CASE WHEN bounce_pct > 1.00 THEN 1 ELSE 0 END) AS fail_bounce_max,
+                SUM(CASE WHEN elapsed_sec > 1200 THEN 1 ELSE 0 END) AS fail_elapsed,
+                SUM(CASE WHEN pool_quote_at_signal IS NOT NULL AND pool_quote_at_signal < 10 THEN 1 ELSE 0 END) AS fail_pool,
+                SUM(CASE WHEN pool_quote_at_signal IS NULL THEN 1 ELSE 0 END) AS no_pool_data,
+                AVG(bounce_pct) AS avg_bp,
+                PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY bounce_pct) AS p25_bp,
+                PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY bounce_pct) AS p50_bp,
+                PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY bounce_pct) AS p75_bp,
+                AVG(elapsed_sec) AS avg_elapsed,
+                AVG(pool_quote_at_signal) AS avg_pool
+            FROM bounce_signals
+            WHERE ts_signal >= %(s)s::timestamptz
+        """, {"s": since_ts})
+        stats = cur.fetchone()
+
+        if stats and stats["total"]:
+            tot = stats["total"]
+            h += "<h3>Estatísticas dos Bounce Signals Existentes</h3>"
+            h += "<table><tr><th>Métrica</th><th>Valor</th><th>Interpretação</th></tr>"
+            p50 = (stats["p50_bp"] or 0) * 100
+            avg_bp = (stats["avg_bp"] or 0) * 100
+            p25 = (stats["p25_bp"] or 0) * 100
+            p75 = (stats["p75_bp"] or 0) * 100
+            avg_elapsed = stats["avg_elapsed"] or 0
+            avg_pool = stats["avg_pool"] or 0
+
+            interp_bp = "Normal" if avg_bp >= 30 else ("⚠️ Maioria abaixo do threshold!" if avg_bp < 25 else "Limítrofe")
+            h += f"<tr><td>bounce_pct médio</td><td class='hi'>{avg_bp:.1f}%</td><td class='dim'>{interp_bp}</td></tr>"
+            h += f"<tr><td>bounce_pct P25/P50/P75</td><td>{p25:.0f}% / {p50:.0f}% / {p75:.0f}%</td><td class='dim'>Distribuição dos sinais que PASSARAM</td></tr>"
+            h += f"<tr><td>elapsed médio no sinal</td><td>{avg_elapsed//60:.0f}m {avg_elapsed%60:.0f}s</td><td class='dim'>{'OK' if avg_elapsed < 900 else '⚠️ Muitos sinais tardios'}</td></tr>"
+            h += f"<tr><td>pool_quote médio</td><td>{avg_pool:.1f} SOL</td><td class='dim'>{'OK' if avg_pool >= 15 else '⚠️ Pools rasas'}</td></tr>"
+            h += "</table>"
+
+            h += "<h3>Sinais que falhariam em cada filtro (dos que PASSARAM hoje)</h3>"
+            h += "<table><tr><th>Filtro</th><th>Env Var / Threshold</th><th>Falhariam</th><th>% dos sinais</th><th>Ação</th></tr>"
+
+            filters = [
+                ("A.7 bounce < 30%", "BOUNCE_MIN_PCT=0.30", stats["fail_bounce_30"] or 0, "Reduzir para 0.20–0.25 se WR confirmar"),
+                ("A.8 bounce > 100%", "BOUNCE_MAX_PCT=1.00", stats["fail_bounce_max"] or 0, "OK — bloqueia entradas tardias"),
+                ("A.5 elapsed > 20min", "BOUNCE_TIME_MAX=20", stats["fail_elapsed"] or 0, "OK — tokens velhos"),
+                ("C3 pool < 10 SOL", "POOL_MIN_SOL_BOUNCE=10", stats["fail_pool"] or 0, "Manter — física do AMM"),
+                ("Sem dados de pool", "—", stats["no_pool_data"] or 0, "Tokens sem erpc coverage"),
+            ]
+            for fname, env, n_fail, action in filters:
+                pct_fail = 100 * n_fail / tot if tot else 0
+                color = "#f85149" if pct_fail > 50 else "#f0883e" if pct_fail > 20 else "#3fb950"
+                h += f"<tr><td class='hi'>{fname}</td><td class='dim'>{env}</td>"
+                h += f"<td style='color:{color}'>{n_fail}</td>"
+                h += f"<td style='color:{color}'>{pct_fail:.0f}%</td>"
+                h += f"<td class='dim'>{action}</td></tr>"
+            h += "</table>"
+
+        # ── SEÇÃO 6: RESUMO E RECOMENDAÇÃO ────────────────────────────────────────
+        h += "<h2>6 · Resumo e Recomendação</h2>"
+
+        # Calcular dias no período
+        cur.execute("""
+            SELECT
+                MIN(ts_signal) AS first_signal,
+                MAX(ts_signal) AS last_signal,
+                COUNT(*) AS total_signals,
+                AVG(bounce_pct) AS avg_bounce
+            FROM bounce_signals
+            WHERE ts_signal >= %(s)s::timestamptz
+        """, {"s": since_ts})
+        summary = cur.fetchone()
+
+        if summary and summary["total_signals"]:
+            first = summary["first_signal"]
+            last = summary["last_signal"]
+            if first and last:
+                days_range = max(1, (last - first).days + 1)
+                signals_per_day = summary["total_signals"] / days_range
+                trades_per_day = n_trades / days_range
+                avg_b = (summary["avg_bounce"] or 0) * 100
+            else:
+                days_range = n_days
+                signals_per_day = summary["total_signals"] / max(1, n_days)
+                trades_per_day = n_trades / max(1, n_days)
+                avg_b = (summary["avg_bounce"] or 0) * 100
+
+            h += "<table><tr><th>Métrica</th><th>Valor</th><th>Observação</th></tr>"
+            h += f"<tr><td>Período analisado</td><td>{days_range} dias</td><td class='dim'>Desde {since_ts}</td></tr>"
+            h += f"<tr><td>Bounce signals/dia</td><td class='hi'>{signals_per_day:.1f}</td><td class='dim'>Sinais que passaram A.5+A.6+A.7+A.8+C3</td></tr>"
+            h += f"<tr><td>Trades/dia</td><td class='hi'>{trades_per_day:.1f}</td><td class='dim'>Dos sinais, quantos viraram trade</td></tr>"
+            h += f"<tr><td>Taxa sinal→trade</td><td class='hi'>{pct(n_trades, n_bounces)}</td><td class='dim'>Deve ser ~100% se TRADING_ENABLED</td></tr>"
+            h += f"<tr><td>bounce_pct médio dos sinais</td><td class='hi'>{avg_b:.1f}%</td><td class='dim'>Abaixo de 30%? Threshold precisa ajustar.</td></tr>"
+
+            # Diagnosis
+            if signals_per_day < 3:
+                diag = "🔴 CRÍTICO: volume de sinais muito baixo. Verificar BOUNCE_MIN_PCT e filtros A.7/A.8."
+            elif signals_per_day < 7:
+                diag = "🟡 BAIXO: abaixo do esperado (7-10/dia). Considerar reduzir BOUNCE_MIN_PCT."
+            else:
+                diag = "🟢 OK: volume de sinais adequado."
+            h += f"<tr><td>Diagnóstico</td><td colspan='2' style='color:#f0883e'>{diag}</td></tr>"
+            h += "</table>"
+
+            # Recomendações específicas
+            h += "<h3>Recomendações</h3><ul>"
+            if avg_b < 25:
+                h += f"<li class='warn'>⚠️ bounce_pct médio = {avg_b:.1f}% — abaixo do threshold de 30%. Considere <b>BOUNCE_MIN_PCT=0.20</b> para dobrar o volume de sinais. Validar WR com 30 trades.</li>"
+            if signals_per_day < 5:
+                h += "<li class='warn'>⚠️ Volume baixo pode ser estrutural — tokens pós-migração real tendem a ter bounce menor do que os fictícios (que tinham mc_min inflado pela transição bonding curve). Dados limpos = menores bounces, WR maior.</li>"
+            if n_trades < n_bounces:
+                miss = n_bounces - n_trades
+                h += f"<li class='warn'>⚠️ {miss} bounce_signals sem trade — verificar TRADING_ENABLED, CALIBRATION_MAX_TRADES, e logs do executor.</li>"
+            h += "<li class='dim'>💡 Hipótese central: com mc_min real (não fictício), a maioria dos tokens genuinamente faz bounce de 10-20% antes de continuar subindo. O threshold de 30% foi calibrado com dados corrompidos. Pode ser necessário recalibrar para 15-20%.</li>"
+            h += "</ul>"
+
+        cur.close()
+        conn.close()
+
+    except Exception as e:
+        import traceback
+        h += f"<pre class='bad'>ERRO: {e}\n{traceback.format_exc()}</pre>"
+
+    h += "</body></html>"
+    return h
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
