@@ -14348,7 +14348,7 @@ def analise_trade_autopsy():
                                  THEN COALESCE(tt.mc_high, tt.mc) END)                         AS max_mc_5min,
                         MAX(CASE WHEN tt.tick_ts <= b.ts_signal + INTERVAL '10 minutes'
                                  THEN COALESCE(tt.mc_high, tt.mc) END)                         AS max_mc_10min,
-                        MAX(CASE WHEN tt.tick_ts <= b.ts_signal + INTERVAL '20 minutes'
+                        MAX(CASE WHEN tt.tick_ts <= b.ts_signal + INTERVAL '60 minutes'
                                  THEN COALESCE(tt.mc_high, tt.mc) END)                         AS max_mc_20min
                     FROM base b
                     JOIN token_ticks tt ON tt.mint = b.mint
@@ -28465,7 +28465,7 @@ def analise_sinal_puro():
                 FROM bounce_signals bs
                 JOIN token_ticks tt ON tt.mint = bs.mint
                     AND tt.tick_ts > bs.ts_signal
-                    AND tt.tick_ts < bs.ts_signal + INTERVAL '20 minutes'
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
                 LEFT JOIN migrations m ON m.mint = bs.mint
                 WHERE bs.mc_min IS NOT NULL
                   AND bs.mc_min > 0
@@ -29135,7 +29135,7 @@ def analise_h23_sinal():
                 FROM bounce_signals bs
                 JOIN token_ticks tt ON tt.mint = bs.mint
                     AND tt.tick_ts > bs.ts_signal
-                    AND tt.tick_ts < bs.ts_signal + INTERVAL '20 minutes'
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
                 LEFT JOIN migrations m ON m.mint = bs.mint
                 WHERE bs.mc_at_signal IS NOT NULL
                   AND bs.mc_at_signal > 0
@@ -29562,7 +29562,7 @@ def analise_intersecao_h23():
                 FROM bounce_signals bs
                 JOIN token_ticks tt ON tt.mint = bs.mint
                     AND tt.tick_ts > bs.ts_signal
-                    AND tt.tick_ts < bs.ts_signal + INTERVAL '20 minutes'
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
                 LEFT JOIN migrations m ON m.mint = bs.mint
                 WHERE bs.mc_at_signal IS NOT NULL
                   AND bs.mc_at_signal > 0
@@ -29972,7 +29972,7 @@ def analise_intersecao_v2():
                 FROM bounce_signals bs
                 JOIN token_ticks tt ON tt.mint = bs.mint
                     AND tt.tick_ts > bs.ts_signal
-                    AND tt.tick_ts < bs.ts_signal + INTERVAL '20 minutes'
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
                 LEFT JOIN migrations m ON m.mint = bs.mint
                 WHERE bs.mc_at_signal IS NOT NULL
                   AND bs.mc_at_signal > 0
@@ -33668,7 +33668,7 @@ def analise_cruzamento_wallets():
                 ON  qt.token_mint = bs.mint
                 AND qt.tipo = 'COMPRA'
                 AND qt.ts < bs.ts_signal
-                AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+                AND qt.ts > bs.ts_signal - INTERVAL '60 minutes'
             LEFT JOIN migrations m ON m.mint = bs.mint
             LEFT JOIN trades t
                 ON  t.mint = bs.mint
@@ -33687,7 +33687,7 @@ def analise_cruzamento_wallets():
                     ON  qt.token_mint = bs.mint
                     AND qt.tipo = 'COMPRA'
                     AND qt.ts < bs.ts_signal
-                    AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+                    AND qt.ts > bs.ts_signal - INTERVAL '60 minutes'
             )
             SELECT
                 'com_wallet'            AS grupo,
@@ -33724,7 +33724,7 @@ def analise_cruzamento_wallets():
                     ON  qt.token_mint = bs.mint
                     AND qt.tipo = 'COMPRA'
                     AND qt.ts < bs.ts_signal
-                    AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+                    AND qt.ts > bs.ts_signal - INTERVAL '60 minutes'
             )
             SELECT
                 CASE WHEN c.mint IS NOT NULL THEN 'com_wallet' ELSE 'sem_wallet' END AS grupo,
@@ -33748,7 +33748,7 @@ def analise_cruzamento_wallets():
                 ON  qt.token_mint = bs.mint
                 AND qt.tipo = 'COMPRA'
                 AND qt.ts < bs.ts_signal
-                AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+                AND qt.ts > bs.ts_signal - INTERVAL '60 minutes'
             GROUP BY qt.carteira
             ORDER BY n_tokens DESC
         """)
@@ -33774,7 +33774,7 @@ def analise_cruzamento_wallets():
                 ON  qt.token_mint = bs.mint
                 AND qt.tipo = 'COMPRA'
                 AND qt.ts < bs.ts_signal
-                AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+                AND qt.ts > bs.ts_signal - INTERVAL '60 minutes'
             LEFT JOIN migrations m ON m.mint = bs.mint
             LEFT JOIN trades t
                 ON  t.mint = bs.mint
@@ -33797,7 +33797,7 @@ def analise_cruzamento_wallets():
                         ON  qt.token_mint = bs.mint
                         AND qt.tipo = 'COMPRA'
                         AND qt.ts < bs.ts_signal
-                        AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+                        AND qt.ts > bs.ts_signal - INTERVAL '60 minutes'
                     WHERE qt.carteira NOT IN ('{noise_list}')
                 )
                 SELECT
@@ -33833,7 +33833,7 @@ def analise_cruzamento_wallets():
                         ON  qt.token_mint = bs.mint
                         AND qt.tipo = 'COMPRA'
                         AND qt.ts < bs.ts_signal
-                        AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+                        AND qt.ts > bs.ts_signal - INTERVAL '60 minutes'
                     WHERE qt.carteira NOT IN ('{noise_list}')
                 )
                 SELECT
@@ -33864,7 +33864,7 @@ def analise_cruzamento_wallets():
                     ON  qt.token_mint = bs.mint
                     AND qt.tipo = 'COMPRA'
                     AND qt.ts < bs.ts_signal
-                    AND qt.ts > bs.ts_signal - INTERVAL '20 minutes'
+                    AND qt.ts > bs.ts_signal - INTERVAL '60 minutes'
                 LEFT JOIN migrations m ON m.mint = bs.mint
                 WHERE qt.carteira NOT IN ('{noise_list}')
                 GROUP BY bs.mint, bs.ts_signal, bs.bounce_pct, m.recovery, m.pct_gain
@@ -34025,7 +34025,7 @@ def analise_cruzamento_wallets():
           .gate{{padding:12px 20px;border-radius:6px;margin:16px 0;font-size:14px;}}
         </style></head><body>
         <h1>Cruzamento wallet-monitor × NeideBOT</h1>
-        <p class='note'>Wallets monitoradas que compraram o mesmo token DURANTE o dump (até 20min antes do bounce disparar)</p>
+        <p class='note'>Wallets monitoradas que compraram o mesmo token DURANTE o dump (até 60min antes do bounce disparar)</p>
 
         <div class='gate' style='background:{gate_color}22;border:1px solid {gate_color};color:{gate_color}'>
           {gate_msg}
@@ -34159,7 +34159,7 @@ def analise_cruzamento_wallets_ticks():
     TP_MULT   = 1.75   # +75%
     SL_MULT   = 0.75   # -25%
     MIN_TICKS = 3
-    DUMP_WINDOW_MIN = 20   # wallet comprou até 20min antes do sinal
+    DUMP_WINDOW_MIN = 20   # wallet comprou até 60min antes do sinal
 
     # Wallets conhecidas como ruído/bot — excluídas do grupo "smart money"
     NOISE_WALLETS = {"Gold", "carteira_S", "carteira_O"}
@@ -34199,7 +34199,7 @@ def analise_cruzamento_wallets_ticks():
                 JOIN token_ticks tt
                     ON  tt.mint    = bs.mint
                     AND tt.tick_ts > bs.ts_signal
-                    AND tt.tick_ts < bs.ts_signal + INTERVAL '20 minutes'
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
                 WHERE bs.mc_at_signal IS NOT NULL
                   AND bs.mc_at_signal > 0
                   AND bs.bounce_pct   IS NOT NULL
@@ -34510,7 +34510,7 @@ def analise_wallet_entry_depth():
                 JOIN token_ticks tt
                     ON  tt.mint    = bs.mint
                     AND tt.tick_ts > bs.ts_signal
-                    AND tt.tick_ts < bs.ts_signal + INTERVAL '20 minutes'
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
                 WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
                   AND bs.mc_migration  IS NOT NULL AND bs.mc_migration  > 0
                   AND bs.bounce_pct    IS NOT NULL
@@ -34539,7 +34539,7 @@ def analise_wallet_entry_depth():
                 ON  qt.token_mint = o.mint
                 AND qt.tipo       = 'COMPRA'
                 AND qt.ts         < o.ts_signal
-                AND qt.ts         > o.ts_signal - INTERVAL '20 minutes'
+                AND qt.ts         > o.ts_signal - INTERVAL '60 minutes'
                 AND qt.mc_t0 IS NOT NULL
                 AND o.mc_migration > 0
             ORDER BY o.ts_signal DESC
@@ -34558,7 +34558,7 @@ def analise_wallet_entry_depth():
                 JOIN token_ticks tt
                     ON  tt.mint    = bs.mint
                     AND tt.tick_ts > bs.ts_signal
-                    AND tt.tick_ts < bs.ts_signal + INTERVAL '20 minutes'
+                    AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
                 WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
                 GROUP BY bs.mint, bs.mc_at_signal
                 HAVING COUNT(tt.id) >= %(min_ticks)s
@@ -34838,7 +34838,7 @@ def analise_wallet_token_outcome():
                 ON  qt.token_mint = bs.mint
                 AND qt.tipo       = 'COMPRA'
                 AND qt.ts         < bs.ts_signal
-                AND qt.ts         > bs.ts_signal - INTERVAL '20 minutes'
+                AND qt.ts         > bs.ts_signal - INTERVAL '60 minutes'
                 AND qt.mc_t0 IS NOT NULL
                 AND bs.mc_migration > 0
             WHERE bs.mc_min IS NOT NULL AND bs.mc_min > 0
@@ -40123,9 +40123,9 @@ def analise_invisible_demand_lab():  # noqa: C901
             bs.mc_at_signal AS entry_mc,
             MIN(CASE WHEN COALESCE(tt.mc_high,tt.mc) >= bs.mc_at_signal * %(tp)s THEN tt.tick_ts END) AS first_tp_ts,
             MIN(CASE WHEN COALESCE(tt.mc_low, tt.mc) <= bs.mc_at_signal * %(sl)s THEN tt.tick_ts END) AS first_sl_ts,
-            MAX(CASE WHEN tt.tick_ts <= bs.ts_signal + INTERVAL '20 minutes' THEN COALESCE(tt.mc_high,tt.mc) END) AS max_mc_20m,
+            MAX(CASE WHEN tt.tick_ts <= bs.ts_signal + INTERVAL '60 minutes' THEN COALESCE(tt.mc_high,tt.mc) END) AS max_mc_20m,
             MAX(COALESCE(tt.mc_high,tt.mc)) AS max_mc_60m,
-            MIN(CASE WHEN tt.tick_ts <= bs.ts_signal + INTERVAL '20 minutes' THEN COALESCE(tt.mc_low,tt.mc) END) AS min_mc_20m,
+            MIN(CASE WHEN tt.tick_ts <= bs.ts_signal + INTERVAL '60 minutes' THEN COALESCE(tt.mc_low,tt.mc) END) AS min_mc_20m,
             MIN(COALESCE(tt.mc_low,tt.mc)) AS min_mc_60m,
             COUNT(tt.id) AS tick_count
         FROM bounce_signals bs
@@ -46524,8 +46524,8 @@ def analise_bounce_funnel():  # noqa: C901
                  FROM token_ticks tt
                  WHERE tt.mint = m.mint
                    AND tt.tick_ts > m.ts_migration + INTERVAL '90 seconds'
-                   AND tt.tick_ts < m.ts_migration + INTERVAL '20 minutes'
-                ) AS mc_peak_20min,
+                   AND tt.tick_ts < m.ts_migration + INTERVAL '60 minutes'
+                ) AS mc_peak_60min,
                 -- número de ticks disponíveis na janela
                 (SELECT COUNT(*)
                  FROM token_ticks tt
@@ -46562,7 +46562,7 @@ def analise_bounce_funnel():  # noqa: C901
                 cats["fired"].append(r)
                 continue
             mb = r["mc_bottom"]
-            mp = r["mc_peak_20min"]
+            mp = r["mc_peak_60min"]
             ticks = r["tick_count"] or 0
             if ticks == 0:
                 cats["sem_ticks"].append(r)
@@ -46616,7 +46616,7 @@ def analise_bounce_funnel():  # noqa: C901
                   "<th>A.5 elapsed</th><th>DexScreener</th></tr>")
             for r in sorted(cats["spike_possivel"], key=lambda x: x["ts_migration"] or 0, reverse=True):
                 mb = r["mc_bottom"] or 0
-                mp = r["mc_peak_20min"] or 0
+                mp = r["mc_peak_60min"] or 0
                 bp_est = (mp - mb) / mb * 100 if mb > 0 else 0
                 ts_str = r["ts_migration"].strftime("%m/%d %H:%M") if r["ts_migration"] else "—"
                 sym = r["symbol"] or (r["mint"][:8] if r["mint"] else "?")
@@ -46640,7 +46640,7 @@ def analise_bounce_funnel():  # noqa: C901
 
         # ── 4. DISTRIBUIÇÃO DE BOUNCE ESTIMADO (TODOS OS TOKENS COM BOTTOM) ───────
         h += "<h2>4 · Distribuição de Bounce Estimado — TODOS os Tokens com Fundo</h2>"
-        h += "<p class='dim'>Bounce estimado = (mc_peak nos ticks até 20min) / mc_bottom. "
+        h += "<p class='dim'>Bounce estimado = (mc_peak nos ticks até 60min) / mc_bottom. "
         h += "Inclui tanto os que dispararam sinal quanto os que não dispararam.</p>"
 
         cur.execute("""
@@ -46660,7 +46660,7 @@ def analise_bounce_funnel():  # noqa: C901
                         (SELECT MAX(tt.mc) FROM token_ticks tt
                          WHERE tt.mint = m.mint
                            AND tt.tick_ts > m.ts_migration + INTERVAL '90 seconds'
-                           AND tt.tick_ts < m.ts_migration + INTERVAL '20 minutes'),
+                           AND tt.tick_ts < m.ts_migration + INTERVAL '60 minutes'),
                         m.mc_bottom
                     ) AS mc_peak,
                     (bs.id IS NOT NULL) AS has_signal
@@ -46675,7 +46675,7 @@ def analise_bounce_funnel():  # noqa: C901
 
         if dist_rows:
             max_n = max((r["n"] for r in dist_rows), default=1)
-            h += ("<table><tr><th>Bounce estimado (20min)</th><th>N tokens</th>"
+            h += ("<table><tr><th>Bounce estimado (60min)</th><th>N tokens</th>"
                   "<th>Com sinal</th><th>Sem sinal</th><th>Barra</th></tr>")
             for r in dist_rows:
                 lo = r["lo"] or 0
@@ -46696,14 +46696,14 @@ def analise_bounce_funnel():  # noqa: C901
 
         # ── 5. SENSIBILIDADE DO THRESHOLD (baseado em bounce estimado real) ────────
         h += "<h2>5 · Sensibilidade do BOUNCE_MIN_PCT — Sinais Possíveis/dia</h2>"
-        h += "<p class='dim'>Estimativa baseada no bounce máximo real de cada token (token_ticks até 20min). "
+        h += "<p class='dim'>Estimativa baseada no bounce máximo real de cada token (token_ticks até 60min). "
         h += "Conta quantos tokens poderiam ter disparado sinal com cada threshold.</p>"
 
         # Collect bounce estimates
         bounces_est = []
         for r in all_rows:
             mb = r["mc_bottom"]
-            mp = r["mc_peak_20min"]
+            mp = r["mc_peak_60min"]
             if mb and mp and mb > 0:
                 bounces_est.append((mp - mb) / mb)
 
