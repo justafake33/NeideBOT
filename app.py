@@ -47327,5 +47327,383 @@ def analise_filter_calibration():  # noqa: C901
     return h
 
 
+@app.route("/analise/ticks-features")
+def analise_ticks_features():  # noqa: C901
+    """
+    Calibração Stage 2 derivada exclusivamente de token_ticks (pós-2026-05-26).
+
+    Para cada token que entrou no HotMonitor, computa diretamente dos ticks:
+      - mc_bottom   = min(mc) na janela 90s–60min
+      - elapsed_min = minutos entre ts_migration e o tick de menor MC
+      - drop_pct    = (mc_migration - mc_bottom) / mc_migration
+      - rec75       = max(mc após fundo) >= mc_bottom × 2.275
+                      (equivale a: entry em +30% do fundo, TP em +75% do entry)
+
+    Não depende de bounce_signals (n=8) nem de migrations.mc_bottom.
+    Dataset limpo: 110 tokens com ticks pós phantom fix.
+    """
+    import psycopg2.extras
+    from datetime import date as _date
+
+    since_ts = request.args.get("since", "2026-05-26") or "2026-05-26"
+
+    CSS = (
+        "<style>"
+        "body{background:#0d1117;color:#e6edf3;font:12px/1.6 monospace;padding:20px}"
+        "h2{color:#58a6ff;margin-top:28px;border-bottom:1px solid #30363d;padding-bottom:6px}"
+        "h3{color:#79c0ff;margin-top:18px}"
+        "table{border-collapse:collapse;width:100%;margin-bottom:14px}"
+        "th{background:#161b22;padding:6px 10px;text-align:left;font-size:11px;"
+        "color:#8b949e;border-bottom:2px solid #30363d}"
+        "td{padding:4px 10px;border-bottom:1px solid #21262d;font-size:11px}"
+        ".good{color:#3fb950}.warn{color:#f0883e}.bad{color:#f85149}"
+        ".dim{color:#8b949e}.hi{color:#e6edf3;font-weight:bold}"
+        ".note{background:#1a1f2e;padding:8px 12px;border-left:3px solid #388bfd;"
+        "margin:8px 0;font-size:11px}"
+        "a{color:#58a6ff}"
+        "</style>"
+    )
+
+    h = "<html><head><meta charset='utf-8'>" + CSS + "</head><body>"
+    h += "<h2>📊 Token Ticks Features — Stage 2 Calibração</h2>"
+    h += "<p class='dim'>Período desde <b>{}</b> · ".format(since_ts)
+    h += "<a href='?since=2026-05-26'>26/mai</a> | "
+    h += "<a href='?since=2026-06-01'>01/jun</a> | "
+    h += "<a href='javascript:location.reload()'>↻</a></p>"
+    h += "<div class='note'>Fonte: token_ticks 90s–60min. Outcome: rec75 = max_mc_pós_fundo ≥ mc_bottom × 2.275. "
+    h += "Critério de ação: delta ≥ 15pp + n ≥ 20 por grupo + padrão monotônico.</div>"
+
+    try:
+        conn = psycopg2.connect(db.DATABASE_URL)
+        conn.autocommit = True
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # ── Core query: bottom + rec75 calculados 100% dos token_ticks ────────
+        cur.execute("""
+            WITH tick_window AS (
+                SELECT
+                    tt.mint,
+                    tt.mc,
+                    tt.tick_ts,
+                    EXTRACT(EPOCH FROM (tt.tick_ts - m.ts_migration)) AS elapsed_sec,
+                    m.mc_migration,
+                    m.ts_migration,
+                    m.smart_wallets,
+                    m.renowned_wallets,
+                    m.sniper_wallets,
+                    m.top10_holder_rate,
+                    m.rat_trader_rate,
+                    m.bundler_trader_amount_rate,
+                    m.bot_degen_rate,
+                    m.total_fee_sol,
+                    m.liq_migration,
+                    m.cto_flag,
+                    m.creator_token_status
+                FROM token_ticks tt
+                JOIN migrations m ON m.mint = tt.mint
+                WHERE m.ts_migration >= %(s)s::timestamptz
+                  AND tt.tick_ts > m.ts_migration + INTERVAL '90 seconds'
+                  AND tt.tick_ts < m.ts_migration + INTERVAL '60 minutes'
+            ),
+            bottom_per_mint AS (
+                SELECT DISTINCT ON (mint)
+                    mint, mc AS mc_bottom, elapsed_sec AS elapsed_to_bottom_sec,
+                    mc_migration, smart_wallets, renowned_wallets, sniper_wallets,
+                    top10_holder_rate, rat_trader_rate, bundler_trader_amount_rate,
+                    bot_degen_rate, total_fee_sol, liq_migration, cto_flag, creator_token_status
+                FROM tick_window
+                ORDER BY mint, mc ASC, elapsed_sec ASC
+            ),
+            max_after_bottom AS (
+                SELECT tw.mint, MAX(tw.mc) AS mc_max_after
+                FROM tick_window tw
+                JOIN bottom_per_mint bp ON bp.mint = tw.mint
+                WHERE tw.elapsed_sec > bp.elapsed_to_bottom_sec
+                GROUP BY tw.mint
+            )
+            SELECT
+                bp.mint,
+                bp.mc_bottom,
+                bp.elapsed_to_bottom_sec / 60.0          AS elapsed_min,
+                bp.mc_migration,
+                CASE WHEN bp.mc_migration > 0
+                    THEN (bp.mc_migration - bp.mc_bottom) / bp.mc_migration
+                    ELSE NULL END                         AS drop_pct,
+                mab.mc_max_after,
+                CASE WHEN mab.mc_max_after IS NOT NULL AND bp.mc_bottom > 0
+                    THEN mab.mc_max_after >= bp.mc_bottom * 2.275
+                    ELSE NULL END                         AS rec75,
+                bp.smart_wallets,
+                bp.renowned_wallets,
+                bp.sniper_wallets,
+                bp.top10_holder_rate,
+                bp.rat_trader_rate,
+                bp.bundler_trader_amount_rate,
+                bp.bot_degen_rate,
+                bp.total_fee_sol,
+                bp.liq_migration,
+                bp.cto_flag,
+                bp.creator_token_status
+            FROM bottom_per_mint bp
+            LEFT JOIN max_after_bottom mab ON mab.mint = bp.mint
+            WHERE bp.mc_bottom IS NOT NULL AND bp.mc_bottom > 0
+            ORDER BY bp.mint
+        """, {"s": since_ts})
+        rows = cur.fetchall()
+
+        n_total   = len(rows)
+        n_rec     = sum(1 for r in rows if r["rec75"] is not None)
+        n_rec75   = sum(1 for r in rows if r["rec75"] is True)
+        baseline  = n_rec75 / n_rec if n_rec else 0
+
+        try:
+            d0 = _date.fromisoformat(since_ts)
+            n_days = max(1, (_date.today() - d0).days)
+        except Exception:
+            n_days = 15
+
+        h += "<h2>0 · Resumo</h2>"
+        h += "<table><tr><th>Métrica</th><th>Valor</th><th>Nota</th></tr>"
+        h += "<tr><td>Tokens com ticks (pós 90s)</td><td class='hi'>{}</td><td class='dim'>{:.1f}/dia</td></tr>".format(n_total, n_total / n_days)
+        h += "<tr><td>Com rec75 computável</td><td>{}</td><td class='dim'>{:.0f}% têm ticks pós-fundo</td></tr>".format(n_rec, 100 * n_rec / max(n_total, 1))
+        h += "<tr><td class='hi'>Baseline rec75</td><td class='hi'>{:.0f}% ({}/{})</td><td class='dim'>% que atingiu mc_bottom × 2.275 após o fundo</td></tr>".format(baseline * 100, n_rec75, n_rec)
+        h += "</table>"
+
+        # ── Helper analyze_buckets ─────────────────────────────────────────────
+        def bucket_table(label, get_val, buckets, note=""):
+            cov = sum(1 for r in rows if get_val(r) is not None)
+            out = "<h3>{}</h3>".format(label)
+            if note:
+                out += "<p class='dim'>{}</p>".format(note)
+            out += "<p class='dim'>Cobertura: {}/{} tokens</p>".format(cov, n_total)
+            out += ("<table><tr><th>Faixa</th><th>N</th><th>rec75</th>"
+                    "<th>vs baseline</th><th>Sinal</th></tr>")
+            for lo, hi, blabel in buckets:
+                grp = [r for r in rows
+                       if r["rec75"] is not None
+                       and get_val(r) is not None
+                       and lo <= get_val(r) < hi]
+                n_g  = len(grp)
+                n_tp = sum(1 for r in grp if r["rec75"])
+                wr   = n_tp / n_g if n_g else None
+                if wr is None:
+                    out += "<tr><td>{}</td><td class='dim'>0</td><td>—</td><td>—</td><td>—</td></tr>".format(blabel)
+                    continue
+                delta = wr - baseline
+                col   = "#3fb950" if delta > 0.10 else "#f85149" if delta < -0.10 else "#8b949e"
+                act   = n_g >= 20 and abs(delta) >= 0.15
+                sig   = "✅ acionável" if act else ("📊 tendência" if abs(delta) >= 0.08 else "— ruído")
+                sc    = "#3fb950" if act else ("#f0883e" if abs(delta) >= 0.08 else "#8b949e")
+                out += ("<tr><td>{}</td><td>{}</td>"
+                        "<td style='color:{}'><b>{:.0f}%</b></td>"
+                        "<td style='color:{}'>{:+.0f}pp</td>"
+                        "<td style='color:{}'>{}</td></tr>").format(
+                    blabel, n_g, col, wr * 100, col, delta * 100, sc, sig)
+            out += "</table>"
+            return out
+
+        # ════════════════════════════════════════════════════════════════════════
+        # STAGE 2 — Features temporais / estruturais (calculadas dos ticks)
+        # ════════════════════════════════════════════════════════════════════════
+        h += "<h2>1 · Stage 2 — Features Estruturais (derivadas de token_ticks)</h2>"
+        h += "<p class='dim'>Estas features descrevem O DUMP em si, não a qualidade do token. "
+        h += "Cada valor é computado diretamente dos ticks — sem dependência de bounce_signals.</p>"
+
+        # 1a. Tempo até o fundo (elapsed_min)
+        h += bucket_table(
+            "Tempo até o Fundo (elapsed_min desde migração)",
+            lambda r: r["elapsed_min"],
+            [(0, 3,  "0–3 min"),
+             (3, 5,  "3–5 min"),
+             (5, 10, "5–10 min"),
+             (10, 20, "10–20 min"),
+             (20, 60, "20–60 min")],
+            note="H10 hipótese: fundo rápido (< 10min) → melhor recovery. "
+                 "Dados anteriores confirmaram +22pp mas com mc_bottom corrompido."
+        )
+
+        # 1b. Profundidade do dump (drop_pct)
+        h += bucket_table(
+            "Profundidade do Dump (drop_pct vs mc_migration)",
+            lambda r: r["drop_pct"],
+            [(0,   0.20, "0–20% drop"),
+             (0.20, 0.35, "20–35% drop"),
+             (0.35, 0.50, "35–50% drop"),
+             (0.50, 0.65, "50–65% drop"),
+             (0.65, 0.80, "65–80% drop"),
+             (0.80, 1.00, "80%+ drop")],
+            note="Drop profundo = mais upside potencial, mas também mais sellers pendentes."
+        )
+
+        # 1c. Tamanho da migração (mc_migration)
+        h += bucket_table(
+            "Tamanho na Migração (mc_migration USD)",
+            lambda r: r["mc_migration"],
+            [(0,      10000, "< $10k"),
+             (10000,  20000, "$10k–$20k"),
+             (20000,  35000, "$20k–$35k"),
+             (35000,  55000, "$35k–$55k"),
+             (55000,  85000, "$55k–$85k"),
+             (85000, 999999, "> $85k")],
+            note="Tokens maiores têm mais liquidez — menos slippage mas mais capital para sair."
+        )
+
+        # 1d. Liquidez na migração
+        h += bucket_table(
+            "Liquidez na Migração (liq_migration USD)",
+            lambda r: r["liq_migration"],
+            [(0,      5000, "< $5k"),
+             (5000,  15000, "$5k–$15k"),
+             (15000, 25000, "$15k–$25k"),
+             (25000, 40000, "$25k–$40k"),
+             (40000, 999999, "> $40k")],
+        )
+
+        # 1e. Fee total (proxy de volume real)
+        h += bucket_table(
+            "Total Fee SOL (proxy de volume real)",
+            lambda r: r["total_fee_sol"],
+            [(0, 1, "< 1 SOL"),
+             (1, 3, "1–3 SOL"),
+             (3, 7, "3–7 SOL"),
+             (7, 15, "7–15 SOL"),
+             (15, 999, "15+ SOL")],
+        )
+
+        # ════════════════════════════════════════════════════════════════════════
+        # STAGE 1 — Qualidade do token (via migrations, mesmo dataset)
+        # ════════════════════════════════════════════════════════════════════════
+        h += "<h2>2 · Stage 1 — Qualidade do Token (via migrations)</h2>"
+        h += "<p class='dim'>Mesmos tokens, features de qualidade do scanner. "
+        h += "Baseline: <b>{:.0f}%</b> ({}/{})</p>".format(baseline * 100, n_rec75, n_rec)
+
+        h += bucket_table(
+            "Smart Wallets",
+            lambda r: r["smart_wallets"],
+            [(0, 1, "0"), (1, 2, "1"), (2, 3, "2"), (3, 4, "3"),
+             (4, 6, "4–5"), (6, 999, "6+")],
+        )
+
+        h += bucket_table(
+            "Renowned Wallets (KOLs)",
+            lambda r: r["renowned_wallets"],
+            [(0, 1, "0"), (1, 2, "1"), (2, 4, "2–3"), (4, 999, "4+")],
+        )
+
+        h += bucket_table(
+            "Sniper Wallets",
+            lambda r: r["sniper_wallets"],
+            [(0, 5, "0–4"), (5, 10, "5–9"), (10, 20, "10–19"),
+             (20, 40, "20–39"), (40, 999, "40+")],
+        )
+
+        h += bucket_table(
+            "Rat Trader Rate",
+            lambda r: r["rat_trader_rate"],
+            [(0, 0.02, "0–2%"), (0.02, 0.05, "2–5%"), (0.05, 0.10, "5–10%"),
+             (0.10, 0.20, "10–20%"), (0.20, 1.0, "20%+")],
+        )
+
+        h += bucket_table(
+            "Bundler Rate",
+            lambda r: r["bundler_trader_amount_rate"],
+            [(0, 0.10, "0–10%"), (0.10, 0.25, "10–25%"), (0.25, 0.40, "25–40%"),
+             (0.40, 0.55, "40–55%"), (0.55, 1.0, "55%+")],
+        )
+
+        h += bucket_table(
+            "Bot Degen Rate",
+            lambda r: r["bot_degen_rate"],
+            [(0, 0.30, "0–30%"), (0.30, 0.50, "30–50%"), (0.50, 0.70, "50–70%"),
+             (0.70, 1.0, "70%+")],
+        )
+
+        # ── Binários ──────────────────────────────────────────────────────────
+        h += "<h2>3 · Features Binárias</h2>"
+        for fname, fkey in [("CTO Flag", "cto_flag"),
+                             ("Creator Hold", "creator_token_status")]:
+            h += "<h3>{}</h3>".format(fname)
+            if fkey == "creator_token_status":
+                pairs = [("creator_hold", "creator_hold"), ("creator_close", "creator_close")]
+            else:
+                pairs = [(True, "Sim"), (False, "Não")]
+            for val, label in pairs:
+                grp  = [r for r in rows if r["rec75"] is not None and r[fkey] == val]
+                n_g  = len(grp)
+                n_tp = sum(1 for r in grp if r["rec75"])
+                wr   = n_tp / n_g if n_g else None
+                delta = (wr - baseline) if wr is not None else None
+                col  = "#3fb950" if (delta or 0) > 0.10 else "#f85149" if (delta or 0) < -0.10 else "#8b949e"
+                h += "<p class='dim'>{}: n={}, rec75={} ({}</p>".format(
+                    label, n_g,
+                    "{:.0f}%".format(wr * 100) if wr is not None else "—",
+                    "<span style='color:{}'>{:+.0f}pp</span>)".format(col, (delta or 0) * 100)
+                )
+
+        # ── Grid 2D: elapsed × drop ────────────────────────────────────────────
+        h += "<h2>4 · Grid 2D — Elapsed × Drop (zona de entrada ideal)</h2>"
+        h += "<p class='dim'>Rec75 por combinação de tempo até fundo + profundidade do dump.</p>"
+        elapsed_buckets = [(0, 5, "0–5m"), (5, 10, "5–10m"), (10, 20, "10–20m"), (20, 60, "20m+")]
+        drop_buckets    = [(0, 0.35, "<35%"), (0.35, 0.55, "35–55%"), (0.55, 0.75, "55–75%"), (0.75, 1.0, "75%+")]
+
+        h += "<table><tr><th>Elapsed \\ Drop</th>"
+        for _, _, dl in drop_buckets:
+            h += "<th>{}</th>".format(dl)
+        h += "</tr>"
+        for el_lo, el_hi, el_label in elapsed_buckets:
+            h += "<tr><td class='hi'>{}</td>".format(el_label)
+            for dr_lo, dr_hi, _ in drop_buckets:
+                cell = [r for r in rows
+                        if r["rec75"] is not None
+                        and r["elapsed_min"] is not None and el_lo <= r["elapsed_min"] < el_hi
+                        and r["drop_pct"] is not None and dr_lo <= r["drop_pct"] < dr_hi]
+                n_c  = len(cell)
+                n_tp = sum(1 for r in cell if r["rec75"])
+                wr   = n_tp / n_c if n_c else None
+                if wr is None:
+                    h += "<td class='dim'>—</td>"
+                else:
+                    delta = wr - baseline
+                    col   = "#3fb950" if delta > 0.10 else "#f85149" if delta < -0.10 else "#8b949e"
+                    h += "<td style='color:{}'><b>{:.0f}%</b><br><span class='dim'>n={}</span></td>".format(col, wr * 100, n_c)
+            h += "</tr>"
+        h += "</table>"
+
+        # ── Token list (debug) ─────────────────────────────────────────────────
+        h += "<h2>5 · Lista Completa</h2>"
+        h += "<p class='dim'>Todos os {} tokens com ticks. Verde = rec75 ✅ / Vermelho = ❌</p>".format(n_total)
+        h += ("<table><tr><th>Mint</th><th>mc_mig</th><th>mc_bottom</th>"
+              "<th>drop%</th><th>elapsed</th><th>smart</th><th>rat%</th><th>bundler%</th><th>rec75</th></tr>")
+        for r in sorted(rows, key=lambda x: (x["rec75"] is not True, x["elapsed_min"] or 0)):
+            rec_col = "#3fb950" if r["rec75"] else ("#f85149" if r["rec75"] is False else "#8b949e")
+            rec_s   = "✅" if r["rec75"] else ("❌" if r["rec75"] is False else "—")
+            drop_s  = "{:.0f}%".format((r["drop_pct"] or 0) * 100)
+            el_s    = "{:.1f}m".format(r["elapsed_min"]) if r["elapsed_min"] is not None else "—"
+            h += ("<tr style='color:{}'><td class='dim'>{}</td>"
+                  "<td>${:.0f}k</td><td>${:.0f}k</td><td>{}</td><td>{}</td>"
+                  "<td>{}</td><td>{}</td><td>{}</td><td><b>{}</b></td></tr>").format(
+                rec_col,
+                r["mint"][:8],
+                (r["mc_migration"] or 0) / 1000,
+                (r["mc_bottom"] or 0) / 1000,
+                drop_s, el_s,
+                r["smart_wallets"] or "—",
+                "{:.0f}%".format((r["rat_trader_rate"] or 0) * 100),
+                "{:.0f}%".format((r["bundler_trader_amount_rate"] or 0) * 100),
+                rec_s,
+            )
+        h += "</table>"
+
+        cur.close()
+        conn.close()
+
+    except Exception as e:
+        import traceback
+        h += "<pre style='color:#f85149'>ERRO: {}\n{}</pre>".format(e, traceback.format_exc())
+
+    h += "</body></html>"
+    return h
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
