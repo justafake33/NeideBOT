@@ -46862,5 +46862,470 @@ def analise_bounce_funnel():  # noqa: C901
     return h
 
 
+
+@app.route("/analise/filter-calibration")
+def analise_filter_calibration():  # noqa: C901
+    """Calibração de filtros do zero com dados limpos (pós-2026-05-26)."""
+    import psycopg2.extras
+    from datetime import date as _date
+
+    since_ts = request.args.get("since", "2026-05-26") or "2026-05-26"
+
+    CSS = (
+        "<style>"
+        "body{background:#0d1117;color:#e6edf3;font:12px/1.6 monospace;padding:20px}"
+        "h2{color:#58a6ff;margin-top:28px;border-bottom:1px solid #30363d;padding-bottom:6px}"
+        "h3{color:#79c0ff;margin-top:18px}"
+        "table{border-collapse:collapse;width:100%;margin-bottom:14px}"
+        "th{background:#161b22;padding:6px 10px;text-align:left;font-size:11px;"
+        "color:#8b949e;border-bottom:2px solid #30363d}"
+        "td{padding:4px 10px;border-bottom:1px solid #21262d;font-size:11px;vertical-align:top}"
+        ".good{color:#3fb950}.warn{color:#f0883e}.bad{color:#f85149}"
+        ".dim{color:#8b949e}.hi{color:#e6edf3;font-weight:bold}"
+        ".bar{display:inline-block;height:10px;vertical-align:middle}"
+        ".note{background:#1a1f2e;padding:8px 12px;border-left:3px solid #388bfd;"
+        "margin:8px 0;font-size:11px}"
+        "a{color:#58a6ff}"
+        "</style>"
+    )
+    h = f"<html><head><meta charset='utf-8'>{CSS}</head><body>"
+    h += "<h2>\U0001f9ea Filter Calibration — Do Zero com Dados Limpos</h2>"
+    h += f"<p class='dim'>Período desde <b>{since_ts}</b> (phantom fix). "
+    h += "<a href='?since=2026-05-26'>26/mai</a> &nbsp;|&nbsp; "
+    h += "<a href='?since=2026-06-01'>01/jun</a> &nbsp;|&nbsp; "
+    h += "<a href='javascript:location.reload()'>↻ Refresh</a></p>"
+
+    h += "<div class='note'>⚠️ <b>Metodologia</b>: Stage 1 usa rec75 = token atingiu +75% do entry estimado "
+    h += "(mc_bottom × 1.30 × 1.75 = mc_bottom × 2.28) em 60min via token_ticks. "
+    h += "Stage 2 usa os bounce_signals reais. Critério de ação: delta ≥ 15pp + n ≥ 20 por grupo + padrão monotônico. "
+    h += "Com n pequeno, tudo é exploratório — não grid search.</div>"
+
+    try:
+        conn = psycopg2.connect(db.DATABASE_URL)
+        conn.autocommit = True
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # ── Pré-computa rec75 para todas as migrations com mc_bottom ───────────
+        # rec75 = max(mc em token_ticks, 90s–60min) >= mc_bottom * 2.275
+        # (equivale a: entrando em mc_bottom*1.30, TP em +75% da entrada)
+        cur.execute("""
+            WITH ticks_peak AS (
+                SELECT
+                    tt.mint,
+                    MAX(tt.mc) AS max_mc_60
+                FROM token_ticks tt
+                JOIN migrations m ON m.mint = tt.mint
+                WHERE m.ts_migration >= %(s)s::timestamptz
+                  AND tt.tick_ts > m.ts_migration + INTERVAL '90 seconds'
+                  AND tt.tick_ts < m.ts_migration + INTERVAL '60 minutes'
+                GROUP BY tt.mint
+            )
+            SELECT
+                m.mint,
+                m.token_nome          AS symbol,
+                m.ts_migration,
+                m.mc_migration,
+                m.mc_bottom,
+                m.smart_wallets,
+                m.renowned_wallets,
+                m.sniper_wallets,
+                m.rug_ratio,
+                m.top10_holder_rate,
+                m.rat_trader_rate,
+                m.bundler_trader_amount_rate,
+                m.is_wash_trading,
+                m.bot_degen_rate,
+                m.entrapment_ratio,
+                m.cto_flag,
+                m.has_social,
+                m.creator_token_status,
+                m.top70_sniper_hold_rate,
+                m.total_fee_sol,
+                m.liq_migration,
+                tp.max_mc_60,
+                CASE
+                    WHEN m.mc_bottom > 0 AND tp.max_mc_60 IS NOT NULL
+                    THEN (tp.max_mc_60 >= m.mc_bottom * 2.275)
+                    ELSE NULL
+                END AS rec75,
+                -- pct_drop medido vs migração
+                CASE WHEN m.mc_migration > 0
+                    THEN (m.mc_migration - m.mc_bottom) / m.mc_migration
+                    ELSE NULL
+                END AS drop_from_mig
+            FROM migrations m
+            LEFT JOIN ticks_peak tp ON tp.mint = m.mint
+            WHERE m.ts_migration >= %(s)s::timestamptz
+            ORDER BY m.ts_migration DESC
+        """, {"s": since_ts})
+        all_mig = cur.fetchall()
+
+        n_total = len(all_mig)
+        n_with_bottom = sum(1 for r in all_mig if r["mc_bottom"] is not None)
+        n_with_rec = sum(1 for r in all_mig if r["rec75"] is not None)
+        n_rec75 = sum(1 for r in all_mig if r["rec75"] is True)
+        baseline_rec75 = n_rec75 / n_with_rec if n_with_rec else 0
+
+        try:
+            d0 = _date.fromisoformat(since_ts)
+            n_days = max(1, (_date.today() - d0).days)
+        except Exception:
+            n_days = 14
+
+        # ── SEÇÃO 0: RESUMO DOS DADOS ──────────────────────────────────────────
+        h += "<h2>0 · Resumo do Dataset</h2>"
+        h += "<table><tr><th>Métrica</th><th>Valor</th><th>Nota</th></tr>"
+        h += f"<tr><td>Período</td><td class='hi'>{n_days} dias</td><td class='dim'>Desde {since_ts}</td></tr>"
+        h += f"<tr><td>Migrações no scanner</td><td>{n_total}</td><td class='dim'>{n_total/n_days:.1f}/dia</td></tr>"
+        h += f"<tr><td>Com mc_bottom confirmado</td><td>{n_with_bottom}</td><td class='dim'>{100*n_with_bottom/max(n_total,1):.0f}% do total</td></tr>"
+        h += f"<tr><td>Com token_ticks (rec75 computável)</td><td>{n_with_rec}</td><td class='dim'>{100*n_with_rec/max(n_total,1):.0f}% do total</td></tr>"
+        h += f"<tr><td class='hi'>Baseline rec75 (sem filtro)</td><td class='hi'>{baseline_rec75*100:.0f}% ({n_rec75}/{n_with_rec})</td><td class='dim'>% que atingiu +75% do entry estimado</td></tr>"
+        h += f"<tr><td>Bounce signals disparados</td><td>8</td><td class='dim'>Dados Stage 2 (n insuficiente para calibrar)</td></tr>"
+        h += "</table>"
+
+        h += "<div class='note'>📌 <b>Critério de ação</b>: só implementa filtro se delta rec75 ≥ 15pp "
+        h += "E n ≥ 20 por grupo E padrão monotônico. Abaixo disso: exploratório apenas.</div>"
+
+        # ── Helper: analisa uma feature contínua ──────────────────────────────
+        def analyze_feature(label, rows, get_val, buckets, unit=""):
+            """Retorna HTML de tabela com rec75 por bucket."""
+            data = []
+            for lo, hi, bucket_label in buckets:
+                bucket = [r for r in rows
+                          if r["rec75"] is not None
+                          and get_val(r) is not None
+                          and lo <= get_val(r) < hi]
+                n_b = len(bucket)
+                n_good = sum(1 for r in bucket if r["rec75"])
+                wr = n_good / n_b if n_b else None
+                data.append((bucket_label, n_b, n_good, wr))
+
+            out = f"<h3>{label}</h3>"
+            coverage = sum(1 for r in rows if get_val(r) is not None)
+            out += f"<p class='dim'>Cobertura: {coverage}/{len(rows)} tokens com dado</p>"
+            out += "<table><tr><th>Faixa</th><th>N tokens</th><th>rec75</th><th>vs baseline</th><th>Sinal</th></tr>"
+            for blabel, n_b, n_good, wr in data:
+                if wr is None:
+                    out += f"<tr><td>{blabel}</td><td class='dim'>0</td><td>—</td><td>—</td><td>—</td></tr>"
+                    continue
+                delta = wr - baseline_rec75
+                wr_color = "#3fb950" if delta > 0.10 else "#f85149" if delta < -0.10 else "#8b949e"
+                actionable = n_b >= 20 and abs(delta) >= 0.15
+                signal = "✅ acionável" if actionable else ("📊 tendência" if abs(delta) >= 0.10 else "— ruído")
+                sig_color = "#3fb950" if actionable else ("#f0883e" if abs(delta) >= 0.10 else "#8b949e")
+                out += (f"<tr><td>{blabel}</td><td>{n_b}</td>"
+                        f"<td style='color:{wr_color}'><b>{wr*100:.0f}%</b></td>"
+                        f"<td style='color:{wr_color}'>{delta*100:+.0f}pp</td>"
+                        f"<td style='color:{sig_color}'>{signal}</td></tr>")
+            out += "</table>"
+            return out
+
+        # ── SEÇÃO 1: FILTROS STAGE 1 — QUALIDADE DO TOKEN ─────────────────────
+        h += "<h2>1 · Stage 1 — Filtros de Qualidade (pré-scanner)</h2>"
+        h += "<p class='dim'>Rec75 = token atingiu +75% do entry estimado (mc_bottom × 2.28) em 60min. "
+        h += f"Baseline: <b>{baseline_rec75*100:.0f}%</b> ({n_rec75}/{n_with_rec})</p>"
+
+        # 1.1 smart_wallets
+        h += analyze_feature(
+            "Smart Wallets (smart_degen_count)",
+            all_mig,
+            lambda r: r["smart_wallets"],
+            [(0, 1, "0"), (1, 2, "1"), (2, 3, "2"), (3, 4, "3"), (4, 6, "4-5"), (6, 999, "6+")]
+        )
+
+        # 1.2 top10_holder_rate
+        h += analyze_feature(
+            "Top 10 Holder Rate",
+            all_mig,
+            lambda r: r["top10_holder_rate"],
+            [(0, 0.5, "0–50%"), (0.5, 0.65, "50–65%"), (0.65, 0.75, "65–75%"),
+             (0.75, 0.85, "75–85%"), (0.85, 1.0, "85–100%")]
+        )
+
+        # 1.3 rat_trader_rate
+        h += analyze_feature(
+            "Rat Trader Rate",
+            all_mig,
+            lambda r: r["rat_trader_rate"],
+            [(0, 0.05, "0–5%"), (0.05, 0.10, "5–10%"), (0.10, 0.15, "10–15%"),
+             (0.15, 0.20, "15–20%"), (0.20, 1.0, "20%+")]
+        )
+
+        # 1.4 bundler_trader_amount_rate
+        h += analyze_feature(
+            "Bundler Rate",
+            all_mig,
+            lambda r: r["bundler_trader_amount_rate"],
+            [(0, 0.05, "0–5%"), (0.05, 0.15, "5–15%"), (0.15, 0.30, "15–30%"),
+             (0.30, 0.50, "30–50%"), (0.50, 1.0, "50%+")]
+        )
+
+        # 1.5 rug_ratio
+        h += analyze_feature(
+            "Rug Ratio (score GMGN)",
+            all_mig,
+            lambda r: r["rug_ratio"],
+            [(0, 0.05, "0–5%"), (0.05, 0.15, "5–15%"), (0.15, 0.30, "15–30%"),
+             (0.30, 0.50, "30–50%"), (0.50, 1.0, "50%+")]
+        )
+
+        # 1.6 bot_degen_rate
+        h += analyze_feature(
+            "Bot Degen Rate",
+            all_mig,
+            lambda r: r["bot_degen_rate"],
+            [(0, 0.3, "0–30%"), (0.3, 0.5, "30–50%"), (0.5, 0.7, "50–70%"),
+             (0.7, 0.9, "70–90%"), (0.9, 1.0, "90–100%")]
+        )
+
+        # 1.7 top70_sniper_hold_rate
+        h += analyze_feature(
+            "Top 70 Sniper Hold Rate",
+            all_mig,
+            lambda r: r["top70_sniper_hold_rate"],
+            [(0, 0.10, "0–10%"), (0.10, 0.20, "10–20%"), (0.20, 0.35, "20–35%"),
+             (0.35, 0.50, "35–50%"), (0.50, 1.0, "50%+")]
+        )
+
+        # 1.8 sniper_wallets count
+        h += analyze_feature(
+            "Sniper Wallets (count)",
+            all_mig,
+            lambda r: r["sniper_wallets"],
+            [(0, 5, "0–4"), (5, 10, "5–9"), (10, 20, "10–19"),
+             (20, 40, "20–39"), (40, 999, "40+")]
+        )
+
+        # 1.9 entrapment_ratio
+        h += analyze_feature(
+            "Entrapment Ratio",
+            all_mig,
+            lambda r: r["entrapment_ratio"],
+            [(0, 0.1, "0–10%"), (0.1, 0.2, "10–20%"), (0.2, 0.4, "20–40%"),
+             (0.4, 1.0, "40%+")]
+        )
+
+        # 1.10 total_fee_sol
+        h += analyze_feature(
+            "Total Fee (SOL) — proxy de volume real",
+            all_mig,
+            lambda r: r["total_fee_sol"],
+            [(0, 1, "<1 SOL"), (1, 3, "1–3 SOL"), (3, 7, "3–7 SOL"),
+             (7, 15, "7–15 SOL"), (15, 999, "15+ SOL")]
+        )
+
+        # 1.11 is_wash_trading (binário)
+        h += "<h3>Is Wash Trading (binário)</h3>"
+        for val, label in [(False, "Não wash"), (True, "Wash trading")]:
+            grp = [r for r in all_mig if r["rec75"] is not None and r["is_wash_trading"] == val]
+            n_g = len(grp)
+            n_good = sum(1 for r in grp if r["rec75"])
+            wr = n_good / n_g if n_g else None
+            delta = (wr - baseline_rec75) if wr is not None else None
+            h += (f"<p class='dim'>{label}: n={n_g}, rec75={f'{wr*100:.0f}%' if wr is not None else '—'} "
+                  f"({f'{delta*100:+.0f}pp vs baseline' if delta is not None else ''})</p>")
+
+        # 1.12 creator_token_status
+        h += "<h3>Creator Token Status</h3>"
+        for val in ["creator_hold", "creator_close", None]:
+            grp = [r for r in all_mig if r["rec75"] is not None and r["creator_token_status"] == val]
+            n_g = len(grp)
+            n_good = sum(1 for r in grp if r["rec75"])
+            wr = n_good / n_g if n_g else None
+            delta = (wr - baseline_rec75) if wr is not None else None
+            label = val or "NULL/desconhecido"
+            h += (f"<p class='dim'>{label}: n={n_g}, rec75={f'{wr*100:.0f}%' if wr is not None else '—'} "
+                  f"({f'{delta*100:+.0f}pp' if delta is not None else ''})</p>")
+
+        # 1.13 cto_flag e has_social
+        for fname, fkey in [("CTO Flag", "cto_flag"), ("Has Social", "has_social")]:
+            h += f"<h3>{fname}</h3>"
+            for val, label in [(True, "Sim"), (False, "Não")]:
+                grp = [r for r in all_mig if r["rec75"] is not None and r[fkey] == val]
+                n_g = len(grp)
+                n_good = sum(1 for r in grp if r["rec75"])
+                wr = n_good / n_g if n_g else None
+                delta = (wr - baseline_rec75) if wr is not None else None
+                h += (f"<p class='dim'>{label}: n={n_g}, rec75={f'{wr*100:.0f}%' if wr is not None else '—'} "
+                      f"({f'{delta*100:+.0f}pp' if delta is not None else ''})</p>")
+
+        # ── SEÇÃO 2: DISTRIBUIÇÃO DOS FILTROS ATUAIS ──────────────────────────
+        h += "<h2>2 · Distribuição dos Filtros Atuais no Dataset</h2>"
+        h += "<p class='dim'>Onde os 164 tokens caem em cada filtro. "
+        h += "Filtros que bloqueiam >90% dos tokens têm impacto no volume de sinais.</p>"
+
+        cur.execute("""
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN smart_wallets >= 3 THEN 1 ELSE 0 END) AS smart_gte3,
+                SUM(CASE WHEN smart_wallets >= 2 THEN 1 ELSE 0 END) AS smart_gte2,
+                SUM(CASE WHEN top10_holder_rate <= 0.80 THEN 1 ELSE 0 END) AS top10_ok,
+                SUM(CASE WHEN rat_trader_rate <= 0.20 THEN 1 ELSE 0 END) AS rat_ok,
+                SUM(CASE WHEN bundler_trader_amount_rate <= 0.60 THEN 1 ELSE 0 END) AS bundler_ok,
+                SUM(CASE WHEN rug_ratio <= 0.50 THEN 1 ELSE 0 END) AS rug_ok,
+                SUM(CASE WHEN bot_degen_rate <= 0.80 THEN 1 ELSE 0 END) AS bot_ok,
+                SUM(CASE WHEN (is_wash_trading IS NULL OR is_wash_trading = FALSE) THEN 1 ELSE 0 END) AS wash_ok,
+                SUM(CASE WHEN liq_migration >= 10000 THEN 1 ELSE 0 END) AS liq_ok,
+                SUM(CASE WHEN total_fee_sol >= 1.0 THEN 1 ELSE 0 END) AS fee_ok,
+                -- cobertura de dados
+                SUM(CASE WHEN smart_wallets IS NOT NULL THEN 1 ELSE 0 END) AS cov_smart,
+                SUM(CASE WHEN top10_holder_rate IS NOT NULL THEN 1 ELSE 0 END) AS cov_top10,
+                SUM(CASE WHEN rat_trader_rate IS NOT NULL THEN 1 ELSE 0 END) AS cov_rat,
+                SUM(CASE WHEN bundler_trader_amount_rate IS NOT NULL THEN 1 ELSE 0 END) AS cov_bundler,
+                SUM(CASE WHEN bot_degen_rate IS NOT NULL THEN 1 ELSE 0 END) AS cov_bot
+            FROM migrations
+            WHERE ts_migration >= %(s)s::timestamptz
+        """, {"s": since_ts})
+        dist = cur.fetchone()
+        tot = dist["total"] or 1
+
+        h += "<table><tr><th>Filtro (threshold atual)</th><th>Passam</th><th>%</th><th>Cobertura</th><th>Impacto vol.</th></tr>"
+        filter_rows = [
+            ("smart_wallets ≥ 3", dist["smart_gte3"], dist["cov_smart"]),
+            ("smart_wallets ≥ 2", dist["smart_gte2"], dist["cov_smart"]),
+            ("top10_holder_rate ≤ 80%", dist["top10_ok"], dist["cov_top10"]),
+            ("rat_trader_rate ≤ 20%", dist["rat_ok"], dist["cov_rat"]),
+            ("bundler_rate ≤ 60%", dist["bundler_ok"], dist["cov_bundler"]),
+            ("rug_ratio ≤ 50%", dist["rug_ok"], dist["cov_smart"]),  # same coverage approx
+            ("bot_degen_rate ≤ 80%", dist["bot_ok"], dist["cov_bot"]),
+            ("is_wash_trading = FALSE", dist["wash_ok"], tot),
+            ("liq_migration ≥ $10k", dist["liq_ok"], tot),
+            ("total_fee_sol ≥ 1.0", dist["fee_ok"], tot),
+        ]
+        for fname, n_pass, n_cov in filter_rows:
+            n_pass = n_pass or 0
+            pct_pass = 100 * n_pass / tot
+            impact = "🔴 alto" if pct_pass < 40 else "🟡 médio" if pct_pass < 70 else "🟢 baixo"
+            pct_color = "#f85149" if pct_pass < 40 else "#f0883e" if pct_pass < 70 else "#3fb950"
+            h += (f"<tr><td class='hi'>{fname}</td>"
+                  f"<td>{n_pass}/{tot}</td>"
+                  f"<td style='color:{pct_color}'>{pct_pass:.0f}%</td>"
+                  f"<td class='dim'>{n_cov}/{tot}</td>"
+                  f"<td>{impact}</td></tr>")
+        h += "</table>"
+
+        # ── SEÇÃO 3: STAGE 2 — FILTROS DE BOUNCE ──────────────────────────────
+        h += "<h2>3 · Stage 2 — Filtros de Bounce (sinal de entrada)</h2>"
+        h += "<div class='note'>⚠️ <b>n=8 bounce_signals</b> — insuficiente para calibrar estatisticamente. "
+        h += "Apresentado apenas como referência descritiva. Não alterar thresholds de Stage 2 antes de n≥30 GMGN.</div>"
+
+        cur.execute("""
+            SELECT
+                bs.symbol, bs.bounce_pct, bs.drop_from_mig, bs.elapsed_sec,
+                bs.pool_quote_at_signal, bs.net_sol_flow, bs.rise_events,
+                bs.absorption_events, bs.buy_concentration,
+                -- simula rec75 via token_ticks pós-sinal
+                (SELECT MAX(tt.mc) FROM token_ticks tt
+                 WHERE tt.mint = bs.mint
+                   AND tt.tick_ts > bs.ts_signal
+                   AND tt.tick_ts < bs.ts_signal + INTERVAL '20 minutes'
+                ) AS max_mc_20min,
+                bs.mc_at_signal, bs.mc_min,
+                t.status AS trade_status, t.pnl_pct_real
+            FROM bounce_signals bs
+            LEFT JOIN trades t ON t.mint = bs.mint
+                AND t.ts_signal >= bs.ts_signal - INTERVAL '30 seconds'
+                AND t.ts_signal <= bs.ts_signal + INTERVAL '30 seconds'
+            WHERE bs.ts_signal >= %(s)s::timestamptz
+            ORDER BY bs.ts_signal DESC
+        """, {"s": since_ts})
+        bs_rows = cur.fetchall()
+
+        h += "<h3>Bounce Signals — Descritivo Completo</h3>"
+        h += ("<table><tr><th>Símbolo</th><th>bounce%</th><th>drop%</th>"
+              "<th>elapsed</th><th>pool SOL</th><th>net_flow</th>"
+              "<th>rise_ev</th><th>abs_ev</th><th>buy_conc</th>"
+              "<th>max 20min</th><th>rec75?</th><th>trade</th></tr>")
+        for r in bs_rows:
+            bp = (r["bounce_pct"] or 0) * 100
+            drop = (r["drop_from_mig"] or 0) * 100
+            el = r["elapsed_sec"] or 0
+            pool = r["pool_quote_at_signal"]
+            net = r["net_sol_flow"]
+            mc_sig = r["mc_at_signal"] or 0
+            max20 = r["max_mc_20min"]
+            rec = (max20 >= mc_sig * 1.75) if (max20 and mc_sig) else None
+            rec_s = "✅ sim" if rec is True else ("❌ não" if rec is False else "—")
+            rec_col = "#3fb950" if rec else ("#f85149" if rec is False else "#8b949e")
+            trade_s = "—"
+            if r["trade_status"]:
+                pnl = r["pnl_pct_real"]
+                pnl_s = "{:+.0f}%".format(pnl * 100) if pnl is not None else ""
+                t_col = "#3fb950" if r["trade_status"] in ("tp", "trailing_active") else "#f85149" if r["trade_status"] == "sl" else "#8b949e"
+                trade_s = f"<span style='color:{t_col}'>{r['trade_status']} {pnl_s}</span>"
+            h += (f"<tr><td class='hi'>{r['symbol'] or '?'}</td>"
+                  f"<td class='warn'>{bp:.0f}%</td>"
+                  f"<td class='dim'>-{drop:.0f}%</td>"
+                  f"<td class='dim'>{el//60}m{el%60}s</td>"
+                  f"<td class='dim'>{'{:.1f}'.format(pool) if pool else '—'}</td>"
+                  f"<td class='dim'>{'{:+.2f}'.format(net) if net is not None else '—'}</td>"
+                  f"<td class='dim'>{r['rise_events'] or '—'}</td>"
+                  f"<td class='dim'>{r['absorption_events'] or '—'}</td>"
+                  f"<td class='dim'>{'{:.2f}'.format(r['buy_concentration']) if r['buy_concentration'] else '—'}</td>"
+                  f"<td class='dim'>${'{:.0f}'.format(max20/1000)+'k' if max20 else '—'}</td>"
+                  f"<td style='color:{rec_col}'>{rec_s}</td>"
+                  f"<td>{trade_s}</td></tr>")
+        h += "</table>"
+
+        # ── SEÇÃO 4: FILTROS COMBINADOS — IMPACTO EM VOLUME ───────────────────
+        h += "<h2>4 · Combinações de Filtros — Quantos Tokens Sobram</h2>"
+        h += "<p class='dim'>Simula quantos dos 164 tokens passariam com diferentes combinações Stage 1. "
+        h += "Volume × qualidade são inversamente proporcionais — ver onde está o equilíbrio.</p>"
+
+        combos = [
+            ("Nenhum filtro extra", "1=1"),
+            ("smart ≥ 2", "smart_wallets >= 2"),
+            ("smart ≥ 3", "smart_wallets >= 3"),
+            ("rat ≤ 20%", "rat_trader_rate <= 0.20"),
+            ("bundler ≤ 30%", "bundler_trader_amount_rate <= 0.30"),
+            ("top10 ≤ 75%", "top10_holder_rate <= 0.75"),
+            ("smart≥2 + rat≤20%", "smart_wallets >= 2 AND rat_trader_rate <= 0.20"),
+            ("smart≥2 + rat≤20% + bundler≤30%", "smart_wallets >= 2 AND rat_trader_rate <= 0.20 AND bundler_trader_amount_rate <= 0.30"),
+            ("smart≥3 + rat≤20%", "smart_wallets >= 3 AND rat_trader_rate <= 0.20"),
+            ("smart≥3 + rat≤20% + top10≤75%", "smart_wallets >= 3 AND rat_trader_rate <= 0.20 AND top10_holder_rate <= 0.75"),
+        ]
+        h += "<table><tr><th>Combinação</th><th>N tokens pass</th><th>%</th><th>Est./dia</th></tr>"
+        for label, cond in combos:
+            cur.execute(f"""
+                SELECT COUNT(*) AS n FROM migrations
+                WHERE ts_migration >= %(s)s::timestamptz AND ({cond})
+            """, {"s": since_ts})
+            n_pass = cur.fetchone()["n"] or 0
+            pct = 100 * n_pass / tot
+            pct_col = "#f85149" if pct < 20 else "#f0883e" if pct < 50 else "#3fb950"
+            h += (f"<tr><td class='hi'>{label}</td><td>{n_pass}</td>"
+                  f"<td style='color:{pct_col}'>{pct:.0f}%</td>"
+                  f"<td class='dim'>{n_pass/n_days:.1f}</td></tr>")
+        h += "</table>"
+
+        # ── SEÇÃO 5: RECOMENDAÇÃO EXECUTIVA ───────────────────────────────────
+        h += "<h2>5 · Recomendação Executiva</h2>"
+        h += "<div class='note'>"
+        h += "<b>Stage 1 (filtros de qualidade):</b><br>"
+        h += "• Qualquer filtro com delta &lt; 15pp ou n &lt; 20 = exploratório apenas. Não implementar.<br>"
+        h += "• Foque em: smart_wallets (único com evidência live) e is_wash_trading (binário, baixo custo).<br>"
+        h += "• Demais filtros: manter thresholds atuais sem ajuste até n ≥ 200 clean.<br>"
+        h += "<br>"
+        h += "<b>Stage 2 (bounce trigger):</b><br>"
+        h += "• n=8 sinais / 4 outcomes = insuficiente para qualquer calibração. Intocável.<br>"
+        h += f"• Com o anti-decline fix deployado hoje, espera-se 6–8 sinais/dia. "
+        h += "Acumule 30+ outcomes GMGN antes de ajustar BOUNCE_MIN_PCT, BOUNCE_MAX_PCT ou MIN_POOL_SOL.<br>"
+        h += "<br>"
+        h += "<b>Próximo checkpoint:</b><br>"
+        h += "• Após 30 trades GMGN com dados limpos: reabrir esta análise.<br>"
+        h += "• Após 200 migrações limpas: análise Stage 1 com poder estatístico adequado."
+        h += "</div>"
+
+        cur.close()
+        conn.close()
+
+    except Exception as e:
+        import traceback
+        h += f"<pre style='color:#f85149'>ERRO: {e}\n{traceback.format_exc()}</pre>"
+
+    h += "</body></html>"
+    return h
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)

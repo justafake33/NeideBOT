@@ -335,12 +335,15 @@ class HotMonitor:
                          mint[:8], bounce_pct * 100, self.BOUNCE_MAX_PCT * 100)
             return
 
-        # Anti-decline: rejeita se o preço está caindo em relação ao pico rastreado.
-        # Token que fez fundo→pico→queda passa em bounce_pct mas está em declínio real.
-        # Threshold 85%: tolera pullbacks normais de até 15%; bloqueia quedas pós-pico.
+        # Anti-decline: rejeita se o preço está caindo em relação a um pico REAL pós-migração.
+        # Bug original: mc_max é inicializado com mc_migration → a condição mc_max > mc_min
+        # era sempre True após o dump, bloqueando qualquer bounce abaixo de 85% da migração.
+        # Exemplo: mc_migration=$27k, mc_bottom=$5k → anti-decline exigia mc >= $22.95k,
+        # mas com BOUNCE_MAX_PCT=100% o token é bloqueado antes de chegar lá.
+        # Fix: só aplica se mc_max superou 5% acima da migração (pico real pós-migração).
         mc_max = mint_state["mc_max"]
-        if mc_max > mc_min and mc < mc_max * 0.85:
-            logger.debug("BOUNCE skip %s — declining: $%.0f < pico $%.0f × 85%%",
+        if mc_max > mc_migration * 1.05 and mc < mc_max * 0.85:
+            logger.debug("BOUNCE skip %s — declining: $%.0f < pico real $%.0f × 85%%",
                          mint[:8], mc, mc_max)
             return
 
