@@ -47705,5 +47705,298 @@ def analise_ticks_features():  # noqa: C901
     return h
 
 
+@app.route("/analise/filter-impact")
+def analise_filter_impact():  # noqa: C901
+    """
+    Para cada filtro ativo, mostra:
+      - N tokens bloqueados vs N que passam
+      - rec75 do grupo bloqueado vs grupo que passa
+      - Se bloqueado tem rec75 MAIOR = filtro está errado (corta os bons)
+
+    Dataset: token_ticks pós-2026-05-26 (dados limpos).
+    Outcome: rec75 = max_mc_após_fundo >= mc_bottom_ticks × 2.275
+    """
+    import psycopg2.extras
+    from datetime import date as _date
+
+    since_ts = request.args.get("since", "2026-05-26") or "2026-05-26"
+
+    CSS = (
+        "<style>"
+        "body{background:#0d1117;color:#e6edf3;font:12px/1.6 monospace;padding:20px}"
+        "h2{color:#58a6ff;margin-top:28px;border-bottom:1px solid #30363d;padding-bottom:6px}"
+        "h3{color:#79c0ff;margin-top:20px}"
+        "table{border-collapse:collapse;width:100%;margin-bottom:10px}"
+        "th{background:#161b22;padding:6px 10px;text-align:left;font-size:11px;"
+        "color:#8b949e;border-bottom:2px solid #30363d}"
+        "td{padding:5px 10px;border-bottom:1px solid #21262d;font-size:12px}"
+        ".good{color:#3fb950}.warn{color:#f0883e}.bad{color:#f85149}"
+        ".dim{color:#8b949e}.hi{color:#e6edf3;font-weight:bold}"
+        ".note{background:#1a1f2e;padding:8px 12px;border-left:3px solid #388bfd;margin:8px 0;font-size:11px}"
+        ".alert{background:#2d1b1b;padding:8px 12px;border-left:3px solid #f85149;margin:8px 0;font-size:11px}"
+        "a{color:#58a6ff}"
+        "</style>"
+    )
+    h = "<html><head><meta charset='utf-8'>" + CSS + "</head><body>"
+    h += "<h2>🔬 Filter Impact — O que cada filtro bloqueia</h2>"
+    h += "<p class='dim'>Período desde <b>{}</b> · ".format(since_ts)
+    h += "<a href='?since=2026-05-26'>26/mai</a> | "
+    h += "<a href='?since=2026-06-01'>01/jun</a> | "
+    h += "<a href='javascript:location.reload()'>↻</a></p>"
+    h += "<div class='note'>Lógica: se o grupo BLOQUEADO tem rec75 maior que o grupo que PASSA → "
+    h += "o filtro está cortando os tokens bons. "
+    h += "Rec75 = max(mc após fundo) ≥ mc_bottom × 2.275 em 60min de token_ticks.</div>"
+
+    try:
+        conn = psycopg2.connect(db.DATABASE_URL)
+        conn.autocommit = True
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # ── Core: mesma query do ticks-features ───────────────────────────────
+        cur.execute("""
+            WITH tick_window AS (
+                SELECT
+                    tt.mint, tt.mc, tt.tick_ts,
+                    EXTRACT(EPOCH FROM (tt.tick_ts - m.ts_migration)) AS elapsed_sec,
+                    m.mc_migration, m.ts_migration, m.total_fee_sol, m.liq_migration
+                FROM token_ticks tt
+                JOIN migrations m ON m.mint = tt.mint
+                WHERE m.ts_migration >= %(s)s::timestamptz
+                  AND tt.tick_ts > m.ts_migration + INTERVAL '90 seconds'
+                  AND tt.tick_ts < m.ts_migration + INTERVAL '60 minutes'
+            ),
+            bottom_per_mint AS (
+                SELECT DISTINCT ON (mint)
+                    mint, mc AS mc_bottom, elapsed_sec AS elapsed_to_bottom,
+                    mc_migration
+                FROM tick_window
+                ORDER BY mint, mc ASC, elapsed_sec ASC
+            ),
+            time_to_30pct AS (
+                -- Primeiro tick após o fundo onde bounce ≥ 30% (proxy para quando o sinal dispararia)
+                SELECT DISTINCT ON (tw.mint)
+                    tw.mint,
+                    tw.elapsed_sec AS elapsed_at_bounce30,
+                    bp.elapsed_to_bottom AS elapsed_to_bottom,
+                    (tw.elapsed_sec - bp.elapsed_to_bottom) AS secs_bottom_to_bounce30,
+                    (tw.mc - bp.mc_bottom) / bp.mc_bottom AS bounce_pct_at_signal
+                FROM tick_window tw
+                JOIN bottom_per_mint bp ON bp.mint = tw.mint
+                WHERE tw.elapsed_sec > bp.elapsed_to_bottom
+                  AND bp.mc_bottom > 0
+                  AND (tw.mc - bp.mc_bottom) / bp.mc_bottom >= 0.30
+                ORDER BY tw.mint, tw.elapsed_sec ASC
+            ),
+            max_after_bottom AS (
+                SELECT tw.mint, MAX(tw.mc) AS mc_max_after
+                FROM tick_window tw
+                JOIN bottom_per_mint bp ON bp.mint = tw.mint
+                WHERE tw.elapsed_sec > bp.elapsed_to_bottom
+                GROUP BY tw.mint
+            )
+            SELECT
+                bp.mint,
+                bp.mc_bottom,
+                bp.elapsed_to_bottom,
+                bp.mc_migration,
+                CASE WHEN bp.mc_migration > 0
+                    THEN (bp.mc_migration - bp.mc_bottom) / bp.mc_migration
+                    ELSE NULL END AS drop_pct,
+                mab.mc_max_after,
+                CASE WHEN mab.mc_max_after IS NOT NULL AND bp.mc_bottom > 0
+                    THEN mab.mc_max_after >= bp.mc_bottom * 2.275
+                    ELSE NULL END AS rec75,
+                t30.elapsed_at_bounce30,
+                t30.secs_bottom_to_bounce30,
+                t30.bounce_pct_at_signal
+            FROM bottom_per_mint bp
+            LEFT JOIN max_after_bottom mab ON mab.mint = bp.mint
+            LEFT JOIN time_to_30pct t30 ON t30.mint = bp.mint
+            WHERE bp.mc_bottom IS NOT NULL AND bp.mc_bottom > 0
+        """, {"s": since_ts})
+        rows = cur.fetchall()
+
+        n_total  = len(rows)
+        n_rec    = sum(1 for r in rows if r["rec75"] is not None)
+        n_rec75  = sum(1 for r in rows if r["rec75"] is True)
+        baseline = n_rec75 / n_rec if n_rec else 0
+
+        try:
+            d0 = _date.fromisoformat(since_ts)
+            n_days = max(1, (_date.today() - d0).days)
+        except Exception:
+            n_days = 15
+
+        h += "<p class='dim'>Dataset: <b>{}</b> tokens com ticks · baseline rec75 = <b>{:.0f}%</b> ({}/{}) · {:.1f}/dia</p>".format(
+            n_total, baseline * 100, n_rec75, n_rec, n_total / n_days)
+
+        # ── Helper: mostra uma tabela PASSA / BLOQUEADO ───────────────────────
+        def filter_row(label, env_val, condition_blocked, note=""):
+            """condition_blocked(row) → True se o filtro BLOQUEARIA este token."""
+            blocked = [r for r in rows if r["rec75"] is not None and condition_blocked(r)]
+            passes  = [r for r in rows if r["rec75"] is not None and not condition_blocked(r)]
+
+            n_bl   = len(blocked)
+            n_pa   = len(passes)
+            wr_bl  = sum(1 for r in blocked if r["rec75"]) / n_bl if n_bl else None
+            wr_pa  = sum(1 for r in passes  if r["rec75"]) / n_pa if n_pa else None
+
+            # Inclui tokens sem rec75 no count de bloqueados para mostrar impacto total
+            n_bl_all = sum(1 for r in rows if condition_blocked(r))
+            n_pa_all = n_total - n_bl_all
+
+            problema = wr_bl is not None and wr_pa is not None and wr_bl > wr_pa + 0.05
+
+            out  = "<h3>{}</h3>".format(label)
+            out += "<p class='dim'>Valor atual: <b>{}</b>".format(env_val)
+            if note:
+                out += " · {}".format(note)
+            out += "</p>"
+
+            if problema:
+                out += "<div class='alert'>⚠️ <b>ATENÇÃO:</b> grupo BLOQUEADO tem rec75 maior ({:.0f}%) que grupo que PASSA ({:.0f}%). ".format(
+                    (wr_bl or 0) * 100, (wr_pa or 0) * 100)
+                out += "Este filtro está cortando os tokens bons.</div>"
+
+            out += "<table><tr><th>Grupo</th><th>N (total)</th><th>N (c/ rec75)</th><th>rec75</th><th>vs baseline</th><th>Veredicto</th></tr>"
+
+            for grupo, n_all, n_with, wr in [
+                ("✅ PASSA o filtro", n_pa_all, n_pa, wr_pa),
+                ("🚫 BLOQUEADO",      n_bl_all, n_bl, wr_bl),
+            ]:
+                if wr is None:
+                    out += "<tr><td>{}</td><td>{}</td><td class='dim'>0</td><td>—</td><td>—</td><td class='dim'>sem dados</td></tr>".format(
+                        grupo, n_all)
+                    continue
+                delta = wr - baseline
+                col   = "#3fb950" if delta > 0.08 else "#f85149" if delta < -0.08 else "#8b949e"
+                if "BLOQUEADO" in grupo:
+                    veredicto = "<span style='color:#f85149'>❌ filtro incorreto</span>" if problema else "<span style='color:#3fb950'>✓ correto bloquear</span>"
+                else:
+                    veredicto = "—"
+                out += "<tr><td class='hi'>{}</td><td>{}</td><td>{}</td><td style='color:{}'><b>{:.0f}%</b></td><td style='color:{}'>{:+.0f}pp</td><td>{}</td></tr>".format(
+                    grupo, n_all, n_with, col, wr * 100, col, delta * 100, veredicto)
+            out += "</table>"
+            return out
+
+        # ════════════════════════════════════════════════════════════════════════
+        h += "<h2>Filtros em análise</h2>"
+
+        # ── 1. BOUNCE_DROP_MIN = 0.30 ─────────────────────────────────────────
+        h += filter_row(
+            "1 · BOUNCE_DROP_MIN = 0.30",
+            "0.30 (bloqueia dumps < 30%)",
+            lambda r: (r["drop_pct"] or 0) < 0.30,
+            note="token não caiu 30% da migração → sinal não dispara"
+        )
+
+        # ── 2. BOUNCE_MAX_PCT = 1.00 ──────────────────────────────────────────
+        # Proxy: bounce_pct_at_signal (primeira vez que o token chegou a +30% do fundo)
+        # Se > 1.00 nesse momento, o sinal seria bloqueado imediatamente
+        h += filter_row(
+            "2 · BOUNCE_MAX_PCT = 1.00",
+            "1.00 = 100% (bloqueia bounces > 100% do fundo)",
+            lambda r: (r["bounce_pct_at_signal"] or 0) > 1.00,
+            note="proxy: bounce_pct na primeira vez que token cruzou +30% nos ticks"
+        )
+
+        # ── 3. TRADE_MAX_ELAPSED_SEC = 300 (5 min) ────────────────────────────
+        # O bounce dispara quando o token está na subida, logo após o fundo.
+        # O elapsed relevante é elapsed_at_bounce30 (quando o sinal teria disparado).
+        # Se não temos esse dado, usamos elapsed_to_bottom + secs_bottom_to_bounce30.
+        def elapsed_at_signal(r):
+            if r["elapsed_at_bounce30"] is not None:
+                return r["elapsed_at_bounce30"]
+            # fallback: bottom + tempo até bounce
+            if r["elapsed_to_bottom"] is not None and r["secs_bottom_to_bounce30"] is not None:
+                return r["elapsed_to_bottom"] + r["secs_bottom_to_bounce30"]
+            return r["elapsed_to_bottom"]
+
+        h += filter_row(
+            "3 · TRADE_MAX_ELAPSED_SEC = 300 (5 min)",
+            "300s = 5min (trade bloqueado se sinal dispara > 5min após migração)",
+            lambda r: (elapsed_at_signal(r) or 0) > 300,
+            note="elapsed no momento em que o sinal teria disparado (primeiro tick com bounce ≥ 30%)"
+        )
+
+        # ── 4. BOTTOM_FRESHNESS_SEC = 180 (3 min) ────────────────────────────
+        # Proxy: tempo entre o fundo e o primeiro tick com bounce ≥ 30%
+        # Se > 180s, A.6 teria bloqueado o sinal
+        h += filter_row(
+            "4 · BOTTOM_FRESHNESS_SEC = 180 (3 min)",
+            "180s = 3min (bloqueia se fundo foi detectado há > 3min)",
+            lambda r: (r["secs_bottom_to_bounce30"] or 0) > 180,
+            note="proxy: segundos entre o tick de fundo e o primeiro tick com bounce ≥ 30%"
+        )
+
+        # ── 5. TRADE_REQUIRE_HELIUS_FEATURES = true ───────────────────────────
+        # Não temos esse dado em token_ticks — mostramos a cobertura de pool_quote
+        # nos bounce_signals como indicação.
+        h += "<h3>5 · TRADE_REQUIRE_HELIUS_FEATURES = true</h3>"
+        h += "<p class='dim'>Bloqueia trade quando pool_quote_at_signal ou net_sol_flow estão ausentes no contexto Helius.</p>"
+        cur.execute("""
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN pool_quote_at_signal IS NOT NULL THEN 1 ELSE 0 END) AS com_pool,
+                SUM(CASE WHEN net_sol_flow IS NOT NULL THEN 1 ELSE 0 END) AS com_flow,
+                SUM(CASE WHEN pool_quote_at_signal IS NOT NULL
+                          AND net_sol_flow IS NOT NULL THEN 1 ELSE 0 END) AS com_ambos
+            FROM bounce_signals
+            WHERE ts_signal >= %(s)s::timestamptz
+        """, {"s": since_ts})
+        bs = cur.fetchone()
+        total_bs = bs["total"] or 1
+        h += "<table><tr><th>Métrica</th><th>Valor</th><th>Impacto</th></tr>"
+        h += "<tr><td>Bounce signals pós-{}</td><td><b>{}</b></td><td class='dim'>amostra</td></tr>".format(since_ts, bs["total"])
+        h += "<tr><td>Com pool_quote_at_signal</td><td>{}/{} ({:.0f}%)</td><td class='dim'>{}</td></tr>".format(
+            bs["com_pool"], bs["total"],
+            100 * (bs["com_pool"] or 0) / total_bs,
+            "✅ ok" if (bs["com_pool"] or 0) / total_bs > 0.8 else "⚠️ cobertura baixa")
+        h += "<tr><td>Com net_sol_flow</td><td>{}/{} ({:.0f}%)</td><td class='dim'>{}</td></tr>".format(
+            bs["com_flow"], bs["total"],
+            100 * (bs["com_flow"] or 0) / total_bs,
+            "✅ ok" if (bs["com_flow"] or 0) / total_bs > 0.8 else "⚠️ cobertura baixa")
+        h += "<tr><td class='hi'>Passariam pelo gate completo</td><td class='hi'>{}/{} ({:.0f}%)</td><td>{}</td></tr>".format(
+            bs["com_ambos"], bs["total"],
+            100 * (bs["com_ambos"] or 0) / total_bs,
+            "<span class='good'>✅ ok</span>" if (bs["com_ambos"] or 0) / total_bs > 0.8
+            else "<span class='warn'>⚠️ bloqueia alguns válidos</span>")
+        h += "</table>"
+
+        # ── Resumo executivo ──────────────────────────────────────────────────
+        h += "<h2>Resumo Executivo</h2>"
+        h += "<table><tr><th>Filtro</th><th>N bloqueados (c/ rec75)</th>"
+        h += "<th>rec75 bloqueados</th><th>rec75 que passam</th><th>Ação</th></tr>"
+
+        def summary_row(label, condition_blocked):
+            bl = [r for r in rows if r["rec75"] is not None and condition_blocked(r)]
+            pa = [r for r in rows if r["rec75"] is not None and not condition_blocked(r)]
+            wr_bl = sum(1 for r in bl if r["rec75"]) / len(bl) if bl else None
+            wr_pa = sum(1 for r in pa if r["rec75"]) / len(pa) if pa else None
+            problema = wr_bl is not None and wr_pa is not None and wr_bl > wr_pa + 0.05
+            col_bl = "#f85149" if problema else "#8b949e"
+            acao = "<span style='color:#f85149'>🔴 REVISAR</span>" if problema else "<span style='color:#3fb950'>✓ ok</span>"
+            bl_s = "{:.0f}% n={}".format((wr_bl or 0) * 100, len(bl)) if wr_bl is not None else "—"
+            pa_s = "{:.0f}% n={}".format((wr_pa or 0) * 100, len(pa)) if wr_pa is not None else "—"
+            return "<tr><td class='hi'>{}</td><td>{}</td><td style='color:{}'>{}</td><td>{}</td><td>{}</td></tr>".format(
+                label, len(bl), col_bl, bl_s, pa_s, acao)
+
+        h += summary_row("BOUNCE_DROP_MIN=0.30", lambda r: (r["drop_pct"] or 0) < 0.30)
+        h += summary_row("BOUNCE_MAX_PCT=1.00",  lambda r: (r["bounce_pct_at_signal"] or 0) > 1.00)
+        h += summary_row("TRADE_MAX_ELAPSED_SEC=300", lambda r: (elapsed_at_signal(r) or 0) > 300)
+        h += summary_row("BOTTOM_FRESHNESS_SEC=180", lambda r: (r["secs_bottom_to_bounce30"] or 0) > 180)
+        h += "</table>"
+
+        cur.close()
+        conn.close()
+
+    except Exception as e:
+        import traceback
+        h += "<pre style='color:#f85149'>ERRO: {}\n{}</pre>".format(e, traceback.format_exc())
+
+    h += "</body></html>"
+    return h
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
