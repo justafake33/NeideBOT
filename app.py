@@ -47997,5 +47997,294 @@ def analise_filter_impact():  # noqa: C901
     return h
 
 
+@app.route("/analise/filter-ranges")
+def analise_filter_ranges():  # noqa: C901
+    """
+    Para cada filtro principal, mostra rec75 por faixa (bucket).
+    Permite decidir onde cortar: se a faixa bloqueada tem rec75 alto, o threshold está errado.
+
+    Dataset: token_ticks. Outcome: rec75 = max_mc_after >= mc_bottom * 2.275
+    """
+    import psycopg2.extras
+
+    since_ts = request.args.get("since", "2026-05-26") or "2026-05-26"
+
+    CSS = (
+        "<style>"
+        "body{background:#0d1117;color:#e6edf3;font:12px/1.6 monospace;padding:20px}"
+        "h2{color:#58a6ff;margin-top:28px;border-bottom:1px solid #30363d;padding-bottom:6px}"
+        "h3{color:#79c0ff;margin-top:20px}"
+        "table{border-collapse:collapse;width:100%;margin-bottom:10px}"
+        "th{background:#161b22;padding:6px 10px;text-align:left;font-size:11px;"
+        "color:#8b949e;border-bottom:2px solid #30363d}"
+        "td{padding:5px 10px;border-bottom:1px solid #21262d;font-size:12px}"
+        ".good{color:#3fb950}.warn{color:#f0883e}.bad{color:#f85149}"
+        ".dim{color:#8b949e}.hi{color:#e6edf3;font-weight:bold}"
+        ".note{background:#1a1f2e;padding:8px 12px;border-left:3px solid #388bfd;margin:8px 0;font-size:11px}"
+        ".cur{background:#1f2937;font-weight:bold}"
+        "a{color:#58a6ff}"
+        "</style>"
+    )
+
+    def wr_cell(n_tp, n_total, baseline):
+        if n_total == 0:
+            return "<td class='dim'>—</td><td class='dim'>—</td><td class='dim'>—</td>"
+        wr = n_tp / n_total
+        delta = wr - baseline
+        col = "#3fb950" if delta > 0.08 else "#f85149" if delta < -0.08 else "#8b949e"
+        bar_w = int(wr * 80)
+        bar = "<div style='background:{};height:6px;width:{}px;display:inline-block'></div>".format(col, bar_w)
+        return "<td>{}/{}</td><td style='color:{}'><b>{:.0f}%</b> {}</td><td style='color:{}'>{:+.0f}pp</td>".format(
+            n_tp, n_total, col, wr * 100, bar, col, delta * 100)
+
+    h = "<html><head><meta charset='utf-8'>" + CSS + "</head><body>"
+    h += "<h2>📊 Filter Ranges — rec75 por faixa de threshold</h2>"
+    h += "<p class='dim'>Período desde <b>{}</b> · ".format(since_ts)
+    h += "<a href='?since=2026-05-26'>26/mai</a> | "
+    h += "<a href='?since=2026-06-01'>01/jun</a></p>"
+    h += "<div class='note'>Cada linha = uma faixa do parâmetro. "
+    h += "<b>Linha destacada</b> = threshold atual do Railway. "
+    h += "Se faixas bloqueadas pelo threshold atual têm rec75 alto → threshold está errado.</div>"
+
+    try:
+        conn = psycopg2.connect(db.DATABASE_URL)
+        conn.autocommit = True
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        cur.execute("""
+            WITH tick_window AS (
+                SELECT
+                    tt.mint, tt.mc, tt.tick_ts,
+                    EXTRACT(EPOCH FROM (tt.tick_ts - m.ts_migration)) AS elapsed_sec,
+                    m.mc_migration, m.ts_migration
+                FROM token_ticks tt
+                JOIN migrations m ON m.mint = tt.mint
+                WHERE m.ts_migration >= %s::timestamptz
+                  AND tt.tick_ts > m.ts_migration + INTERVAL '90 seconds'
+                  AND tt.tick_ts < m.ts_migration + INTERVAL '60 minutes'
+            ),
+            bottom_per_mint AS (
+                SELECT DISTINCT ON (mint)
+                    mint, mc AS mc_bottom, elapsed_sec AS elapsed_to_bottom, mc_migration
+                FROM tick_window
+                ORDER BY mint, mc ASC, elapsed_sec ASC
+            ),
+            time_to_30pct AS (
+                SELECT DISTINCT ON (tw.mint)
+                    tw.mint,
+                    tw.elapsed_sec AS elapsed_at_bounce30,
+                    bp.elapsed_to_bottom,
+                    (tw.elapsed_sec - bp.elapsed_to_bottom) AS secs_bottom_to_bounce30,
+                    (tw.mc - bp.mc_bottom) / bp.mc_bottom AS bounce_pct_at_signal
+                FROM tick_window tw
+                JOIN bottom_per_mint bp ON bp.mint = tw.mint
+                WHERE tw.elapsed_sec > bp.elapsed_to_bottom
+                  AND bp.mc_bottom > 0
+                  AND (tw.mc - bp.mc_bottom) / bp.mc_bottom >= 0.30
+                ORDER BY tw.mint, tw.elapsed_sec ASC
+            ),
+            max_after_bottom AS (
+                SELECT tw.mint, MAX(tw.mc) AS mc_max_after
+                FROM tick_window tw
+                JOIN bottom_per_mint bp ON bp.mint = tw.mint
+                WHERE tw.elapsed_sec > bp.elapsed_to_bottom
+                GROUP BY tw.mint
+            )
+            SELECT
+                bp.mint,
+                bp.mc_bottom,
+                bp.elapsed_to_bottom,
+                bp.mc_migration,
+                CASE WHEN bp.mc_migration > 0
+                    THEN (bp.mc_migration - bp.mc_bottom) / bp.mc_migration
+                    ELSE NULL END AS drop_pct,
+                mab.mc_max_after,
+                CASE WHEN mab.mc_max_after IS NOT NULL AND bp.mc_bottom > 0
+                    THEN mab.mc_max_after >= bp.mc_bottom * 2.275
+                    ELSE NULL END AS rec75,
+                t30.elapsed_at_bounce30,
+                t30.secs_bottom_to_bounce30,
+                t30.bounce_pct_at_signal
+            FROM bottom_per_mint bp
+            LEFT JOIN max_after_bottom mab ON mab.mint = bp.mint
+            LEFT JOIN time_to_30pct t30 ON t30.mint = bp.mint
+            WHERE bp.mc_bottom IS NOT NULL AND bp.mc_bottom > 0
+        """, (since_ts,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        # Apenas tokens com rec75 definido para calcular WR
+        scored = [r for r in rows if r["rec75"] is not None]
+        n_scored = len(scored)
+        n_rec75 = sum(1 for r in scored if r["rec75"])
+        baseline = n_rec75 / n_scored if n_scored else 0
+
+        h += "<p class='dim'>Dataset: <b>{}</b> tokens · scored: <b>{}</b> · baseline rec75 = <b>{:.0f}%</b></p>".format(
+            len(rows), n_scored, baseline * 100)
+
+        def bucket_table(title, env_key, env_val, buckets, get_val, fmt_label, current_threshold_fn):
+            """
+            buckets: list of (label, lo, hi) where lo <= val < hi (None = open)
+            get_val: fn(row) -> float or None
+            current_threshold_fn: fn(lo, hi) -> bool if this bucket is at/above the current cutoff
+            """
+            out = "<h3>{}</h3>".format(title)
+            out += "<p class='dim'>Env var: <b>{}</b> = <b>{}</b></p>".format(env_key, env_val)
+            out += "<table><tr><th>Faixa</th><th>N total</th><th>TP/N scored</th>"
+            out += "<th>rec75</th><th>vs baseline</th><th>Status</th></tr>"
+
+            for (label, lo, hi) in buckets:
+                def in_bucket(r, lo=lo, hi=hi):
+                    v = get_val(r)
+                    if v is None:
+                        return False
+                    if lo is not None and v < lo:
+                        return False
+                    if hi is not None and v >= hi:
+                        return False
+                    return True
+
+                bucket_rows = [r for r in rows if in_bucket(r)]
+                bucket_scored = [r for r in bucket_rows if r["rec75"] is not None]
+                n_all = len(bucket_rows)
+                n_sc = len(bucket_scored)
+                n_tp = sum(1 for r in bucket_scored if r["rec75"])
+                is_cur = current_threshold_fn(lo, hi)
+                tr_class = " class='cur'" if is_cur else ""
+
+                status_label = "← threshold atual" if is_cur else ""
+                out += "<tr{}>".format(tr_class)
+                out += "<td class='hi'>{}</td><td>{}</td>".format(label, n_all)
+                out += wr_cell(n_tp, n_sc, baseline)
+                out += "<td class='dim'>{}</td></tr>".format(status_label)
+
+            out += "</table>"
+            return out
+
+        # ── 1. drop_pct (BOUNCE_DROP_MIN) ────────────────────────────────────
+        h += bucket_table(
+            "1 · drop_pct — BOUNCE_DROP_MIN = 0.30",
+            "BOUNCE_DROP_MIN", "0.30",
+            [
+                ("negativo (token subiu após migração)", None, 0.0),
+                ("0–10%  caiu muito pouco",              0.0,  0.10),
+                ("10–20% caiu pouco",                    0.10, 0.20),
+                ("20–30% caiu moderado",                 0.20, 0.30),
+                ("30–40% caiu bastante  ← threshold",    0.30, 0.40),
+                ("40–50% dump médio",                    0.40, 0.50),
+                ("50–60% dump profundo",                 0.50, 0.60),
+                ("60–70% dump severo",                   0.60, 0.70),
+                ("70–80% dump extremo",                  0.70, 0.80),
+                (">80%   quase rug",                     0.80, None),
+            ],
+            lambda r: r["drop_pct"],
+            lambda lo, hi: "{:.0f}–{:.0f}%".format((lo or 0) * 100, (hi or 100) * 100),
+            lambda lo, hi: lo is not None and abs(lo - 0.30) < 0.001,
+        )
+
+        # ── 2. bounce_pct_at_signal (BOUNCE_MAX_PCT) ─────────────────────────
+        h += bucket_table(
+            "2 · bounce_pct_at_signal — BOUNCE_MAX_PCT = 1.00",
+            "BOUNCE_MAX_PCT", "1.00",
+            [
+                ("30–40%  bounce mínimo",     0.30, 0.40),
+                ("40–55%  bounce baixo",      0.40, 0.55),
+                ("55–70%  bounce médio",      0.55, 0.70),
+                ("70–85%  bounce alto",       0.70, 0.85),
+                ("85–100% quase dobrou",      0.85, 1.00),
+                (">100%  dobrou ← threshold", 1.00, None),
+            ],
+            lambda r: r["bounce_pct_at_signal"],
+            lambda lo, hi: "",
+            lambda lo, hi: lo is not None and abs(lo - 1.00) < 0.001,
+        )
+
+        # ── 3. elapsed_at_bounce30 (TRADE_MAX_ELAPSED_SEC) ───────────────────
+        def elapsed_signal(r):
+            if r["elapsed_at_bounce30"] is not None:
+                return r["elapsed_at_bounce30"]
+            if r["elapsed_to_bottom"] is not None and r["secs_bottom_to_bounce30"] is not None:
+                return r["elapsed_to_bottom"] + r["secs_bottom_to_bounce30"]
+            return r["elapsed_to_bottom"]
+
+        h += bucket_table(
+            "3 · elapsed ao sinal — TRADE_MAX_ELAPSED_SEC = 300 (5min)",
+            "TRADE_MAX_ELAPSED_SEC", "300",
+            [
+                ("0–2min   (0–120s)",          0,   120),
+                ("2–5min   (120–300s) ← atual", 120, 300),
+                ("5–8min   (300–480s)",          300, 480),
+                ("8–12min  (480–720s)",          480, 720),
+                ("12–15min (720–900s)",          720, 900),
+                ("15–20min (900–1200s)",         900, 1200),
+                (">20min   (>1200s)",            1200, None),
+            ],
+            elapsed_signal,
+            lambda lo, hi: "",
+            lambda lo, hi: lo is not None and abs(lo - 120) < 1,
+        )
+
+        # ── 4. secs_bottom_to_bounce30 (BOTTOM_FRESHNESS_SEC) ────────────────
+        h += bucket_table(
+            "4 · secs fundo→sinal — BOTTOM_FRESHNESS_SEC = 180 (3min)",
+            "BOTTOM_FRESHNESS_SEC", "180",
+            [
+                ("0–30s    fundo instantâneo",   0,   30),
+                ("30–60s   1 minuto",            30,  60),
+                ("60–120s  2 minutos",           60,  120),
+                ("120–180s 3 min ← threshold",  120, 180),
+                ("180–300s 3–5 minutos",         180, 300),
+                ("300–600s 5–10 minutos",        300, 600),
+                (">600s    >10 minutos",         600, None),
+            ],
+            lambda r: r["secs_bottom_to_bounce30"],
+            lambda lo, hi: "",
+            lambda lo, hi: lo is not None and abs(lo - 120) < 1,
+        )
+
+        # ── Tabela de correlação drop_pct × elapsed ───────────────────────────
+        h += "<h2>Correlação drop_pct × elapsed ao sinal</h2>"
+        h += "<div class='note'>Grid 2D: cada célula = rec75 nessa combinação. "
+        h += "Mostra onde está o edge real — dump profundo rápido vs dump leve tardio.</div>"
+
+        drop_buckets  = [(">0–20%", 0.0, 0.20), ("20–40%", 0.20, 0.40),
+                         ("40–60%", 0.40, 0.60), (">60%", 0.60, None)]
+        elapsed_buckets = [("0–2min", 0, 120), ("2–5min", 120, 300),
+                           ("5–10min", 300, 600), ("10–15min", 600, 900), (">15min", 900, None)]
+
+        h += "<table><tr><th>drop \\ elapsed</th>"
+        for (el, _, _) in elapsed_buckets:
+            h += "<th>{}</th>".format(el)
+        h += "</tr>"
+
+        for (dl, dlo, dhi) in drop_buckets:
+            h += "<tr><td class='hi'>{}</td>".format(dl)
+            for (el, elo, ehi) in elapsed_buckets:
+                cell = [r for r in scored
+                        if (r["drop_pct"] or 0) >= (dlo or 0)
+                        and ((dhi is None) or (r["drop_pct"] or 0) < dhi)
+                        and (elapsed_signal(r) or 0) >= elo
+                        and ((ehi is None) or (elapsed_signal(r) or 0) < ehi)]
+                n_c = len(cell)
+                n_tp_c = sum(1 for r in cell if r["rec75"])
+                if n_c == 0:
+                    h += "<td class='dim'>—</td>"
+                else:
+                    wr_c = n_tp_c / n_c
+                    col = "#3fb950" if wr_c > baseline + 0.08 else "#f85149" if wr_c < baseline - 0.08 else "#8b949e"
+                    h += "<td style='color:{}'><b>{:.0f}%</b><br><span class='dim'>n={}</span></td>".format(
+                        col, wr_c * 100, n_c)
+            h += "</tr>"
+        h += "</table>"
+
+    except Exception as e:
+        import traceback
+        h += "<pre style='color:#f85149'>ERRO: {}\n{}</pre>".format(e, traceback.format_exc())
+
+    h += "</body></html>"
+    return h
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
