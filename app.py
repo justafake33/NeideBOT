@@ -47773,7 +47773,7 @@ def analise_filter_impact():  # noqa: C901
                 ORDER BY mint, mc ASC, elapsed_sec ASC
             ),
             time_to_30pct AS (
-                -- Primeiro tick após o fundo onde bounce ≥ 30% (proxy para quando o sinal dispararia)
+                -- Primeiro tick apos o fundo onde bounce >= 30pct (proxy para quando o sinal dispararia)
                 SELECT DISTINCT ON (tw.mint)
                     tw.mint,
                     tw.elapsed_sec AS elapsed_at_bounce30,
