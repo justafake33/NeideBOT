@@ -384,6 +384,8 @@ def _do_init_db():
             "ADD COLUMN IF NOT EXISTS buy_concentration FLOAT",
             # Tiering de qualidade de dados
             "ADD COLUMN IF NOT EXISTS data_quality      TEXT",
+            # H27 — token apareceu no GMGN trending nos 15min antes do bounce?
+            "ADD COLUMN IF NOT EXISTS trending_at_bounce BOOLEAN",
         ]:
             cur.execute(f"ALTER TABLE bounce_signals {col}")
 
@@ -1212,7 +1214,7 @@ def insert_bounce_signal(data: dict):
                  rise_buy_vol, rise_sell_vol, rise_net_flow, rise_events, rise_lrg_buy,
                  pool_quote_at_signal,
                  dump_seller_count, dump_seller_hhi, dump_top_seller_frac,
-                 buy_concentration, data_quality)
+                 buy_concentration, data_quality, trending_at_bounce)
             VALUES
                 (%(mint)s, %(symbol)s, %(exchange)s, %(elapsed_sec)s, %(mc_migration)s, %(mc_min)s,
                  %(mc_at_signal)s, %(drop_from_mig)s, %(bounce_pct)s,
@@ -1225,7 +1227,12 @@ def insert_bounce_signal(data: dict):
                  %(rise_events)s, %(rise_lrg_buy)s,
                  %(pool_quote_at_signal)s,
                  %(dump_seller_count)s, %(dump_seller_hhi)s, %(dump_top_seller_frac)s,
-                 %(buy_concentration)s, %(data_quality)s)
+                 %(buy_concentration)s, %(data_quality)s,
+                 (SELECT EXISTS(
+                     SELECT 1 FROM gmgn_trending_snapshots
+                     WHERE mint = %(mint)s
+                       AND ts_snapshot >= NOW() - INTERVAL '15 minutes'
+                 )))
             ON CONFLICT (mint) DO UPDATE SET
                 absorption_score       = EXCLUDED.absorption_score,
                 absorption_grade       = EXCLUDED.absorption_grade,
