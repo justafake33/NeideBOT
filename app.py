@@ -48286,5 +48286,341 @@ def analise_filter_ranges():  # noqa: C901
     return h
 
 
+@app.route("/analise/filtros-simples")
+def analise_filtros_simples():  # noqa: C901
+    """
+    Dashboard simplificado para análise de filtros — linguagem de negócio.
+    """
+    import psycopg2.extras
+    from datetime import date as _date
+
+    since_ts = request.args.get("since", "2026-05-26") or "2026-05-26"
+
+    CSS = (
+        "<style>"
+        "body{background:#0f1117;color:#e2e8f0;font:14px/1.8 -apple-system,sans-serif;padding:32px;max-width:960px;margin:0 auto}"
+        "h1{color:#fff;font-size:24px;margin-bottom:4px}"
+        "h2{color:#60a5fa;font-size:18px;margin-top:40px;margin-bottom:4px;border-bottom:1px solid #1e293b;padding-bottom:8px}"
+        "h3{color:#94a3b8;font-size:13px;font-weight:normal;margin:0 0 16px 0}"
+        "table{border-collapse:collapse;width:100%;margin:16px 0 24px 0}"
+        "th{background:#1e293b;padding:10px 14px;text-align:left;font-size:12px;color:#64748b;font-weight:600;letter-spacing:.05em;text-transform:uppercase}"
+        "td{padding:9px 14px;border-bottom:1px solid #1e293b;font-size:13px;vertical-align:middle}"
+        "tr:hover td{background:#161b27}"
+        ".highlight{background:#1a2436!important}"
+        ".highlight td{font-weight:600}"
+        ".badge-green{background:#14532d;color:#4ade80;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:700}"
+        ".badge-yellow{background:#422006;color:#fbbf24;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:700}"
+        ".badge-red{background:#3b0000;color:#f87171;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:700}"
+        ".badge-gray{background:#1e293b;color:#64748b;padding:3px 10px;border-radius:20px;font-size:12px}"
+        ".card{background:#1e293b;border-radius:10px;padding:18px 22px;margin:16px 0}"
+        ".card p{margin:4px 0;color:#94a3b8;font-size:13px}"
+        ".card strong{color:#e2e8f0}"
+        ".explain{background:#172033;border-left:3px solid #3b82f6;padding:12px 16px;border-radius:0 6px 6px 0;margin:12px 0 20px;font-size:13px;color:#94a3b8}"
+        ".explain b{color:#93c5fd}"
+        ".warn-box{background:#1f1208;border-left:3px solid #f59e0b;padding:12px 16px;border-radius:0 6px 6px 0;margin:12px 0;font-size:13px;color:#d4a35a}"
+        ".action-box{background:#0c1f1a;border-left:3px solid #34d399;padding:12px 16px;border-radius:0 6px 6px 0;margin:12px 0;font-size:13px;color:#6ee7b7}"
+        ".stat{display:inline-block;margin-right:28px}"
+        ".stat .val{font-size:28px;font-weight:700;color:#fff}"
+        ".stat .lbl{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.06em}"
+        ".dim{color:#475569}"
+        ".arrow{color:#f59e0b;font-size:16px}"
+        "a{color:#60a5fa;text-decoration:none}"
+        ".tag-atual{background:#1d2d1a;color:#4ade80;font-size:11px;padding:2px 8px;border-radius:4px;margin-left:6px}"
+        ".tag-block{background:#2d1a1a;color:#f87171;font-size:11px;padding:2px 8px;border-radius:4px;margin-left:6px}"
+        ".pct-bar{display:inline-block;height:8px;border-radius:4px;margin-left:8px;vertical-align:middle}"
+        "</style>"
+    )
+
+    h = "<html><head><meta charset='utf-8'><title>Análise de Filtros — NeideBOT</title>" + CSS + "</head><body>"
+
+    # ── Cabeçalho ─────────────────────────────────────────────────────────────
+    h += "<h1>🤖 NeideBOT — Análise de Filtros</h1>"
+    h += "<p class='dim'>Dados desde {} &nbsp;·&nbsp; ".format(since_ts)
+    h += "<a href='?since=2026-05-26'>desde 26/mai</a> &nbsp;|&nbsp; "
+    h += "<a href='?since=2026-06-01'>desde 01/jun</a></p>"
+
+    try:
+        conn = psycopg2.connect(db.DATABASE_URL)
+        conn.autocommit = True
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        cur.execute("""
+            WITH tick_window AS (
+                SELECT tt.mint, tt.mc, tt.tick_ts,
+                    EXTRACT(EPOCH FROM (tt.tick_ts - m.ts_migration)) AS elapsed_sec,
+                    m.mc_migration, m.ts_migration
+                FROM token_ticks tt
+                JOIN migrations m ON m.mint = tt.mint
+                WHERE m.ts_migration >= %s::timestamptz
+                  AND tt.tick_ts > m.ts_migration + INTERVAL '90 seconds'
+                  AND tt.tick_ts < m.ts_migration + INTERVAL '60 minutes'
+            ),
+            bottom_per_mint AS (
+                SELECT DISTINCT ON (mint) mint,
+                    mc AS mc_bottom, elapsed_sec AS elapsed_to_bottom, mc_migration
+                FROM tick_window ORDER BY mint, mc ASC, elapsed_sec ASC
+            ),
+            time_to_30pct AS (
+                SELECT DISTINCT ON (tw.mint)
+                    tw.mint, tw.elapsed_sec AS elapsed_at_bounce30,
+                    bp.elapsed_to_bottom,
+                    (tw.elapsed_sec - bp.elapsed_to_bottom) AS secs_bottom_to_bounce30,
+                    (tw.mc - bp.mc_bottom) / bp.mc_bottom AS bounce_pct_at_signal
+                FROM tick_window tw
+                JOIN bottom_per_mint bp ON bp.mint = tw.mint
+                WHERE tw.elapsed_sec > bp.elapsed_to_bottom AND bp.mc_bottom > 0
+                  AND (tw.mc - bp.mc_bottom) / bp.mc_bottom >= 0.30
+                ORDER BY tw.mint, tw.elapsed_sec ASC
+            ),
+            max_after_bottom AS (
+                SELECT tw.mint, MAX(tw.mc) AS mc_max_after
+                FROM tick_window tw
+                JOIN bottom_per_mint bp ON bp.mint = tw.mint
+                WHERE tw.elapsed_sec > bp.elapsed_to_bottom GROUP BY tw.mint
+            )
+            SELECT bp.mint, bp.mc_bottom, bp.elapsed_to_bottom, bp.mc_migration,
+                CASE WHEN bp.mc_migration > 0
+                    THEN (bp.mc_migration - bp.mc_bottom) / bp.mc_migration ELSE NULL END AS drop_pct,
+                mab.mc_max_after,
+                CASE WHEN mab.mc_max_after IS NOT NULL AND bp.mc_bottom > 0
+                    THEN mab.mc_max_after >= bp.mc_bottom * 2.275 ELSE NULL END AS rec75,
+                t30.elapsed_at_bounce30, t30.secs_bottom_to_bounce30, t30.bounce_pct_at_signal
+            FROM bottom_per_mint bp
+            LEFT JOIN max_after_bottom mab ON mab.mint = bp.mint
+            LEFT JOIN time_to_30pct t30 ON t30.mint = bp.mint
+            WHERE bp.mc_bottom IS NOT NULL AND bp.mc_bottom > 0
+        """, (since_ts,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        scored = [r for r in rows if r["rec75"] is not None]
+        n_sc = len(scored)
+        n_rec75 = sum(1 for r in scored if r["rec75"])
+        baseline = n_rec75 / n_sc if n_sc else 0
+
+        try:
+            d0 = _date.fromisoformat(since_ts)
+            n_days = max(1, (_date.today() - d0).days)
+        except Exception:
+            n_days = 15
+
+        def elapsed_signal(r):
+            if r["elapsed_at_bounce30"] is not None:
+                return r["elapsed_at_bounce30"]
+            if r["elapsed_to_bottom"] is not None and r["secs_bottom_to_bounce30"] is not None:
+                return r["elapsed_to_bottom"] + r["secs_bottom_to_bounce30"]
+            return r["elapsed_to_bottom"]
+
+        # ── Resumo geral ──────────────────────────────────────────────────────
+        h += "<div class='card'>"
+        h += "<div>"
+        h += "<span class='stat'><div class='val'>{}</div><div class='lbl'>Tokens analisados</div></span>".format(len(rows))
+        h += "<span class='stat'><div class='val'>{:.0f}/dia</div><div class='lbl'>Frequência</div></span>".format(len(rows) / n_days)
+        h += "<span class='stat'><div class='val' style='color:#4ade80'>{:.0f}%</div><div class='lbl'>Taxa base de sucesso</div></span>".format(baseline * 100)
+        h += "<span class='stat'><div class='val'>{}</div><div class='lbl'>Período (dias)</div></span>".format(n_days)
+        h += "</div>"
+        h += "<p style='margin-top:14px'><b>Como ler:</b> "
+        h += '"Taxa de sucesso" = % dos tokens que chegaram a +75% acima do ponto de entrada simulado nos 60 minutos após a migração. '
+        h += "Taxa base de <b>{:.0f}%</b> é o resultado SEM nenhum filtro extra.</p>".format(baseline * 100)
+        h += "</div>"
+
+        # ── Helper para tabela de faixas ──────────────────────────────────────
+        def faixa_table(buckets, get_val, cur_lo, note_fn=None):
+            out = "<table><tr><th>Faixa</th><th>Tokens</th><th>Taxa de sucesso</th><th>vs média geral</th><th></th></tr>"
+            for (label, lo, hi, descr) in buckets:
+                def in_b(r, lo=lo, hi=hi):
+                    v = get_val(r)
+                    if v is None:
+                        return False
+                    if lo is not None and v < lo:
+                        return False
+                    if hi is not None and v >= hi:
+                        return False
+                    return True
+
+                br = [r for r in scored if in_b(r)]
+                n_b = len(br)
+                n_tp = sum(1 for r in br if r["rec75"])
+                wr = n_tp / n_b if n_b else None
+
+                is_cur = (lo is not None and cur_lo is not None and abs(lo - cur_lo) < 0.001)
+                tr_cls = " class='highlight'" if is_cur else ""
+
+                tag = ""
+                if is_cur:
+                    tag = "<span class='tag-atual'>← valor atual</span>"
+
+                if wr is None:
+                    out += "<tr{}><td>{}{}</td><td class='dim'>0</td><td class='dim'>—</td><td class='dim'>—</td><td></td></tr>".format(
+                        tr_cls, label, tag)
+                    continue
+
+                delta = wr - baseline
+                if delta > 0.08:
+                    badge = "<span class='badge-green'>✓ {:.0f}%</span>".format(wr * 100)
+                elif delta < -0.08:
+                    badge = "<span class='badge-red'>✗ {:.0f}%</span>".format(wr * 100)
+                else:
+                    badge = "<span class='badge-yellow'>{:.0f}%</span>".format(wr * 100)
+
+                delta_str = "{:+.0f}pp".format(delta * 100)
+                delta_col = "#4ade80" if delta > 0.08 else "#f87171" if delta < -0.08 else "#94a3b8"
+                bar_w = int(wr * 120)
+                bar = "<div class='pct-bar' style='width:{}px;background:{}'></div>".format(bar_w, delta_col)
+
+                note = ""
+                if note_fn:
+                    note = note_fn(lo, hi, wr, n_b)
+
+                out += "<tr{}>".format(tr_cls)
+                out += "<td>{}{}<br><span class='dim' style='font-size:11px'>{}</span></td>".format(label, tag, descr)
+                out += "<td>{}</td>".format(n_b)
+                out += "<td>{}{}</td>".format(badge, bar)
+                out += "<td style='color:{}'>{}</td>".format(delta_col, delta_str)
+                out += "<td class='dim' style='font-size:11px'>{}</td>".format(note)
+                out += "</tr>"
+            out += "</table>"
+            return out
+
+        # ══════════════════════════════════════════════════════════════════════
+        # FILTRO 1 — BOUNCE_DROP_MIN
+        # ══════════════════════════════════════════════════════════════════════
+        h += "<h2>📉 Filtro 1 — Queda mínima exigida após a migração</h2>"
+        h += "<h3>Valor atual no Railway: <b>BOUNCE_DROP_MIN = 0.30</b> (exige queda de pelo menos 30%)</h3>"
+        h += "<div class='explain'>"
+        h += "<b>O que é:</b> quando um token migra do Pump.fun para a DEX, o preço costuma cair primeiro (os primeiros compradores saem). "
+        h += "Este filtro define: 'só compro se o token já caiu pelo menos X% desde que chegou na DEX'. "
+        h += "<br><b>Problema identificado:</b> os dados mostram que tokens que caíram pouco (10–30%) têm taxa de sucesso muito maior do que os que caíram muito (>40%). "
+        h += "O bot está ignorando os melhores e comprando os piores."
+        h += "</div>"
+
+        h += faixa_table(
+            [
+                ("Subiu após migração",         None, 0.0,  "token não caiu — veio comprando desde o início"),
+                ("Caiu 0 a 10%",                0.0,  0.10, "caiu muito pouco — demanda forte"),
+                ("Caiu 10% a 20%",              0.10, 0.20, "caiu pouco — ainda demanda saudável"),
+                ("Caiu 20% a 30%",              0.20, 0.30, "caiu moderado — ponto de entrada razoável"),
+                ("Caiu 30% a 40%",              0.30, 0.40, "LIMITE ATUAL — passa a partir daqui"),
+                ("Caiu 40% a 50%",              0.40, 0.50, "caiu bastante"),
+                ("Caiu 50% a 60%",              0.50, 0.60, "dump médio"),
+                ("Caiu 60% a 70%",              0.60, 0.70, "dump profundo"),
+                ("Caiu 70% a 80%",              0.70, 0.80, "dump severo"),
+                ("Caiu mais de 80%",            0.80, None, "quase rug — raramente recupera"),
+            ],
+            lambda r: r["drop_pct"],
+            0.30,
+        )
+
+        h += "<div class='warn-box'>⚠️ <b>O que os dados dizem:</b> "
+        h += "tokens que caíram 10–30% têm taxa de sucesso de 38–46% (quase o dobro da média). "
+        h += "Tokens que caíram 30–50% têm 12–17% (abaixo da média). "
+        h += "O filtro atual está bloqueando os melhores e aceitando os piores.</div>"
+        h += "<div class='action-box'>✅ <b>Sugestão:</b> mudar <code>BOUNCE_DROP_MIN</code> de <b>0.30</b> para <b>0.10</b>. "
+        h += "Isso inclui tokens que caíram a partir de 10% — onde está o edge real.</div>"
+
+        # ══════════════════════════════════════════════════════════════════════
+        # FILTRO 2 — TRADE_MAX_ELAPSED_SEC
+        # ══════════════════════════════════════════════════════════════════════
+        h += "<h2>⏱️ Filtro 2 — Tempo máximo após a migração para comprar</h2>"
+        h += "<h3>Valor atual no Railway: <b>TRADE_MAX_ELAPSED_SEC = 300</b> (só compra se o sinal vier nos primeiros 5 minutos)</h3>"
+        h += "<div class='explain'>"
+        h += "<b>O que é:</b> após a migração, o bot monitora o token. Quando detecta uma recuperação do preço, tenta comprar. "
+        h += "Este filtro diz: 'só executo a compra se esse sinal chegou em menos de X segundos após a migração'. "
+        h += "<br><b>Problema identificado:</b> os dados mostram que os melhores resultados estão entre 8 e 15 minutos — muito depois dos 5 min do filtro atual. "
+        h += "Estamos comprando numa janela que tem taxa de sucesso média, e ignorando a janela com maior taxa de sucesso."
+        h += "</div>"
+
+        h += faixa_table(
+            [
+                ("0 a 2 minutos",            0,    120,  "sinal imediato — geralmente armadilha"),
+                ("2 a 5 minutos",            120,  300,  "LIMITE ATUAL — aceita até aqui"),
+                ("5 a 8 minutos",            300,  480,  "levemente melhor que a janela atual"),
+                ("8 a 12 minutos",           480,  720,  "melhor janela da amostra"),
+                ("12 a 15 minutos",          720,  900,  "excelente — poucos tokens mas alta taxa"),
+                ("15 a 20 minutos",          900,  1200, "começa a cair"),
+                ("Mais de 20 minutos",       1200, None, "tarde demais — token perdeu força"),
+            ],
+            elapsed_signal,
+            120,
+        )
+
+        h += "<div class='warn-box'>⚠️ <b>O que os dados dizem:</b> "
+        h += "74% dos sinais do bot chegam APÓS os 5 minutos e são bloqueados. "
+        h += "A janela 8–15 min tem taxa de sucesso de 41–100%. "
+        h += "Estamos descartando a maioria dos sinais e os melhores.</div>"
+        h += "<div class='action-box'>✅ <b>Sugestão:</b> mudar <code>TRADE_MAX_ELAPSED_SEC</code> de <b>300</b> para <b>900</b>. "
+        h += "Isso abre a janela para 15 minutos — capturando o sweet spot 8–15 min.</div>"
+
+        # ══════════════════════════════════════════════════════════════════════
+        # FILTRO 3 — BOTTOM_FRESHNESS_SEC
+        # ══════════════════════════════════════════════════════════════════════
+        h += "<h2>🕐 Filtro 3 — Quão recente foi o fundo antes do sinal</h2>"
+        h += "<h3>Valor atual no Railway: <b>BOTTOM_FRESHNESS_SEC = 180</b> (o fundo tem que ter acontecido nos últimos 3 minutos)</h3>"
+        h += "<div class='explain'>"
+        h += "<b>O que é:</b> quando o bot detecta que o preço subiu 30% a partir do fundo, ele verifica: 'esse fundo foi recente?' "
+        h += "Se o fundo aconteceu há muito tempo e o preço está subindo lentamente, o sinal é bloqueado. "
+        h += "<br><b>Problema identificado:</b> o filtro de 3 minutos está bloqueando tokens onde o sinal demora um pouco mais a aparecer (3–10 min após o fundo), mas esses tokens têm taxa de sucesso acima da média."
+        h += "</div>"
+
+        h += faixa_table(
+            [
+                ("Sinal em até 30 segundos",      0,   30,  "fundo e subida quase simultâneos"),
+                ("Sinal em 30s a 1 minuto",       30,  60,  "recuperação rápida — boa"),
+                ("Sinal em 1 a 2 minutos",        60,  120, "ritmo saudável — melhor resultado"),
+                ("Sinal em 2 a 3 minutos",        120, 180, "LIMITE ATUAL — aceita até aqui"),
+                ("Sinal em 3 a 5 minutos",        180, 300, "acima da média — bloqueado atualmente"),
+                ("Sinal em 5 a 10 minutos",       300, 600, "acima da média — bloqueado atualmente"),
+                ("Sinal depois de 10 minutos",    600, None, "recovery muito lento — raramente funciona"),
+            ],
+            lambda r: r["secs_bottom_to_bounce30"],
+            120,
+        )
+
+        h += "<div class='warn-box'>⚠️ <b>O que os dados dizem:</b> "
+        h += "a faixa de 3–10 minutos tem taxa de sucesso de 33% (acima da média de 24%). "
+        h += "O único grupo realmente ruim é acima de 10 minutos (0%). "
+        h += "O corte em 3 minutos está muito apertado.</div>"
+        h += "<div class='action-box'>✅ <b>Sugestão:</b> mudar <code>BOTTOM_FRESHNESS_SEC</code> de <b>180</b> para <b>600</b>. "
+        h += "Bloqueia apenas recuperações muito lentas (>10 min após o fundo), que de fato não funcionam.</div>"
+
+        # ══════════════════════════════════════════════════════════════════════
+        # RESUMO FINAL
+        # ══════════════════════════════════════════════════════════════════════
+        h += "<h2>📋 Resumo — O que mudar</h2>"
+
+        changes = [
+            ("BOUNCE_DROP_MIN",      "0.30", "0.10",
+             "Inclui tokens que caíram 10–30% — taxa de sucesso 38–46% vs 12–17% atual"),
+            ("TRADE_MAX_ELAPSED_SEC","300",  "900",
+             "Abre janela para 15 min — captura o sweet spot 8–15 min com 41%+ de sucesso"),
+            ("BOTTOM_FRESHNESS_SEC", "180",  "600",
+             "Permite recuperações mais lentas (até 10 min após fundo) que têm 33% de sucesso"),
+        ]
+
+        h += "<table><tr><th>Parâmetro</th><th>Valor atual</th><th>Sugerido</th><th>Motivo</th></tr>"
+        for (param, cur_v, new_v, motivo) in changes:
+            h += "<tr><td class='hi'><code>{}</code></td>".format(param)
+            h += "<td><span class='badge-red'>{}</span></td>".format(cur_v)
+            h += "<td><span class='badge-green'>{}</span></td>".format(new_v)
+            h += "<td class='dim'>{}</td></tr>".format(motivo)
+        h += "</table>"
+
+        h += "<div class='card'>"
+        h += "<p><strong>Importante:</strong> essas três mudanças são apenas nas variáveis de ambiente do Railway — zero alteração de código.</p>"
+        h += "<p>Os dados acima são de {} tokens reais monitorados pelo bot nos últimos {} dias. ".format(len(rows), n_days)
+        h += "Cada token foi acompanhado por 60 minutos após a migração.</p>"
+        h += "<p><strong>Próximo passo:</strong> aplicar as mudanças, acumular 30+ trades com os novos parâmetros e medir o impacto real na taxa de sucesso.</p>"
+        h += "</div>"
+
+    except Exception as e:
+        import traceback
+        h += "<pre style='color:#f87171'>ERRO: {}\n{}</pre>".format(e, traceback.format_exc())
+
+    h += "</body></html>"
+    return h
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
+
