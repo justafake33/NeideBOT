@@ -48286,11 +48286,9 @@ def analise_filter_ranges():  # noqa: C901
     return h
 
 
-@app.route("/analise/filtros-simples")
-def analise_filtros_simples():  # noqa: C901
-    """
-    Dashboard simplificado para análise de filtros — linguagem de negócio.
-    """
+@app.route("/analise/filtros-simples-legacy-removed")
+def _analise_filtros_simples_old():  # noqa: C901
+    """REMOVED — duplicate route replaced by new implementation below."""
     import psycopg2.extras
     from datetime import date as _date
 
