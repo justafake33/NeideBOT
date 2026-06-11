@@ -48965,7 +48965,6 @@ def analise_sem_bounce():
     conn.autocommit = True
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # Tokens sem bounce_signals, com mc_peak calculado via token_ticks
             cur.execute("""
                 WITH no_bounce AS (
                     SELECT m.mint, m.token_nome, m.ts_migration, m.mc_migration,
@@ -48977,21 +48976,23 @@ def analise_sem_bounce():
                       AND bs.mint IS NULL
                       AND m.mc_migration > 0
                 ),
-                -- mc_peak via token_ticks quando migrations.mc_peak é null
-                ticks_peak AS (
-                    SELECT tt.mint,
-                           MAX(tt.mc) AS tick_peak,
-                           EXTRACT(EPOCH FROM (
-                               MIN(tt.tick_ts) FILTER (WHERE tt.mc = MAX(tt.mc) OVER (PARTITION BY tt.mint))
-                               - m.ts_migration
-                           )) / 60.0 AS tick_time_to_peak
+                ticks_max AS (
+                    SELECT tt.mint, MAX(tt.mc) AS tick_peak
                     FROM token_ticks tt
                     JOIN migrations m ON m.mint = tt.mint
                     WHERE m.ts_migration >= NOW() - INTERVAL %(hours)s
                       AND tt.tick_ts > m.ts_migration + INTERVAL '90 seconds'
                     GROUP BY tt.mint
                 ),
-                -- volume nos primeiros 5 min via ticks
+                ticks_peak_ts AS (
+                    SELECT DISTINCT ON (tt.mint) tt.mint,
+                           EXTRACT(EPOCH FROM (tt.tick_ts - m.ts_migration)) / 60.0 AS tick_time_to_peak
+                    FROM token_ticks tt
+                    JOIN migrations m ON m.mint = tt.mint
+                    JOIN ticks_max tm ON tm.mint = tt.mint AND tt.mc = tm.tick_peak
+                    WHERE m.ts_migration >= NOW() - INTERVAL %(hours)s
+                    ORDER BY tt.mint, tt.tick_ts ASC
+                ),
                 early_vol AS (
                     SELECT tt.mint,
                            COUNT(*) AS tick_count_5m,
@@ -49004,12 +49005,13 @@ def analise_sem_bounce():
                     GROUP BY tt.mint
                 )
                 SELECT nb.*,
-                       COALESCE(nb.mc_peak, tp.tick_peak) AS peak_used,
+                       COALESCE(nb.mc_peak, tm.tick_peak) AS peak_used,
                        COALESCE(nb.time_to_peak, tp.tick_time_to_peak) AS ttp_used,
-                       tp.tick_peak, tp.tick_time_to_peak,
+                       tm.tick_peak, tp.tick_time_to_peak,
                        ev.mc_peak_5m, ev.tick_count_5m
                 FROM no_bounce nb
-                LEFT JOIN ticks_peak tp ON tp.mint = nb.mint
+                LEFT JOIN ticks_max tm ON tm.mint = nb.mint
+                LEFT JOIN ticks_peak_ts tp ON tp.mint = nb.mint
                 LEFT JOIN early_vol ev ON ev.mint = nb.mint
                 ORDER BY nb.ts_migration DESC
             """, {"hours": f"{hours} hours"})
