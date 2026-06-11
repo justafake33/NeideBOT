@@ -48621,6 +48621,322 @@ def analise_filtros_simples():  # noqa: C901
     return h
 
 
+@app.route("/analise/filtros-simples")
+def analise_filtros_simples():
+    """
+    Dashboard: mostra cada migração recente e qual filtro passou/falhou.
+    Inclui filtros de migração, bounce detector e trade gate.
+    ?hours=24 (padrão 24h)
+    """
+    hours = int(request.args.get("hours", 24))
+
+    # Configs ativas (lidas do env — mesmas do scanner/executor)
+    cfg = {
+        "smart_min":    int(os.getenv("FILTER_SMART_MIN",    "2")),
+        "rug_max":      float(os.getenv("FILTER_RUG_MAX",    "0.50")),
+        "bundler_max":  float(os.getenv("FILTER_BUNDLER_MAX","0.60")),
+        "bot_max":      float(os.getenv("FILTER_BOT_MAX",    "0.80")),
+        "sniper_max":   float(os.getenv("FILTER_SNIPER_MAX", "0.10")),
+        "rat_max":      float(os.getenv("FILTER_RAT_MAX",    "0.20")),
+        "top10_max":    float(os.getenv("FILTER_TOP10_MAX",  "0.80")),
+        "wash_block":   os.getenv("FILTER_WASH_BLOCK",       "true").lower() == "true",
+        "mc_min":       float(os.getenv("FILTER_MC_MIN",     "5000")),
+        "mc_max":       float(os.getenv("FILTER_MC_MAX",     "200000")),
+        "liq_min":      float(os.getenv("FILTER_LIQ_MIN",   "10000")),
+        "fee_min":      float(os.getenv("FILTER_FEE_MIN",   "1.0")),
+        "pump_only":    os.getenv("FILTER_PUMP_ONLY",        "true").lower() == "true",
+        # bounce
+        "drop_min":     float(os.getenv("BOUNCE_DROP_MIN",   "0.30")),
+        "bounce_min":   float(os.getenv("BOUNCE_MIN_PCT",    "0.30")),
+        "bounce_max":   float(os.getenv("BOUNCE_MAX_PCT",    "9.99")),
+        "time_max":     float(os.getenv("BOUNCE_TIME_MAX",   "20.0")),
+        "freshness":    int(os.getenv("BOTTOM_FRESHNESS_SEC","300")),
+        # trade gate
+        "pool_min":     float(os.getenv("TRADE_MIN_POOL_SOL","40")),
+        "net_flow_min": float(os.getenv("TRADE_MIN_NET_SOL_FLOW","-5")),
+        "elapsed_max":  int(os.getenv("TRADE_MAX_ELAPSED_SEC","300")),
+    }
+
+    import psycopg2
+    import psycopg2.extras
+    conn = psycopg2.connect(db.DATABASE_URL)
+    conn.autocommit = True
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT m.mint, m.token_nome, m.ts_migration, m.mc_migration,
+                       m.liq_migration, m.total_fee_sol, m.exchange,
+                       m.smart_wallets, m.rug_ratio, m.bundler_trader_amount_rate,
+                       m.bot_degen_rate, m.top70_sniper_hold_rate, m.rat_trader_rate,
+                       m.top10_holder_rate, m.is_wash_trading,
+                       bs.mc_min, bs.mc_at_signal, bs.bounce_pct, bs.drop_from_mig,
+                       bs.elapsed_sec as bounce_elapsed_sec,
+                       bs.pool_quote_at_signal, bs.net_sol_flow,
+                       bs.ts_signal as bounce_ts,
+                       t.id as trade_id, t.status as trade_status,
+                       t.helius_gate_passed, t.helius_gate_reason
+                FROM migrations m
+                LEFT JOIN bounce_signals bs ON bs.mint = m.mint
+                LEFT JOIN trades t ON t.mint = m.mint
+                WHERE m.ts_migration >= NOW() - INTERVAL '{hours} hours'
+                ORDER BY m.ts_migration DESC
+            """.format(hours=int(hours)))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    def chk(ok, val_str=""):
+        """Retorna (célula html, passed bool)"""
+        if ok:
+            return f"<span style='color:#4ade80'>✅ {val_str}</span>", True
+        else:
+            return f"<span style='color:#f87171'>❌ {val_str}</span>", False
+
+    def fmt_v(v, decimals=0, pct=False):
+        if v is None:
+            return "—"
+        if pct:
+            return f"{v*100:.{decimals}f}%"
+        return f"{v:.{decimals}f}"
+
+    BRT = timezone(timedelta(hours=-3))
+
+    # Monta linhas — uma por token (pode ter bounce + trade)
+    seen = {}
+    for r in rows:
+        mint = r["mint"]
+        if mint in seen:
+            continue
+        seen[mint] = r
+
+    h = """<!DOCTYPE html><html><head>
+<meta charset='utf-8'>
+<title>Filtros Simples</title>
+<style>
+  body{background:#0d1117;color:#e6edf3;font-family:monospace;font-size:12px;padding:16px;margin:0}
+  h2{color:#58a6ff;margin:0 0 4px}
+  .sub{color:#8b949e;margin:0 0 16px;font-size:11px}
+  table{border-collapse:collapse;width:100%}
+  th{background:#161b22;color:#8b949e;padding:6px 8px;text-align:left;position:sticky;top:0;z-index:1;font-size:11px;border-bottom:1px solid #30363d}
+  td{padding:5px 8px;border-bottom:1px solid #21262d;vertical-align:top;white-space:nowrap}
+  tr:hover td{background:#161b22}
+  .pass{color:#4ade80} .fail{color:#f87171} .skip{color:#8b949e} .warn{color:#fbbf24}
+  .section{background:#0d1117;color:#58a6ff;font-weight:bold;padding:4px 8px;font-size:10px;letter-spacing:1px;border-bottom:1px solid #30363d}
+  .badge-tp{background:#166534;color:#4ade80;padding:1px 6px;border-radius:3px;font-size:10px}
+  .badge-sl{background:#7f1d1d;color:#f87171;padding:1px 6px;border-radius:3px;font-size:10px}
+  .badge-open{background:#1e3a5f;color:#60a5fa;padding:1px 6px;border-radius:3px;font-size:10px}
+  .badge-blocked{background:#451a03;color:#fbbf24;padding:1px 6px;border-radius:3px;font-size:10px}
+  .badge-none{background:#1f2937;color:#6b7280;padding:1px 6px;border-radius:3px;font-size:10px}
+  .cfg{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px 16px;margin-bottom:16px;display:flex;gap:24px;flex-wrap:wrap}
+  .cfg-item{font-size:11px;color:#8b949e} .cfg-item span{color:#e6edf3}
+  a{color:#58a6ff;text-decoration:none}
+  .gmgn-link{font-size:10px;color:#58a6ff}
+</style>
+</head><body>
+"""
+    h += f"<h2>🔍 Filtros por Token — últimas {hours}h</h2>"
+    h += f"<p class='sub'>{len(seen)} tokens migrados · <a href='?hours=6'>6h</a> · <a href='?hours=12'>12h</a> · <a href='?hours=24'>24h</a> · <a href='?hours=48'>48h</a></p>"
+
+    # Config box
+    h += "<div class='cfg'>"
+    cfg_items = [
+        ("smart≥", cfg["smart_min"]),
+        ("rug≤", f"{cfg['rug_max']:.0%}"),
+        ("bundler≤", f"{cfg['bundler_max']:.0%}"),
+        ("sniper≤", f"{cfg['sniper_max']:.0%}"),
+        ("top10≤", f"{cfg['top10_max']:.0%}"),
+        ("rat≤", f"{cfg['rat_max']:.0%}"),
+        ("liq≥", f"${cfg['liq_min']:,.0f}"),
+        ("fee≥", f"{cfg['fee_min']}SOL"),
+        ("drop≥", f"{cfg['drop_min']:.0%}"),
+        ("bounce≥", f"{cfg['bounce_min']:.0%}"),
+        ("time≤", f"{cfg['time_max']:.0f}min"),
+        ("pool≥", f"{cfg['pool_min']}SOL"),
+        ("net_flow≥", f"{cfg['net_flow_min']}SOL"),
+    ]
+    for k, v in cfg_items:
+        h += f"<div class='cfg-item'>{k} <span>{v}</span></div>"
+    h += "</div>"
+
+    h += "<table>"
+    h += "<tr>"
+    h += "<th>Token</th><th>Hora</th><th>MC mig</th>"
+    # Filtros de migração
+    h += "<th title='FILTER_PUMP_ONLY'>pump</th>"
+    h += "<th title='FILTER_MC_MIN/MAX'>MC ok</th>"
+    h += "<th title='FILTER_LIQ_MIN'>liq</th>"
+    h += "<th title='FILTER_FEE_MIN'>fee</th>"
+    h += "<th title='FILTER_SMART_MIN'>smart</th>"
+    h += "<th title='FILTER_RUG_MAX'>rug</th>"
+    h += "<th title='FILTER_BUNDLER_MAX'>bndlr</th>"
+    h += "<th title='FILTER_SNIPER_MAX'>snpr</th>"
+    h += "<th title='FILTER_TOP10_MAX'>top10</th>"
+    h += "<th title='FILTER_WASH_BLOCK'>wash</th>"
+    # Bounce
+    h += "<th>drop</th>"
+    h += "<th>bounce</th>"
+    h += "<th>⏱min</th>"
+    # Trade gate
+    h += "<th>pool</th>"
+    h += "<th>net</th>"
+    # Resultado
+    h += "<th>Trade</th>"
+    h += "</tr>"
+
+    for mint, r in seen.items():
+        ts = r.get("ts_migration")
+        try:
+            dt = ts.astimezone(BRT).strftime("%d/%m %H:%M") if ts else "—"
+        except Exception:
+            dt = "—"
+
+        nome  = r.get("token_nome") or mint[:8]
+        mc    = r.get("mc_migration") or 0
+        liq   = r.get("liq_migration") or 0
+        fee   = r.get("total_fee_sol") or 0
+        exch  = (r.get("exchange") or "").lower()
+        smart = r.get("smart_wallets")
+        rug   = r.get("rug_ratio") or 0
+        bndlr = r.get("bundler_trader_amount_rate") or 0
+        snpr  = r.get("top70_sniper_hold_rate") or 0
+        top10 = r.get("top10_holder_rate") or 0
+        rat   = r.get("rat_trader_rate") or 0
+        wash  = r.get("is_wash_trading")
+
+        # Bounce fields
+        mc_min    = r.get("mc_min")
+        mc_sig    = r.get("mc_at_signal")
+        b_pct     = r.get("bounce_pct")
+        drop_mig  = r.get("drop_from_mig")
+        b_elapsed = r.get("bounce_elapsed_sec")
+        pool_sig  = r.get("pool_quote_at_signal")
+        net_flow  = r.get("net_sol_flow")
+        bounce_ts = r.get("bounce_ts")
+
+        # --- Migração ---
+        ok_pump  = not cfg["pump_only"] or "pump" in exch
+        ok_mc    = cfg["mc_min"] <= mc <= cfg["mc_max"] if mc > 0 else False
+        ok_liq   = liq >= cfg["liq_min"]
+        ok_fee   = fee >= cfg["fee_min"]
+        ok_smart = (smart or 0) >= cfg["smart_min"]
+        ok_rug   = rug <= cfg["rug_max"]
+        ok_bndlr = bndlr <= cfg["bundler_max"]
+        ok_snpr  = snpr <= cfg["sniper_max"]
+        ok_top10 = top10 <= cfg["top10_max"]
+        ok_wash  = not (cfg["wash_block"] and wash)
+
+        mig_pass = all([ok_pump, ok_mc, ok_liq, ok_fee, ok_smart, ok_rug,
+                        ok_bndlr, ok_snpr, ok_top10, ok_wash])
+
+        def cell(ok, val):
+            cls = "pass" if ok else "fail"
+            return f"<td class='{cls}'>{val}</td>"
+
+        # Highlight row se algum filtro de migração falhou
+        row_bg = "" if mig_pass else " style='opacity:0.6'"
+
+        h += f"<tr{row_bg}>"
+        gmgn = f"https://gmgn.ai/sol/token/{mint}"
+        h += f"<td><a class='gmgn-link' href='{gmgn}' target='_blank'>{nome}</a></td>"
+        h += f"<td style='color:#8b949e'>{dt}</td>"
+        h += f"<td>${mc:,.0f}</td>"
+
+        # Filtros migração
+        h += cell(ok_pump,  "✅" if ok_pump  else f"❌ {exch[:6]}")
+        h += cell(ok_mc,    "✅" if ok_mc    else f"❌ ${mc:,.0f}")
+        h += cell(ok_liq,   "✅" if ok_liq   else f"❌ ${liq:,.0f}")
+        h += cell(ok_fee,   "✅" if ok_fee   else f"❌ {fee:.1f}")
+        h += cell(ok_smart, "✅" if ok_smart else f"❌ {smart}")
+        h += cell(ok_rug,   "✅" if ok_rug   else f"❌ {rug:.0%}")
+        h += cell(ok_bndlr, "✅" if ok_bndlr else f"❌ {bndlr:.0%}")
+        h += cell(ok_snpr,  "✅" if ok_snpr  else f"❌ {snpr:.0%}")
+        h += cell(ok_top10, "✅" if ok_top10 else f"❌ {top10:.0%}")
+        h += cell(ok_wash,  "✅" if ok_wash  else "❌ wash")
+
+        # --- Bounce ---
+        if not mig_pass:
+            # Token filtrado antes do bounce — cells cinza
+            h += "<td class='skip' colspan='5'>— filtrado na migração</td>"
+        elif bounce_ts is None:
+            # Passou migração mas bounce nunca disparou
+            h += "<td class='skip'>sem sinal</td>" * 5
+        else:
+            ok_drop   = (drop_mig or 0) >= cfg["drop_min"]
+            ok_bounce = (b_pct or 0) >= cfg["bounce_min"]
+            ok_time   = (b_elapsed or 9999) / 60 <= cfg["time_max"]
+
+            h += cell(ok_drop,   f"{(drop_mig or 0):.0%}")
+            h += cell(ok_bounce, f"{(b_pct or 0):.0%}")
+            h += cell(ok_time,   f"{(b_elapsed or 0)/60:.1f}m")
+
+            # Trade gate
+            if pool_sig is None:
+                h += "<td class='skip'>sem erpc</td>"
+            else:
+                ok_pool = pool_sig >= cfg["pool_min"]
+                h += cell(ok_pool, f"{pool_sig:.0f}")
+
+            if net_flow is None:
+                h += "<td class='skip'>—</td>"
+            else:
+                ok_net = net_flow > cfg["net_flow_min"]
+                h += cell(ok_net, f"{net_flow:+.1f}")
+
+        # --- Trade resultado ---
+        trade_id     = r.get("trade_id")
+        trade_status = r.get("trade_status")
+        gate_passed  = r.get("helius_gate_passed")
+        gate_reason  = r.get("helius_gate_reason") or ""
+
+        if trade_id is None and bounce_ts is None:
+            h += "<td><span class='badge-none'>sem bounce</span></td>"
+        elif trade_id is None:
+            h += f"<td><span class='badge-blocked' title='{gate_reason}'>bloqueado</span></td>"
+        elif trade_status in ("tp",):
+            h += f"<td><span class='badge-tp'>TP</span></td>"
+        elif trade_status in ("sl",):
+            h += f"<td><span class='badge-sl'>SL</span></td>"
+        elif trade_status in ("open", "pending", "trailing_active"):
+            h += f"<td><span class='badge-open'>{trade_status}</span></td>"
+        elif trade_status == "blocked_helius_gate":
+            h += f"<td><span class='badge-blocked' title='{gate_reason}'>gate: {gate_reason[:20]}</span></td>"
+        else:
+            h += f"<td><span class='badge-none'>{trade_status or '?'}</span></td>"
+
+        h += "</tr>"
+
+    h += "</table>"
+
+    # Resumo
+    total = len(seen)
+    passed_mig = sum(1 for mint, r in seen.items() if all([
+        not cfg["pump_only"] or "pump" in (r.get("exchange") or "").lower(),
+        cfg["mc_min"] <= (r.get("mc_migration") or 0) <= cfg["mc_max"],
+        (r.get("liq_migration") or 0) >= cfg["liq_min"],
+        (r.get("total_fee_sol") or 0) >= cfg["fee_min"],
+        (r.get("smart_wallets") or 0) >= cfg["smart_min"],
+        (r.get("rug_ratio") or 0) <= cfg["rug_max"],
+        (r.get("bundler_trader_amount_rate") or 0) <= cfg["bundler_max"],
+        (r.get("top70_sniper_hold_rate") or 0) <= cfg["sniper_max"],
+        (r.get("top10_holder_rate") or 0) <= cfg["top10_max"],
+        not (cfg["wash_block"] and r.get("is_wash_trading")),
+    ]))
+    bounced = sum(1 for r in seen.values() if r.get("bounce_ts") is not None)
+    traded  = sum(1 for r in seen.values() if r.get("trade_id") is not None)
+
+    h += f"""
+<div style='margin-top:16px;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px 16px;font-size:12px;color:#8b949e'>
+  <strong style='color:#e6edf3'>Resumo {hours}h:</strong>
+  {total} migrados →
+  <span style='color:#60a5fa'>{passed_mig} passaram filtros de migração</span> →
+  <span style='color:#a78bfa'>{bounced} bounces detectados</span> →
+  <span style='color:#4ade80'>{traded} trades executados</span>
+</div>
+"""
+    h += "</body></html>"
+    return h
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
 
