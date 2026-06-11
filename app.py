@@ -48977,11 +48977,16 @@ def analise_sem_bounce():
                       AND m.mc_migration > 0
                 ),
                 ticks_max AS (
-                    SELECT tt.mint, MAX(tt.mc) AS tick_peak
+                    SELECT tt.mint,
+                           MAX(GREATEST(
+                               COALESCE(NULLIF(tt.mc_high, 0), 0),
+                               COALESCE(NULLIF(tt.mc, 0), 0)
+                           )) AS tick_peak
                     FROM token_ticks tt
                     JOIN migrations m ON m.mint = tt.mint
                     WHERE m.ts_migration >= NOW() - INTERVAL %(hours)s
-                      AND tt.tick_ts > m.ts_migration + INTERVAL '90 seconds'
+                      AND tt.tick_ts BETWEEN m.ts_migration + INTERVAL '90 seconds'
+                                        AND m.ts_migration + INTERVAL '70 minutes'
                     GROUP BY tt.mint
                 ),
                 ticks_peak_ts AS (
@@ -48989,7 +48994,9 @@ def analise_sem_bounce():
                            EXTRACT(EPOCH FROM (tt.tick_ts - m.ts_migration)) / 60.0 AS tick_time_to_peak
                     FROM token_ticks tt
                     JOIN migrations m ON m.mint = tt.mint
-                    JOIN ticks_max tm ON tm.mint = tt.mint AND tt.mc = tm.tick_peak
+                    JOIN ticks_max tm ON tm.mint = tt.mint
+                        AND GREATEST(COALESCE(NULLIF(tt.mc_high,0),0), COALESCE(NULLIF(tt.mc,0),0))
+                            = tm.tick_peak
                     WHERE m.ts_migration >= NOW() - INTERVAL %(hours)s
                     ORDER BY tt.mint, tt.tick_ts ASC
                 ),
@@ -49005,8 +49012,9 @@ def analise_sem_bounce():
                     GROUP BY tt.mint
                 )
                 SELECT nb.*,
-                       COALESCE(nb.mc_peak, tm.tick_peak) AS peak_used,
-                       COALESCE(nb.time_to_peak, tp.tick_time_to_peak) AS ttp_used,
+                       -- ticks são fonte primária; migrations como fallback
+                       COALESCE(tm.tick_peak, nb.mc_peak) AS peak_used,
+                       COALESCE(tp.tick_time_to_peak, nb.time_to_peak) AS ttp_used,
                        tm.tick_peak, tp.tick_time_to_peak,
                        ev.mc_peak_5m, ev.tick_count_5m
                 FROM no_bounce nb
@@ -49140,6 +49148,7 @@ def analise_drop_real():
     Para tokens que subiram ≥20% mas o bot NUNCA comprou (sem bounce),
     mostra quanto eles caíram antes de subir.
     Objetivo: descobrir se BOUNCE_DROP_MIN=0.30 está bloqueando boas entradas.
+    Pico e queda medidos nos token_ticks (fonte de verdade), não em migrations.
     """
     import psycopg2
     import psycopg2.extras
@@ -49150,38 +49159,71 @@ def analise_drop_real():
     cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     cur.execute("""
-        WITH eligible AS (
-            SELECT m.mint, m.token_nome, m.mc_migration, m.mc_peak,
-                   m.time_to_peak, m.ts_migration
+        WITH base AS (
+            SELECT m.mint, m.token_nome, m.mc_migration, m.ts_migration
             FROM migrations m
             LEFT JOIN bounce_signals bs ON bs.mint = m.mint
             WHERE bs.mint IS NULL
               AND m.ts_migration >= NOW() - INTERVAL %(interval)s
               AND m.mc_migration > 0
-              AND m.mc_peak IS NOT NULL
-              AND m.mc_peak >= m.mc_migration * 1.20
+        ),
+        tick_stats AS (
+            -- pico e mínimo reais medidos nos ticks (90s–70min após migração)
+            SELECT tt.mint,
+                   MAX(GREATEST(
+                       COALESCE(NULLIF(tt.mc_high, 0), 0),
+                       COALESCE(NULLIF(tt.mc, 0), 0)
+                   ))                                                         AS mc_peak_ticks,
+                   MIN(CASE WHEN COALESCE(NULLIF(tt.mc_low,0), tt.mc) > 0
+                            THEN COALESCE(NULLIF(tt.mc_low,0), tt.mc) END)   AS mc_min_ticks,
+                   COUNT(*)                                                   AS n_ticks
+            FROM token_ticks tt
+            JOIN base b ON b.mint = tt.mint
+            WHERE tt.tick_ts BETWEEN b.ts_migration + INTERVAL '90 seconds'
+                                 AND b.ts_migration + INTERVAL '70 minutes'
+            GROUP BY tt.mint
         ),
         early_min AS (
+            -- mínimo nos primeiros 20min (para calcular drop de entrada)
             SELECT tt.mint,
-                   MIN(LEAST(tt.mc, COALESCE(NULLIF(tt.mc_low, 0), tt.mc))) AS mc_min_early
+                   MIN(COALESCE(NULLIF(tt.mc_low, 0), tt.mc)) AS mc_min_early
             FROM token_ticks tt
-            JOIN eligible e ON e.mint = tt.mint
-            WHERE tt.tick_ts BETWEEN e.ts_migration + INTERVAL '90 seconds'
-                                 AND e.ts_migration + INTERVAL '20 minutes'
+            JOIN base b ON b.mint = tt.mint
+            WHERE tt.tick_ts BETWEEN b.ts_migration + INTERVAL '90 seconds'
+                                 AND b.ts_migration + INTERVAL '20 minutes'
               AND tt.mc > 0
             GROUP BY tt.mint
+        ),
+        peak_ts AS (
+            -- timestamp do pico (primeiro tick que atingiu mc_peak_ticks)
+            SELECT DISTINCT ON (tt.mint) tt.mint,
+                   EXTRACT(EPOCH FROM (tt.tick_ts - b.ts_migration)) / 60.0 AS ttp_ticks
+            FROM token_ticks tt
+            JOIN base b      ON b.mint = tt.mint
+            JOIN tick_stats ts ON ts.mint = tt.mint
+                AND GREATEST(COALESCE(NULLIF(tt.mc_high,0),0), COALESCE(NULLIF(tt.mc,0),0))
+                    = ts.mc_peak_ticks
+            ORDER BY tt.mint, tt.tick_ts ASC
         )
-        SELECT e.mint, e.token_nome, e.mc_migration, e.mc_peak,
-               e.time_to_peak, e.ts_migration, em.mc_min_early,
-               CASE WHEN em.mc_min_early IS NOT NULL AND e.mc_migration > 0
-                    THEN (e.mc_migration - em.mc_min_early) / e.mc_migration
-                    ELSE NULL END AS drop_pct,
-               (e.mc_peak - e.mc_migration) / e.mc_migration AS gain_pct
-        FROM eligible e
-        LEFT JOIN early_min em ON em.mint = e.mint
+        SELECT b.mint, b.token_nome, b.mc_migration, b.ts_migration,
+               ts.mc_peak_ticks, ts.mc_min_ticks, ts.n_ticks,
+               em.mc_min_early,
+               pt.ttp_ticks AS time_to_peak,
+               CASE WHEN ts.mc_peak_ticks > 0 AND b.mc_migration > 0
+                    THEN (ts.mc_peak_ticks - b.mc_migration) / b.mc_migration
+                    ELSE NULL END AS gain_pct,
+               CASE WHEN em.mc_min_early IS NOT NULL AND b.mc_migration > 0
+                    THEN (b.mc_migration - em.mc_min_early) / b.mc_migration
+                    ELSE NULL END AS drop_pct
+        FROM base b
+        LEFT JOIN tick_stats ts ON ts.mint = b.mint
+        LEFT JOIN early_min  em ON em.mint = b.mint
+        LEFT JOIN peak_ts    pt ON pt.mint = b.mint
+        WHERE ts.mc_peak_ticks >= b.mc_migration * 1.20  -- só tokens que subiram ≥20% nos ticks
+           OR ts.mc_peak_ticks IS NULL                   -- mantém sem-ticks para contagem
         ORDER BY
-            CASE WHEN em.mc_min_early IS NULL THEN 1 ELSE 0 END,
-            (e.mc_migration - em.mc_min_early) / NULLIF(e.mc_migration, 0) ASC
+            CASE WHEN ts.n_ticks IS NULL THEN 1 ELSE 0 END,
+            (b.mc_migration - em.mc_min_early) / NULLIF(b.mc_migration, 0) ASC
     """, {"interval": f"{hours} hours"})
     rows = cur.fetchall()
     cur.close()
@@ -49299,7 +49341,7 @@ def analise_drop_real():
             mc_m  = r.get("mc_migration") or 0
             mc_mn = r.get("mc_min_early") or 0
             drop  = r.get("drop_pct")
-            peak  = r.get("mc_peak") or 0
+            peak  = r.get("mc_peak_ticks") or 0
             gain  = r.get("gain_pct") or 0
             ttp   = r.get("time_to_peak")
             mint  = r["mint"]
