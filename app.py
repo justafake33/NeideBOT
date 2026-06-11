@@ -48631,7 +48631,7 @@ def analise_filtros_simples():
     # Configs ativas (lidas do env — mesmas do scanner/executor)
     # Defaults espelham o Railway atual; se a web service não tiver a var, usa o mesmo valor do worker.
     cfg = {
-        "smart_min":    int(os.getenv("FILTER_SMART_MIN",    "3")),
+        "smart_min":    int(os.getenv("FILTER_SMART_MIN",    "1")),
         "rug_max":      float(os.getenv("FILTER_RUG_MAX",    "0.50")),
         "bundler_max":  float(os.getenv("FILTER_BUNDLER_MAX","0.60")),
         "bot_max":      float(os.getenv("FILTER_BOT_MAX",    "0.80")),
