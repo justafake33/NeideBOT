@@ -49145,9 +49145,9 @@ def analise_sem_bounce():
 @app.route("/analise/drop-real")
 def analise_drop_real():
     """
-    Para tokens que subiram ≥20% mas o bot NUNCA comprou (sem bounce),
-    mostra quanto eles caíram antes de subir.
-    Objetivo: descobrir se BOUNCE_DROP_MIN=0.30 está bloqueando boas entradas.
+    Analisa o drop real das migrations e simula entrada no bounce do fundo.
+    A tabela histórica destaca tokens que subiram ≥20%, enquanto o backtest de
+    WR usa a base completa para estimar o melhor BOUNCE_DROP_MIN.
     Pico medido nos token_ticks/migrations; fundo medido combinando token_ticks
     com mc_bottom/time_to_bottom gravados pelo pipeline erpc/kline em migrations.
     """
