@@ -46454,8 +46454,8 @@ def analise_bounce_funnel():  # noqa: C901
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
         try:
-            d0 = _date.fromisoformat(since_ts)
-            n_days = max(1, (_date.today() - d0).days)
+            cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM NOW() - MIN(ts_migration))/86400, 14) AS days FROM migrations WHERE ts_migration >= %(s)s::timestamptz", {"s": since_ts})
+            n_days = max(1, int(cur.fetchone()["days"] or 1))
         except Exception:
             n_days = 14
 
@@ -46967,8 +46967,8 @@ def analise_filter_calibration():  # noqa: C901
         baseline_rec75 = n_rec75 / n_with_rec if n_with_rec else 0
 
         try:
-            d0 = _date.fromisoformat(since_ts)
-            n_days = max(1, (_date.today() - d0).days)
+            cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM NOW() - MIN(ts_migration))/86400, 14) AS days FROM migrations WHERE ts_migration >= %(s)s::timestamptz", {"s": since_ts})
+            n_days = max(1, int(cur.fetchone()["days"] or 1))
         except Exception:
             n_days = 14
 
@@ -47457,10 +47457,10 @@ def analise_ticks_features():  # noqa: C901
         baseline  = n_rec75 / n_rec if n_rec else 0
 
         try:
-            d0 = _date.fromisoformat(since_ts)
-            n_days = max(1, (_date.today() - d0).days)
+            cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM NOW() - MIN(ts_migration))/86400, 4) AS days FROM migrations WHERE ts_migration >= %(s)s::timestamptz", {"s": since_ts})
+            n_days = max(1, int(cur.fetchone()["days"] or 1))
         except Exception:
-            n_days = 15
+            n_days = 4
 
         h += "<h2>0 · Resumo</h2>"
         h += "<table><tr><th>Métrica</th><th>Valor</th><th>Nota</th></tr>"
@@ -47821,10 +47821,10 @@ def analise_filter_impact():  # noqa: C901
         baseline = n_rec75 / n_rec if n_rec else 0
 
         try:
-            d0 = _date.fromisoformat(since_ts)
-            n_days = max(1, (_date.today() - d0).days)
+            cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM NOW() - MIN(ts_migration))/86400, 4) AS days FROM migrations WHERE ts_migration >= %s::timestamptz", (since_ts,))
+            n_days = max(1, int(cur.fetchone()["days"] or 1))
         except Exception:
-            n_days = 15
+            n_days = 4
 
         h += "<p class='dim'>Dataset: <b>{}</b> tokens com ticks · baseline rec75 = <b>{:.0f}%</b> ({}/{}) · {:.1f}/dia</p>".format(
             n_total, baseline * 100, n_rec75, n_rec, n_total / n_days)
@@ -48391,6 +48391,11 @@ def analise_filtros_simples():  # noqa: C901
             WHERE bp.mc_bottom IS NOT NULL AND bp.mc_bottom > 0
         """, (since_ts,))
         rows = cur.fetchall()
+        try:
+            cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM NOW() - MIN(ts_migration))/86400, 4) AS days FROM migrations WHERE ts_migration >= %s::timestamptz", (since_ts,))
+            n_days = max(1, int(cur.fetchone()["days"] or 1))
+        except Exception:
+            n_days = 4
         cur.close()
         conn.close()
 
@@ -48398,12 +48403,6 @@ def analise_filtros_simples():  # noqa: C901
         n_sc = len(scored)
         n_rec75 = sum(1 for r in scored if r["rec75"])
         baseline = n_rec75 / n_sc if n_sc else 0
-
-        try:
-            d0 = _date.fromisoformat(since_ts)
-            n_days = max(1, (_date.today() - d0).days)
-        except Exception:
-            n_days = 15
 
         def elapsed_signal(r):
             if r["elapsed_at_bounce30"] is not None:

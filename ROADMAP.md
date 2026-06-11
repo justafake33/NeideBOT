@@ -1,6 +1,6 @@
 # NeideBOT — Roadmap
 
-**Atualizado:** 2026-06-08 (sessão 20)
+**Atualizado:** 2026-06-11 (sessão 21)
 **Estado:** Bot ATIVO · `TRADING_ENABLED=true` · branch ativo: `claude/relaxed-planck-H3Qg2`
 
 ---
@@ -92,6 +92,10 @@
 | **Railway nova DB + fix `db.py`** | 2026-06-08 | Banco `beautiful-heart` com disco 100% full → loop PANIC. Novo PostgreSQL criado em `intelligent-spirit` (mesmo projeto web+worker). `beautiful-heart` preservado com dados históricos de carteiras (`cozy-growth`). Fix `db.py`: ALTER TABLE antes de CREATE TABLE em fresh DB → ordem invertida. Commit `b93b13c`. Nota: `postgres.railway.internal` só funciona dentro do mesmo projeto — cross-project usa URL `rlwy.net`. |
 | **`db_retention.py` — retenção automática com alertas Telegram** | 2026-06-08 | Roda a cada 6h via HeapScheduler. Alerta Telegram ANTES de deletar (preview + espaço) + confirmação APÓS. Nunca deleta `migrations`/`bounce_signals`/`trades`. Retenção configurável: `token_ticks` (30d), `micro_absorption_snapshots` (60d), `gmgn_trending_*` (14d). `RETENTION_DRY_RUN=true` para simular. |
 | **TrendingRadar: dedup 1h + filtro de qualidade** | 2026-06-08 | Dedup 1x/hora por mint+interval (de ~12k para ~200 rows/hora). `_quality_reject()` rejeita `not_pump_launchpad` e `flash_migration_<120s`. Defaults: `TRENDING_FILTER_PUMP_ONLY=true`, `TRENDING_FILTER_MIN_BC_SEC=120`. Roda no worker. Commit `47e09b3`. |
+| **Análise de filtros — sessão 21 (2026-06-11)** | 2026-06-11 | Dashboards `/analise/filter-ranges` e `/analise/filtros-simples` revelaram três filtros mal calibrados: `BOUNCE_DROP_MIN=0.30` bloqueava tokens com rec75 de 38-46% (melhor quartil); `TRADE_MAX_ELAPSED_SEC=300` bloqueava 74% dos sinais incluindo a zona 8-15min (41-100% rec75); `BOTTOM_FRESHNESS_SEC=180` cortava a zona 3-10min (33% rec75). Ajustes no Railway: `BOUNCE_DROP_MIN=0.20`, `TRADE_MAX_ELAPSED_SEC=900`, `BOTTOM_FRESHNESS_SEC=600`. |
+| **TrendingRadar desativado + H27 trending_at_bounce** | 2026-06-11 | 91% dos tokens trending não estão em migrations — sistema shadow WR sempre 0%. Radar autônomo desativado (`TRENDING_RADAR_ENABLED=false` por default). Campo `trending_at_bounce BOOLEAN` adicionado passivamente em `bounce_signals`: subquery checa `gmgn_trending_snapshots` nos 15min antes do bounce. Gate de análise: n≥50 bounces. |
+| **n_days corrigido em todos os dashboards** | 2026-06-11 | Dashboards calculavam n_days como `today - since_param`, mostrando "15 dias" para banco com apenas 4 dias de dados (novo banco 07/06). Fix: query `SELECT EXTRACT(EPOCH FROM NOW() - MIN(ts_migration))/86400 AS days FROM migrations WHERE ts_migration >= %s` usando cursor já aberto. Afeta: `/analise/bounce-funnel`, `/analise/filter-impact`, `/analise/filter-ranges`, `/analise/ticks-features`, `/analise/filtros-simples`. |
+| **Novos dashboards de calibração** | 2026-06-11 | `/analise/bounce-funnel` (funil de conversão com frequência real), `/analise/filter-ranges` (rec75 por faixa de threshold para cada filtro), `/analise/filtros-simples` (linguagem simples para stakeholders — explica o que cada filtro faz, taxa de bloqueio, se está "ajudando" ou "atrapalhando"). |
 
 > ⚠️ **WR REAL CORRIGIDO (2026-05-14 sessão 5):** banco tinha dados fictícios — TradeMonitor inferia saídas de MC snapshots, não da blockchain. Auditoria via Helius revelou WR real de **10.1%** (14 TP / 125 SL / 139 trades). WR anterior de 32% era inflado por falsos TPs. `/debug/sell-recovery` executado: 139 correções persistidas.
 > ⚠️ **DADOS HISTÓRICOS SUSPEITOS (sessão 9):** mc_min de todos os tokens antes do fix (elapsed_sec < 90) pode estar corrompido pelo candle de transição. Análises de WR baseadas em `mc_min` histórico (bounce_pct, entry_ratio, drop_from_mig) devem ser tratadas com cautela.
@@ -101,11 +105,16 @@
 
 ## 🔬 V2 — Reestruturação de Microestrutura
 
-### Estado atual (2026-06-06)
+### Estado atual (2026-06-11)
 
 **Bot ATIVO** · `TRADING_ENABLED=true` · Branch: `claude/relaxed-planck-H3Qg2`
 
-Bot reativado em 2026-06-06 após 9 dias parado para captação de microdados. Gate H23 implementado no código mas **desativado** (n=13, insuficiente para decisão). Acumular ~200 bounces limpos antes de ativar qualquer gate de fluxo.
+Filtros recalibrados na sessão 21 com base em análise real do banco novo (07/06). Três filtros estavam bloqueando os melhores tokens — ajustados no Railway. Gate H23 (`H23_NET_MIN`) desativado (n=13, insuficiente). Acumular ~200 bounces limpos antes de ativar qualquer gate de fluxo.
+
+**Filtros ativos (Railway) pós-sessão 21:**
+- `BOUNCE_DROP_MIN=0.20` (era 0.30 — bloqueava rec75 de 38-46%)
+- `TRADE_MAX_ELAPSED_SEC=900` (era 300 — bloqueava 74% dos sinais)
+- `BOTTOM_FRESHNESS_SEC=600` (era 180 — cortava zona 3-10min com 33% rec75)
 
 A ideia central da V2 continua válida: filtros estáticos (smart count, bounce_pct, elapsed, creator_status) entregam no máximo +7pp de WR. O edge real está em **quem comprou o fundo e com que força** — e só conseguimos responder isso com dados de fluxo de ordens em granularidade de segundos.
 
