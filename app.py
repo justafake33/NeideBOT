@@ -14,6 +14,7 @@ from scheduler import HeapScheduler
 from scanner import Scanner, HotMonitor
 from executor import TradeExecutor, TradeMonitor
 from trending_radar_routes import trending_radar_bp
+from drop_real_routes import drop_real_bp
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,6 +26,7 @@ init_sentry()
 
 app = Flask(__name__)
 app.register_blueprint(trending_radar_bp)
+app.register_blueprint(drop_real_bp)
 BRT = timedelta(hours=-3)
 
 
@@ -49435,6 +49437,9 @@ def analise_drop_real():
     h += "</body></html>"
     return h
 
+
+
+@app.route("/analise/holders")
 
 
 @app.route("/analise/holders")
