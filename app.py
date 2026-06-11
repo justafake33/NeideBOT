@@ -48977,11 +48977,16 @@ def analise_sem_bounce():
                       AND m.mc_migration > 0
                 ),
                 ticks_max AS (
-                    SELECT tt.mint, MAX(tt.mc) AS tick_peak
+                    SELECT tt.mint,
+                           MAX(GREATEST(
+                               COALESCE(NULLIF(tt.mc_high, 0), 0),
+                               COALESCE(NULLIF(tt.mc, 0), 0)
+                           )) AS tick_peak
                     FROM token_ticks tt
                     JOIN migrations m ON m.mint = tt.mint
                     WHERE m.ts_migration >= NOW() - INTERVAL %(hours)s
-                      AND tt.tick_ts > m.ts_migration + INTERVAL '90 seconds'
+                      AND tt.tick_ts BETWEEN m.ts_migration + INTERVAL '90 seconds'
+                                        AND m.ts_migration + INTERVAL '70 minutes'
                     GROUP BY tt.mint
                 ),
                 ticks_peak_ts AS (
@@ -48989,7 +48994,9 @@ def analise_sem_bounce():
                            EXTRACT(EPOCH FROM (tt.tick_ts - m.ts_migration)) / 60.0 AS tick_time_to_peak
                     FROM token_ticks tt
                     JOIN migrations m ON m.mint = tt.mint
-                    JOIN ticks_max tm ON tm.mint = tt.mint AND tt.mc = tm.tick_peak
+                    JOIN ticks_max tm ON tm.mint = tt.mint
+                        AND GREATEST(COALESCE(NULLIF(tt.mc_high,0),0), COALESCE(NULLIF(tt.mc,0),0))
+                            = tm.tick_peak
                     WHERE m.ts_migration >= NOW() - INTERVAL %(hours)s
                     ORDER BY tt.mint, tt.tick_ts ASC
                 ),
@@ -49005,8 +49012,9 @@ def analise_sem_bounce():
                     GROUP BY tt.mint
                 )
                 SELECT nb.*,
-                       COALESCE(nb.mc_peak, tm.tick_peak) AS peak_used,
-                       COALESCE(nb.time_to_peak, tp.tick_time_to_peak) AS ttp_used,
+                       -- ticks são fonte primária; migrations como fallback
+                       COALESCE(tm.tick_peak, nb.mc_peak) AS peak_used,
+                       COALESCE(tp.tick_time_to_peak, nb.time_to_peak) AS ttp_used,
                        tm.tick_peak, tp.tick_time_to_peak,
                        ev.mc_peak_5m, ev.tick_count_5m
                 FROM no_bounce nb
@@ -49140,6 +49148,7 @@ def analise_drop_real():
     Para tokens que subiram ≥20% mas o bot NUNCA comprou (sem bounce),
     mostra quanto eles caíram antes de subir.
     Objetivo: descobrir se BOUNCE_DROP_MIN=0.30 está bloqueando boas entradas.
+    Pico e queda medidos nos token_ticks (fonte de verdade), não em migrations.
     """
     import psycopg2
     import psycopg2.extras
@@ -49150,38 +49159,71 @@ def analise_drop_real():
     cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     cur.execute("""
-        WITH eligible AS (
-            SELECT m.mint, m.token_nome, m.mc_migration, m.mc_peak,
-                   m.time_to_peak, m.ts_migration
+        WITH base AS (
+            SELECT m.mint, m.token_nome, m.mc_migration, m.ts_migration
             FROM migrations m
             LEFT JOIN bounce_signals bs ON bs.mint = m.mint
             WHERE bs.mint IS NULL
               AND m.ts_migration >= NOW() - INTERVAL %(interval)s
               AND m.mc_migration > 0
-              AND m.mc_peak IS NOT NULL
-              AND m.mc_peak >= m.mc_migration * 1.20
+        ),
+        tick_stats AS (
+            -- pico e mínimo reais medidos nos ticks (90s–70min após migração)
+            SELECT tt.mint,
+                   MAX(GREATEST(
+                       COALESCE(NULLIF(tt.mc_high, 0), 0),
+                       COALESCE(NULLIF(tt.mc, 0), 0)
+                   ))                                                         AS mc_peak_ticks,
+                   MIN(CASE WHEN COALESCE(NULLIF(tt.mc_low,0), tt.mc) > 0
+                            THEN COALESCE(NULLIF(tt.mc_low,0), tt.mc) END)   AS mc_min_ticks,
+                   COUNT(*)                                                   AS n_ticks
+            FROM token_ticks tt
+            JOIN base b ON b.mint = tt.mint
+            WHERE tt.tick_ts BETWEEN b.ts_migration + INTERVAL '90 seconds'
+                                 AND b.ts_migration + INTERVAL '70 minutes'
+            GROUP BY tt.mint
         ),
         early_min AS (
+            -- mínimo nos primeiros 20min (para calcular drop de entrada)
             SELECT tt.mint,
-                   MIN(LEAST(tt.mc, COALESCE(NULLIF(tt.mc_low, 0), tt.mc))) AS mc_min_early
+                   MIN(COALESCE(NULLIF(tt.mc_low, 0), tt.mc)) AS mc_min_early
             FROM token_ticks tt
-            JOIN eligible e ON e.mint = tt.mint
-            WHERE tt.tick_ts BETWEEN e.ts_migration + INTERVAL '90 seconds'
-                                 AND e.ts_migration + INTERVAL '20 minutes'
+            JOIN base b ON b.mint = tt.mint
+            WHERE tt.tick_ts BETWEEN b.ts_migration + INTERVAL '90 seconds'
+                                 AND b.ts_migration + INTERVAL '20 minutes'
               AND tt.mc > 0
             GROUP BY tt.mint
+        ),
+        peak_ts AS (
+            -- timestamp do pico (primeiro tick que atingiu mc_peak_ticks)
+            SELECT DISTINCT ON (tt.mint) tt.mint,
+                   EXTRACT(EPOCH FROM (tt.tick_ts - b.ts_migration)) / 60.0 AS ttp_ticks
+            FROM token_ticks tt
+            JOIN base b      ON b.mint = tt.mint
+            JOIN tick_stats ts ON ts.mint = tt.mint
+                AND GREATEST(COALESCE(NULLIF(tt.mc_high,0),0), COALESCE(NULLIF(tt.mc,0),0))
+                    = ts.mc_peak_ticks
+            ORDER BY tt.mint, tt.tick_ts ASC
         )
-        SELECT e.mint, e.token_nome, e.mc_migration, e.mc_peak,
-               e.time_to_peak, e.ts_migration, em.mc_min_early,
-               CASE WHEN em.mc_min_early IS NOT NULL AND e.mc_migration > 0
-                    THEN (e.mc_migration - em.mc_min_early) / e.mc_migration
-                    ELSE NULL END AS drop_pct,
-               (e.mc_peak - e.mc_migration) / e.mc_migration AS gain_pct
-        FROM eligible e
-        LEFT JOIN early_min em ON em.mint = e.mint
+        SELECT b.mint, b.token_nome, b.mc_migration, b.ts_migration,
+               ts.mc_peak_ticks, ts.mc_min_ticks, ts.n_ticks,
+               em.mc_min_early,
+               pt.ttp_ticks AS time_to_peak,
+               CASE WHEN ts.mc_peak_ticks > 0 AND b.mc_migration > 0
+                    THEN (ts.mc_peak_ticks - b.mc_migration) / b.mc_migration
+                    ELSE NULL END AS gain_pct,
+               CASE WHEN em.mc_min_early IS NOT NULL AND b.mc_migration > 0
+                    THEN (b.mc_migration - em.mc_min_early) / b.mc_migration
+                    ELSE NULL END AS drop_pct
+        FROM base b
+        LEFT JOIN tick_stats ts ON ts.mint = b.mint
+        LEFT JOIN early_min  em ON em.mint = b.mint
+        LEFT JOIN peak_ts    pt ON pt.mint = b.mint
+        WHERE ts.mc_peak_ticks >= b.mc_migration * 1.20  -- só tokens que subiram ≥20% nos ticks
+           OR ts.mc_peak_ticks IS NULL                   -- mantém sem-ticks para contagem
         ORDER BY
-            CASE WHEN em.mc_min_early IS NULL THEN 1 ELSE 0 END,
-            (e.mc_migration - em.mc_min_early) / NULLIF(e.mc_migration, 0) ASC
+            CASE WHEN ts.n_ticks IS NULL THEN 1 ELSE 0 END,
+            (b.mc_migration - em.mc_min_early) / NULLIF(b.mc_migration, 0) ASC
     """, {"interval": f"{hours} hours"})
     rows = cur.fetchall()
     cur.close()
@@ -49299,7 +49341,7 @@ def analise_drop_real():
             mc_m  = r.get("mc_migration") or 0
             mc_mn = r.get("mc_min_early") or 0
             drop  = r.get("drop_pct")
-            peak  = r.get("mc_peak") or 0
+            peak  = r.get("mc_peak_ticks") or 0
             gain  = r.get("gain_pct") or 0
             ttp   = r.get("time_to_peak")
             mint  = r["mint"]
@@ -49337,6 +49379,304 @@ def analise_drop_real():
     h += "</body></html>"
     return h
 
+
+@app.route("/analise/holders")
+def analise_holders():
+    """Analisa holders_count na migração vs performance real medida nos token_ticks."""
+    days = int(request.args.get("days", 30))
+
+    # Ganho máximo real medido nos token_ticks dentro da janela quente (60min).
+    # mc_low e mc são os campos disponíveis por tick; usamos o MAX de ambos como pico.
+    # Entry = mc_migration (como o token entrou no mercado).
+    sql_agg = """
+        WITH migs AS (
+            SELECT m.mint, m.token_nome, m.holders_count, m.mc_migration, m.ts_migration,
+                   CASE
+                       WHEN m.holders_count < 30   THEN 'a_menos30'
+                       WHEN m.holders_count < 60   THEN 'b_30a60'
+                       WHEN m.holders_count < 100  THEN 'c_60a100'
+                       WHEN m.holders_count < 200  THEN 'd_100a200'
+                       WHEN m.holders_count < 500  THEN 'e_200a500'
+                       ELSE                             'f_500mais'
+                   END AS bucket,
+                   bs.mint IS NOT NULL             AS had_bounce,
+                   t.status                        AS trade_status
+            FROM migrations m
+            LEFT JOIN bounce_signals bs ON bs.mint = m.mint
+            LEFT JOIN LATERAL (
+                SELECT status FROM trades
+                WHERE mint = m.mint
+                ORDER BY ts_signal DESC LIMIT 1
+            ) t ON TRUE
+            WHERE m.ts_migration >= NOW() - INTERVAL '%(days)s days'
+              AND m.holders_count IS NOT NULL AND m.holders_count > 0
+              AND m.mc_migration > 0
+        ),
+        tick_peaks AS (
+            -- pico real medido nos ticks dentro da janela quente (90s–60min)
+            SELECT tt.mint,
+                   MAX(GREATEST(
+                       COALESCE(NULLIF(tt.mc_high, 0), 0),
+                       COALESCE(NULLIF(tt.mc, 0), 0)
+                   )) AS mc_peak_ticks,
+                   MIN(CASE WHEN COALESCE(NULLIF(tt.mc_low,0), tt.mc) > 0
+                            THEN COALESCE(NULLIF(tt.mc_low,0), tt.mc) END) AS mc_min_ticks,
+                   COUNT(*) AS n_ticks
+            FROM token_ticks tt
+            JOIN migs m ON m.mint = tt.mint
+            WHERE tt.tick_ts BETWEEN m.ts_migration + INTERVAL '90 seconds'
+                                 AND m.ts_migration + INTERVAL '70 minutes'
+            GROUP BY tt.mint
+        ),
+        with_gain AS (
+            SELECT m.*,
+                   tp.mc_peak_ticks,
+                   tp.mc_min_ticks,
+                   tp.n_ticks,
+                   CASE WHEN tp.mc_peak_ticks > 0 AND m.mc_migration > 0
+                        THEN (tp.mc_peak_ticks - m.mc_migration) / m.mc_migration
+                        ELSE NULL END AS gain_pct,
+                   CASE WHEN tp.mc_min_ticks > 0 AND m.mc_migration > 0
+                        THEN (m.mc_migration - tp.mc_min_ticks) / m.mc_migration
+                        ELSE NULL END AS drop_pct
+            FROM migs m
+            LEFT JOIN tick_peaks tp ON tp.mint = m.mint
+        )
+        SELECT
+            bucket,
+            COUNT(*)                                                             AS n_total,
+            COUNT(*) FILTER (WHERE n_ticks > 0)                                 AS n_com_ticks,
+            COUNT(*) FILTER (WHERE gain_pct >= 0.20)                            AS n_20,
+            COUNT(*) FILTER (WHERE gain_pct >= 0.50)                            AS n_50,
+            COUNT(*) FILTER (WHERE gain_pct >= 0.75)                            AS n_75,
+            COUNT(*) FILTER (WHERE gain_pct >= 1.00)                            AS n_100,
+            COUNT(*) FILTER (WHERE gain_pct >= 2.00)                            AS n_200,
+            COUNT(*) FILTER (WHERE gain_pct >= 5.00)                            AS n_500,
+            COUNT(*) FILTER (WHERE had_bounce)                                  AS n_bounce,
+            COUNT(*) FILTER (WHERE trade_status IN ('tp','tp_hit'))             AS n_tp_trade,
+            COUNT(*) FILTER (WHERE trade_status IN ('sl','sl_hit'))             AS n_sl_trade,
+            ROUND(AVG(holders_count))                                           AS avg_holders,
+            ROUND(AVG(gain_pct) FILTER (WHERE gain_pct IS NOT NULL)::numeric * 100, 1) AS avg_gain_pct,
+            ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY gain_pct) * 100::numeric, 1) AS median_gain_pct,
+            ROUND(MAX(gain_pct)::numeric * 100, 0)                              AS max_gain_pct,
+            ROUND(AVG(drop_pct) FILTER (WHERE drop_pct IS NOT NULL)::numeric * 100, 1) AS avg_drop_pct
+        FROM with_gain
+        GROUP BY bucket
+        ORDER BY bucket
+    """ % {"days": days}
+
+    # Tabela de tokens individuais (ticks) para inspeção
+    sql_detail = """
+        WITH migs AS (
+            SELECT m.mint, m.token_nome, m.holders_count, m.mc_migration, m.ts_migration,
+                   bs.mint IS NOT NULL AS had_bounce,
+                   t.status           AS trade_status
+            FROM migrations m
+            LEFT JOIN bounce_signals bs ON bs.mint = m.mint
+            LEFT JOIN LATERAL (
+                SELECT status FROM trades WHERE mint = m.mint
+                ORDER BY ts_signal DESC LIMIT 1
+            ) t ON TRUE
+            WHERE m.ts_migration >= NOW() - INTERVAL '%(days)s days'
+              AND m.holders_count IS NOT NULL AND m.holders_count > 0
+              AND m.mc_migration > 0
+        ),
+        tick_peaks AS (
+            SELECT tt.mint,
+                   MAX(GREATEST(
+                       COALESCE(NULLIF(tt.mc_high,0),0),
+                       COALESCE(NULLIF(tt.mc,0),0)
+                   )) AS mc_peak_ticks,
+                   COUNT(*) AS n_ticks
+            FROM token_ticks tt
+            JOIN migs m ON m.mint = tt.mint
+            WHERE tt.tick_ts BETWEEN m.ts_migration + INTERVAL '90 seconds'
+                                 AND m.ts_migration + INTERVAL '70 minutes'
+            GROUP BY tt.mint
+        )
+        SELECT m.mint, m.token_nome, m.holders_count, m.mc_migration, m.ts_migration,
+               tp.mc_peak_ticks, tp.n_ticks,
+               m.had_bounce, m.trade_status,
+               CASE WHEN tp.mc_peak_ticks > 0 AND m.mc_migration > 0
+                    THEN (tp.mc_peak_ticks - m.mc_migration) / m.mc_migration
+                    ELSE NULL END AS gain_pct
+        FROM migs m
+        LEFT JOIN tick_peaks tp ON tp.mint = m.mint
+        WHERE tp.mc_peak_ticks > m.mc_migration * 1.50
+        ORDER BY m.holders_count,
+                 (tp.mc_peak_ticks - m.mc_migration) / NULLIF(m.mc_migration,0) DESC NULLS LAST
+        LIMIT 300
+    """ % {"days": days}
+
+    rows = []
+    total_n = 0
+    with db._cursor() as cur:
+        cur.execute(sql_agg)
+        rows = cur.fetchall()
+        total_n = sum(r["n_total"] for r in rows)
+
+    detail_rows = []
+    with db._cursor() as cur:
+        cur.execute(sql_detail)
+        detail_rows = cur.fetchall()
+
+    bucket_labels = {
+        "a_menos30": "< 30 holders",
+        "b_30a60":   "30 – 60",
+        "c_60a100":  "60 – 100",
+        "d_100a200": "100 – 200",
+        "e_200a500": "200 – 500",
+        "f_500mais": "500+",
+    }
+    bucket_labels_full = {
+        "a_menos30": "< 30 holders",
+        "b_30a60":   "30 – 60 holders",
+        "c_60a100":  "60 – 100 holders",
+        "d_100a200": "100 – 200 holders",
+        "e_200a500": "200 – 500 holders",
+        "f_500mais": "500+ holders",
+    }
+    bucket_desc = {
+        "a_menos30": "Token sem adoção — pouquíssimas carteiras",
+        "b_30a60":   "Early adopters apenas",
+        "c_60a100":  "Atenção inicial — começa a aparecer no radar",
+        "d_100a200": "Crescimento real — comunidade se formando",
+        "e_200a500": "Tração — interesse genuíno",
+        "f_500mais": "Muito distribuído — pode ser pump coordenado",
+    }
+
+    css = """<style>
+        body{font-family:monospace;padding:20px;background:#0d0d0d;color:#e0e0e0}
+        h1{color:#fff}h2{color:#aaa;font-size:.9em;margin-top:28px;letter-spacing:.08em}
+        table{border-collapse:collapse;width:100%;font-size:.82em;margin-top:12px}
+        th{background:#1e1e1e;color:#666;padding:6px 10px;text-align:right;border-bottom:1px solid #2a2a2a;white-space:nowrap}
+        th:first-child{text-align:left}
+        td{padding:5px 10px;border-bottom:1px solid #161616;text-align:right}
+        td:first-child{text-align:left}
+        tr:hover td{background:#151515}
+        .pos{color:#4caf50}.neg{color:#f44336}.neu{color:#666}
+        .best{background:#0d2010!important}
+        .bar{display:inline-block;height:8px;background:#2d6a4f;border-radius:2px;vertical-align:middle;margin-left:4px}
+        a{color:#5ab4f0;text-decoration:none}
+        .note{background:#111;border-left:3px solid #5ab4f0;padding:10px 16px;margin:16px 0;font-size:.84em;line-height:1.6}
+        .hdr{color:#888;font-size:.7em;text-transform:uppercase;letter-spacing:.1em}
+        .sep td{background:#0f0f0f;color:#555;font-size:.8em;padding:4px 10px}
+    </style>"""
+
+    h = f"<html><head><meta charset='utf-8'><title>Holders vs Performance</title>{css}</head><body>"
+    h += f"<h1>👥 Holders na migração vs ganho real (token_ticks)</h1>"
+    h += f"<p class='neu'>Últimos {days} dias · {total_n} tokens · pico medido nos token_ticks (90s–60min após migração)</p>"
+    h += "<p>" + " · ".join(f"<a href='?days={d}'>{d}d</a>" for d in [7,14,30,60]) + "</p>"
+
+    # Tabela principal
+    thresholds = [("20%", "n_20"), ("50%", "n_50"), ("75%", "n_75"),
+                  ("100%", "n_100"), ("200%", "n_200"), ("500%", "n_500")]
+
+    h += "<h2>TAXA DE TOKENS QUE ATINGIRAM CADA GANHO (medido nos ticks)</h2>"
+    cols = "".join(f"<th>+{lbl}</th>" for lbl, _ in thresholds)
+    h += f"<table><tr><th>Faixa de Holders</th><th>Tokens</th><th>Com ticks</th>{cols}<th>Avg gain</th><th>Mediana</th><th>Maior</th><th>Avg drop</th></tr>"
+
+    # acha melhor faixa por n_75 para highlight
+    best_bk = None
+    best_n75_rate = 0
+    for r in rows:
+        n = r["n_total"]; n75 = r["n_75"] or 0
+        if n >= 10 and n75 / n > best_n75_rate:
+            best_n75_rate = n75 / n
+            best_bk = r["bucket"]
+
+    for r in rows:
+        bk  = r["bucket"]
+        n   = r["n_total"]
+        ntk = r["n_com_ticks"] or 0
+        avg_g = float(r["avg_gain_pct"] or 0)
+        med_g = float(r["median_gain_pct"] or 0)
+        max_g = float(r["max_gain_pct"] or 0)
+        avg_d = float(r["avg_drop_pct"] or 0)
+        label = bucket_labels_full.get(bk, bk)
+        desc  = bucket_desc.get(bk, "")
+        is_best = bk == best_bk
+        tr_cls = " class='best'" if is_best else ""
+
+        cells = ""
+        for lbl, col in thresholds:
+            cnt = r[col] or 0
+            base = ntk if ntk else n
+            rate = cnt / base * 100 if base else 0
+            bar_w = int(rate * 0.8)
+            clr = "#4caf50" if rate >= 30 else ("#f5a623" if rate >= 15 else "#555")
+            cells += f"<td style='color:{clr}'>{cnt}<span style='color:#333'>/</span>{base} <span style='color:{clr};font-size:.85em'>({rate:.0f}%)</span><span class='bar' style='width:{bar_w}px;background:{clr}'></span></td>"
+
+        h += f"<tr{tr_cls}><td><b>{label}</b><br><span style='color:#444;font-size:.78em'>{desc}</span></td>"
+        h += f"<td>{n}</td><td class='neu'>{ntk}</td>"
+        h += cells
+        h += f"<td class='{'pos' if avg_g>0 else 'neg'}'>{avg_g:+.0f}%</td>"
+        h += f"<td class='neu'>{med_g:+.0f}%</td>"
+        h += f"<td class='pos'>{max_g:+.0f}%</td>"
+        h += f"<td class='neu'>{avg_d:.0f}%</td>"
+        h += "</tr>"
+    h += "</table>"
+
+    # Conclusão
+    h += "<div class='note'>"
+    h += "<b>📊 Leitura dos dados:</b><br>"
+    if best_bk and best_n75_rate > 0:
+        bl = bucket_labels_full.get(best_bk, best_bk)
+        h += f"Faixa com maior proporção de tokens que dobraram (+75%): <b>{bl}</b> ({best_n75_rate*100:.0f}% dos tokens com ticks nessa faixa).<br>"
+    # checa monoticidade (cresce ou cai com holders?)
+    rates_75 = [(r["bucket"], (r["n_75"] or 0) / (r["n_com_ticks"] or r["n_total"] or 1))
+                for r in rows if (r["n_com_ticks"] or r["n_total"] or 0) >= 5]
+    if len(rates_75) >= 3:
+        vals = [v for _, v in rates_75]
+        increasing = all(vals[i] <= vals[i+1] for i in range(len(vals)-1))
+        decreasing = all(vals[i] >= vals[i+1] for i in range(len(vals)-1))
+        if increasing:
+            h += "Tendência clara: <b>mais holders = mais ganho</b>. Considera adicionar FILTER_SMART_MIN-like para holders mínimo.<br>"
+        elif decreasing:
+            h += "Tendência clara: <b>menos holders = mais ganho</b>. Tokens com poucos holders tendem a explodir mais.<br>"
+        else:
+            h += "Sem tendência linear clara. A relação holders→ganho é não-monotônica — holders médios podem ser o sweet spot.<br>"
+    h += "<br><b>Gate:</b> só implementar filtro se diferença ≥ 20pp entre faixas E n_ticks ≥ 30 por faixa."
+    h += "</div>"
+
+    # Tabela de tokens individuais +50%
+    if detail_rows:
+        h += f"<h2>TOKENS QUE SUBIRAM +50% NOS TICKS (últimos {days} dias) — por holders</h2>"
+        h += "<table><tr><th>Token</th><th>Holders</th><th>MC mig</th><th>Pico (ticks)</th><th>Ganho</th><th>Ticks</th><th>Bounce?</th><th>Trade</th><th>Hora</th></tr>"
+        prev_bk = None
+        for r in detail_rows:
+            bk_row = ("a_menos30" if (r["holders_count"] or 0) < 30 else
+                      "b_30a60"   if (r["holders_count"] or 0) < 60 else
+                      "c_60a100"  if (r["holders_count"] or 0) < 100 else
+                      "d_100a200" if (r["holders_count"] or 0) < 200 else
+                      "e_200a500" if (r["holders_count"] or 0) < 500 else "f_500mais")
+            if bk_row != prev_bk:
+                lbl = bucket_labels_full.get(bk_row, bk_row)
+                h += f"<tr class='sep'><td colspan='9'>{lbl}</td></tr>"
+                prev_bk = bk_row
+            nome  = r["token_nome"] or r["mint"][:8]
+            hc    = r["holders_count"] or 0
+            mc    = r["mc_migration"] or 0
+            peak  = r["mc_peak_ticks"] or 0
+            ntk   = r["n_ticks"] or 0
+            gain  = float(r["gain_pct"] or 0)
+            had_b = r["had_bounce"]
+            status= r["trade_status"] or "—"
+            ts    = r["ts_migration"]
+            ts_s  = ts.strftime("%m-%d %H:%M") if ts else "—"
+            mint  = r["mint"]
+            sc    = "#4caf50" if status in ("tp","tp_hit") else ("#f44336" if status in ("sl","sl_hit") else "#555")
+            bs_s  = "✓" if had_b else "—"
+            link  = f"https://gmgn.ai/sol/token/{mint}"
+            h += (f"<tr><td><a href='{link}' target='_blank'>{nome}</a></td>"
+                  f"<td>{hc}</td><td>${mc:,.0f}</td><td>${peak:,.0f}</td>"
+                  f"<td class='pos'>+{gain:.0%}</td><td class='neu'>{ntk}</td>"
+                  f"<td class='neu'>{bs_s}</td><td style='color:{sc}'>{status}</td>"
+                  f"<td class='neu'>{ts_s}</td></tr>")
+        h += "</table>"
+
+    h += "</body></html>"
+    return h
 
 
 if __name__ == "__main__":
