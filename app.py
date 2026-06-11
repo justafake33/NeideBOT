@@ -14,7 +14,6 @@ from scheduler import HeapScheduler
 from scanner import Scanner, HotMonitor
 from executor import TradeExecutor, TradeMonitor
 from trending_radar_routes import trending_radar_bp
-from drop_real_shadow_routes import drop_real_bp
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,7 +25,6 @@ init_sentry()
 
 app = Flask(__name__)
 app.register_blueprint(trending_radar_bp)
-app.register_blueprint(drop_real_bp)
 BRT = timedelta(hours=-3)
 
 
@@ -49386,9 +49384,6 @@ def analise_drop_real():
 
 
 @app.route("/analise/holders")
-
-
-@app.route("/analise/holders")
 def analise_holders():
     """
     Analisa variação de holders entre migração → fundo → bounce.
@@ -49672,3 +49667,4 @@ def analise_holders():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
+

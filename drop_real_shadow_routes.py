@@ -2,14 +2,13 @@
 
 from datetime import timezone, timedelta
 
-from flask import Blueprint, request
+from flask import request
 
 import db
+from trending_radar_routes import trending_radar_bp
 
 
-drop_real_bp = Blueprint("drop_real", __name__)
-
-@drop_real_bp.route("/analise/drop-real")
+@trending_radar_bp.route("/analise/drop-real")
 def analise_drop_real():
     """
     Analisa o drop real das migrations e simula entrada no bounce do fundo.
