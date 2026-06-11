@@ -49172,10 +49172,10 @@ def analise_drop_real():
         cur.execute("""
         WITH base AS (
             SELECT m.mint, m.token_nome, m.mc_migration, m.ts_migration,
-                   m.mc_peak, m.time_to_peak, m.mc_bottom, m.time_to_bottom
+                   m.mc_peak, m.time_to_peak, m.mc_bottom, m.time_to_bottom,
+                   EXISTS (SELECT 1 FROM bounce_signals bs WHERE bs.mint = m.mint) AS had_bounce
             FROM migrations m
-            LEFT JOIN bounce_signals bs ON bs.mint = m.mint
-            WHERE bs.mint IS NULL
+            WHERE 1=1
               {time_filter_sql}
               AND m.mc_migration > 0
         ),
@@ -49245,7 +49245,7 @@ def analise_drop_real():
             ORDER BY tp.mint, tp.tick_ts ASC
         ),
         scored AS (
-            SELECT b.mint, b.token_nome, b.mc_migration, b.ts_migration,
+            SELECT b.mint, b.token_nome, b.mc_migration, b.ts_migration, b.had_bounce,
                    NULLIF(GREATEST(COALESCE(tst.mc_peak_ticks, 0), COALESCE(NULLIF(b.mc_peak, 0), 0)), 0) AS mc_peak_ticks,
                    tst.mc_min_ticks, tst.n_ticks,
                    bc.mc_bottom_used AS mc_min_early,
@@ -49261,7 +49261,7 @@ def analise_drop_real():
             LEFT JOIN bottom_choice bc  ON bc.mint  = b.mint
             LEFT JOIN peak_ts       pt  ON pt.mint  = b.mint
         )
-        SELECT s.mint, s.token_nome, s.mc_migration, s.ts_migration,
+        SELECT s.mint, s.token_nome, s.mc_migration, s.ts_migration, s.had_bounce,
                s.mc_peak_ticks, s.mc_min_ticks, s.n_ticks,
                s.mc_min_early, s.time_to_bottom, s.bottom_source,
                s.time_to_peak,
@@ -49466,7 +49466,7 @@ def analise_drop_real():
     capturavel = n_leve + n_medio   # 15-30% capturável com BOUNCE_DROP_MIN=0.15
 
     conclusao_html = f"""
-<b>📊 O que aconteceu com {total_all} tokens que o bot não comprou (e que subiram ≥20%):</b><br><br>
+<b>📊 O que aconteceu com {total_all} tokens que subiram ≥20%:</b><br><br>
 <span style='color:#f87171'>🚀 {n_up} tokens ({pct(n_up)}) subiram direto</span> — nunca caíram abaixo do preço de migração. O bot não consegue pegar esses: quando detecta, o token já está no topo.<br>
 <span style='color:#fbbf24'>📉 {n_leve} tokens ({pct(n_leve)}) caíram 1–15% antes de subir</span> — dip muito pequeno. Capturar esses exigiria BOUNCE_DROP_MIN=0.05 (arriscado, muitos falsos positivos).<br>
 <span style='color:#4ade80'>📉 {n_medio} tokens ({pct(n_medio)}) caíram 15–30% antes de subir</span> — <b>ZONA DE OPORTUNIDADE.</b> Baixar BOUNCE_DROP_MIN de 0.30 para 0.15 capturaria esses.<br>
@@ -49501,9 +49501,9 @@ def analise_drop_real():
 </style></head><body>
 """
     period_label = f"últimas {hours}h" if hours else "todo o histórico"
-    h += f"<h2>📉 Por que o bot não comprou esses tokens?</h2>"
-    h += f"<p class='sub'>Tokens de {period_label} que <b>subiram ≥20%</b> mas o bot <b>não comprou</b> · "
-    h += f"{total_all} tokens vencedores analisados · base WR: {overall_sim['tokens']} tokens com fundo · "
+    h += f"<h2>📉 WR por drop real — entrada no bounce do fundo</h2>"
+    h += f"<p class='sub'>Migrations de {period_label}; tabela histórica abaixo filtra tokens que <b>subiram ≥20%</b> · "
+    h += f"{total_all} tokens vencedores na tabela histórica · base WR: {overall_sim['tokens']} tokens com fundo · "
     h += f"entry bounce={entry_pct:.0%} · TP={tp_pct:.0%} · SL={sl_pct:.0%} · "
     h += f"<a href='?'>todos</a> · <a href='?hours=24'>24h</a> · <a href='?hours=48'>48h</a> · <a href='?hours=72'>72h</a></p>"
 
