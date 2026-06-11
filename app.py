@@ -49168,15 +49168,14 @@ def analise_drop_real():
               AND m.mc_migration > 0
         ),
         tick_stats AS (
-            -- pico e mínimo reais medidos nos ticks (90s–70min após migração)
             SELECT tt.mint,
                    MAX(GREATEST(
                        COALESCE(NULLIF(tt.mc_high, 0), 0),
                        COALESCE(NULLIF(tt.mc, 0), 0)
-                   ))                                                         AS mc_peak_ticks,
+                   )) AS mc_peak_ticks,
                    MIN(CASE WHEN COALESCE(NULLIF(tt.mc_low,0), tt.mc) > 0
-                            THEN COALESCE(NULLIF(tt.mc_low,0), tt.mc) END)   AS mc_min_ticks,
-                   COUNT(*)                                                   AS n_ticks
+                            THEN COALESCE(NULLIF(tt.mc_low,0), tt.mc) END) AS mc_min_ticks,
+                   COUNT(*) AS n_ticks
             FROM token_ticks tt
             JOIN base b ON b.mint = tt.mint
             WHERE tt.tick_ts BETWEEN b.ts_migration + INTERVAL '90 seconds'
@@ -49184,7 +49183,6 @@ def analise_drop_real():
             GROUP BY tt.mint
         ),
         early_min AS (
-            -- mínimo nos primeiros 20min (para calcular drop de entrada)
             SELECT tt.mint,
                    MIN(COALESCE(NULLIF(tt.mc_low, 0), tt.mc)) AS mc_min_early
             FROM token_ticks tt
@@ -49195,35 +49193,34 @@ def analise_drop_real():
             GROUP BY tt.mint
         ),
         peak_ts AS (
-            -- timestamp do pico (primeiro tick que atingiu mc_peak_ticks)
             SELECT DISTINCT ON (tt.mint) tt.mint,
                    EXTRACT(EPOCH FROM (tt.tick_ts - b.ts_migration)) / 60.0 AS ttp_ticks
             FROM token_ticks tt
-            JOIN base b      ON b.mint = tt.mint
-            JOIN tick_stats ts ON ts.mint = tt.mint
+            JOIN base b        ON b.mint = tt.mint
+            JOIN tick_stats tst ON tst.mint = tt.mint
                 AND GREATEST(COALESCE(NULLIF(tt.mc_high,0),0), COALESCE(NULLIF(tt.mc,0),0))
-                    = ts.mc_peak_ticks
+                    = tst.mc_peak_ticks
             ORDER BY tt.mint, tt.tick_ts ASC
         )
         SELECT b.mint, b.token_nome, b.mc_migration, b.ts_migration,
-               ts.mc_peak_ticks, ts.mc_min_ticks, ts.n_ticks,
+               tst.mc_peak_ticks, tst.mc_min_ticks, tst.n_ticks,
                em.mc_min_early,
                pt.ttp_ticks AS time_to_peak,
-               CASE WHEN ts.mc_peak_ticks > 0 AND b.mc_migration > 0
-                    THEN (ts.mc_peak_ticks - b.mc_migration) / b.mc_migration
+               CASE WHEN tst.mc_peak_ticks > 0 AND b.mc_migration > 0
+                    THEN (tst.mc_peak_ticks - b.mc_migration) / b.mc_migration
                     ELSE NULL END AS gain_pct,
                CASE WHEN em.mc_min_early IS NOT NULL AND b.mc_migration > 0
                     THEN (b.mc_migration - em.mc_min_early) / b.mc_migration
                     ELSE NULL END AS drop_pct
         FROM base b
-        LEFT JOIN tick_stats ts ON ts.mint = b.mint
-        LEFT JOIN early_min  em ON em.mint = b.mint
-        LEFT JOIN peak_ts    pt ON pt.mint = b.mint
-        WHERE ts.mc_peak_ticks >= b.mc_migration * 1.20  -- só tokens que subiram ≥20% nos ticks
-           OR ts.mc_peak_ticks IS NULL                   -- mantém sem-ticks para contagem
+        LEFT JOIN tick_stats tst ON tst.mint = b.mint
+        LEFT JOIN early_min  em  ON em.mint  = b.mint
+        LEFT JOIN peak_ts    pt  ON pt.mint  = b.mint
+        WHERE tst.mc_peak_ticks >= b.mc_migration * 1.20
+           OR tst.mc_peak_ticks IS NULL
         ORDER BY
-            CASE WHEN ts.n_ticks IS NULL THEN 1 ELSE 0 END,
-            (b.mc_migration - em.mc_min_early) / NULLIF(b.mc_migration, 0) ASC
+            CASE WHEN tst.n_ticks IS NULL THEN 1 ELSE 0 END,
+            (b.mc_migration - COALESCE(em.mc_min_early, b.mc_migration)) / NULLIF(b.mc_migration, 0) ASC
     """, {"interval": f"{hours} hours"})
     rows = cur.fetchall()
     cur.close()
@@ -49456,10 +49453,10 @@ def analise_holders():
             COUNT(*) FILTER (WHERE trade_status IN ('tp','tp_hit'))             AS n_tp_trade,
             COUNT(*) FILTER (WHERE trade_status IN ('sl','sl_hit'))             AS n_sl_trade,
             ROUND(AVG(holders_count))                                           AS avg_holders,
-            ROUND(AVG(gain_pct) FILTER (WHERE gain_pct IS NOT NULL)::numeric * 100, 1) AS avg_gain_pct,
-            ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY gain_pct) * 100::numeric, 1) AS median_gain_pct,
+            ROUND((AVG(gain_pct) FILTER (WHERE gain_pct IS NOT NULL))::numeric * 100, 1) AS avg_gain_pct,
+            ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY gain_pct))::numeric * 100, 1) AS median_gain_pct,
             ROUND(MAX(gain_pct)::numeric * 100, 0)                              AS max_gain_pct,
-            ROUND(AVG(drop_pct) FILTER (WHERE drop_pct IS NOT NULL)::numeric * 100, 1) AS avg_drop_pct
+            ROUND((AVG(drop_pct) FILTER (WHERE drop_pct IS NOT NULL))::numeric * 100, 1) AS avg_drop_pct
         FROM with_gain
         GROUP BY bucket
         ORDER BY bucket
