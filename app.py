@@ -49158,7 +49158,8 @@ def analise_drop_real():
     conn = psycopg2.connect(db.DATABASE_URL)
     cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    cur.execute("""
+    try:
+     cur.execute("""
         WITH base AS (
             SELECT m.mint, m.token_nome, m.mc_migration, m.ts_migration
             FROM migrations m
@@ -49222,6 +49223,10 @@ def analise_drop_real():
             CASE WHEN tst.n_ticks IS NULL THEN 1 ELSE 0 END,
             (b.mc_migration - COALESCE(em.mc_min_early, b.mc_migration)) / NULLIF(b.mc_migration, 0) ASC
     """, {"interval": f"{hours} hours"})
+    except Exception as e:
+        import traceback
+        cur.close(); conn.close()
+        return f"<pre style='color:red'>{traceback.format_exc()}</pre>"
     rows = cur.fetchall()
     cur.close()
     conn.close()
