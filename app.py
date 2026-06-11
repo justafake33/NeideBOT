@@ -49338,6 +49338,265 @@ def analise_drop_real():
     return h
 
 
+@app.route("/analise/holders")
+def analise_holders():
+    """Analisa holders_count na migração vs performance do token."""
+    import math
+
+    days = int(request.args.get("days", 30))
+
+    sql = """
+        WITH base AS (
+            SELECT m.mint, m.token_nome,
+                   m.holders_count,
+                   m.mc_migration,
+                   m.mc_peak,
+                   m.ts_migration,
+                   CASE WHEN m.mc_peak IS NOT NULL AND m.mc_migration > 0
+                        THEN (m.mc_peak - m.mc_migration) / m.mc_migration
+                        ELSE NULL END AS gain_pct,
+                   bs.mint AS had_bounce,
+                   t.status AS trade_status
+            FROM migrations m
+            LEFT JOIN bounce_signals bs ON bs.mint = m.mint
+            LEFT JOIN LATERAL (
+                SELECT status FROM trades
+                WHERE mint = m.mint
+                ORDER BY ts_signal DESC LIMIT 1
+            ) t ON TRUE
+            WHERE m.ts_migration >= NOW() - INTERVAL '%(days)s days'
+              AND m.holders_count IS NOT NULL
+              AND m.holders_count > 0
+        ),
+        bucketed AS (
+            SELECT *,
+                   CASE
+                       WHEN holders_count < 30   THEN 'a_menos30'
+                       WHEN holders_count < 60   THEN 'b_30a60'
+                       WHEN holders_count < 100  THEN 'c_60a100'
+                       WHEN holders_count < 200  THEN 'd_100a200'
+                       WHEN holders_count < 500  THEN 'e_200a500'
+                       ELSE                           'f_500mais'
+                   END AS bucket
+            FROM base
+        )
+        SELECT
+            bucket,
+            COUNT(*)                                                    AS n_total,
+            COUNT(*) FILTER (WHERE gain_pct >= 0.20)                    AS n_subiu,
+            COUNT(*) FILTER (WHERE gain_pct >= 0.75)                    AS n_tp,
+            COUNT(*) FILTER (WHERE had_bounce IS NOT NULL)              AS n_bounce,
+            COUNT(*) FILTER (WHERE trade_status IN ('tp','tp_hit'))     AS n_tp_trade,
+            COUNT(*) FILTER (WHERE trade_status IN ('sl','sl_hit'))     AS n_sl_trade,
+            ROUND(AVG(holders_count))                                   AS avg_holders,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY holders_count)  AS median_holders,
+            ROUND(AVG(gain_pct) FILTER (WHERE gain_pct IS NOT NULL)::numeric * 100, 1) AS avg_gain_pct,
+            ROUND(AVG(gain_pct) FILTER (WHERE gain_pct >= 0.20)::numeric * 100, 1) AS avg_gain_winners,
+            MAX(gain_pct)                                               AS max_gain
+        FROM bucketed
+        GROUP BY bucket
+        ORDER BY bucket
+    """ % {"days": days}
+
+    bucket_labels = {
+        "a_menos30":  "< 30 holders",
+        "b_30a60":    "30 – 60 holders",
+        "c_60a100":   "60 – 100 holders",
+        "d_100a200":  "100 – 200 holders",
+        "e_200a500":  "200 – 500 holders",
+        "f_500mais":  "500+ holders",
+    }
+
+    bucket_desc = {
+        "a_menos30":  "Token muito novo ou sem adoção — pouquíssimas carteiras",
+        "b_30a60":    "Early adopters apenas — comunidade ainda não chegou",
+        "c_60a100":   "Atenção inicial — começa a aparecer no radar",
+        "d_100a200":  "Crescimento real — comunidade ativa se formando",
+        "e_200a500":  "Token com tração — interesse genuíno do mercado",
+        "f_500mais":  "Muito distribuído — pode indicar pump coordenado ou token antigo",
+    }
+
+    rows = []
+    total_n = 0
+    with db._cursor() as cur:
+        cur.execute(sql)
+        rows = cur.fetchall()
+        total_n = sum(r["n_total"] for r in rows)
+
+    # também puxa os tokens individuais para a tabela de detalhe
+    sql_detail = """
+        SELECT m.mint, m.token_nome, m.holders_count, m.mc_migration, m.mc_peak,
+               m.ts_migration,
+               CASE WHEN m.mc_peak IS NOT NULL AND m.mc_migration > 0
+                    THEN (m.mc_peak - m.mc_migration) / m.mc_migration
+                    ELSE NULL END AS gain_pct,
+               bs.mint IS NOT NULL AS had_bounce,
+               t.status AS trade_status
+        FROM migrations m
+        LEFT JOIN bounce_signals bs ON bs.mint = m.mint
+        LEFT JOIN LATERAL (
+            SELECT status FROM trades
+            WHERE mint = m.mint
+            ORDER BY ts_signal DESC LIMIT 1
+        ) t ON TRUE
+        WHERE m.ts_migration >= NOW() - INTERVAL '%(days)s days'
+          AND m.holders_count IS NOT NULL AND m.holders_count > 0
+          AND m.mc_peak IS NOT NULL AND m.mc_migration > 0
+          AND (m.mc_peak - m.mc_migration) / m.mc_migration >= 0.75
+        ORDER BY m.holders_count, (m.mc_peak - m.mc_migration) / m.mc_migration DESC
+        LIMIT 200
+    """ % {"days": days}
+
+    detail_rows = []
+    with db._cursor() as cur:
+        cur.execute(sql_detail)
+        detail_rows = cur.fetchall()
+
+    # ---- HTML ----
+    css = """
+    <style>
+        body{font-family:monospace;padding:20px;background:#0d0d0d;color:#e0e0e0}
+        h1{color:#fff}
+        h2{color:#aaa;font-size:1em;margin-top:30px}
+        .cards{display:flex;flex-wrap:wrap;gap:12px;margin:20px 0}
+        .card{background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:14px 18px;min-width:200px}
+        .card h3{margin:0 0 4px;font-size:.8em;color:#888;text-transform:uppercase}
+        .card .big{font-size:2em;font-weight:bold;color:#fff}
+        .card .sub{font-size:.8em;color:#666;margin-top:4px}
+        .card.green{border-color:#2d6a4f}
+        .card.yellow{border-color:#6a4f2d}
+        .card.red{border-color:#6a2d2d}
+        table{border-collapse:collapse;width:100%;font-size:.82em;margin-top:16px}
+        th{background:#1e1e1e;color:#888;padding:6px 10px;text-align:left;border-bottom:1px solid #333}
+        td{padding:5px 10px;border-bottom:1px solid #1a1a1a}
+        tr:hover td{background:#1a1a1a}
+        .sep td{background:#111;color:#aaa;font-weight:bold;padding:8px 10px}
+        .pos{color:#4caf50}.neg{color:#f44336}.neu{color:#888}
+        .pill{display:inline-block;padding:1px 6px;border-radius:4px;font-size:.75em}
+        .pill-g{background:#1b3a28;color:#4caf50}
+        .pill-r{background:#3a1b1b;color:#f44336}
+        .pill-b{background:#1b2a3a;color:#5ab4f0}
+        a{color:#5ab4f0;text-decoration:none}
+        .note{background:#1a1a2a;border-left:3px solid #5ab4f0;padding:10px 14px;margin:16px 0;font-size:.85em}
+    </style>
+    """
+
+    h = f"<html><head><meta charset='utf-8'><title>Análise de Holders</title>{css}</head><body>"
+    h += f"<h1>👥 Holders na Migração vs Performance</h1>"
+    h += f"<p style='color:#666'>Últimos {days} dias · {total_n} tokens com holders_count preenchido</p>"
+    h += f"<p><a href='?days=7'>7 dias</a> · <a href='?days=14'>14 dias</a> · <a href='?days=30'>30 dias</a> · <a href='?days=60'>60 dias</a></p>"
+
+    h += "<div class='cards'>"
+    for r in rows:
+        bk = r["bucket"]
+        n = r["n_total"]
+        n_sub = r["n_subiu"] or 0
+        n_tp = r["n_tp"] or 0
+        avg_g = float(r["avg_gain_pct"] or 0)
+        avg_w = float(r["avg_gain_winners"] or 0)
+        max_g = float(r["max_gain"] or 0) * 100
+        rate_sub = n_sub / n * 100 if n else 0
+        clr = "green" if rate_sub >= 40 else ("yellow" if rate_sub >= 25 else "red")
+        label = bucket_labels.get(bk, bk)
+        h += f"""
+        <div class='card {clr}'>
+            <h3>{label}</h3>
+            <div class='big'>{n}</div>
+            <div class='sub'>tokens · {int(r['avg_holders'] or 0)} holders avg</div>
+            <div class='sub' style='margin-top:6px'>Subiram +20%: <b style='color:#4caf50'>{n_sub}</b> ({rate_sub:.0f}%)</div>
+            <div class='sub'>Subiram +75%: <b>{n_tp}</b></div>
+            <div class='sub'>Avg gain (todos): <b>{avg_g:+.1f}%</b></div>
+            <div class='sub'>Avg gain (vencedores): <b>{avg_w:+.1f}%</b></div>
+            <div class='sub'>Maior ganho: <b>{max_g:+.0f}%</b></div>
+        </div>"""
+    h += "</div>"
+
+    # Tabela comparativa
+    h += "<h2>COMPARATIVO POR FAIXA</h2>"
+    h += "<table><tr><th>Faixa de Holders</th><th>Tokens</th><th>Subiram +20%</th><th>Taxa</th><th>Avg gain</th><th>Avg gain venc.</th><th>Maior</th><th>Bounces</th><th>Descrição</th></tr>"
+    for r in rows:
+        bk = r["bucket"]
+        n = r["n_total"]
+        n_sub = r["n_subiu"] or 0
+        n_tp = r["n_tp"] or 0
+        avg_g = float(r["avg_gain_pct"] or 0)
+        avg_w = float(r["avg_gain_winners"] or 0)
+        max_g = float(r["max_gain"] or 0) * 100
+        rate_sub = n_sub / n * 100 if n else 0
+        n_bounce = r["n_bounce"] or 0
+        rate_bounce = n_bounce / n * 100 if n else 0
+        clr = "#4caf50" if rate_sub >= 40 else ("#f5a623" if rate_sub >= 25 else "#888")
+        label = bucket_labels.get(bk, bk)
+        desc = bucket_desc.get(bk, "")
+        h += f"""<tr>
+            <td><b>{label}</b></td>
+            <td>{n}</td>
+            <td>{n_sub}</td>
+            <td style='color:{clr}'><b>{rate_sub:.0f}%</b></td>
+            <td class='{"pos" if avg_g >= 0 else "neg"}'>{avg_g:+.1f}%</td>
+            <td class='pos'>{avg_w:+.1f}%</td>
+            <td class='pos'>{max_g:+.0f}%</td>
+            <td>{n_bounce} ({rate_bounce:.0f}%)</td>
+            <td style='color:#666;font-size:.85em'>{desc}</td>
+        </tr>"""
+    h += "</table>"
+
+    # Conclusão automática
+    best_bucket = None
+    best_rate = 0
+    for r in rows:
+        n = r["n_total"]
+        n_sub = r["n_subiu"] or 0
+        rate = n_sub / n * 100 if n else 0
+        if n >= 10 and rate > best_rate:
+            best_rate = rate
+            best_bucket = r
+
+    h += "<div class='note'>"
+    h += "<b>📊 O que os dados dizem:</b><br>"
+    if best_bucket:
+        bl = bucket_labels.get(best_bucket["bucket"], best_bucket["bucket"])
+        h += f"Faixa com maior taxa de tokens que subiram +20%: <b>{bl}</b> ({best_rate:.0f}% dos tokens nessa faixa subiram).<br>"
+
+    # correlação simples — queda monotônica ou não?
+    rates = [(r["bucket"], (r["n_subiu"] or 0) / r["n_total"] * 100) for r in rows if r["n_total"] >= 5]
+    h += f"<br>Faixas com n≥5 tokens: {', '.join(f'{bucket_labels.get(b,b)} → {rt:.0f}%' for b, rt in rates)}<br>"
+    h += f"<br><b>Recomendação:</b> "
+    if len(rates) >= 3:
+        mid = [rt for _, rt in rates if rt > 0]
+        if mid and max(mid) > 40:
+            bk_name = rates[[rt for _, rt in rates].index(max([rt for _, rt in rates]))][0]
+            h += f"Investigar se concentrar em tokens com {bucket_labels.get(bk_name,bk_name)} melhora WR. Gate apenas se diferença ≥ 20pp e n ≥ 30."
+        else:
+            h += "Nenhuma faixa se destaca claramente. Coletar mais dados antes de criar filtro."
+    else:
+        h += "Poucos dados por faixa. Ampliar janela de análise ou aguardar mais migrações."
+    h += "</div>"
+
+    # Tabela de tokens com TP (+75%) por holders
+    if detail_rows:
+        h += "<h2>TOKENS QUE SUBIRAM +75% — por holders na migração (últimos {days} dias)</h2>"
+        h += f"<table><tr><th>Token</th><th>Holders</th><th>MC mig</th><th>Ganho</th><th>Bounce?</th><th>Trade</th><th>Hora</th></tr>"
+        for r in detail_rows:
+            nome = r["token_nome"] or r["mint"][:8]
+            holders = r["holders_count"]
+            mc = r["mc_migration"] or 0
+            gain = float(r["gain_pct"] or 0)
+            had_b = r["had_bounce"]
+            status = r["trade_status"] or "—"
+            ts = r["ts_migration"]
+            ts_s = ts.strftime("%m-%d %H:%M") if ts else "—"
+            clr_s = "#4caf50" if status in ("tp","tp_hit") else ("#f44336" if status in ("sl","sl_hit") else "#888")
+            bounce_s = "<span class='pill pill-b'>✓</span>" if had_b else "<span class='neu'>—</span>"
+            gs = f"<span class='pos'>+{gain:.0%}</span>"
+            mint = r["mint"]
+            link = f"https://gmgn.ai/sol/token/{mint}"
+            h += f"<tr><td><a href='{link}' target='_blank'>{nome}</a></td><td>{holders}</td><td>${mc:,.0f}</td><td>{gs}</td><td>{bounce_s}</td><td style='color:{clr_s}'>{status}</td><td>{ts_s}</td></tr>"
+        h += "</table>"
+
+    h += "</body></html>"
+    return h
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
