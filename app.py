@@ -49134,6 +49134,261 @@ def analise_sem_bounce():
     return h
 
 
+@app.route("/analise/drop-real")
+def analise_drop_real():
+    """
+    Analisa o drop real mínimo nos primeiros 20 min pós-migração para tokens que:
+    - NÃO dispararam bounce (sem registro em bounce_signals)
+    - Subiram ≥20% do mc_migration (tokens "bem-sucedidos")
+    - Migraram nas últimas 72h (configurável via ?hours=)
+    Objetivo: avaliar se BOUNCE_DROP_MIN=0.30 é muito restritivo.
+    """
+    import psycopg2
+    import psycopg2.extras
+    hours = int(request.args.get("hours", 72))
+
+    conn = psycopg2.connect(db.DATABASE_URL)
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    # Pega tokens SEM bounce, que subiram >=20%, com ticks nos primeiros 20min
+    cur.execute("""
+        WITH eligible AS (
+            SELECT
+                m.mint,
+                m.token_nome,
+                m.mc_migration,
+                m.mc_peak,
+                m.time_to_peak,
+                m.ts_migration
+            FROM migrations m
+            LEFT JOIN bounce_signals bs ON bs.mint = m.mint
+            WHERE bs.mint IS NULL
+              AND m.ts_migration >= NOW() - INTERVAL '%(hours)s hours'
+              AND m.mc_migration > 0
+              AND m.mc_peak IS NOT NULL
+              AND m.mc_peak >= m.mc_migration * 1.20
+        ),
+        early_min AS (
+            SELECT DISTINCT ON (tt.mint)
+                tt.mint,
+                LEAST(
+                    MIN(tt.mc) FILTER (WHERE tt.mc > 0),
+                    MIN(tt.mc_low) FILTER (WHERE tt.mc_low > 0 AND tt.source = 'kline')
+                ) AS mc_min_early
+            FROM token_ticks tt
+            JOIN eligible e ON e.mint = tt.mint
+            WHERE tt.tick_ts BETWEEN e.ts_migration + INTERVAL '90 seconds'
+                                 AND e.ts_migration + INTERVAL '20 minutes'
+              AND tt.mc > 0
+            GROUP BY tt.mint
+        )
+        SELECT
+            e.mint,
+            e.token_nome,
+            e.mc_migration,
+            e.mc_peak,
+            e.time_to_peak,
+            e.ts_migration,
+            em.mc_min_early,
+            CASE
+                WHEN em.mc_min_early > 0 AND e.mc_migration > 0
+                THEN (e.mc_migration - em.mc_min_early) / e.mc_migration
+                ELSE NULL
+            END AS drop_pct,
+            CASE
+                WHEN e.mc_peak > e.mc_migration AND e.mc_migration > 0
+                THEN (e.mc_peak - e.mc_migration) / e.mc_migration
+                ELSE 0
+            END AS gain_pct
+        FROM eligible e
+        LEFT JOIN early_min em ON em.mint = e.mint
+        ORDER BY e.ts_migration DESC
+    """, {"hours": hours})
+    rows = cur.fetchall()
+
+    # Também conta tokens elegíveis sem ticks (para contexto de cobertura)
+    cur.execute("""
+        WITH eligible AS (
+            SELECT m.mint
+            FROM migrations m
+            LEFT JOIN bounce_signals bs ON bs.mint = m.mint
+            WHERE bs.mint IS NULL
+              AND m.ts_migration >= NOW() - INTERVAL '%(hours)s hours'
+              AND m.mc_migration > 0
+              AND m.mc_peak IS NOT NULL
+              AND m.mc_peak >= m.mc_migration * 1.20
+        )
+        SELECT COUNT(*) AS total_eligible FROM eligible
+    """, {"hours": hours})
+    total_eligible = cur.fetchone()["total_eligible"]
+
+    cur.close()
+    conn.close()
+
+    # Agrupa em faixas de drop_pct
+    faixas = [
+        ("0–5%",   0.00, 0.05),
+        ("5–10%",  0.05, 0.10),
+        ("10–15%", 0.10, 0.15),
+        ("15–20%", 0.15, 0.20),
+        ("20–25%", 0.20, 0.25),
+        ("25–30%", 0.25, 0.30),
+        (">30%",   0.30, 9.99),
+    ]
+
+    # Apenas rows com drop_pct calculado
+    rows_with_data = [r for r in rows if r["drop_pct"] is not None]
+    n_total = len(rows_with_data)
+    n_no_ticks = len(rows) - n_total
+
+    dist = {}
+    for label, lo, hi in faixas:
+        bucket = [r for r in rows_with_data if lo <= r["drop_pct"] < hi]
+        gains = [r["gain_pct"] for r in bucket if r["gain_pct"] > 0]
+        dist[label] = {
+            "n": len(bucket),
+            "pct": len(bucket) / n_total * 100 if n_total > 0 else 0,
+            "avg_gain": sum(gains) / len(gains) if gains else 0,
+            "rows": bucket,
+        }
+
+    # Conclusão automática
+    n_below_20 = sum(dist[l]["n"] for l in ["0–5%", "5–10%", "10–15%", "15–20%"])
+    n_below_30 = sum(dist[l]["n"] for l in ["0–5%", "5–10%", "10–15%", "15–20%", "20–25%", "25–30%"])
+    pct_below_20 = n_below_20 / n_total * 100 if n_total > 0 else 0
+    pct_below_30 = n_below_30 / n_total * 100 if n_total > 0 else 0
+
+    if pct_below_20 >= 50:
+        if dist["0–5%"]["n"] / n_total >= 0.30 if n_total > 0 else False:
+            conclusao = (
+                f"⚡ {pct_below_20:.0f}% dos tokens caem menos de 20% antes de subir. "
+                f"{dist['0–5%']['pct']:.0f}% caem <5%. "
+                "RECOMENDAÇÃO: Este padrão sugere tokens de momentum — precisam de detector de "
+                "momentum/breakout, não de bounce detector. BOUNCE_DROP_MIN pode ser reduzido "
+                "para 0.10–0.15 como experimento, mas pode não capturar esses tokens de forma confiável."
+            )
+        else:
+            conclusao = (
+                f"📉 {pct_below_20:.0f}% dos tokens caem menos de 20% antes de subir. "
+                "RECOMENDAÇÃO: Reduzir BOUNCE_DROP_MIN de 0.30 para 0.15–0.20 para capturar "
+                "esses tokens. Avaliar o impacto no WR com n≥30 bounces."
+            )
+    elif pct_below_30 >= 50:
+        conclusao = (
+            f"📊 {pct_below_30:.0f}% dos tokens caem entre 0–30% antes de subir. "
+            "RECOMENDAÇÃO: Reduzir BOUNCE_DROP_MIN para 0.20–0.25 pode capturar mais tokens "
+            "sem comprometer muito a qualidade do sinal. Avaliar com n≥30."
+        )
+    else:
+        conclusao = (
+            f"✅ {dist['>30%']['pct']:.0f}% dos tokens caem >30% antes de subir. "
+            "BOUNCE_DROP_MIN=0.30 parece calibrado corretamente para esta janela de dados."
+        )
+
+    # HTML
+    BRT = __import__("zoneinfo", fromlist=["ZoneInfo"]).ZoneInfo("America/Sao_Paulo")
+
+    h = """<!DOCTYPE html><html><head>
+<meta charset='utf-8'><title>Drop Real — NeideBOT</title>
+<style>
+  body{background:#0d1117;color:#e6edf3;font-family:monospace;font-size:12px;padding:16px;margin:0}
+  h2{color:#58a6ff;margin:0 0 4px}
+  .sub{color:#8b949e;font-size:11px;margin:0 0 12px}
+  .conclusao{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px 16px;margin-bottom:16px;color:#fbbf24;font-size:13px}
+  .dist-table{border-collapse:collapse;margin-bottom:24px}
+  .dist-table th{background:#161b22;color:#8b949e;padding:6px 12px;text-align:left;border-bottom:1px solid #30363d;font-size:11px}
+  .dist-table td{padding:5px 12px;border-bottom:1px solid #21262d}
+  .bar{display:inline-block;height:10px;background:#58a6ff;border-radius:2px;vertical-align:middle;margin-right:6px}
+  table{border-collapse:collapse;width:100%}
+  th{background:#161b22;color:#8b949e;padding:6px 8px;text-align:left;position:sticky;top:0;font-size:11px;border-bottom:1px solid #30363d}
+  td{padding:5px 8px;border-bottom:1px solid #21262d;vertical-align:top;white-space:nowrap}
+  tr:hover td{background:#161b22}
+  a{color:#58a6ff;text-decoration:none}
+  .dim{color:#475569}
+  .section{color:#58a6ff;margin:16px 0 6px;font-size:13px;font-weight:bold}
+</style></head><body>
+"""
+    h += f"<h2>📉 Drop Real Pré-Bounce (últimas {hours}h)</h2>"
+    h += (f"<p class='sub'>"
+          f"Tokens SEM bounce_signals · que subiram ≥20% · com ticks nos primeiros 20min · "
+          f"{n_total} com dados / {total_eligible} elegíveis totais / {n_no_ticks} sem ticks · "
+          f"<a href='?hours=24'>24h</a> · <a href='?hours=48'>48h</a> · <a href='?hours=72'>72h</a>"
+          f"</p>")
+
+    h += f"<div class='conclusao'>{conclusao}</div>"
+
+    h += "<p class='section'>Distribuição de drops (primeiros 20min pós-migração)</p>"
+    h += "<table class='dist-table'>"
+    h += "<tr><th>Faixa de Drop</th><th>n tokens</th><th>% do total</th><th>Gain médio</th><th>Visualização</th></tr>"
+
+    max_n = max((v["n"] for v in dist.values()), default=1) or 1
+    for label, lo, hi in faixas:
+        d = dist[label]
+        bar_w = int(d["n"] / max_n * 200)
+        color = "#4ade80" if hi <= 0.20 else "#fbbf24" if hi <= 0.30 else "#f87171"
+        h += "<tr>"
+        h += f"<td style='color:{color}'>{label}</td>"
+        h += f"<td><b>{d['n']}</b></td>"
+        h += f"<td>{d['pct']:.1f}%</td>"
+        h += f"<td>{d['avg_gain']:+.0%}</td>" if d["avg_gain"] else "<td class='dim'>—</td>"
+        h += f"<td><span class='bar' style='width:{bar_w}px;background:{color}'></span>{d['pct']:.0f}%</td>"
+        h += "</tr>"
+
+    h += f"<tr style='color:#8b949e;font-size:11px'>"
+    h += f"<td>TOTAL</td><td><b>{n_total}</b></td><td>100%</td><td></td><td></td></tr>"
+    h += "</table>"
+
+    h += "<p class='section'>Tokens individuais</p>"
+    h += "<table>"
+    h += ("<tr><th>Token</th><th>Hora Mig</th><th>MC Mig</th>"
+          "<th>MC Min 20m</th><th>Drop %</th><th>MC Peak</th>"
+          "<th>Gain %</th><th>⏱ Peak</th><th>Links</th></tr>")
+
+    # Ordena por drop_pct crescente (menor drop primeiro — os que o bot está perdendo)
+    sorted_rows = sorted(rows_with_data, key=lambda r: r["drop_pct"])
+    # Também inclui rows sem ticks no final
+    no_tick_rows = [r for r in rows if r["drop_pct"] is None]
+
+    for r in sorted_rows + no_tick_rows:
+        ts = r.get("ts_migration")
+        dt = ts.astimezone(BRT).strftime("%d/%m %H:%M") if ts else "—"
+        nome = r.get("token_nome") or r["mint"][:8]
+        mc_mig = r.get("mc_migration") or 0
+        mc_min = r.get("mc_min_early") or 0
+        drop = r.get("drop_pct")
+        mc_peak = r.get("mc_peak") or 0
+        gain = r.get("gain_pct") or 0
+        ttp = r.get("time_to_peak")
+        mint = r["mint"]
+
+        drop_color = "#4ade80" if drop is not None and drop < 0.20 else \
+                     "#fbbf24" if drop is not None and drop < 0.30 else "#f87171"
+        gain_color = "#4ade80" if gain >= 0.5 else "#fbbf24" if gain >= 0.2 else "#94a3b8"
+
+        h += "<tr>"
+        h += f"<td>{nome}</td>"
+        h += f"<td class='dim'>{dt}</td>"
+        h += f"<td>${mc_mig:,.0f}</td>"
+        h += f"<td>${mc_min:,.0f}</td>" if mc_min > 0 else "<td class='dim'>sem ticks</td>"
+        h += f"<td style='color:{drop_color}'>{drop:.1%}</td>" if drop is not None else "<td class='dim'>—</td>"
+        h += f"<td>${mc_peak:,.0f}</td>" if mc_peak > 0 else "<td class='dim'>—</td>"
+        h += f"<td style='color:{gain_color}'>{gain:+.0%}</td>"
+        h += f"<td>{ttp:.1f}m</td>" if ttp is not None else "<td class='dim'>—</td>"
+        gmgn = f"https://gmgn.ai/sol/token/{mint}"
+        dex  = f"https://dexscreener.com/solana/{mint}"
+        h += f"<td><a href='{gmgn}' target='_blank'>gmgn</a> <a href='{dex}' target='_blank'>dex</a></td>"
+        h += "</tr>"
+
+    h += "</table>"
+    h += ("<p style='color:#475569;font-size:10px;margin-top:16px'>"
+          "Drop calculado com LEAST(mc, mc_low) nos token_ticks entre ts_migration+90s e ts_migration+20min. "
+          "Tokens sem ticks nessa janela aparecem no final como 'sem ticks'. "
+          "Apenas tokens SEM bounce_signals (bot não disparou) e com mc_peak ≥ mc_migration×1.20."
+          "</p>")
+    h += "</body></html>"
+    return h
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
 
