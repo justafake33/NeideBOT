@@ -48950,6 +48950,188 @@ def analise_filtros_simples():
     return h
 
 
+@app.route("/analise/sem-bounce")
+def analise_sem_bounce():
+    """
+    Tokens sem bounce signal nas últimas N horas.
+    Para cada um: mc_peak, time_to_peak, pct_gain, padrão (momentum vs morreu).
+    ?hours=48 (padrão)
+    """
+    hours = int(request.args.get("hours", 48))
+
+    import psycopg2
+    import psycopg2.extras
+    conn = psycopg2.connect(db.DATABASE_URL)
+    conn.autocommit = True
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Tokens sem bounce_signals, com mc_peak calculado via token_ticks
+            cur.execute("""
+                WITH no_bounce AS (
+                    SELECT m.mint, m.token_nome, m.ts_migration, m.mc_migration,
+                           m.mc_peak, m.time_to_peak, m.mc_bottom, m.time_to_bottom,
+                           m.mc_1h, m.exchange, m.smart_wallets
+                    FROM migrations m
+                    LEFT JOIN bounce_signals bs ON bs.mint = m.mint
+                    WHERE m.ts_migration >= NOW() - INTERVAL %(hours)s
+                      AND bs.mint IS NULL
+                      AND m.mc_migration > 0
+                ),
+                -- mc_peak via token_ticks quando migrations.mc_peak é null
+                ticks_peak AS (
+                    SELECT tt.mint,
+                           MAX(tt.mc) AS tick_peak,
+                           EXTRACT(EPOCH FROM (
+                               MIN(tt.tick_ts) FILTER (WHERE tt.mc = MAX(tt.mc) OVER (PARTITION BY tt.mint))
+                               - m.ts_migration
+                           )) / 60.0 AS tick_time_to_peak
+                    FROM token_ticks tt
+                    JOIN migrations m ON m.mint = tt.mint
+                    WHERE m.ts_migration >= NOW() - INTERVAL %(hours)s
+                      AND tt.tick_ts > m.ts_migration + INTERVAL '90 seconds'
+                    GROUP BY tt.mint
+                ),
+                -- volume nos primeiros 5 min via ticks
+                early_vol AS (
+                    SELECT tt.mint,
+                           COUNT(*) AS tick_count_5m,
+                           MAX(tt.mc) AS mc_peak_5m
+                    FROM token_ticks tt
+                    JOIN migrations m ON m.mint = tt.mint
+                    WHERE m.ts_migration >= NOW() - INTERVAL %(hours)s
+                      AND tt.tick_ts BETWEEN m.ts_migration + INTERVAL '90 seconds'
+                                         AND m.ts_migration + INTERVAL '5 minutes'
+                    GROUP BY tt.mint
+                )
+                SELECT nb.*,
+                       COALESCE(nb.mc_peak, tp.tick_peak) AS peak_used,
+                       COALESCE(nb.time_to_peak, tp.tick_time_to_peak) AS ttp_used,
+                       tp.tick_peak, tp.tick_time_to_peak,
+                       ev.mc_peak_5m, ev.tick_count_5m
+                FROM no_bounce nb
+                LEFT JOIN ticks_peak tp ON tp.mint = nb.mint
+                LEFT JOIN early_vol ev ON ev.mint = nb.mint
+                ORDER BY nb.ts_migration DESC
+            """, {"hours": f"{hours} hours"})
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    BRT = timezone(timedelta(hours=-3))
+
+    # Classifica padrão por token
+    def classify(r):
+        mc_mig  = r["mc_migration"] or 0
+        peak    = r["peak_used"] or 0
+        ttp     = r["ttp_used"]        # minutos até o pico
+        peak_5m = r["mc_peak_5m"] or 0
+
+        if mc_mig <= 0:
+            return "sem dados", "#475569"
+
+        gain = (peak - mc_mig) / mc_mig if peak > mc_mig else 0
+
+        if peak_5m > mc_mig * 1.30 and (ttp is None or ttp <= 10):
+            return f"🚀 momentum +{gain:.0%}", "#4ade80"
+        elif gain >= 0.50:
+            return f"📈 subiu +{gain:.0%} (lento)", "#a78bfa"
+        elif gain >= 0.10:
+            return f"↗ pequeno +{gain:.0%}", "#fbbf24"
+        elif gain <= 0.05 or peak <= 0:
+            return "💀 morreu flat", "#64748b"
+        else:
+            return f"➡ lateral +{gain:.0%}", "#94a3b8"
+
+    # Agrega estatísticas
+    momentum = flat = slow_up = small_up = lateral = 0
+    for r in rows:
+        label, _ = classify(r)
+        if "🚀" in label: momentum += 1
+        elif "💀" in label: flat += 1
+        elif "📈" in label: slow_up += 1
+        elif "↗" in label: small_up += 1
+        else: lateral += 1
+
+    total = len(rows)
+
+    h = """<!DOCTYPE html><html><head>
+<meta charset='utf-8'><title>Sem Bounce — NeideBOT</title>
+<style>
+  body{background:#0d1117;color:#e6edf3;font-family:monospace;font-size:12px;padding:16px;margin:0}
+  h2{color:#58a6ff;margin:0 0 4px}
+  .sub{color:#8b949e;font-size:11px;margin:0 0 12px}
+  .stats{display:flex;gap:16px;flex-wrap:wrap;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px 16px;margin-bottom:16px}
+  .stat{text-align:center}
+  .stat .v{font-size:22px;font-weight:700}
+  .stat .l{font-size:10px;color:#8b949e;text-transform:uppercase}
+  table{border-collapse:collapse;width:100%}
+  th{background:#161b22;color:#8b949e;padding:6px 8px;text-align:left;position:sticky;top:0;font-size:11px;border-bottom:1px solid #30363d}
+  td{padding:5px 8px;border-bottom:1px solid #21262d;vertical-align:top;white-space:nowrap}
+  tr:hover td{background:#161b22}
+  a{color:#58a6ff;text-decoration:none}
+  .dim{color:#475569}
+</style></head><body>
+"""
+    h += f"<h2>🔕 Tokens Sem Bounce — últimas {hours}h</h2>"
+    h += f"<p class='sub'>{total} tokens passaram filtros de migração mas nunca dispararam bounce · "
+    h += f"<a href='?hours=24'>24h</a> · <a href='?hours=48'>48h</a> · <a href='?hours=72'>72h</a></p>"
+
+    # Bloco de stats
+    h += "<div class='stats'>"
+    h += f"<div class='stat'><div class='v' style='color:#4ade80'>{momentum}</div><div class='l'>🚀 momentum</div></div>"
+    h += f"<div class='stat'><div class='v' style='color:#a78bfa'>{slow_up}</div><div class='l'>📈 subiu lento</div></div>"
+    h += f"<div class='stat'><div class='v' style='color:#fbbf24'>{small_up}</div><div class='l'>↗ pequeno</div></div>"
+    h += f"<div class='stat'><div class='v' style='color:#94a3b8'>{lateral}</div><div class='l'>➡ lateral</div></div>"
+    h += f"<div class='stat'><div class='v' style='color:#475569'>{flat}</div><div class='l'>💀 morreu</div></div>"
+    if total > 0:
+        pct_mom = momentum / total * 100
+        h += f"<div class='stat'><div class='v' style='color:#4ade80'>{pct_mom:.0f}%</div><div class='l'>% momentum</div></div>"
+    h += "</div>"
+
+    h += "<table>"
+    h += "<tr><th>Token</th><th>Hora</th><th>MC mig</th><th>Peak</th><th>+% mig</th><th>⏱ peak</th><th>Peak 5min</th><th>smart</th><th>Padrão</th><th>Links</th></tr>"
+
+    for r in rows:
+        ts  = r.get("ts_migration")
+        dt  = ts.astimezone(BRT).strftime("%d/%m %H:%M") if ts else "—"
+        nome = r.get("token_nome") or r["mint"][:8]
+        mc_mig  = r.get("mc_migration") or 0
+        peak    = r.get("peak_used") or 0
+        ttp     = r.get("ttp_used")
+        peak_5m = r.get("mc_peak_5m") or 0
+        smart   = r.get("smart_wallets") or 0
+        mint    = r["mint"]
+
+        gain = (peak - mc_mig) / mc_mig if peak > mc_mig and mc_mig > 0 else 0
+        gain_5m = (peak_5m - mc_mig) / mc_mig if peak_5m > mc_mig and mc_mig > 0 else 0
+
+        label, color = classify(r)
+
+        h += "<tr>"
+        h += f"<td>{nome}</td>"
+        h += f"<td class='dim'>{dt}</td>"
+        h += f"<td>${mc_mig:,.0f}</td>"
+        h += f"<td>${peak:,.0f}</td>" if peak > 0 else "<td class='dim'>—</td>"
+        h += f"<td style='color:{'#4ade80' if gain>=0.5 else '#fbbf24' if gain>=0.1 else '#475569'}'>{gain:+.0%}</td>"
+        h += f"<td>{ttp:.1f}m</td>" if ttp is not None else "<td class='dim'>—</td>"
+        h += f"<td style='color:{'#4ade80' if gain_5m>=0.3 else '#fbbf24' if gain_5m>=0.1 else '#475569'}'>{gain_5m:+.0%}</td>" if peak_5m > 0 else "<td class='dim'>—</td>"
+        h += f"<td>{smart}</td>"
+        h += f"<td style='color:{color}'>{label}</td>"
+        gmgn = f"https://gmgn.ai/sol/token/{mint}"
+        dex  = f"https://dexscreener.com/solana/{mint}"
+        h += f"<td><a href='{gmgn}' target='_blank'>gmgn</a> <a href='{dex}' target='_blank'>dex</a></td>"
+        h += "</tr>"
+
+    h += "</table>"
+
+    if total == 0:
+        h += "<p style='color:#475569;margin-top:16px'>Nenhum token sem bounce no período.</p>"
+
+    h += "<p style='color:#475569;font-size:10px;margin-top:16px'>Peak via migrations.mc_peak ou MAX(token_ticks.mc) após 90s. Peak 5min = MAX(ticks) nos primeiros 5min.</p>"
+    h += "</body></html>"
+    return h
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
 
