@@ -48628,31 +48628,35 @@ def analise_filtros_simples():
     """
     hours = int(request.args.get("hours", 24))
 
-    # Configs ativas (lidas do env — mesmas do scanner/executor)
+    # Configs ativas — defaults espelham Railway exato do worker.
     cfg = {
-        "smart_min":    int(os.getenv("FILTER_SMART_MIN",    "2")),
-        "rug_max":      float(os.getenv("FILTER_RUG_MAX",    "0.50")),
-        "bundler_max":  float(os.getenv("FILTER_BUNDLER_MAX","0.60")),
-        "bot_max":      float(os.getenv("FILTER_BOT_MAX",    "0.80")),
-        "sniper_max":   float(os.getenv("FILTER_SNIPER_MAX", "0.10")),
-        "rat_max":      float(os.getenv("FILTER_RAT_MAX",    "0.20")),
-        "top10_max":    float(os.getenv("FILTER_TOP10_MAX",  "0.80")),
-        "wash_block":   os.getenv("FILTER_WASH_BLOCK",       "true").lower() == "true",
-        "mc_min":       float(os.getenv("FILTER_MC_MIN",     "5000")),
-        "mc_max":       float(os.getenv("FILTER_MC_MAX",     "200000")),
-        "liq_min":      float(os.getenv("FILTER_LIQ_MIN",   "10000")),
-        "fee_min":      float(os.getenv("FILTER_FEE_MIN",   "1.0")),
-        "pump_only":    os.getenv("FILTER_PUMP_ONLY",        "true").lower() == "true",
+        "smart_min":      int(os.getenv("FILTER_SMART_MIN",         "1")),
+        "rug_max":        float(os.getenv("FILTER_RUG_MAX",         "0.40")),
+        "bundler_max":    float(os.getenv("FILTER_BUNDLER_MAX",     "0.50")),
+        "bot_max":        float(os.getenv("FILTER_BOT_MAX",         "0.60")),
+        "sniper_max":     float(os.getenv("FILTER_SNIPER_MAX",      "0.10")),
+        "rat_max":        float(os.getenv("FILTER_RAT_MAX",         "0.20")),
+        "top10_max":      float(os.getenv("FILTER_TOP10_MAX",       "0.70")),
+        "wash_block":     os.getenv("FILTER_WASH_BLOCK",            "true").lower() == "true",
+        "mc_min":         float(os.getenv("FILTER_MC_MIN",          "5000")),
+        "mc_max":         float(os.getenv("FILTER_MC_MAX",          "85000")),
+        "liq_min":        float(os.getenv("FILTER_LIQ_MIN",         "10000")),
+        "fee_min":        float(os.getenv("FILTER_FEE_MIN",         "1.0")),
+        "pump_only":      os.getenv("FILTER_PUMP_ONLY",             "true").lower() == "true",
         # bounce
-        "drop_min":     float(os.getenv("BOUNCE_DROP_MIN",   "0.30")),
-        "bounce_min":   float(os.getenv("BOUNCE_MIN_PCT",    "0.30")),
-        "bounce_max":   float(os.getenv("BOUNCE_MAX_PCT",    "9.99")),
-        "time_max":     float(os.getenv("BOUNCE_TIME_MAX",   "20.0")),
-        "freshness":    int(os.getenv("BOTTOM_FRESHNESS_SEC","300")),
+        "drop_min":       float(os.getenv("BOUNCE_DROP_MIN",        "0.30")),
+        "bounce_min":     float(os.getenv("BOUNCE_MIN_PCT",         "0.10")),
+        "bounce_max":     float(os.getenv("BOUNCE_MAX_PCT",         "1.00")),
+        "time_max":       float(os.getenv("BOUNCE_TIME_MAX",        "20.0")),
+        "freshness":      int(os.getenv("BOTTOM_FRESHNESS_SEC",     "600")),
+        "pool_bounce_min": float(os.getenv("POOL_MIN_SOL_BOUNCE",   "20")),
         # trade gate
-        "pool_min":     float(os.getenv("TRADE_MIN_POOL_SOL","40")),
-        "net_flow_min": float(os.getenv("TRADE_MIN_NET_SOL_FLOW","-5")),
-        "elapsed_max":  int(os.getenv("TRADE_MAX_ELAPSED_SEC","300")),
+        "pool_min":       float(os.getenv("TRADE_MIN_POOL_SOL",     "40")),
+        "net_flow_min":   float(os.getenv("TRADE_MIN_NET_SOL_FLOW", "-999")),
+        "elapsed_max":    int(os.getenv("TRADE_MAX_ELAPSED_SEC",    "900")),
+        "gate_enabled":   os.getenv("TRADE_GATE_ENABLED",           "true").lower() == "true",
+        "require_helius": os.getenv("TRADE_REQUIRE_HELIUS_FEATURES","true").lower() == "true",
+        "require_h23":    os.getenv("TRADE_REQUIRE_H23_BOTTOM",     "true").lower() == "true",
     }
 
     import psycopg2
@@ -48738,19 +48742,25 @@ def analise_filtros_simples():
     # Config box
     h += "<div class='cfg'>"
     cfg_items = [
-        ("smart≥", cfg["smart_min"]),
-        ("rug≤", f"{cfg['rug_max']:.0%}"),
-        ("bundler≤", f"{cfg['bundler_max']:.0%}"),
-        ("sniper≤", f"{cfg['sniper_max']:.0%}"),
-        ("top10≤", f"{cfg['top10_max']:.0%}"),
-        ("rat≤", f"{cfg['rat_max']:.0%}"),
-        ("liq≥", f"${cfg['liq_min']:,.0f}"),
-        ("fee≥", f"{cfg['fee_min']}SOL"),
-        ("drop≥", f"{cfg['drop_min']:.0%}"),
-        ("bounce≥", f"{cfg['bounce_min']:.0%}"),
-        ("time≤", f"{cfg['time_max']:.0f}min"),
-        ("pool≥", f"{cfg['pool_min']}SOL"),
-        ("net_flow≥", f"{cfg['net_flow_min']}SOL"),
+        ("smart≥",      cfg["smart_min"]),
+        ("rug≤",        f"{cfg['rug_max']:.0%}"),
+        ("bundler≤",    f"{cfg['bundler_max']:.0%}"),
+        ("bot≤",        f"{cfg['bot_max']:.0%}"),
+        ("sniper≤",     f"{cfg['sniper_max']:.0%}"),
+        ("top10≤",      f"{cfg['top10_max']:.0%}"),
+        ("rat≤",        f"{cfg['rat_max']:.0%}"),
+        ("MC≤",         f"${cfg['mc_max']:,.0f}"),
+        ("liq≥",        f"${cfg['liq_min']:,.0f}"),
+        ("drop≥",       f"{cfg['drop_min']:.0%}"),
+        ("bounce",      f"{cfg['bounce_min']:.0%}–{cfg['bounce_max']:.0%}"),
+        ("time≤",       f"{cfg['time_max']:.0f}min"),
+        ("fresh≤",      f"{cfg['freshness']}s"),
+        ("pool(bou)≥",  f"{cfg['pool_bounce_min']}SOL"),
+        ("pool(trd)≥",  f"{cfg['pool_min']}SOL"),
+        ("net_flow≥",   "OFF" if cfg['net_flow_min'] <= -500 else f"{cfg['net_flow_min']}SOL"),
+        ("elapsed≤",    f"{cfg['elapsed_max']}s"),
+        ("h23",         "req" if cfg['require_h23'] else "opt"),
+        ("helius",      "req" if cfg['require_helius'] else "opt"),
     ]
     for k, v in cfg_items:
         h += f"<div class='cfg-item'>{k} <span>{v}</span></div>"
@@ -48771,12 +48781,13 @@ def analise_filtros_simples():
     h += "<th title='FILTER_TOP10_MAX'>top10</th>"
     h += "<th title='FILTER_WASH_BLOCK'>wash</th>"
     # Bounce
-    h += "<th>drop</th>"
-    h += "<th>bounce</th>"
-    h += "<th>⏱min</th>"
+    h += "<th title='drop_from_mig ≥ BOUNCE_DROP_MIN'>drop</th>"
+    h += "<th title='BOUNCE_MIN_PCT–BOUNCE_MAX_PCT'>bounce</th>"
+    h += "<th title='BOUNCE_TIME_MAX'>⏱min</th>"
+    h += "<th title='POOL_MIN_SOL_BOUNCE (no bounce)'>pool(b)</th>"
     # Trade gate
-    h += "<th>pool</th>"
-    h += "<th>net</th>"
+    h += "<th title='TRADE_MIN_POOL_SOL (no trade)'>pool(t)</th>"
+    h += "<th title='TRADE_MIN_NET_SOL_FLOW'>net</th>"
     # Resultado
     h += "<th>Trade</th>"
     h += "</tr>"
@@ -48853,29 +48864,33 @@ def analise_filtros_simples():
 
         # --- Bounce ---
         if not mig_pass:
-            # Token filtrado antes do bounce — cells cinza
-            h += "<td class='skip' colspan='5'>— filtrado na migração</td>"
+            h += "<td class='skip' colspan='6'>— filtrado na migração</td>"
         elif bounce_ts is None:
-            # Passou migração mas bounce nunca disparou
-            h += "<td class='skip'>sem sinal</td>" * 5
+            h += "<td class='skip'>sem sinal</td>" * 6
         else:
             ok_drop   = (drop_mig or 0) >= cfg["drop_min"]
-            ok_bounce = (b_pct or 0) >= cfg["bounce_min"]
+            ok_bounce = cfg["bounce_min"] <= (b_pct or 0) <= cfg["bounce_max"]
             ok_time   = (b_elapsed or 9999) / 60 <= cfg["time_max"]
+            ok_pbounce = pool_sig is None or pool_sig >= cfg["pool_bounce_min"]
 
-            h += cell(ok_drop,   f"{(drop_mig or 0):.0%}")
-            h += cell(ok_bounce, f"{(b_pct or 0):.0%}")
-            h += cell(ok_time,   f"{(b_elapsed or 0)/60:.1f}m")
+            h += cell(ok_drop,    f"{(drop_mig or 0):.0%}")
+            h += cell(ok_bounce,  f"{(b_pct or 0):.0%}")
+            h += cell(ok_time,    f"{(b_elapsed or 0)/60:.1f}m")
+            h += cell(ok_pbounce, f"{pool_sig:.0f}S" if pool_sig is not None else "—")
 
-            # Trade gate
+            # Trade gate — pool_min
             if pool_sig is None:
-                h += "<td class='skip'>sem erpc</td>"
+                h += "<td class='skip'>—</td>"
             else:
                 ok_pool = pool_sig >= cfg["pool_min"]
                 h += cell(ok_pool, f"{pool_sig:.0f}")
 
+            # net_flow — informativo quando desativado
             if net_flow is None:
                 h += "<td class='skip'>—</td>"
+            elif cfg["net_flow_min"] <= -500:
+                color = "#4ade80" if net_flow >= 0 else "#fbbf24" if net_flow >= -10 else "#f87171"
+                h += f"<td style='color:{color}'>{net_flow:+.1f}</td>"
             else:
                 ok_net = net_flow > cfg["net_flow_min"]
                 h += cell(ok_net, f"{net_flow:+.1f}")
