@@ -49377,97 +49377,22 @@ def analise_drop_real():
     return h
 
 
+
 @app.route("/analise/holders")
 def analise_holders():
-    """Analisa holders_count na migração vs performance real medida nos token_ticks."""
+    """
+    Analisa variação de holders entre migração → fundo → bounce.
+    Pergunta central: acumulação durante o dump prediz recovery?
+    """
     days = int(request.args.get("days", 30))
+    min_ticks = int(request.args.get("min_ticks", 5))
 
-    # Ganho máximo real medido nos token_ticks dentro da janela quente (60min).
-    # mc_low e mc são os campos disponíveis por tick; usamos o MAX de ambos como pico.
-    # Entry = mc_migration (como o token entrou no mercado).
-    sql_agg = """
+    sql = """
         WITH migs AS (
-            SELECT m.mint, m.token_nome, m.holders_count, m.mc_migration, m.ts_migration,
-                   CASE
-                       WHEN m.holders_count < 30   THEN 'a_menos30'
-                       WHEN m.holders_count < 60   THEN 'b_30a60'
-                       WHEN m.holders_count < 100  THEN 'c_60a100'
-                       WHEN m.holders_count < 200  THEN 'd_100a200'
-                       WHEN m.holders_count < 500  THEN 'e_200a500'
-                       ELSE                             'f_500mais'
-                   END AS bucket,
-                   bs.mint IS NOT NULL             AS had_bounce,
-                   t.status                        AS trade_status
-            FROM migrations m
-            LEFT JOIN bounce_signals bs ON bs.mint = m.mint
-            LEFT JOIN LATERAL (
-                SELECT status FROM trades
-                WHERE mint = m.mint
-                ORDER BY ts_signal DESC LIMIT 1
-            ) t ON TRUE
-            WHERE m.ts_migration >= NOW() - INTERVAL '%(days)s days'
-              AND m.holders_count IS NOT NULL AND m.holders_count > 0
-              AND m.mc_migration > 0
-        ),
-        tick_peaks AS (
-            -- pico real medido nos ticks dentro da janela quente (90s–60min)
-            SELECT tt.mint,
-                   MAX(GREATEST(
-                       COALESCE(NULLIF(tt.mc_high, 0), 0),
-                       COALESCE(NULLIF(tt.mc, 0), 0)
-                   )) AS mc_peak_ticks,
-                   MIN(CASE WHEN COALESCE(NULLIF(tt.mc_low,0), tt.mc) > 0
-                            THEN COALESCE(NULLIF(tt.mc_low,0), tt.mc) END) AS mc_min_ticks,
-                   COUNT(*) AS n_ticks
-            FROM token_ticks tt
-            JOIN migs m ON m.mint = tt.mint
-            WHERE tt.tick_ts BETWEEN m.ts_migration + INTERVAL '90 seconds'
-                                 AND m.ts_migration + INTERVAL '70 minutes'
-            GROUP BY tt.mint
-        ),
-        with_gain AS (
-            SELECT m.*,
-                   tp.mc_peak_ticks,
-                   tp.mc_min_ticks,
-                   tp.n_ticks,
-                   CASE WHEN tp.mc_peak_ticks > 0 AND m.mc_migration > 0
-                        THEN (tp.mc_peak_ticks - m.mc_migration) / m.mc_migration
-                        ELSE NULL END AS gain_pct,
-                   CASE WHEN tp.mc_min_ticks > 0 AND m.mc_migration > 0
-                        THEN (m.mc_migration - tp.mc_min_ticks) / m.mc_migration
-                        ELSE NULL END AS drop_pct
-            FROM migs m
-            LEFT JOIN tick_peaks tp ON tp.mint = m.mint
-        )
-        SELECT
-            bucket,
-            COUNT(*)                                                             AS n_total,
-            COUNT(*) FILTER (WHERE n_ticks > 0)                                 AS n_com_ticks,
-            COUNT(*) FILTER (WHERE gain_pct >= 0.20)                            AS n_20,
-            COUNT(*) FILTER (WHERE gain_pct >= 0.50)                            AS n_50,
-            COUNT(*) FILTER (WHERE gain_pct >= 0.75)                            AS n_75,
-            COUNT(*) FILTER (WHERE gain_pct >= 1.00)                            AS n_100,
-            COUNT(*) FILTER (WHERE gain_pct >= 2.00)                            AS n_200,
-            COUNT(*) FILTER (WHERE gain_pct >= 5.00)                            AS n_500,
-            COUNT(*) FILTER (WHERE had_bounce)                                  AS n_bounce,
-            COUNT(*) FILTER (WHERE trade_status IN ('tp','tp_hit'))             AS n_tp_trade,
-            COUNT(*) FILTER (WHERE trade_status IN ('sl','sl_hit'))             AS n_sl_trade,
-            ROUND(AVG(holders_count))                                           AS avg_holders,
-            ROUND((AVG(gain_pct) FILTER (WHERE gain_pct IS NOT NULL))::numeric * 100, 1) AS avg_gain_pct,
-            ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY gain_pct))::numeric * 100, 1) AS median_gain_pct,
-            ROUND(MAX(gain_pct)::numeric * 100, 0)                              AS max_gain_pct,
-            ROUND((AVG(drop_pct) FILTER (WHERE drop_pct IS NOT NULL))::numeric * 100, 1) AS avg_drop_pct
-        FROM with_gain
-        GROUP BY bucket
-        ORDER BY bucket
-    """ % {"days": days}
-
-    # Tabela de tokens individuais (ticks) para inspeção
-    sql_detail = """
-        WITH migs AS (
-            SELECT m.mint, m.token_nome, m.holders_count, m.mc_migration, m.ts_migration,
-                   bs.mint IS NOT NULL AS had_bounce,
-                   t.status           AS trade_status
+            SELECT m.mint, m.token_nome, m.holders_count AS h_mig,
+                   m.mc_migration, m.ts_migration,
+                   bs.ts_signal, bs.mc_at_signal, bs.bounce_pct,
+                   t.status AS trade_status
             FROM migrations m
             LEFT JOIN bounce_signals bs ON bs.mint = m.mint
             LEFT JOIN LATERAL (
@@ -49478,202 +49403,261 @@ def analise_holders():
               AND m.holders_count IS NOT NULL AND m.holders_count > 0
               AND m.mc_migration > 0
         ),
-        tick_peaks AS (
-            SELECT tt.mint,
-                   MAX(GREATEST(
-                       COALESCE(NULLIF(tt.mc_high,0),0),
-                       COALESCE(NULLIF(tt.mc,0),0)
-                   )) AS mc_peak_ticks,
-                   COUNT(*) AS n_ticks
+        bottom_tick AS (
+            SELECT DISTINCT ON (tt.mint) tt.mint,
+                   tt.holders_count   AS h_bottom,
+                   tt.mc              AS mc_at_bottom,
+                   tt.tick_ts         AS ts_bottom,
+                   EXTRACT(EPOCH FROM (tt.tick_ts - m.ts_migration)) / 60.0 AS min_since_mig
+            FROM token_ticks tt
+            JOIN migs m ON m.mint = tt.mint
+            WHERE tt.tick_ts BETWEEN m.ts_migration + INTERVAL '90 seconds'
+                                 AND m.ts_migration + INTERVAL '25 minutes'
+              AND tt.mc > 0
+              AND tt.holders_count IS NOT NULL
+            ORDER BY tt.mint, COALESCE(NULLIF(tt.mc_low,0), tt.mc) ASC, tt.tick_ts ASC
+        ),
+        peak_tick AS (
+            SELECT DISTINCT ON (tt.mint) tt.mint,
+                   tt.holders_count   AS h_peak,
+                   GREATEST(COALESCE(NULLIF(tt.mc_high,0),0), COALESCE(NULLIF(tt.mc,0),0)) AS mc_peak_ticks,
+                   COUNT(*) OVER (PARTITION BY tt.mint) AS n_ticks
             FROM token_ticks tt
             JOIN migs m ON m.mint = tt.mint
             WHERE tt.tick_ts BETWEEN m.ts_migration + INTERVAL '90 seconds'
                                  AND m.ts_migration + INTERVAL '70 minutes'
-            GROUP BY tt.mint
+            ORDER BY tt.mint,
+                     GREATEST(COALESCE(NULLIF(tt.mc_high,0),0), COALESCE(NULLIF(tt.mc,0),0)) DESC
+        ),
+        bounce_tick AS (
+            SELECT DISTINCT ON (tt.mint) tt.mint,
+                   tt.holders_count AS h_bounce
+            FROM token_ticks tt
+            JOIN migs m ON m.mint = tt.mint
+            WHERE m.ts_signal IS NOT NULL
+              AND tt.tick_ts BETWEEN m.ts_signal - INTERVAL '2 minutes'
+                                 AND m.ts_signal + INTERVAL '2 minutes'
+            ORDER BY tt.mint, ABS(EXTRACT(EPOCH FROM (tt.tick_ts - m.ts_signal))) ASC
+        ),
+        combined AS (
+            SELECT m.*,
+                   bt.h_bottom, bt.mc_at_bottom, bt.ts_bottom, bt.min_since_mig AS t_bottom_min,
+                   pt.h_peak,   pt.mc_peak_ticks, pt.n_ticks,
+                   bnt.h_bounce,
+                   bt.h_bottom  - m.h_mig    AS delta_mig_to_bottom,
+                   pt.h_peak    - bt.h_bottom AS delta_bottom_to_peak,
+                   bnt.h_bounce - bt.h_bottom AS delta_bottom_to_bounce,
+                   CASE WHEN pt.mc_peak_ticks > 0 AND m.mc_migration > 0
+                        THEN (pt.mc_peak_ticks - m.mc_migration) / m.mc_migration
+                        ELSE NULL END AS gain_pct,
+                   CASE WHEN bt.mc_at_bottom > 0 AND m.mc_migration > 0
+                        THEN (m.mc_migration - bt.mc_at_bottom) / m.mc_migration
+                        ELSE NULL END AS drop_pct
+            FROM migs m
+            LEFT JOIN bottom_tick bt  ON bt.mint  = m.mint
+            LEFT JOIN peak_tick   pt  ON pt.mint  = m.mint
+            LEFT JOIN bounce_tick bnt ON bnt.mint = m.mint
+            WHERE pt.n_ticks >= %(min_ticks)s OR pt.n_ticks IS NULL
         )
-        SELECT m.mint, m.token_nome, m.holders_count, m.mc_migration, m.ts_migration,
-               tp.mc_peak_ticks, tp.n_ticks,
-               m.had_bounce, m.trade_status,
-               CASE WHEN tp.mc_peak_ticks > 0 AND m.mc_migration > 0
-                    THEN (tp.mc_peak_ticks - m.mc_migration) / m.mc_migration
-                    ELSE NULL END AS gain_pct
-        FROM migs m
-        LEFT JOIN tick_peaks tp ON tp.mint = m.mint
-        WHERE tp.mc_peak_ticks > m.mc_migration * 1.50
-        ORDER BY m.holders_count,
-                 (tp.mc_peak_ticks - m.mc_migration) / NULLIF(m.mc_migration,0) DESC NULLS LAST
-        LIMIT 300
-    """ % {"days": days}
+        SELECT * FROM combined
+        ORDER BY ts_migration DESC
+    """ % {"days": days, "min_ticks": min_ticks}
 
     rows = []
-    total_n = 0
     with db._cursor() as cur:
-        cur.execute(sql_agg)
+        cur.execute(sql)
         rows = cur.fetchall()
-        total_n = sum(r["n_total"] for r in rows)
 
-    detail_rows = []
-    with db._cursor() as cur:
-        cur.execute(sql_detail)
-        detail_rows = cur.fetchall()
+    def bucket_delta(d):
+        if d is None:  return "sem_dado"
+        if d < -10:    return "a_perdeu_muito"
+        if d < 0:      return "b_perdeu_pouco"
+        if d == 0:     return "c_flat"
+        if d <= 10:    return "d_ganhou_pouco"
+        if d <= 30:    return "e_ganhou_medio"
+        return         "f_ganhou_muito"
 
-    bucket_labels = {
-        "a_menos30": "< 30 holders",
-        "b_30a60":   "30 – 60",
-        "c_60a100":  "60 – 100",
-        "d_100a200": "100 – 200",
-        "e_200a500": "200 – 500",
-        "f_500mais": "500+",
+    bucket_label = {
+        "a_perdeu_muito":  "▼ Perdeu >10 holders no dump",
+        "b_perdeu_pouco":  "▼ Perdeu 1–10 holders no dump",
+        "c_flat":          "→ Holders estáveis no dump",
+        "d_ganhou_pouco":  "▲ Ganhou 1–10 holders no dump",
+        "e_ganhou_medio":  "▲ Ganhou 11–30 holders no dump",
+        "f_ganhou_muito":  "▲ Ganhou >30 holders no dump",
+        "sem_dado":        "? Sem dado de holders nos ticks",
     }
-    bucket_labels_full = {
-        "a_menos30": "< 30 holders",
-        "b_30a60":   "30 – 60 holders",
-        "c_60a100":  "60 – 100 holders",
-        "d_100a200": "100 – 200 holders",
-        "e_200a500": "200 – 500 holders",
-        "f_500mais": "500+ holders",
+
+    def bucket_h(h):
+        if h is None:  return "sem_dado"
+        if h < 100:    return "a_menos100"
+        if h < 200:    return "b_100_200"
+        if h < 350:    return "c_200_350"
+        if h < 500:    return "d_350_500"
+        return         "e_500mais"
+
+    bucket_h_label = {
+        "a_menos100": "< 100 holders",
+        "b_100_200":  "100 – 200 holders",
+        "c_200_350":  "200 – 350 holders",
+        "d_350_500":  "350 – 500 holders",
+        "e_500mais":  "500+ holders",
+        "sem_dado":   "Sem dado",
     }
-    bucket_desc = {
-        "a_menos30": "Token sem adoção — pouquíssimas carteiras",
-        "b_30a60":   "Early adopters apenas",
-        "c_60a100":  "Atenção inicial — começa a aparecer no radar",
-        "d_100a200": "Crescimento real — comunidade se formando",
-        "e_200a500": "Tração — interesse genuíno",
-        "f_500mais": "Muito distribuído — pode ser pump coordenado",
-    }
+
+    from collections import defaultdict
+    by_delta = defaultdict(list)
+    by_h     = defaultdict(list)
+    for r in rows:
+        by_delta[bucket_delta(r["delta_mig_to_bottom"])].append(r)
+        by_h[bucket_h(r["h_mig"])].append(r)
+
+    def stats(lst):
+        gains = [float(r["gain_pct"]) for r in lst if r.get("gain_pct") is not None]
+        ntk   = len(gains)
+        n20   = sum(1 for g in gains if g >= 0.20)
+        n75   = sum(1 for g in gains if g >= 0.75)
+        n200  = sum(1 for g in gains if g >= 2.00)
+        avg   = sum(gains)/ntk if ntk else None
+        mx    = max(gains) if gains else None
+        return len(lst), ntk, n20, n75, n200, avg, mx
 
     css = """<style>
         body{font-family:monospace;padding:20px;background:#0d0d0d;color:#e0e0e0}
-        h1{color:#fff}h2{color:#aaa;font-size:.9em;margin-top:28px;letter-spacing:.08em}
-        table{border-collapse:collapse;width:100%;font-size:.82em;margin-top:12px}
-        th{background:#1e1e1e;color:#666;padding:6px 10px;text-align:right;border-bottom:1px solid #2a2a2a;white-space:nowrap}
-        th:first-child{text-align:left}
-        td{padding:5px 10px;border-bottom:1px solid #161616;text-align:right}
-        td:first-child{text-align:left}
-        tr:hover td{background:#151515}
-        .pos{color:#4caf50}.neg{color:#f44336}.neu{color:#666}
-        .best{background:#0d2010!important}
-        .bar{display:inline-block;height:8px;background:#2d6a4f;border-radius:2px;vertical-align:middle;margin-left:4px}
+        h1{color:#fff;margin-bottom:4px}
+        h2{color:#888;font-size:.85em;text-transform:uppercase;letter-spacing:.08em;margin:28px 0 8px}
+        p.sub{color:#555;font-size:.82em;margin:0 0 10px}
+        table{border-collapse:collapse;width:100%;font-size:.82em;margin-top:8px}
+        th{background:#111;color:#555;padding:6px 10px;text-align:right;border-bottom:1px solid #1e1e1e;white-space:nowrap}
+        th:first-child,th:nth-child(2){text-align:left}
+        td{padding:5px 10px;border-bottom:1px solid #141414;text-align:right}
+        td:first-child,td:nth-child(2){text-align:left}
+        tr:hover td{background:#111}
+        .pos{color:#4caf50}.neg{color:#f44336}.neu{color:#555}
+        .best{background:#0a1f10!important}
+        .bar{display:inline-block;height:7px;border-radius:2px;vertical-align:middle;margin-left:3px}
         a{color:#5ab4f0;text-decoration:none}
-        .note{background:#111;border-left:3px solid #5ab4f0;padding:10px 16px;margin:16px 0;font-size:.84em;line-height:1.6}
-        .hdr{color:#888;font-size:.7em;text-transform:uppercase;letter-spacing:.1em}
-        .sep td{background:#0f0f0f;color:#555;font-size:.8em;padding:4px 10px}
+        .note{background:#0f0f1a;border-left:3px solid #5ab4f0;padding:12px 16px;margin:16px 0;font-size:.84em;line-height:1.7}
+        .sep td{background:#080808;color:#444;font-size:.78em;padding:4px 10px;text-align:left!important}
     </style>"""
 
-    h = f"<html><head><meta charset='utf-8'><title>Holders vs Performance</title>{css}</head><body>"
-    h += f"<h1>👥 Holders na migração vs ganho real (token_ticks)</h1>"
-    h += f"<p class='neu'>Últimos {days} dias · {total_n} tokens · pico medido nos token_ticks (90s–60min após migração)</p>"
-    h += "<p>" + " · ".join(f"<a href='?days={d}'>{d}d</a>" for d in [7,14,30,60]) + "</p>"
+    h = f"<html><head><meta charset='utf-8'><title>Holders Dinâmicos</title>{css}</head><body>"
+    h += "<h1>👥 Holders: migração → fundo → bounce</h1>"
+    h += f"<p class='sub'>Últimos {days} dias · {len(rows)} tokens · min_ticks={min_ticks} (ticks com dado de gain)</p>"
+    h += "<p class='sub'>" + " · ".join(f"<a href='?days={d}&min_ticks={min_ticks}'>{d}d</a>" for d in [7,14,30,60])
+    h += " &nbsp;|&nbsp; " + " · ".join(f"<a href='?days={days}&min_ticks={t}'>min_ticks={t}</a>" for t in [1,5,10,20]) + "</p>"
 
-    # Tabela principal
-    thresholds = [("20%", "n_20"), ("50%", "n_50"), ("75%", "n_75"),
-                  ("100%", "n_100"), ("200%", "n_200"), ("500%", "n_500")]
+    def table_rows(by_bk, label_map, order):
+        out = ""
+        best_bk = None
+        best_rate = -1
+        for bk in order:
+            lst = by_bk.get(bk, [])
+            if not lst: continue
+            n, ntk, n20, n75, n200, avg, mx = stats(lst)
+            if ntk >= 10 and (n75/ntk) > best_rate:
+                best_rate = n75/ntk
+                best_bk = bk
 
-    h += "<h2>TAXA DE TOKENS QUE ATINGIRAM CADA GANHO (medido nos ticks)</h2>"
-    cols = "".join(f"<th>+{lbl}</th>" for lbl, _ in thresholds)
-    h += f"<table><tr><th>Faixa de Holders</th><th>Tokens</th><th>Com ticks</th>{cols}<th>Avg gain</th><th>Mediana</th><th>Maior</th><th>Avg drop</th></tr>"
+        for bk in order:
+            lst = by_bk.get(bk, [])
+            if not lst: continue
+            n, ntk, n20, n75, n200, avg, mx = stats(lst)
+            label = label_map.get(bk, bk)
+            r75 = n75/ntk*100 if ntk else 0
+            r20 = n20/ntk*100 if ntk else 0
+            c75 = "#4caf50" if r75>=30 else ("#f5a623" if r75>=15 else "#555")
+            avg_s = f"<span class='{'pos' if avg and avg>0 else 'neg'}'>{avg*100:+.0f}%</span>" if avg is not None else "—"
+            mx_s  = f"<span class='pos'>+{mx*100:.0f}%</span>" if mx else "—"
+            bw    = int(r75*0.7)
+            n_b   = sum(1 for r in lst if r.get("ts_signal"))
+            tr_cls = " class='best'" if bk == best_bk else ""
+            out += (f"<tr{tr_cls}><td><b>{label}</b></td>"
+                    f"<td>{n}</td><td class='neu'>{ntk}</td>"
+                    f"<td class='neu'>{n20}/{ntk} ({r20:.0f}%)</td>"
+                    f"<td style='color:{c75}'><b>{n75}/{ntk} ({r75:.0f}%)</b>"
+                    f"<span class='bar' style='width:{bw}px;background:{c75}'></span></td>"
+                    f"<td class='neu'>{n200}/{ntk}</td>"
+                    f"<td>{avg_s}</td><td>{mx_s}</td><td class='neu'>{n_b}</td></tr>")
+        return out
 
-    # acha melhor faixa por n_75 para highlight
-    best_bk = None
-    best_n75_rate = 0
-    for r in rows:
-        n = r["n_total"]; n75 = r["n_75"] or 0
-        if n >= 10 and n75 / n > best_n75_rate:
-            best_n75_rate = n75 / n
-            best_bk = r["bucket"]
+    header = """<table><tr>
+        <th>Faixa</th><th>Tokens</th><th>Com gain</th>
+        <th>+20%</th><th>+75%</th><th>+200%</th>
+        <th>Avg gain</th><th>Maior</th><th>Bounce</th>
+    </tr>"""
 
-    for r in rows:
-        bk  = r["bucket"]
-        n   = r["n_total"]
-        ntk = r["n_com_ticks"] or 0
-        avg_g = float(r["avg_gain_pct"] or 0)
-        med_g = float(r["median_gain_pct"] or 0)
-        max_g = float(r["max_gain_pct"] or 0)
-        avg_d = float(r["avg_drop_pct"] or 0)
-        label = bucket_labels_full.get(bk, bk)
-        desc  = bucket_desc.get(bk, "")
-        is_best = bk == best_bk
-        tr_cls = " class='best'" if is_best else ""
-
-        cells = ""
-        for lbl, col in thresholds:
-            cnt = r[col] or 0
-            base = ntk if ntk else n
-            rate = cnt / base * 100 if base else 0
-            bar_w = int(rate * 0.8)
-            clr = "#4caf50" if rate >= 30 else ("#f5a623" if rate >= 15 else "#555")
-            cells += f"<td style='color:{clr}'>{cnt}<span style='color:#333'>/</span>{base} <span style='color:{clr};font-size:.85em'>({rate:.0f}%)</span><span class='bar' style='width:{bar_w}px;background:{clr}'></span></td>"
-
-        h += f"<tr{tr_cls}><td><b>{label}</b><br><span style='color:#444;font-size:.78em'>{desc}</span></td>"
-        h += f"<td>{n}</td><td class='neu'>{ntk}</td>"
-        h += cells
-        h += f"<td class='{'pos' if avg_g>0 else 'neg'}'>{avg_g:+.0f}%</td>"
-        h += f"<td class='neu'>{med_g:+.0f}%</td>"
-        h += f"<td class='pos'>{max_g:+.0f}%</td>"
-        h += f"<td class='neu'>{avg_d:.0f}%</td>"
-        h += "</tr>"
+    h += "<h2>VARIAÇÃO DE HOLDERS DURANTE O DUMP (migração → fundo)</h2>"
+    h += "<p class='sub'>Fundo = tick com menor MC nos primeiros 25min. Pergunta: quem acumula durante o dump tem mais ganho?</p>"
+    h += header
+    h += table_rows(by_delta, bucket_label,
+                    ["a_perdeu_muito","b_perdeu_pouco","c_flat","d_ganhou_pouco","e_ganhou_medio","f_ganhou_muito","sem_dado"])
     h += "</table>"
 
-    # Conclusão
+    h += "<h2>HOLDERS NA MIGRAÇÃO (estático) — para comparar</h2>"
+    h += "<p class='sub'>Se o delta acima discriminar mais que essa tabela → o sinal útil é a variação, não o nível.</p>"
+    h += header
+    h += table_rows(by_h, bucket_h_label,
+                    ["a_menos100","b_100_200","c_200_350","d_350_500","e_500mais","sem_dado"])
+    h += "</table>"
+
     h += "<div class='note'>"
-    h += "<b>📊 Leitura dos dados:</b><br>"
-    if best_bk and best_n75_rate > 0:
-        bl = bucket_labels_full.get(best_bk, best_bk)
-        h += f"Faixa com maior proporção de tokens que dobraram (+75%): <b>{bl}</b> ({best_n75_rate*100:.0f}% dos tokens com ticks nessa faixa).<br>"
-    # checa monoticidade (cresce ou cai com holders?)
-    rates_75 = [(r["bucket"], (r["n_75"] or 0) / (r["n_com_ticks"] or r["n_total"] or 1))
-                for r in rows if (r["n_com_ticks"] or r["n_total"] or 0) >= 5]
-    if len(rates_75) >= 3:
-        vals = [v for _, v in rates_75]
-        increasing = all(vals[i] <= vals[i+1] for i in range(len(vals)-1))
-        decreasing = all(vals[i] >= vals[i+1] for i in range(len(vals)-1))
-        if increasing:
-            h += "Tendência clara: <b>mais holders = mais ganho</b>. Considera adicionar FILTER_SMART_MIN-like para holders mínimo.<br>"
-        elif decreasing:
-            h += "Tendência clara: <b>menos holders = mais ganho</b>. Tokens com poucos holders tendem a explodir mais.<br>"
-        else:
-            h += "Sem tendência linear clara. A relação holders→ganho é não-monotônica — holders médios podem ser o sweet spot.<br>"
-    h += "<br><b>Gate:</b> só implementar filtro se diferença ≥ 20pp entre faixas E n_ticks ≥ 30 por faixa."
+    h += "<b>Como ler:</b> compare a variação de WR (+75%) entre as faixas da tabela 1 (dinâmica) vs tabela 2 (estática).<br>"
+    h += "Se 'Ganhou holders no dump' tem WR sistematicamente maior → acumulação é sinal real → candidato a gate.<br>"
+    h += "Gate mínimo: diferença ≥ 20pp entre faixas E n_com_gain ≥ 30 por faixa.<br>"
+    h += "<b>Coluna 'Bounce'</b>: quantos tokens nessa faixa tiveram bounce_signal detectado (o bot considerou comprar)."
     h += "</div>"
 
-    # Tabela de tokens individuais +50%
-    if detail_rows:
-        h += f"<h2>TOKENS QUE SUBIRAM +50% NOS TICKS (últimos {days} dias) — por holders</h2>"
-        h += "<table><tr><th>Token</th><th>Holders</th><th>MC mig</th><th>Pico (ticks)</th><th>Ganho</th><th>Ticks</th><th>Bounce?</th><th>Trade</th><th>Hora</th></tr>"
-        prev_bk = None
-        for r in detail_rows:
-            bk_row = ("a_menos30" if (r["holders_count"] or 0) < 30 else
-                      "b_30a60"   if (r["holders_count"] or 0) < 60 else
-                      "c_60a100"  if (r["holders_count"] or 0) < 100 else
-                      "d_100a200" if (r["holders_count"] or 0) < 200 else
-                      "e_200a500" if (r["holders_count"] or 0) < 500 else "f_500mais")
-            if bk_row != prev_bk:
-                lbl = bucket_labels_full.get(bk_row, bk_row)
-                h += f"<tr class='sep'><td colspan='9'>{lbl}</td></tr>"
-                prev_bk = bk_row
+    # Tabela individual
+    detail = [r for r in rows if r.get("h_mig") and r.get("h_bottom") and r.get("gain_pct") is not None]
+    detail.sort(key=lambda r: float(r["gain_pct"] or 0), reverse=True)
+
+    if detail:
+        h += "<h2>TOKENS COM DADO COMPLETO (h_mig + h_fundo + gain) — top 150 por ganho</h2>"
+        h += """<table><tr>
+            <th>Token</th><th>Hora</th>
+            <th>H mig</th><th>H fundo</th><th>Δ dump</th>
+            <th>H bounce</th><th>Δ bounce</th>
+            <th>Drop</th><th>Gain</th><th>Trade</th>
+        </tr>"""
+        for r in detail[:150]:
             nome  = r["token_nome"] or r["mint"][:8]
-            hc    = r["holders_count"] or 0
-            mc    = r["mc_migration"] or 0
-            peak  = r["mc_peak_ticks"] or 0
-            ntk   = r["n_ticks"] or 0
-            gain  = float(r["gain_pct"] or 0)
-            had_b = r["had_bounce"]
-            status= r["trade_status"] or "—"
+            mint  = r["mint"]
             ts    = r["ts_migration"]
             ts_s  = ts.strftime("%m-%d %H:%M") if ts else "—"
-            mint  = r["mint"]
+            h_mig = r["h_mig"] or 0
+            h_bot = r["h_bottom"] or 0
+            h_bnc = r["h_bounce"]
+            d_dmp = r["delta_mig_to_bottom"]
+            d_bnc = r["delta_bottom_to_bounce"]
+            drop  = r["drop_pct"]
+            gain  = float(r["gain_pct"] or 0)
+            status= r["trade_status"] or "—"
             sc    = "#4caf50" if status in ("tp","tp_hit") else ("#f44336" if status in ("sl","sl_hit") else "#555")
-            bs_s  = "✓" if had_b else "—"
+            gc    = "#4caf50" if gain >= 0.75 else ("#f5a623" if gain >= 0.20 else "#555")
             link  = f"https://gmgn.ai/sol/token/{mint}"
+
+            def dcell(d):
+                if d is None: return "<td class='neu'>—</td>"
+                c = "#4caf50" if d > 0 else ("#f44336" if d < 0 else "#555")
+                ico = "▲" if d > 0 else ("▼" if d < 0 else "→")
+                return f"<td style='color:{c}'>{ico}{abs(d)}</td>"
+
+            drop_s = f"<span class='neg'>-{drop:.0%}</span>" if drop and drop>0 else "<span class='neu'>—</span>"
             h += (f"<tr><td><a href='{link}' target='_blank'>{nome}</a></td>"
-                  f"<td>{hc}</td><td>${mc:,.0f}</td><td>${peak:,.0f}</td>"
-                  f"<td class='pos'>+{gain:.0%}</td><td class='neu'>{ntk}</td>"
-                  f"<td class='neu'>{bs_s}</td><td style='color:{sc}'>{status}</td>"
-                  f"<td class='neu'>{ts_s}</td></tr>")
+                  f"<td class='neu'>{ts_s}</td>"
+                  f"<td>{h_mig}</td><td>{h_bot}</td>"
+                  + dcell(d_dmp)
+                  + f"<td>{'—' if h_bnc is None else h_bnc}</td>"
+                  + dcell(d_bnc)
+                  + f"<td>{drop_s}</td>"
+                  f"<td style='color:{gc}'>{gain:+.0%}</td>"
+                  f"<td style='color:{sc}'>{status}</td></tr>")
         h += "</table>"
 
     h += "</body></html>"
     return h
+
+
 
 
 if __name__ == "__main__":
