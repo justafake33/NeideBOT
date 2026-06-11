@@ -49165,7 +49165,7 @@ def analise_drop_real():
             FROM migrations m
             LEFT JOIN bounce_signals bs ON bs.mint = m.mint
             WHERE bs.mint IS NULL
-              AND m.ts_migration >= NOW() - INTERVAL %(interval)s
+              AND m.ts_migration >= NOW() - %(interval)s::interval
               AND m.mc_migration > 0
         ),
         tick_stats AS (
