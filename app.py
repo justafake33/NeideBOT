@@ -14,7 +14,7 @@ from scheduler import HeapScheduler
 from scanner import Scanner, HotMonitor
 from executor import TradeExecutor, TradeMonitor
 from trending_radar_routes import trending_radar_bp
-from drop_real_routes import drop_real_bp
+from drop_real_shadow_routes import drop_real_bp
 
 logging.basicConfig(
     level=logging.INFO,
