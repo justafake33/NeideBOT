@@ -49113,7 +49113,7 @@ def _analise_pre_rise_ticks_inner():
                 WITH base AS (
                     SELECT
                         bs.mint,
-                        bs.token_nome,
+                        bs.symbol AS token_nome,
                         bs.mc_at_signal,
                         bs.mc_min,
                         bs.bounce_pct,
