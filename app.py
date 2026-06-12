@@ -5248,6 +5248,10 @@ _TRADES_HTML = """
   .b-expired          { background: #2d2d2d; color: #8b949e; }
   .est { color: #8b949e; font-size: 10px; }
   .section    { padding: 16px; }
+  .fast { color: #f85149; font-weight: bold; }
+  .slow { color: #3fb950; }
+  .thin { color: #f85149; }
+  .thick { color: #3fb950; }
 </style>
 </head>
 <body>
@@ -5277,8 +5281,9 @@ _TRADES_HTML = """
 <thead><tr>
   <th>#</th><th>Symbol</th><th>Status</th><th>Sinal</th>
   <th>MC bottom</th><th>Entry REAL</th><th>+% above bot</th>
-  <th>Slippage</th><th>Fee SOL</th><th>Latência</th>
-  <th>Tokens</th><th>P&L real</th><th>Strategy</th>
+  <th>Pool SOL</th><th>Bounce%</th><th>Drop%</th>
+  <th>Hold</th><th>Slippage</th><th>Latência</th>
+  <th>P&L real</th>
 </tr></thead>
 <tbody>
 {% for t in trades %}
@@ -5302,10 +5307,33 @@ _TRADES_HTML = """
       </span>
     {% else %}—{% endif %}
   </td>
+  <td>
+    {% set pq = t.helius_pool_quote_at_signal %}
+    {% if pq %}
+      <span class="{% if pq < 20 %}thin{% elif pq >= 40 %}thick{% endif %}">{{ "%.0f"|format(pq) }}</span>
+    {% else %}—{% endif %}
+  </td>
+  <td>
+    {% if t.bounce_pct_signal is not none %}
+      <span class="{% if t.bounce_pct_signal >= 0.40 and t.bounce_pct_signal <= 0.80 %}green{% else %}yellow{% endif %}">
+        {{ "%.0f%%"|format(t.bounce_pct_signal * 100) }}
+      </span>
+    {% else %}—{% endif %}
+  </td>
+  <td>{{ ("%.0f%%"|format(t.drop_from_mig_signal * 100)) if t.drop_from_mig_signal is not none else '—' }}</td>
+  <td>
+    {% if t.hold_sec is not none %}
+      {% if t.status in ('sl', 'sl_hit') %}
+        <span class="{% if t.hold_sec < 60 %}fast{% elif t.hold_sec < 300 %}yellow{% else %}slow{% endif %}">
+          {% if t.hold_sec < 60 %}{{ t.hold_sec }}s ⚡{% else %}{{ (t.hold_sec // 60) }}m{{ (t.hold_sec % 60) }}s{% endif %}
+        </span>
+      {% else %}
+        {{ (t.hold_sec // 60) }}m{{ (t.hold_sec % 60) }}s
+      {% endif %}
+    {% else %}—{% endif %}
+  </td>
   <td>{{ ("%+.2f%%"|format(t.slippage_pct*100)) if t.slippage_pct is not none else '—' }}</td>
-  <td>{{ ("%.5f"|format(t.fee_sol)) if t.fee_sol else '—' }}</td>
   <td>{{ ("%.1fs"|format(t.latency_sec)) if t.latency_sec else '—' }}</td>
-  <td>{{ ("%.0f"|format(t.tokens_received)) if t.tokens_received else '—' }}</td>
   <td>
     {% if t.pnl_pct_real is not none %}
       <span class="{% if t.pnl_pct_real > 0 %}green{% else %}red{% endif %}">
@@ -5318,10 +5346,9 @@ _TRADES_HTML = """
       <span class="est">GMGN</span>
     {% else %}—{% endif %}
   </td>
-  <td>{{ t.strategy_id[:12] if t.strategy_id else '—' }}</td>
 </tr>
 {% else %}
-<tr><td colspan="13" style="text-align:center;color:#8b949e;padding:20px">
+<tr><td colspan="14" style="text-align:center;color:#8b949e;padding:20px">
   Nenhum trade ainda. Ative TRADING_ENABLED=true no Railway.
 </td></tr>
 {% endfor %}
@@ -5361,6 +5388,18 @@ def trades_dashboard():
     TP_STATUSES = ("tp", "tp_hit", "trailing_active")
     SL_STATUSES = ("sl_hit", "sl")
     OPEN_STATUSES = ("open", "pending", "strategy_pending")
+
+    # Calcula hold_time_sec (ts_signal → exit_ts) e formata exit_ts em BRT
+    for t in trades_raw:
+        ts_sig = t.get("ts_signal")
+        ts_exit = t.get("exit_ts")
+        if ts_sig and ts_exit:
+            delta = (ts_exit - ts_sig).total_seconds()
+            t["hold_sec"] = int(delta)
+        else:
+            t["hold_sec"] = None
+        t["exit_ts_brt"] = (ts_exit + BRT).strftime("%H:%M:%S") if ts_exit else None
+
     closed   = [t for t in trades_raw if t["status"] in TP_STATUSES + SL_STATUSES]
     tp_count = sum(1 for t in trades_raw if t["status"] in TP_STATUSES)
     sl_count = sum(1 for t in trades_raw if t["status"] in SL_STATUSES)
