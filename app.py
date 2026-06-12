@@ -49089,11 +49089,14 @@ def analise_filtros_simples():
 
 @app.route("/analise/pre-rise-ticks")
 def analise_pre_rise_ticks():
-    """
-    Aplica análise PRÉ + RISE sobre bounce_signals completo, usando token_ticks como outcome.
-    rec75 = token atingiu mc_at_signal × 1.75 nos 60min após sinal.
-    Filtros: h23_window='bottom', ts_signal >= since (default 2026-05-26, clean data)
-    """
+    import traceback
+    try:
+        return _analise_pre_rise_ticks_inner()
+    except Exception:
+        tb = traceback.format_exc()
+        return f"<pre style='background:#0d1117;color:#f85149;padding:20px'>{tb}</pre>", 500
+
+def _analise_pre_rise_ticks_inner():
     import psycopg2
     import psycopg2.extras
     from collections import defaultdict
