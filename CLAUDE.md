@@ -559,7 +559,8 @@ get_sol_usd() [gmgn_client.py]
 
 ```
 DATABASE_URL=postgres://...
-GMGN_API_KEY=xxxx
+GMGN_API_KEY=xxxx            # key de TRADE (swap/query_order) — nunca bloqueada pelo scanner
+GMGN_SCANNER_API_KEY=xxxx    # key dedicada ao scanner/discovery — rate limit separado. Configurar em web E worker.
 GMGN_PRIVATE_KEY=xxxx        # Ed25519 PEM — necessário para Fase 6
 GMGN_WALLET_ADDRESS=xxxx     # endereço Solana da carteira — necessário para Fase 6
 GMGN_HOST=https://openapi.gmgn.ai
@@ -860,17 +861,25 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 
 173. **Bug phantom via ALT tx corrigido (sessão 16, 2026-05-26)**: transações Solana versioned (v0) com Address Lookup Tables fazem com que `_parse_account_keys_from_tx()` retorne `[]` (lista vazia) — as account keys estão nas tabelas de lookup, não embutidas no wire format. O check antigo era `if accounts:` — lista vazia é falsy, logo o check era silenciosamente pulado → eventos de secondary pool em transações ALT passavam mesmo com pool confirmada → mc_min contaminado. Fix aplicado em dois commits: `16a512b` (correção inicial — rejeitava `accounts=[]`) e `037a06c` (fix da regressão crítica). A regressão: o fix intermediário usava `if not accounts or ...` — `not None` é True → modo Helius (que passa `accounts=None` por design) rejeitava TODOS os eventos após pool confirmada, tornando o bot completamente cego se erpc caísse. Fix final: `if known_pool and accounts is not None: if not accounts or known_pool not in accounts: return False`. Regra: validação de pool só aplica quando `accounts` é uma lista (erpc mode). `None` = modo Helius = sem dados de account = sem validação possível.
 
+191. **`swap()` e `query_order()` bypassam o global ban — priority lane (sessão 21, 2026-06-12)**: `_post_trade()` e `_get_trade()` recebem parâmetro `priority=False`. Quando `priority=True`, `_wait_global_ban()` é pulado. `swap()` e `query_order()` passam `priority=True`. Causa do problema original: scanner recebia 429 → `_set_global_ban()` bloqueava TODAS as threads por até 5min → executor ficava na mesma fila → swap atrasava 10s a 5min dependendo do momento do ban. Com priority lane, bounce detectado → swap executado imediatamente, independente do estado do rate limit do scanner. Log visível quando bypass ocorre durante ban ativo: `"TRADE POST priority — bypass global ban (X.Xs restantes)"`. Commits `d41feca`.
+
+192. **API key dedicada ao scanner — `GMGN_SCANNER_API_KEY` (sessão 21, 2026-06-12)**: `GmgnClient.__init__` aceita `api_key: str = None`. Scanner, HotMonitor e TrendingRadar instanciam `GmgnClient(api_key=GMGN_SCANNER_API_KEY)`. Executor usa `GmgnClient()` (GMGN_API_KEY — key de trade). Rate limit do scanner e do executor são agora completamente independentes — 429 no scanner não afeta o swap de nenhuma forma. Se `GMGN_SCANNER_API_KEY` não estiver configurada, fallback para `GMGN_API_KEY` sem regressão. **Configurar nos dois serviços Railway (web E worker).** Commits `1cad17c`.
+
 174. **Auditoria de captura de fundo (sessão 16, 2026-05-26, n=15 trades)**: comparação manual bot mc_min vs fundo real em candles de 1 segundo (DexScreener). Resultado: **10/15 precisos (≤3% de erro)**, **3/15 limitação de learning window** (WHY +22.5%, CTO +19.7%, RAMBO +3.7% — fundo real aconteceu durante os ~300ms de learning window do pool-account, via transações ALT com `accounts=[]` → corretamente rejeitados no replay para evitar phantoms — tradeoff intencional), **2/15 phantoms corrigidos** (MILLION -33%, Multipad -57% — causados exatamente pelo bug ALT do item 173, agora corrigido). Phantoms confirmados: MILLION pool secundária estimada ~41 SOL, Multipad ~28 SOL — ambas acima de MIN_POOL_SOL=10, confirmando que o root cause era o ALT tx bypass, não o threshold de pool depth. **Marco zero definitivo: 2026-05-26 (sessão 16).** A partir desta data, mc_min capturado pelo bot é confiável. Todos os dados de trades em 2026-05-26 são válidos e verídicos.
 
 ---
 
-## 🔄 Estado Atual: BOT ATIVO (sessão 19, 2026-06-06)
+## 🔄 Estado Atual: BOT ATIVO (sessão 21, 2026-06-12)
 
 ### Situação atual
-Branch `claude/relaxed-planck-H3Qg2` ativo. erpc operacional.
-Bot reativado após 9 dias parado (estava em `TRADING_ENABLED=false` para captação de microdados V2).
+erpc operacional. Bot ativo com `TRADING_ENABLED=true`.
 
-**Mudança principal desta sessão:** análise H23 com 138 bounces limpos. Gate `H23_NET_MIN` implementado no código mas **desativado** (n insuficiente). Acumular ~200 bounces limpos antes de qualquer gate de fluxo.
+**Mudanças desta sessão (2026-06-12):**
+- **Priority lane para swap**: `swap()` e `query_order()` bypassam `_wait_global_ban()` — execução imediata independente de 429 do scanner. Commit `d41feca`.
+- **API key separada para scanner**: `GMGN_SCANNER_API_KEY` — scanner/HotMonitor/TrendingRadar usam key dedicada. Rate limit do scanner e do executor são completamente independentes. Commit `1cad17c`.
+- **Causa raiz do timing inconsistente resolvida**: trades demorando 10s a 5min eram causados pelo scanner consumir a cota da API key, bloqueando o executor na mesma fila. Agora cada um tem sua própria lane e sua própria key.
+
+**Para ativar separação de keys:** adicionar `GMGN_SCANNER_API_KEY` nos serviços **web E worker** no Railway.
 
 **Marco zero definitivo de dados limpos: 2026-05-26 (sessão 16, phantom fix ativo).**
 - 2026-05-21 a 2026-05-24: erpc operacional mas MIN_POOL_SOL=2 → 43% phantoms. mc_min não confiável.
@@ -884,10 +893,13 @@ Bot reativado após 9 dias parado (estava em `TRADING_ENABLED=false` para capta�
 - Trailing TP responsável por 89% do lucro — TP fixo 50% teria dado -$1.83
 - Contexto: filtros frouxos + 43% phantom prices + entrada não calibrada → WR é FLOOR, não teto
 
-### Pipeline ativo (branch `claude/gallant-ptolemy-HNNbz`)
+### Pipeline ativo
 `TRADING_ENABLED=true` · `CALIBRATION_AMOUNT_USD=1.0` · `CALIBRATION_MAX_TRADES=999999`
-`TRADE_SL_PCT=0.25` · `FILTER_SMART_MIN=3` · `BOUNCE_MIN_PCT=0.30` · `BOUNCE_MAX_PCT=1.00`
+`TRADE_SL_PCT=0.25` · `FILTER_SMART_MIN=3` · `BOUNCE_MIN_PCT=0.10` · `BOUNCE_MAX_PCT=1.00`
 `MIN_POOL_SOL=10` (Railway + código default) · `ERPC_API_KEY` configurado · `HELIUS_RPC_URL` configurado
+`GMGN_SCANNER_API_KEY` — pendente configuração no Railway (web + worker)
+
+> ⚠️ `BOUNCE_MIN_PCT=0.10` — intencional. Captura tokens que correm sem cair muito. WR esperado menor que com 0.30, mas maior cobertura de oportunidades.
 
 **Portfolio:** ~$50 (após perdas com dados corrompidos históricos).
 
@@ -907,15 +919,17 @@ Bot reativado após 9 dias parado (estava em `TRADING_ENABLED=false` para capta�
 - ✅ **A.3 REMOVIDO**: entry ratio 50-65% baseada em dados corrompidos
 - ✅ **Phantom fix ALT tx (CRÍTICO)**: `accounts is not None` guard — erpc ALT txs (`accounts=[]`) rejeitadas corretamente; modo Helius (`accounts=None`) não afetado. Commits `16a512b` + `037a06c`
 - ✅ **Auditoria bottom capture (n=15)**: 67% precisos, 20% learning window, 13% phantoms corrigidos
-- ✅ **C1 — sl_ref fix (TradeMonitor)**: `sl_ref = entry_mc_real or mc_at_signal or entry_expected` — SL calculado com referência correta. Commit `f962915`
-- ✅ **C2 — HeliusWS injetado no TradeExecutor**: `set_helius()` adicionado ao executor, injection em `app.py`. Commit `f962915`
-- ✅ **C3 — Pool depth gate no bounce**: `POOL_MIN_SOL_BOUNCE=10` — rejeita bounce em pool rasa antes de `bounce_fired`. Commit `f962915`
-- ✅ **C4 — ALT PDA fallback**: `accounts=[]` + `_pool_pda[mint] == known_pool` → aceita (PDA criptograficamente garantido). Commit `f962915`
+- ✅ **C1 — sl_ref fix (TradeMonitor)**: `sl_ref = entry_mc_real or mc_at_signal or entry_expected`. Commit `f962915`
+- ✅ **C2 — HeliusWS injetado no TradeExecutor**: `set_helius()` adicionado ao executor. Commit `f962915`
+- ✅ **C3 — Pool depth gate no bounce**: `POOL_MIN_SOL_BOUNCE=10`. Commit `f962915`
+- ✅ **C4 — ALT PDA fallback**: `accounts=[]` + PDA criptográfico → aceita. Commit `f962915`
+- ✅ **Priority lane swap (sessão 21)**: `swap()`/`query_order()` bypassam global ban. Commit `d41feca`
+- ✅ **API key separada scanner (sessão 21)**: `GMGN_SCANNER_API_KEY` isola rate limit. Commit `1cad17c`
 
 **Filtros ativos (ordem de aplicação no _check_bounce):**
 - A.5: bloqueia elapsed > 20min (do ts_migration on-chain)
 - A.6: bloqueia fundo estagnado > 3min (BOTTOM_FRESHNESS_SEC=180)
-- A.7: bloqueia bounce_pct < 30% (BOUNCE_MIN_PCT=0.30)
+- A.7: bloqueia bounce_pct < 10% (BOUNCE_MIN_PCT=0.10) — intencional
 - A.8: bloqueia bounce_pct > 100% (BOUNCE_MAX_PCT=1.00) — entradas tardias
 - C3: bloqueia pool depth < 10 SOL (POOL_MIN_SOL_BOUNCE=10)
 - FILTER_PUMP_ONLY: garante cobertura H22

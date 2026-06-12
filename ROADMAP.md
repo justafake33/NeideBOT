@@ -1,7 +1,7 @@
 # NeideBOT — Roadmap
 
-**Atualizado:** 2026-06-08 (sessão 20)
-**Estado:** Bot ATIVO · `TRADING_ENABLED=true` · branch ativo: `claude/relaxed-planck-H3Qg2`
+**Atualizado:** 2026-06-12 (sessão 21)
+**Estado:** Bot ATIVO · `TRADING_ENABLED=true` · branch ativo: `main`
 
 ---
 
@@ -92,6 +92,8 @@
 | **Railway nova DB + fix `db.py`** | 2026-06-08 | Banco `beautiful-heart` com disco 100% full → loop PANIC. Novo PostgreSQL criado em `intelligent-spirit` (mesmo projeto web+worker). `beautiful-heart` preservado com dados históricos de carteiras (`cozy-growth`). Fix `db.py`: ALTER TABLE antes de CREATE TABLE em fresh DB → ordem invertida. Commit `b93b13c`. Nota: `postgres.railway.internal` só funciona dentro do mesmo projeto — cross-project usa URL `rlwy.net`. |
 | **`db_retention.py` — retenção automática com alertas Telegram** | 2026-06-08 | Roda a cada 6h via HeapScheduler. Alerta Telegram ANTES de deletar (preview + espaço) + confirmação APÓS. Nunca deleta `migrations`/`bounce_signals`/`trades`. Retenção configurável: `token_ticks` (30d), `micro_absorption_snapshots` (60d), `gmgn_trending_*` (14d). `RETENTION_DRY_RUN=true` para simular. |
 | **TrendingRadar: dedup 1h + filtro de qualidade** | 2026-06-08 | Dedup 1x/hora por mint+interval (de ~12k para ~200 rows/hora). `_quality_reject()` rejeita `not_pump_launchpad` e `flash_migration_<120s`. Defaults: `TRENDING_FILTER_PUMP_ONLY=true`, `TRENDING_FILTER_MIN_BC_SEC=120`. Roda no worker. Commit `47e09b3`. |
+| **Priority lane para swap — bypass global ban** | 2026-06-12 | `_post_trade()` e `_get_trade()` recebem `priority=True`. `swap()` e `query_order()` passam `priority=True` → `_wait_global_ban()` pulado. Executor executa swap imediatamente independente de rate limit do scanner. Log visível quando bypass ocorre durante ban ativo. Causa raiz do timing inconsistente (10s a 5min) identificada e corrigida. Commit `d41feca`. |
+| **API key dedicada ao scanner — `GMGN_SCANNER_API_KEY`** | 2026-06-12 | `GmgnClient.__init__` aceita `api_key` opcional. Scanner/HotMonitor/TrendingRadar usam `GMGN_SCANNER_API_KEY`. Executor usa `GMGN_API_KEY` (key de trade). Rate limit completamente isolado entre scanner e executor. Fallback para `GMGN_API_KEY` se env var não configurada. **Configurar em web E worker no Railway.** Commit `1cad17c`. |
 
 > ⚠️ **WR REAL CORRIGIDO (2026-05-14 sessão 5):** banco tinha dados fictícios — TradeMonitor inferia saídas de MC snapshots, não da blockchain. Auditoria via Helius revelou WR real de **10.1%** (14 TP / 125 SL / 139 trades). WR anterior de 32% era inflado por falsos TPs. `/debug/sell-recovery` executado: 139 correções persistidas.
 > ⚠️ **DADOS HISTÓRICOS SUSPEITOS (sessão 9):** mc_min de todos os tokens antes do fix (elapsed_sec < 90) pode estar corrompido pelo candle de transição. Análises de WR baseadas em `mc_min` histórico (bounce_pct, entry_ratio, drop_from_mig) devem ser tratadas com cautela.
@@ -101,11 +103,13 @@
 
 ## 🔬 V2 — Reestruturação de Microestrutura
 
-### Estado atual (2026-06-06)
+### Estado atual (2026-06-12)
 
-**Bot ATIVO** · `TRADING_ENABLED=true` · Branch: `claude/relaxed-planck-H3Qg2`
+**Bot ATIVO** · `TRADING_ENABLED=true` · Branch: `main`
 
-Bot reativado em 2026-06-06 após 9 dias parado para captação de microdados. Gate H23 implementado no código mas **desativado** (n=13, insuficiente para decisão). Acumular ~200 bounces limpos antes de ativar qualquer gate de fluxo.
+Gate H23 implementado no código mas **desativado** (n=13, insuficiente para decisão). Acumular ~200 bounces limpos antes de ativar qualquer gate de fluxo.
+
+**Sessão 21 (2026-06-12):** Causa raiz do timing inconsistente de trades (10s a 5min) identificada e corrigida. Priority lane para swap + API key dedicada ao scanner. Próximo foco: acumular dados e avaliar WR com filtros atuais (BOUNCE_MIN_PCT=0.10).
 
 A ideia central da V2 continua válida: filtros estáticos (smart count, bounce_pct, elapsed, creator_status) entregam no máximo +7pp de WR. O edge real está em **quem comprou o fundo e com que força** — e só conseguimos responder isso com dados de fluxo de ordens em granularidade de segundos.
 
