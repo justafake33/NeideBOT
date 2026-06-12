@@ -494,6 +494,22 @@ class HotMonitor:
             (rise_window.get("buy_vol_sol") or 0) -
             (rise_window.get("sell_vol_sol") or 0)
         ) if rise_window.get("total_events") else None
+
+        # RISE gate — bloqueia sinal se o bounce foi criado com sellers dominando.
+        # Dados (n=61 tokens, token_ticks outcome): RISE < 0 → rec75=9%, sl25=91%.
+        # RISE ≥ 0 → rec75=22%, sl25=84%. Delta -13pp rec75, +7pp sl25.
+        # Se rise_net_flow is None (sem dados Helius), passa: não bloquear sem dado.
+        # Env var RISE_NET_MIN: default 0 (bloqueia qualquer negativo). -999 = desativado.
+        _rise_net_min_str = os.getenv("RISE_NET_MIN")
+        if _rise_net_min_str is not None and rise_net_flow is not None:
+            _rise_threshold = float(_rise_net_min_str)
+            if rise_net_flow < _rise_threshold:
+                logger.info(
+                    "BOUNCE skip %s — RISE gate: rise_net=%+.2f SOL < min=%.1f",
+                    state.get("symbol", mint[:8]), rise_net_flow, _rise_threshold,
+                )
+                return
+
         helius_context = {
             "pool_quote_at_signal": pool_quote_at_signal,
             "absorption_events": absorption_window.get("total_events"),
