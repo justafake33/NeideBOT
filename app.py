@@ -49087,6 +49087,314 @@ def analise_filtros_simples():
     return h
 
 
+@app.route("/analise/pre-rise-ticks")
+def analise_pre_rise_ticks():
+    """
+    Aplica análise PRÉ + RISE sobre bounce_signals completo, usando token_ticks como outcome.
+    rec75 = token atingiu mc_at_signal × 1.75 nos 60min após sinal.
+    Filtros: h23_window='bottom', ts_signal >= since (default 2026-05-26, clean data)
+    """
+    import psycopg2
+    import psycopg2.extras
+    from collections import defaultdict
+
+    since = request.args.get("since", "2026-05-26")
+    min_ticks = int(request.args.get("min_ticks", 3))
+
+    conn = psycopg2.connect(db.DATABASE_URL)
+    conn.autocommit = True
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Base: bounce_signals + token_ticks outcome
+            cur.execute("""
+                WITH base AS (
+                    SELECT
+                        bs.mint,
+                        bs.token_nome,
+                        bs.mc_at_signal,
+                        bs.mc_min,
+                        bs.bounce_pct,
+                        bs.ts_signal,
+                        bs.net_sol_flow                          AS pre_net,
+                        (bs.absorption_buy_vol - bs.absorption_sell_vol)  AS pre_net_calc,
+                        bs.absorption_events                     AS pre_events,
+                        bs.absorption_buy_vol                    AS pre_buy,
+                        bs.absorption_sell_vol                   AS pre_sell,
+                        bs.rise_net_flow                         AS rise_net,
+                        bs.rise_events,
+                        bs.rise_buy_vol,
+                        bs.rise_sell_vol,
+                        bs.rise_lrg_buy,
+                        bs.h23_window,
+                        MAX(COALESCE(tt.mc_high, tt.mc))         AS max_mc_60,
+                        MIN(COALESCE(tt.mc_low,  tt.mc))         AS min_mc_60,
+                        COUNT(tt.id)                             AS n_ticks
+                    FROM bounce_signals bs
+                    LEFT JOIN token_ticks tt
+                        ON tt.mint = bs.mint
+                        AND tt.tick_ts > bs.ts_signal
+                        AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
+                    WHERE bs.mc_at_signal IS NOT NULL
+                      AND bs.mc_at_signal > 0
+                      AND bs.ts_signal >= %(since)s::timestamptz
+                    GROUP BY bs.mint, bs.token_nome, bs.mc_at_signal, bs.mc_min,
+                             bs.bounce_pct, bs.ts_signal,
+                             bs.net_sol_flow, bs.absorption_buy_vol, bs.absorption_sell_vol,
+                             bs.absorption_events,
+                             bs.rise_net_flow, bs.rise_events, bs.rise_buy_vol,
+                             bs.rise_sell_vol, bs.rise_lrg_buy, bs.h23_window
+                    HAVING COUNT(tt.id) >= %(min_ticks)s
+                )
+                SELECT *,
+                    CASE WHEN max_mc_60 >= mc_at_signal * 1.75 THEN 1 ELSE 0 END AS rec75,
+                    CASE WHEN max_mc_60 >= mc_at_signal * 2.00 THEN 1 ELSE 0 END AS rec100,
+                    CASE WHEN min_mc_60 <= mc_at_signal * 0.75 THEN 1 ELSE 0 END AS sl25
+                FROM base
+                ORDER BY ts_signal DESC
+            """, {"since": since, "min_ticks": min_ticks})
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    def _bucket_net(v, label):
+        if v is None:
+            return f"? (sem {label})"
+        if v < 0:
+            return f"negativo (<0)"
+        if v < 1:
+            return f"fraco (0-1)"
+        if v < 3:
+            return f"sweet (1-3)"
+        if v < 10:
+            return f"bom (3-10)"
+        return f"alto (>10)"
+
+    def _wr(lst):
+        if not lst:
+            return 0, 0
+        tp = sum(r["rec75"] for r in lst)
+        return tp, len(lst)
+
+    def _pct(tp, n):
+        if n == 0:
+            return "—"
+        p = tp / n * 100
+        cls = "tp" if p >= 30 else ("sl" if p < 15 else "")
+        return f"<span class='{cls}'>{p:.0f}%</span>"
+
+    # Aggregate by PRÉ net bucket
+    pre_buckets = defaultdict(list)
+    rise_buckets = defaultdict(list)
+    combo_buckets = defaultdict(list)
+
+    for r in rows:
+        pre_net = r.get("pre_net")
+        rise_net = r.get("rise_net")
+        pre_b = _bucket_net(pre_net, "PRÉ")
+        rise_b = _bucket_net(rise_net, "RISE")
+        pre_buckets[pre_b].append(r)
+        rise_buckets[rise_b].append(r)
+        combo_b = f"PRÉ:{pre_b} / RISE:{rise_b}"
+        combo_buckets[combo_b].append(r)
+
+    n_total = len(rows)
+    n_rec75 = sum(r["rec75"] for r in rows)
+    n_with_pre  = sum(1 for r in rows if r.get("pre_events") and r["pre_events"] > 0)
+    n_with_rise = sum(1 for r in rows if r.get("rise_events") and r["rise_events"] > 0)
+    n_bottom_window = sum(1 for r in rows if r.get("h23_window") == "bottom")
+
+    BUCKET_ORDER = ["negativo (<0)", "fraco (0-1)", "sweet (1-3)", "bom (3-10)", "alto (>10)", "? (sem PRÉ)", "? (sem RISE)"]
+
+    css = """<style>
+body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:13px}
+h1{color:#e6edf3;font-size:18px}h2{color:#58a6ff;font-size:15px;margin-top:28px}
+h3{color:#79c0ff;font-size:13px;margin-top:18px}
+table{border-collapse:collapse;width:100%;margin-bottom:16px}
+th{background:#161b22;color:#8b949e;padding:6px 10px;border:1px solid #30363d;text-align:right}
+th:first-child{text-align:left}
+td{padding:5px 10px;border:1px solid #21262d;text-align:right}
+td:first-child{text-align:left;font-size:12px}
+.tp{color:#3fb950;font-weight:bold}.sl{color:#f85149;font-weight:bold}
+.pos{color:#3fb950}.neg{color:#f85149}.dim{color:#484f58}
+.box{background:#161b22;border:1px solid #30363d;padding:12px 16px;margin:12px 0;border-radius:6px}
+.hi{background:#1a2f1a}.lo{background:#2f1a1a}
+a{color:#58a6ff}
+.cards{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px 16px;min-width:140px}
+.card .label{color:#8b949e;font-size:11px}.card .val{font-size:18px;font-weight:bold;margin-top:2px}
+.green{color:#3fb950}.yellow{color:#d29922}.red{color:#f85149}
+</style>"""
+
+    h = css + f"""
+<h1>📊 PRÉ + RISE → token_ticks outcome</h1>
+<p style='color:#8b949e;font-size:12px'>
+  Analisa <b style='color:#c9d1d9'>{n_total}</b> bounce_signals com ≥{min_ticks} ticks nos 60min pós-sinal.<br>
+  Filtro: ts_signal ≥ <b style='color:#c9d1d9'>{since}</b> (dados limpos pós-phantom-fix).<br>
+  <b>rec75</b> = atingiu mc_at_signal × 1.75 nos 60min após sinal (proxy de TP com trailing 75%).<br>
+  Janela PRÉ = 60s antes do fundo. Janela RISE = fundo → sinal.
+  <br><a href='?since=2026-05-26'>desde 26/05</a> · <a href='?since=2026-06-01'>desde 01/06</a> · <a href='?since=2026-06-07'>desde 07/06 (banco novo)</a>
+  · <a href='?min_ticks=1'>min_ticks=1</a> · <a href='?min_ticks=5'>min_ticks=5</a>
+</p>
+"""
+
+    h += f"""<div class='cards'>
+  <div class='card'><div class='label'>Total bounces</div><div class='val'>{n_total}</div></div>
+  <div class='card'><div class='label'>rec75 (WR base)</div><div class='val {'green' if n_total > 0 and n_rec75/n_total >= 0.30 else 'yellow'}'>{n_rec75/n_total*100:.0f}%</div></div>
+  <div class='card'><div class='label'>Com dados PRÉ</div><div class='val {'green' if n_with_pre > 20 else 'yellow'}'>{n_with_pre}</div></div>
+  <div class='card'><div class='label'>Com dados RISE</div><div class='val {'green' if n_with_rise > 20 else 'yellow'}'>{n_with_rise}</div></div>
+  <div class='card'><div class='label'>h23_window=bottom</div><div class='val {'green' if n_bottom_window > n_total*0.5 else 'yellow'}'>{n_bottom_window}</div></div>
+</div>
+"""
+
+    # --- Tabela 1: PRÉ net flow ---
+    h += "<h2>1️⃣ PRÉ net flow — absorção durante o dump (60s antes do fundo)</h2>"
+    h += "<p style='color:#8b949e;font-size:12px'>Quem estava comprando enquanto o dump acontecia?</p>"
+    h += "<table><tr><th>Faixa PRÉ net (SOL)</th><th>n</th><th>rec75</th><th>rec100</th><th>sl25</th><th>avg bounce%</th><th>avg pre_buy</th><th>avg pre_sell</th></tr>"
+    for bkt in BUCKET_ORDER:
+        items = pre_buckets.get(bkt.replace("PRÉ)", "PRÉ)").replace("RISE)", "RISE)"), pre_buckets.get(bkt, []))
+        if not items:
+            continue
+        tp75, n = _wr(items)
+        tp100 = sum(r["rec100"] for r in items)
+        sl25  = sum(r["sl25"]   for r in items)
+        avg_b = sum((r.get("bounce_pct") or 0) for r in items) / n * 100
+        avg_pb = sum((r.get("pre_buy") or 0) for r in items) / n
+        avg_ps = sum((r.get("pre_sell") or 0) for r in items) / n
+        row_cls = "hi" if n >= 10 and tp75/n >= 0.35 else ("lo" if n >= 5 and tp75/n < 0.15 else "")
+        h += f"<tr class='{row_cls}'><td>{bkt}</td><td>{n}</td><td>{_pct(tp75,n)}</td><td>{_pct(tp100,n)}</td><td>{_pct(sl25,n)}</td><td>{avg_b:.0f}%</td><td class='pos'>{avg_pb:.2f}</td><td class='neg'>{avg_ps:.2f}</td></tr>"
+    h += "</table>"
+
+    # --- Tabela 2: RISE net flow ---
+    h += "<h2>2️⃣ RISE net flow — quem criou o bounce (fundo → sinal)</h2>"
+    h += "<p style='color:#8b949e;font-size:12px'>Um bounce fraco (poucos compradores) é um dead-cat. Um bounce com buyers reais continua.</p>"
+    h += "<table><tr><th>Faixa RISE net (SOL)</th><th>n</th><th>rec75</th><th>rec100</th><th>sl25</th><th>avg bounce%</th><th>avg rise_buy</th><th>avg rise_sell</th></tr>"
+    for bkt in BUCKET_ORDER:
+        items = rise_buckets.get(bkt.replace("PRÉ", "RISE"), rise_buckets.get(bkt, []))
+        if not items:
+            continue
+        tp75, n = _wr(items)
+        tp100 = sum(r["rec100"] for r in items)
+        sl25  = sum(r["sl25"]   for r in items)
+        avg_b = sum((r.get("bounce_pct") or 0) for r in items) / n * 100
+        avg_rb = sum((r.get("rise_buy_vol") or 0) for r in items) / n
+        avg_rs = sum((r.get("rise_sell_vol") or 0) for r in items) / n
+        row_cls = "hi" if n >= 10 and tp75/n >= 0.35 else ("lo" if n >= 5 and tp75/n < 0.15 else "")
+        h += f"<tr class='{row_cls}'><td>{bkt}</td><td>{n}</td><td>{_pct(tp75,n)}</td><td>{_pct(tp100,n)}</td><td>{_pct(sl25,n)}</td><td>{avg_b:.0f}%</td><td class='pos'>{avg_rb:.2f}</td><td class='neg'>{avg_rs:.2f}</td></tr>"
+    h += "</table>"
+
+    # --- Tabela 3: RISE net < 0 vs >= 0 (gate simples) ---
+    h += "<h2>3️⃣ Gate binário — RISE net negativo = SL?</h2>"
+    rise_neg  = [r for r in rows if r.get("rise_net") is not None and r["rise_net"] < 0]
+    rise_pos  = [r for r in rows if r.get("rise_net") is not None and r["rise_net"] >= 0]
+    rise_none = [r for r in rows if r.get("rise_net") is None]
+    h += "<table><tr><th>Grupo</th><th>n</th><th>rec75</th><th>rec100</th><th>sl25</th><th>avg bounce%</th></tr>"
+    for label, items in [("RISE net < 0 (SL esperado?)", rise_neg),
+                          ("RISE net ≥ 0 (boa sign)", rise_pos),
+                          ("Sem dados RISE", rise_none)]:
+        if not items:
+            continue
+        tp75, n = _wr(items)
+        tp100 = sum(r["rec100"] for r in items)
+        sl25  = sum(r["sl25"]   for r in items)
+        avg_b = sum((r.get("bounce_pct") or 0) for r in items) / n * 100
+        row_cls = "hi" if tp75/n >= 0.35 and n >= 5 else ("lo" if tp75/n < 0.15 and n >= 5 else "")
+        h += f"<tr class='{row_cls}'><td>{label}</td><td>{n}</td><td>{_pct(tp75,n)}</td><td>{_pct(tp100,n)}</td><td>{_pct(sl25,n)}</td><td>{avg_b:.0f}%</td></tr>"
+    h += "</table>"
+
+    # --- Tabela 4: PRÉ × RISE combinado ---
+    h += "<h2>4️⃣ Combinação PRÉ × RISE (matriz de setup)</h2>"
+    h += "<p style='color:#8b949e;font-size:12px'>Qual é o melhor padrão de absorção completo?</p>"
+
+    # Simplify to 3 categories each
+    def _simple_bucket(v, has_data):
+        if not has_data or v is None:
+            return "sem dado"
+        if v < 0:
+            return "negativo"
+        if v < 3:
+            return "fraco/sweet"
+        return "bom/alto"
+
+    combo2 = defaultdict(list)
+    for r in rows:
+        pre_net = r.get("pre_net")
+        rise_net = r.get("rise_net")
+        pre_has = r.get("pre_events") and r["pre_events"] > 0
+        rise_has = r.get("rise_events") and r["rise_events"] > 0
+        pb = _simple_bucket(pre_net, pre_has)
+        rb = _simple_bucket(rise_net, rise_has)
+        combo2[f"PRÉ {pb} | RISE {rb}"].append(r)
+
+    sorted_combos = sorted(combo2.items(), key=lambda x: -sum(r["rec75"] for r in x[1]) / max(1, len(x[1])))
+    h += "<table><tr><th>Setup (PRÉ | RISE)</th><th>n</th><th>rec75</th><th>rec100</th><th>sl25</th><th>avg bounce%</th></tr>"
+    for combo_key, items in sorted_combos:
+        if not items:
+            continue
+        tp75, n = _wr(items)
+        tp100 = sum(r["rec100"] for r in items)
+        sl25  = sum(r["sl25"]   for r in items)
+        avg_b = sum((r.get("bounce_pct") or 0) for r in items) / n * 100
+        row_cls = "hi" if tp75/n >= 0.35 and n >= 5 else ("lo" if tp75/n < 0.15 and n >= 5 else "")
+        h += f"<tr class='{row_cls}'><td>{combo_key}</td><td>{n}</td><td>{_pct(tp75,n)}</td><td>{_pct(tp100,n)}</td><td>{_pct(sl25,n)}</td><td>{avg_b:.0f}%</td></tr>"
+    h += "</table>"
+
+    # --- Tabela 5: últimos 30 tokens com dados detalhados ---
+    h += "<h2>5️⃣ Detalhes — últimos 30 bounces com dados</h2>"
+    h += "<p style='color:#8b949e;font-size:12px'>Apenas os que têm dados Helius (PRÉ ou RISE). Ordenado por ts_signal DESC.</p>"
+    detailed = [r for r in rows if (r.get("pre_events") and r["pre_events"] > 0) or (r.get("rise_events") and r["rise_events"] > 0)][:30]
+    if detailed:
+        h += """<table>
+<tr>
+  <th style='text-align:left'>Token</th>
+  <th>Data</th>
+  <th>Bounce%</th>
+  <th>PRÉ net</th>
+  <th>PRÉ ev|↑|↓</th>
+  <th>RISE net</th>
+  <th>RISE ev|↑|↓</th>
+  <th>rec75</th>
+  <th>max_mc/entry</th>
+</tr>"""
+        for r in detailed:
+            pre_net = r.get("pre_net") or 0
+            rise_net = r.get("rise_net")
+            pre_ev = r.get("pre_events") or 0
+            pre_buy = r.get("pre_buy") or 0
+            pre_sell = r.get("pre_sell") or 0
+            rise_ev = r.get("rise_events") or 0
+            rise_buy = r.get("rise_buy_vol") or 0
+            rise_sell = r.get("rise_sell_vol") or 0
+            max_mc = r.get("max_mc_60") or 0
+            entry_mc = r.get("mc_at_signal") or 1
+            ratio = max_mc / entry_mc if entry_mc > 0 else 0
+            rec = r.get("rec75", 0)
+            ts = r.get("ts_signal")
+            ts_str = ts.strftime("%m/%d %H:%M") if ts else "?"
+            pre_cls = "pos" if pre_net >= 0 else "neg"
+            rise_cls = "pos" if (rise_net or 0) >= 0 else "neg"
+            rec_cls = "tp" if rec else "sl"
+            bounce_pct = (r.get("bounce_pct") or 0) * 100
+            rise_str = f"<span class='{rise_cls}'>{rise_net:+.1f}</span>" if rise_net is not None else "<span class='dim'>—</span>"
+            h += f"""<tr>
+  <td>{r.get('token_nome') or r['mint'][:8]}</td>
+  <td style='color:#8b949e'>{ts_str}</td>
+  <td>{bounce_pct:.0f}%</td>
+  <td class='{pre_cls}'>{pre_net:+.1f}</td>
+  <td class='dim'>{pre_ev}|{pre_buy:.1f}|{pre_sell:.1f}</td>
+  <td>{rise_str}</td>
+  <td class='dim'>{rise_ev}|{rise_buy:.1f}|{rise_sell:.1f}</td>
+  <td class='{rec_cls}'>{'✅ sim' if rec else '❌ não'}</td>
+  <td>{ratio:.1f}×</td>
+</tr>"""
+        h += "</table>"
+    else:
+        h += "<div class='box dim'>Sem bounces com dados Helius no período selecionado. Bot precisa acumular mais sinais.</div>"
+
+    h += "<p style='color:#484f58;font-size:11px;margin-top:24px'>rec75 = token atingiu mc_at_signal × 1.75 nos 60min pós-sinal. Não é WR de carteira — é WR do token independente da nossa execução. Gate para filtro: n≥30 por bucket com delta ≥ 15pp.</p>"
+    h += "</body></html>"
+    return h
+
+
 @app.route("/analise/sem-bounce")
 def analise_sem_bounce():
     """
