@@ -100,5 +100,5 @@ def debug_trending_radar():
     h += "</table></body></html>"
     return h
 
-# Importa a rota shadow /analise/drop-real no blueprint já registrado pelo app.
-import drop_real_shadow_routes  # noqa: E402,F401
+# Importa a rota conservadora /analise/drop-real no blueprint já registrado pelo app.
+import drop_real_conservative_routes  # noqa: E402,F401
