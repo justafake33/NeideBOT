@@ -219,9 +219,11 @@ class GmgnClient:
         sig     = self._private_key.sign(message)
         return base64.b64encode(sig).decode("ascii")
 
-    def _post_trade(self, path: str, body: dict = None) -> dict:
+    def _post_trade(self, path: str, body: dict = None, priority: bool = False) -> dict:
         """POST com X-Signature (Ed25519) para endpoints de trade.
         O body é serializado UMA vez e o mesmo string é usado na assinatura e no HTTP body.
+        priority=True pula o global ban — usado para swaps de trade que não devem ser
+        bloqueados por rate limit do scanner.
         """
         if not self._private_key:
             raise RuntimeError(
@@ -231,7 +233,10 @@ class GmgnClient:
             raise RuntimeError(
                 "GMGN_WALLET_ADDRESS não configurada — endpoints de trade desabilitados"
             )
-        _wait_global_ban()
+        if not priority:
+            _wait_global_ban()
+        elif _global_ban_until > time.time():
+            logger.info("TRADE POST priority — bypass global ban (%.1fs restantes)", _global_ban_until - time.time())
         body_str = _json.dumps(body or {}, separators=(",", ":"))
         params   = self._params()  # só timestamp + client_id
         logger.info("TRADE POST %s | wallet=%s | body=%s", path,
@@ -247,13 +252,16 @@ class GmgnClient:
         )
         return self._handle_response(resp)
 
-    def _get_trade(self, path: str, extra_params: dict = None) -> dict:
-        """GET com X-Signature (Ed25519) para endpoints de trade (query_order)."""
+    def _get_trade(self, path: str, extra_params: dict = None, priority: bool = False) -> dict:
+        """GET com X-Signature (Ed25519) para endpoints de trade (query_order).
+        priority=True pula o global ban — usado para poll de fill após swap.
+        """
         if not self._private_key:
             raise RuntimeError(
                 "GMGN_PRIVATE_KEY não configurada — endpoints de trade desabilitados"
             )
-        _wait_global_ban()
+        if not priority:
+            _wait_global_ban()
         params = self._params(extra_params)
         sig    = self._sign(path, params, "")  # GET: body="" (não None — evita "None" literal no f-string)
         resp   = self.session.get(
@@ -316,7 +324,7 @@ class GmgnClient:
             body["condition_orders"] = condition_orders
             body["priority_fee"] = os.getenv("STRATEGY_PRIORITY_FEE", "0.0001")
             body["tip_fee"]      = os.getenv("STRATEGY_TIP_FEE",      "0.0001")
-        return self._post_trade("/v1/trade/swap", body)
+        return self._post_trade("/v1/trade/swap", body, priority=True)
 
     def create_strategy(self, token_mint: str, tokens_amount: float,
                         entry_price_sol: float,
@@ -376,7 +384,7 @@ class GmgnClient:
     def query_order(self, order_id: str, chain: str = "sol") -> dict:
         """GET /v1/trade/query_order — status e fill de uma ordem (signed)."""
         return self._get_trade("/v1/trade/query_order",
-                               {"order_id": order_id, "chain": chain})
+                               {"order_id": order_id, "chain": chain}, priority=True)
 
     def get_trenches(self, types: list = None, chain: str = "sol") -> dict:
         """
