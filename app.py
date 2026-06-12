@@ -49835,5 +49835,341 @@ def debug_bottom_quality():
     return h
 
 
+@app.route("/analise/h22-h26")
+def analise_h22_h26():
+    """
+    Consolidado H22-H26 — correlação de features de microestrutura com outcomes reais.
+    Duas fontes de outcome:
+      - Trades blockchain (GMGN confirmado via helius_sell_recovery / status tp/sl)
+      - Token ticks 60min (todos os bounces, entry=mc_at_signal, TP75/SL25)
+    Filtro padrão: ts_signal >= since (default 2026-05-26, marco zero de dados limpos)
+    """
+    since = request.args.get("since", "2026-05-26")
+    tp_pct  = float(request.args.get("tp",  "0.75"))
+    sl_pct  = float(request.args.get("sl",  "0.25"))
+
+    try:
+        import psycopg2, psycopg2.extras
+        conn = psycopg2.connect(db.DATABASE_URL)
+        conn.autocommit = True
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # ── 1. bounce_signals com features calculadas ──────────────────────
+        cur.execute("""
+            SELECT
+                bs.mint, bs.symbol, bs.ts_signal, bs.mc_at_signal,
+                bs.absorption_buy_vol,  bs.absorption_sell_vol,
+                bs.absorption_events,   bs.absorption_lrg_buy,
+                bs.net_sol_flow,        bs.buy_concentration,
+                bs.pool_quote_at_signal,
+                bs.dump_seller_hhi,     bs.dump_seller_count,
+                bs.h23_window,
+                -- H22: buy/sell ratio
+                CASE WHEN COALESCE(bs.absorption_sell_vol,0) > 0
+                     THEN bs.absorption_buy_vol / bs.absorption_sell_vol
+                     ELSE NULL END AS buy_sell_ratio,
+                -- H23: net flow (já em coluna dedicada)
+                COALESCE(bs.net_sol_flow,
+                         bs.absorption_buy_vol - bs.absorption_sell_vol) AS net_flow
+            FROM bounce_signals bs
+            WHERE bs.ts_signal >= %(since)s::timestamptz
+              AND bs.mc_at_signal > 0
+            ORDER BY bs.ts_signal DESC
+        """, {"since": since})
+        bounces = cur.fetchall()
+
+        if not bounces:
+            return "<h2>Sem dados desde " + since + "</h2>"
+
+        mints = [b["mint"] for b in bounces]
+
+        # ── 2. Outcome via trades (blockchain) ─────────────────────────────
+        cur.execute("""
+            SELECT t.mint,
+                   CASE WHEN t.status IN ('tp','tp_hit') THEN 1
+                        WHEN t.status IN ('sl','sl_hit') THEN 0
+                        ELSE NULL END AS is_tp,
+                   t.exit_type, t.pnl_pct_real
+            FROM trades t
+            WHERE t.mint = ANY(%(mints)s)
+              AND t.status IN ('tp','tp_hit','sl','sl_hit')
+        """, {"mints": mints})
+        trade_rows = cur.fetchall()
+        trade_by_mint = {}
+        for r in trade_rows:
+            if r["mint"] not in trade_by_mint:
+                trade_by_mint[r["mint"]] = r
+
+        # ── 3. Outcome via token_ticks 60min (todos os bounces) ────────────
+        cur.execute("""
+            SELECT tt.mint,
+                   MAX(GREATEST(COALESCE(NULLIF(tt.mc_high,0),0),
+                                COALESCE(NULLIF(tt.mc,0),0)))  AS max_mc,
+                   MIN(CASE WHEN COALESCE(NULLIF(tt.mc_low,0), tt.mc) > 0
+                            THEN COALESCE(NULLIF(tt.mc_low,0), tt.mc)
+                            ELSE NULL END)                      AS min_mc
+            FROM token_ticks tt
+            JOIN bounce_signals bs ON bs.mint = tt.mint
+            WHERE tt.mint = ANY(%(mints)s)
+              AND bs.ts_signal >= %(since)s::timestamptz
+              AND tt.tick_ts BETWEEN bs.ts_signal
+                                 AND bs.ts_signal + INTERVAL '60 minutes'
+              AND tt.mc > 0
+            GROUP BY tt.mint
+        """, {"mints": mints, "since": since})
+        tick_rows = cur.fetchall()
+        tick_by_mint = {r["mint"]: r for r in tick_rows}
+
+        cur.close(); conn.close()
+    except Exception as e:
+        return f"<pre>Erro SQL: {e}</pre>", 500
+
+    # ── 4. Enriquecer bounces com outcomes ──────────────────────────────────
+    for b in bounces:
+        m = b["mint"]
+        # outcome trade
+        tr = trade_by_mint.get(m)
+        b["trade_is_tp"]  = tr["is_tp"]   if tr else None
+        b["trade_exit"]   = tr["exit_type"] if tr else None
+
+        # outcome ticks
+        tk = tick_by_mint.get(m)
+        if tk and b["mc_at_signal"] and b["mc_at_signal"] > 0:
+            tp_thr = b["mc_at_signal"] * (1 + tp_pct)
+            sl_thr = b["mc_at_signal"] * (1 - sl_pct)
+            hit_tp = tk["max_mc"] and tk["max_mc"] >= tp_thr
+            hit_sl = tk["min_mc"] and tk["min_mc"] <= sl_thr
+            # conservador: se SL E TP possíveis, marca SL (não temos time ordering)
+            if hit_sl and hit_tp:
+                b["tick_is_tp"] = 0
+            elif hit_tp:
+                b["tick_is_tp"] = 1
+            elif hit_sl:
+                b["tick_is_tp"] = 0
+            else:
+                b["tick_is_tp"] = None  # sem dados suficientes
+        else:
+            b["tick_is_tp"] = None
+
+    # ── 5. Helper para tabela de WR por bucket ──────────────────────────────
+    def bucket_table(bounces, key_fn, bucket_labels, min_n=5):
+        """Agrupa bounces por bucket e retorna stats via trades e ticks."""
+        buckets = {lbl: {"trade": [], "tick": []} for lbl in bucket_labels}
+        buckets["_none"] = {"trade": [], "tick": []}
+
+        for b in bounces:
+            lbl = key_fn(b)
+            if lbl is None:
+                buckets["_none"]["trade"].append(b["trade_is_tp"])
+                buckets["_none"]["tick"].append(b["tick_is_tp"])
+            elif lbl in buckets:
+                buckets[lbl]["trade"].append(b["trade_is_tp"])
+                buckets[lbl]["tick"].append(b["tick_is_tp"])
+
+        rows = []
+        for lbl in bucket_labels:
+            g = buckets[lbl]
+            t_vals = [x for x in g["trade"] if x is not None]
+            k_vals = [x for x in g["tick"]  if x is not None]
+            rows.append({
+                "label": lbl,
+                "n_total": len(g["trade"]),
+                "n_trade": len(t_vals),
+                "wr_trade": sum(t_vals)/len(t_vals)*100 if t_vals else None,
+                "n_tick":  len(k_vals),
+                "wr_tick":  sum(k_vals)/len(k_vals)*100 if k_vals else None,
+            })
+        return rows
+
+    # baseline WR (todos os bounces com dados)
+    base_trade = [b["trade_is_tp"] for b in bounces if b["trade_is_tp"] is not None]
+    base_tick  = [b["tick_is_tp"]  for b in bounces if b["tick_is_tp"]  is not None]
+    base_wr_trade = sum(base_trade)/len(base_trade)*100 if base_trade else 0
+    base_wr_tick  = sum(base_tick) /len(base_tick) *100 if base_tick  else 0
+
+    # ── 6. Definir hipóteses e buckets ──────────────────────────────────────
+    def h22_ratio(b):
+        r = b["buy_sell_ratio"]
+        if r is None:
+            return "sem sells" if (b["absorption_buy_vol"] or 0) > 0 else None
+        if r < 0.5:  return "< 0.5×  (sellers dominam)"
+        if r < 1.0:  return "0.5–1×"
+        if r < 1.5:  return "1–1.5×"
+        if r < 3.0:  return "1.5–3×"
+        return "> 3×"
+
+    def h22_events(b):
+        e = b["absorption_events"]
+        if e is None: return None
+        if e == 0:    return "0 eventos"
+        if e <= 2:    return "1–2"
+        if e <= 5:    return "3–5"
+        if e <= 10:   return "6–10"
+        return "≥ 11"
+
+    def h23_net(b):
+        n = b["net_flow"]
+        if n is None: return None
+        if n < -10:   return "< -10 SOL"
+        if n < -5:    return "-10 a -5 SOL"
+        if n < 0:     return "-5 a 0 SOL"
+        if n < 3:     return "0–3 SOL"
+        if n < 10:    return "3–10 SOL"
+        return "> 10 SOL"
+
+    def h25_pool(b):
+        p = b["pool_quote_at_signal"]
+        if p is None: return None
+        if p < 20:    return "< 20 SOL"
+        if p < 40:    return "20–40 SOL"
+        if p < 70:    return "40–70 SOL"
+        if p < 90:    return "70–90 SOL"
+        return "≥ 90 SOL"
+
+    def h26_conc(b):
+        c = b["buy_concentration"]
+        if c is None:
+            # derivar na hora se não persistido
+            if (b["absorption_buy_vol"] or 0) > 0 and (b["absorption_lrg_buy"] or 0) > 0:
+                c = b["absorption_lrg_buy"] / b["absorption_buy_vol"]
+            else:
+                return None
+        if c < 0.2:   return "< 0.2  (disperso)"
+        if c < 0.5:   return "0.2–0.5"
+        if c < 0.8:   return "0.5–0.8"
+        return "≥ 0.8  (concentrado)"
+
+    def h24_hhi(b):
+        h = b["dump_seller_hhi"]
+        if h is None: return None
+        if h < 0.1:   return "< 0.1  (muitos sellers)"
+        if h < 0.25:  return "0.1–0.25"
+        if h < 0.5:   return "0.25–0.5"
+        return "≥ 0.5  (seller único)"
+
+    hyps = [
+        ("H22 — Buy/Sell Ratio (janela 60s pré-fundo)",
+         h22_ratio,
+         ["< 0.5×  (sellers dominam)", "0.5–1×", "1–1.5×", "1.5–3×", "> 3×", "sem sells"]),
+        ("H22b — Contagem de Eventos Helius",
+         h22_events,
+         ["0 eventos", "1–2", "3–5", "6–10", "≥ 11"]),
+        ("H23 — Net SOL Flow (compra − venda, 60s pré-fundo)",
+         h23_net,
+         ["< -10 SOL", "-10 a -5 SOL", "-5 a 0 SOL", "0–3 SOL", "3–10 SOL", "> 10 SOL"]),
+        ("H25 — Pool Depth no Sinal (pool_quote_at_signal)",
+         h25_pool,
+         ["< 20 SOL", "20–40 SOL", "40–70 SOL", "70–90 SOL", "≥ 90 SOL"]),
+        ("H26 — Buy Concentration (largest_buy / buy_vol)",
+         h26_conc,
+         ["< 0.2  (disperso)", "0.2–0.5", "0.5–0.8", "≥ 0.8  (concentrado)"]),
+        ("H24 — Seller HHI durante dump (concentração de vendedores)",
+         h24_hhi,
+         ["< 0.1  (muitos sellers)", "0.1–0.25", "0.25–0.5", "≥ 0.5  (seller único)"]),
+    ]
+
+    # ── 7. Render HTML ───────────────────────────────────────────────────────
+    def pct(v, base, label="trade"):
+        if v is None: return "<td class='neu'>—</td>"
+        delta = v - base
+        color = "#4caf50" if delta >= 10 else ("#f44336" if delta <= -10 else "#aaa")
+        tip = f"Δ{delta:+.1f}pp vs baseline"
+        return f"<td style='color:{color}' title='{tip}'>{v:.1f}%</td>"
+
+    def gate(n):
+        if n >= 30: return f"<span style='color:#4caf50'>✅ {n}</span>"
+        return f"<span style='color:#f5a623'>⏳ {n}/30</span>"
+
+    cs = """<style>
+      body{font-family:monospace;background:#111;color:#ccc;padding:20px}
+      h1{color:#fff} h2{color:#ddd;margin-top:32px}
+      table{border-collapse:collapse;margin-bottom:24px;width:100%}
+      th{background:#222;padding:6px 10px;text-align:left;font-size:12px;color:#888}
+      td{padding:5px 10px;border-bottom:1px solid #222;font-size:13px}
+      .neu{color:#aaa} .hi{color:#4caf50} .lo{color:#f44336}
+      .summary{background:#1a1a1a;padding:12px;border-radius:6px;margin-bottom:20px;display:flex;gap:30px}
+      .sm{display:flex;flex-direction:column;align-items:center}
+      .sm b{font-size:22px;color:#fff} .sm span{font-size:11px;color:#888}
+      .note{color:#888;font-size:11px;margin-bottom:8px}
+    </style>"""
+
+    n_with_abs    = sum(1 for b in bounces if (b["absorption_events"] or 0) > 0)
+    n_trade_out   = len(base_trade)
+    n_tick_out    = len(base_tick)
+
+    h = f"""<!DOCTYPE html><html><head><title>H22-H26 Edge Lab</title>{cs}</head><body>
+    <h1>H22–H26 Edge Lab</h1>
+    <p class='note'>Dados desde {since} · TP={tp_pct*100:.0f}% · SL={sl_pct*100:.0f}% ·
+    <a href='?since=2026-05-26' style='color:#888'>desde marco-zero</a> |
+    <a href='?since=2026-06-01' style='color:#888'>último mês</a> |
+    <a href='?tp=0.75&sl=0.25' style='color:#888'>TP75/SL25</a></p>
+
+    <div class='summary'>
+      <div class='sm'><b>{len(bounces)}</b><span>bounces totais</span></div>
+      <div class='sm'><b>{n_with_abs}</b><span>com dados Helius</span></div>
+      <div class='sm'><b>{n_trade_out}</b><span>com outcome trade</span></div>
+      <div class='sm'><b>{n_tick_out}</b><span>com outcome ticks</span></div>
+      <div class='sm'><b>{base_wr_trade:.1f}%</b><span>WR baseline (trade)</span></div>
+      <div class='sm'><b>{base_wr_tick:.1f}%</b><span>WR baseline (ticks)</span></div>
+    </div>
+
+    <p class='note'>⚠️ Outcome ticks: conservador — quando SL e TP ambos possíveis na janela de 60min, assume SL.
+    Outcome trade: apenas status tp/sl confirmados no DB (preferencialmente via helius_sell_recovery).</p>
+    """
+
+    for title, key_fn, labels in hyps:
+        rows = bucket_table(bounces, key_fn, labels)
+        has_data = any(r["n_trade"] + r["n_tick"] > 0 for r in rows)
+        if not has_data:
+            h += f"<h2>{title}</h2><p class='note'>Sem dados suficientes ainda.</p>"
+            continue
+
+        h += f"<h2>{title}</h2>"
+        h += """<table>
+          <tr>
+            <th>Bucket</th>
+            <th>n total</th>
+            <th>Gate</th>
+            <th>WR trades</th>
+            <th>Δ vs base</th>
+            <th>WR ticks</th>
+            <th>Δ vs base</th>
+          </tr>"""
+
+        for r in rows:
+            wr_t = r["wr_trade"]
+            wr_k = r["wr_tick"]
+            delta_t = (wr_t - base_wr_trade) if wr_t is not None else None
+            delta_k = (wr_k - base_wr_tick)  if wr_k is not None else None
+
+            def delta_cell(d):
+                if d is None: return "<td class='neu'>—</td>"
+                c = "#4caf50" if d >= 10 else ("#f44336" if d <= -10 else "#aaa")
+                return f"<td style='color:{c}'>{d:+.1f}pp</td>"
+
+            def wr_cell(v):
+                if v is None: return "<td class='neu'>—</td>"
+                c = "#4caf50" if v >= base_wr_trade + 10 else ("#f44336" if v <= base_wr_trade - 10 else "#aaa")
+                return f"<td style='color:{c}'>{v:.1f}%<br><span style='font-size:10px;color:#555'>n={r['n_trade'] if 'trade' in str(v) else r['n_tick']}</span></td>"
+
+            wr_trade_cell = f"<td style='color:{'#4caf50' if wr_t and wr_t >= base_wr_trade+10 else '#f44336' if wr_t and wr_t <= base_wr_trade-10 else '#aaa'}'>{wr_t:.1f}% <small>n={r['n_trade']}</small></td>" if wr_t is not None else "<td class='neu'>— <small>n=0</small></td>"
+            wr_tick_cell  = f"<td style='color:{'#4caf50' if wr_k and wr_k >= base_wr_tick+10 else '#f44336' if wr_k and wr_k <= base_wr_tick-10 else '#aaa'}'>{wr_k:.1f}% <small>n={r['n_tick']}</small></td>"  if wr_k is not None else "<td class='neu'>— <small>n=0</small></td>"
+
+            h += f"""<tr>
+              <td>{r['label']}</td>
+              <td class='neu'>{r['n_total']}</td>
+              <td>{gate(r['n_tick'])}</td>
+              {wr_trade_cell}
+              {delta_cell(delta_t)}
+              {wr_tick_cell}
+              {delta_cell(delta_k)}
+            </tr>"""
+
+        h += "</table>"
+
+    h += "</body></html>"
+    return h
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
