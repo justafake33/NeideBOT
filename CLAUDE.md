@@ -874,6 +874,8 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
     - `/analise/filtros-simples`: dashboard em linguagem simples para stakeholders — explica cada filtro, mostra taxa de bloqueio, compara PASSA vs BLOQUEADO, indica se o filtro está "ajudando" (bloqueia tokens piores) ou "atrapalhando" (bloqueia tokens melhores).
     - `/analise/filter-impact`: resumo do impacto dos filtros ativos sobre rec75 e frequência de sinais.
 
+196. **Análise PRÉ + RISE via token_ticks (sessão 22, 2026-06-12, n=61 bounces limpos)**: endpoint `/analise/pre-rise-ticks` cruza `bounce_signals` (janelas PRÉ e RISE Helius) com `token_ticks` outcome (rec75 = mc_at_signal × 1.75 nos 60min pós-sinal). Descobertas principais: (1) **RISE net < 0 → rec75=9%, sl25=91%** (vs RISE ≥ 0: rec75=22%). Gate implementado como `RISE_NET_MIN` env var em `_check_bounce()` — ativar com `RISE_NET_MIN=0` no Railway. (2) **Melhor combo: PRÉ negativo + RISE fraco/sweet (1-3 SOL)** → rec75=33% (n=15), único bucket acima do baseline. (3) **PRÉ negativo com venda pesada é positivo**: avg 11.49 SOL vendido antes do fundo → rec75=23%. PRÉ fraco (0.85 SOL vendido) → rec75=0%. Capitulação real cria base comprável; drift sem sellers não. (4) **sl25=85% em todos os buckets** — o SL de 25% é testado em praticamente todo trade. O edge está em sobreviver ao teste e atingir TP, não em evitá-lo. (5) **"Big Dump → Relief Rally" trap confirmado nos dados**: RISE alto + bounce alto (ex: Scema RISE +19 SOL, bounce 82%) → rec75=0%. FBE (RISE +4 SOL, bounce 20%) → 5.2x. PRÉ + RISE: bloqueio de RISE negativo bloqueia 18% dos sinais, 91% deles são SL. **Lembrete próxima sessão**: checar resultados após n≥30 novos bounces com gate ativo. Dashboard: `/analise/pre-rise-ticks?since=2026-06-12`. Gate para próximo tier: `PRÉ fraco/sweet + RISE bom/alto` (rec75=0%, n=2 — aguardar n≥10).
+
 172. **Resultado da auditoria final sessão 15 — 100% PASS**: todos os 7 critérios passaram com evidência de código. kline não escreve mc_min_decision (scanner.py:793–795). Gate 90s não existe em `_check_bounce` (scanner.py:304). Replay valida identidade de pool via `pool_acc in _replay_accs` (helius_ws.py:912). mc_min_true com txid persistido (helius_rpc.py:317–432 + db.py:612). bottom_error_pct e bottom_quality calculados e persistidos (scanner.py:947–953 + db.py:616). Monotonicidade: `if mc < state["mc_min"]` in-memory + `AND mc_bottom > %(mc)s` no DB. Logs com source/old/new: `"Fundo(%s) %s: mint=%s mc_old=$%.0f mc_new=$%.0f event_ts=%.3f elapsed=%.1fmin"` com source = `"erpc_live"` ou `"erpc_replay"`. Nenhum FAIL identificado. Este é o marco onde os dados começam a ser auditáveis por txid Solana.
 
 173. **Bug phantom via ALT tx corrigido (sessão 16, 2026-05-26)**: transações Solana versioned (v0) com Address Lookup Tables fazem com que `_parse_account_keys_from_tx()` retorne `[]` (lista vazia) — as account keys estão nas tabelas de lookup, não embutidas no wire format. O check antigo era `if accounts:` — lista vazia é falsy, logo o check era silenciosamente pulado → eventos de secondary pool em transações ALT passavam mesmo com pool confirmada → mc_min contaminado. Fix aplicado em dois commits: `16a512b` (correção inicial — rejeitava `accounts=[]`) e `037a06c` (fix da regressão crítica). A regressão: o fix intermediário usava `if not accounts or ...` — `not None` é True → modo Helius (que passa `accounts=None` por design) rejeitava TODOS os eventos após pool confirmada, tornando o bot completamente cego se erpc caísse. Fix final: `if known_pool and accounts is not None: if not accounts or known_pool not in accounts: return False`. Regra: validação de pool só aplica quando `accounts` é uma lista (erpc mode). `None` = modo Helius = sem dados de account = sem validação possível.
@@ -886,10 +888,25 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 
 ---
 
-## 🔄 Estado Atual: BOT ATIVO (sessão 21, 2026-06-12)
+## 🔄 Estado Atual: BOT ATIVO (sessão 22, 2026-06-12)
 
 ### Situação atual
 Branch `claude/relaxed-planck-H3Qg2` ativo. erpc operacional. Bot ativo com `TRADING_ENABLED=true`.
+
+**Mudanças da sessão 22 (2026-06-12):**
+- **Análise PRÉ + RISE via token_ticks** (n=61 bounces, dados limpos pós-2026-05-26). Endpoint: `/analise/pre-rise-ticks`.
+- **RISE gate implementado** (`RISE_NET_MIN` env var em `scanner.py`): RISE net < 0 → rec75=9%, sl25=91%. Ativar no Railway com `RISE_NET_MIN=0`. Commit `1ce139a`.
+- **Achado principal**: `PRÉ negativo + RISE fraco/sweet (1-3 SOL)` = melhor setup (rec75=33%, n=15). PRÉ negativo com venda pesada = capitulação real = base para bounce. RISE 1-3 SOL = compradores reais sem FOMO pump.
+- **sl25=85% em todos os buckets** — o SL de 25% é testado em praticamente todo trade. O edge não é evitar o teste de SL, é sobreviver a ele e atingir o TP.
+- **Contranuitivo confirmado**: PRÉ com venda pesada (avg 11.49 SOL vendido antes do fundo) → rec75=23%. PRÉ fraco (avg 0.85 SOL) → rec75=0%. Capitulação real > drift sem compradores.
+
+**⚠️ LEMBRETE PARA PRÓXIMA SESSÃO — Analisar resultados do RISE gate:**
+> Após acumular ~30 novos bounces com `RISE_NET_MIN=0` ativo no Railway, checar:
+> 1. Quantos sinais foram bloqueados pelo gate (log `BOUNCE skip — RISE gate`)
+> 2. WR dos trades que passaram vs período anterior
+> 3. Se `PRÉ negativo + RISE fraco/sweet` continua sendo o melhor combo com n≥30
+> 4. Considerar próximo tier: bloquear também `PRÉ fraco/sweet + RISE bom/alto` (rec75=0%, n=2 — aguardar n≥10)
+> Dashboard: `/analise/pre-rise-ticks?since=2026-06-12` para isolsr período pós-gate.
 
 **Mudanças da sessão 21 (2026-06-11/12):**
 - Novo banco de dados (`intelligent-spirit`) criado 07/06/2026 — banco anterior 100% full.
@@ -949,10 +966,11 @@ Branch `claude/relaxed-planck-H3Qg2` ativo. erpc operacional. Bot ativo com `TRA
 
 **Filtros ativos (ordem de aplicação no _check_bounce):**
 - A.5: bloqueia elapsed > 20min (do ts_migration on-chain)
-- A.6: bloqueia fundo estagnado > 3min (BOTTOM_FRESHNESS_SEC=180)
+- A.6: bloqueia fundo estagnado > 10min (BOTTOM_FRESHNESS_SEC=600)
 - A.7: bloqueia bounce_pct < 10% (BOUNCE_MIN_PCT=0.10) — intencional
 - A.8: bloqueia bounce_pct > 100% (BOUNCE_MAX_PCT=1.00) — entradas tardias
 - C3: bloqueia pool depth < 10 SOL (POOL_MIN_SOL_BOUNCE=10)
+- **RISE gate**: bloqueia RISE net flow < 0 (RISE_NET_MIN=0) — ativar no Railway. Dados: rec75=9% vs 22%, sl25=91%. Commit `1ce139a`.
 - FILTER_PUMP_ONLY: garante cobertura H22
 
 **⚠️ WR histórico inválido.** Os primeiros dados REALMENTE confiáveis (phantom fix + auditoria n=15) são trades pós-2026-05-26 (sessão 16).
