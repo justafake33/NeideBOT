@@ -49237,12 +49237,17 @@ a{color:#58a6ff}
 </p>
 """
 
+    wr_base_pct = (n_rec75 / n_total * 100) if n_total > 0 else 0
+    wr_cls      = "green" if wr_base_pct >= 30 else "yellow"
+    pre_cls     = "green" if n_with_pre  > 20 else "yellow"
+    rise_cls_c  = "green" if n_with_rise > 20 else "yellow"
+    bot_cls     = "green" if n_bottom_window > n_total * 0.5 else "yellow"
     h += f"""<div class='cards'>
   <div class='card'><div class='label'>Total bounces</div><div class='val'>{n_total}</div></div>
-  <div class='card'><div class='label'>rec75 (WR base)</div><div class='val {'green' if n_total > 0 and n_rec75/n_total >= 0.30 else 'yellow'}'>{n_rec75/n_total*100:.0f}%</div></div>
-  <div class='card'><div class='label'>Com dados PRÉ</div><div class='val {'green' if n_with_pre > 20 else 'yellow'}'>{n_with_pre}</div></div>
-  <div class='card'><div class='label'>Com dados RISE</div><div class='val {'green' if n_with_rise > 20 else 'yellow'}'>{n_with_rise}</div></div>
-  <div class='card'><div class='label'>h23_window=bottom</div><div class='val {'green' if n_bottom_window > n_total*0.5 else 'yellow'}'>{n_bottom_window}</div></div>
+  <div class='card'><div class='label'>rec75 (WR base)</div><div class='val {wr_cls}'>{wr_base_pct:.0f}%</div></div>
+  <div class='card'><div class='label'>Com dados PRÉ</div><div class='val {pre_cls}'>{n_with_pre}</div></div>
+  <div class='card'><div class='label'>Com dados RISE</div><div class='val {rise_cls_c}'>{n_with_rise}</div></div>
+  <div class='card'><div class='label'>h23_window=bottom</div><div class='val {bot_cls}'>{n_bottom_window}</div></div>
 </div>
 """
 
@@ -49251,7 +49256,7 @@ a{color:#58a6ff}
     h += "<p style='color:#8b949e;font-size:12px'>Quem estava comprando enquanto o dump acontecia?</p>"
     h += "<table><tr><th>Faixa PRÉ net (SOL)</th><th>n</th><th>rec75</th><th>rec100</th><th>sl25</th><th>avg bounce%</th><th>avg pre_buy</th><th>avg pre_sell</th></tr>"
     for bkt in BUCKET_ORDER:
-        items = pre_buckets.get(bkt.replace("PRÉ)", "PRÉ)").replace("RISE)", "RISE)"), pre_buckets.get(bkt, []))
+        items = pre_buckets.get(bkt, [])
         if not items:
             continue
         tp75, n = _wr(items)
@@ -49269,7 +49274,7 @@ a{color:#58a6ff}
     h += "<p style='color:#8b949e;font-size:12px'>Um bounce fraco (poucos compradores) é um dead-cat. Um bounce com buyers reais continua.</p>"
     h += "<table><tr><th>Faixa RISE net (SOL)</th><th>n</th><th>rec75</th><th>rec100</th><th>sl25</th><th>avg bounce%</th><th>avg rise_buy</th><th>avg rise_sell</th></tr>"
     for bkt in BUCKET_ORDER:
-        items = rise_buckets.get(bkt.replace("PRÉ", "RISE"), rise_buckets.get(bkt, []))
+        items = rise_buckets.get(bkt, [])
         if not items:
             continue
         tp75, n = _wr(items)
@@ -49373,19 +49378,21 @@ a{color:#58a6ff}
             pre_cls = "pos" if pre_net >= 0 else "neg"
             rise_cls = "pos" if (rise_net or 0) >= 0 else "neg"
             rec_cls = "tp" if rec else "sl"
+            rec_lbl = "sim" if rec else "nao"
             bounce_pct = (r.get("bounce_pct") or 0) * 100
-            rise_str = f"<span class='{rise_cls}'>{rise_net:+.1f}</span>" if rise_net is not None else "<span class='dim'>—</span>"
-            h += f"""<tr>
-  <td>{r.get('token_nome') or r['mint'][:8]}</td>
-  <td style='color:#8b949e'>{ts_str}</td>
-  <td>{bounce_pct:.0f}%</td>
-  <td class='{pre_cls}'>{pre_net:+.1f}</td>
-  <td class='dim'>{pre_ev}|{pre_buy:.1f}|{pre_sell:.1f}</td>
-  <td>{rise_str}</td>
-  <td class='dim'>{rise_ev}|{rise_buy:.1f}|{rise_sell:.1f}</td>
-  <td class='{rec_cls}'>{'✅ sim' if rec else '❌ não'}</td>
-  <td>{ratio:.1f}×</td>
-</tr>"""
+            rise_str = f"<span class='{rise_cls}'>{rise_net:+.1f}</span>" if rise_net is not None else "<span class='dim'>-</span>"
+            tok_name = r.get("token_nome") or r["mint"][:8]
+            h += (f"<tr>"
+                  f"<td>{tok_name}</td>"
+                  f"<td style='color:#8b949e'>{ts_str}</td>"
+                  f"<td>{bounce_pct:.0f}%</td>"
+                  f"<td class='{pre_cls}'>{pre_net:+.1f}</td>"
+                  f"<td class='dim'>{pre_ev}|{pre_buy:.1f}|{pre_sell:.1f}</td>"
+                  f"<td>{rise_str}</td>"
+                  f"<td class='dim'>{rise_ev}|{rise_buy:.1f}|{rise_sell:.1f}</td>"
+                  f"<td class='{rec_cls}'>{rec_lbl}</td>"
+                  f"<td>{ratio:.1f}x</td>"
+                  f"</tr>")
         h += "</table>"
     else:
         h += "<div class='box dim'>Sem bounces com dados Helius no período selecionado. Bot precisa acumular mais sinais.</div>"
