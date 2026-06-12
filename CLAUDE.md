@@ -857,6 +857,23 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 
 190. **Fix `db.py`: ALTER TABLE token_ticks antes de CREATE TABLE (sessão 20, 2026-06-08)**: em banco novo, o bloco `ALTER TABLE token_ticks ADD COLUMN IF NOT EXISTS...` vinha antes de `CREATE TABLE IF NOT EXISTS token_ticks`, causando erro `relation "token_ticks" does not exist` ao rodar `migrate.py`. Fix: bloco ALTER TABLE movido para depois do CREATE TABLE correspondente. Commit `b93b13c`.
 
+191. **Banco de dados novo — `intelligent-spirit` criado 07/06/2026 (sessão 21)**: banco anterior `beautiful-heart` atingiu disco 100% full. Novo PostgreSQL criado dentro do mesmo projeto `intelligent-spirit` (web + worker). Todos os dados coletados antes de 07/06/2026 NÃO estão disponíveis no banco ativo — começamos do zero. Consequência direta: dashboards que calculavam `n_days` pelo parâmetro `since` mostravam valores errados (ex: "15 dias / 10 tokens/dia" com banco de 4 dias de dados). Fix implementado: todos os endpoints de análise agora calculam `n_days` via `SELECT EXTRACT(EPOCH FROM NOW() - MIN(ts_migration)) / 86400 AS days FROM migrations WHERE ts_migration >= %s` — usa a data mais antiga real do banco, não o parâmetro de filtro.
+
+192. **Calibração de filtros ativos — sessão 21, 2026-06-11 (análise rec75 por faixa)**: dashboards `/analise/filter-impact`, `/analise/filter-ranges`, `/analise/filtros-simples` revelaram três filtros com configuração problemática:
+    - **`BOUNCE_DROP_MIN=0.30`** (bloqueia tokens com drop < 30%): tokens com drop de 10-30% têm rec75 de **38-46%** — o MELHOR quartil. Drop 30-50% tem rec75 de 12-17%. O filtro está **bloqueando os melhores tokens** e deixando passar os piores. Ajustado para `BOUNCE_DROP_MIN=0.20` como teste conservador (receio válido sobre phantom bottoms de 10% ainda existir com dados muito recentes). Revalidar com n≥100 tokens.
+    - **`TRADE_MAX_ELAPSED_SEC=300`** (bloqueia tokens com fundo após 5min): bloqueia **74% dos sinais**. A faixa 8-15min tem rec75 de 41-100% (melhores performances). 0-3min = 32%, 3-8min = 34%, **8-15min = 41%**, **15-30min = 100% (n=4)**. Ajustado para `TRADE_MAX_ELAPSED_SEC=900` (15 min).
+    - **`BOTTOM_FRESHNESS_SEC=180`** (A.6 — fundo estagnado > 3min bloqueia): fundo em 3-10min = **33% rec75**. O filtro corretamente bloqueia fundos velhos (>10min desde o último mc_min), mas 180s era muito restritivo. Ajustado para `BOTTOM_FRESHNESS_SEC=600` (10 min).
+
+193. **TrendingRadar desativado como sistema autônomo — H27 adicionado passivamente (sessão 21)**: análise mostrou que 91% dos tokens trending não estão em `migrations` (tokens estabelecidos, não recém-migrados). Shadow WR era sempre 0% porque não havia token_ticks para esses tokens. Sistema autônomo (TRENDING_RADAR_ENABLED) desativado por padrão (`default="false"`). Em vez disso, adicionado campo `trending_at_bounce BOOLEAN` em `bounce_signals`: subquery que checa se o token apareceu em `gmgn_trending_snapshots` nos 15min antes do bounce. Acumular n≥50 bounces para correlacionar com outcomes GMGN. Tabela `gmgn_trending_snapshots` deve ser truncada no Railway (`TRUNCATE gmgn_trending_snapshots, gmgn_trending_coverage CASCADE`).
+
+194. **Tokens que nunca caíram após migração — estratégia diferente (sessão 21)**: observação empírica: USDJC migrou e subiu direto sem bounce. Análise SQL (DB < 72h): 4 tokens com `mc_bottom > mc_migration × 0.95`: USDJC (drop=-0.2%, peak=+1271%), ANSEM (drop=-0.2%, peak=+123%), FootBALL, H4B. Conclusão: são duas estratégias distintas. (a) **Estratégia atual (dip buying)**: aguarda dump ≥20% → bounce ≥30% → buy. ANSEM teria sido comprado com `BOUNCE_DROP_MIN=0.20` (drop -0.2% < threshold mínimo atual, mas com 0.20 ainda teria sido bloqueado — drop é negativo, não há dump). Na prática, ANSEM teria sido comprado SÓ com `BOUNCE_DROP_MIN=0` ou negativo, o que não faz sentido. (b) **Estratégia momentum (não implementada)**: comprar na migração diretamente, sem aguardar dump. USDJC nunca caiu — impossível de capturar pela estratégia atual independente dos filtros. Manter foco na estratégia atual. Anotar como hipótese futura: H28 = tokens com spike de 1s pós-migração (manipulação detectável on-chain) devem ser excluídos, não incluídos como entrada de momentum.
+
+195. **Novos dashboards de calibração de filtros — sessão 21**: três endpoints adicionados para análise detalhada de filtros:
+    - `/analise/bounce-funnel`: funil de conversão (migrações → bottoms → bounces → trades) com n_days calculado do DB real.
+    - `/analise/filter-ranges`: tabela detalhada de rec75 por faixa de threshold para cada filtro principal (drop_pct, elapsed_to_bottom, BOTTOM_FRESHNESS, bounce_pct, POOL_MIN_SOL). Grid 2D elapsed × drop.
+    - `/analise/filtros-simples`: dashboard em linguagem simples para stakeholders — explica cada filtro, mostra taxa de bloqueio, compara PASSA vs BLOQUEADO, indica se o filtro está "ajudando" (bloqueia tokens piores) ou "atrapalhando" (bloqueia tokens melhores).
+    - `/analise/filter-impact`: resumo do impacto dos filtros ativos sobre rec75 e frequência de sinais.
+
 172. **Resultado da auditoria final sessão 15 — 100% PASS**: todos os 7 critérios passaram com evidência de código. kline não escreve mc_min_decision (scanner.py:793–795). Gate 90s não existe em `_check_bounce` (scanner.py:304). Replay valida identidade de pool via `pool_acc in _replay_accs` (helius_ws.py:912). mc_min_true com txid persistido (helius_rpc.py:317–432 + db.py:612). bottom_error_pct e bottom_quality calculados e persistidos (scanner.py:947–953 + db.py:616). Monotonicidade: `if mc < state["mc_min"]` in-memory + `AND mc_bottom > %(mc)s` no DB. Logs com source/old/new: `"Fundo(%s) %s: mint=%s mc_old=$%.0f mc_new=$%.0f event_ts=%.3f elapsed=%.1fmin"` com source = `"erpc_live"` ou `"erpc_replay"`. Nenhum FAIL identificado. Este é o marco onde os dados começam a ser auditáveis por txid Solana.
 
 173. **Bug phantom via ALT tx corrigido (sessão 16, 2026-05-26)**: transações Solana versioned (v0) com Address Lookup Tables fazem com que `_parse_account_keys_from_tx()` retorne `[]` (lista vazia) — as account keys estão nas tabelas de lookup, não embutidas no wire format. O check antigo era `if accounts:` — lista vazia é falsy, logo o check era silenciosamente pulado → eventos de secondary pool em transações ALT passavam mesmo com pool confirmada → mc_min contaminado. Fix aplicado em dois commits: `16a512b` (correção inicial — rejeitava `accounts=[]`) e `037a06c` (fix da regressão crítica). A regressão: o fix intermediário usava `if not accounts or ...` — `not None` é True → modo Helius (que passa `accounts=None` por design) rejeitava TODOS os eventos após pool confirmada, tornando o bot completamente cego se erpc caísse. Fix final: `if known_pool and accounts is not None: if not accounts or known_pool not in accounts: return False`. Regra: validação de pool só aplica quando `accounts` é uma lista (erpc mode). `None` = modo Helius = sem dados de account = sem validação possível.
@@ -872,12 +889,16 @@ HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (di
 ## 🔄 Estado Atual: BOT ATIVO (sessão 21, 2026-06-12)
 
 ### Situação atual
-erpc operacional. Bot ativo com `TRADING_ENABLED=true`.
+Branch `claude/relaxed-planck-H3Qg2` ativo. erpc operacional. Bot ativo com `TRADING_ENABLED=true`.
 
-**Mudanças desta sessão (2026-06-12):**
+**Mudanças da sessão 21 (2026-06-11/12):**
+- Novo banco de dados (`intelligent-spirit`) criado 07/06/2026 — banco anterior 100% full.
+- Análise de filtros via `/analise/filter-ranges` revelou três filtros mal calibrados. Ajustes: `BOUNCE_DROP_MIN=0.20`, `TRADE_MAX_ELAPSED_SEC=900`, `BOTTOM_FRESHNESS_SEC=600`.
+- TrendingRadar autônomo desativado. Campo `trending_at_bounce` adicionado passivamente em `bounce_signals`.
+- `n_days` corrigido em todos os dashboards — agora usa `MIN(ts_migration)` real do banco.
+- Novos endpoints: `/analise/bounce-funnel`, `/analise/filter-ranges`, `/analise/filtros-simples`, `/analise/filter-impact`.
 - **Priority lane para swap**: `swap()` e `query_order()` bypassam `_wait_global_ban()` — execução imediata independente de 429 do scanner. Commit `d41feca`.
 - **API key separada para scanner**: `GMGN_SCANNER_API_KEY` — scanner/HotMonitor/TrendingRadar usam key dedicada. Rate limit do scanner e do executor são completamente independentes. Commit `1cad17c`.
-- **Causa raiz do timing inconsistente resolvida**: trades demorando 10s a 5min eram causados pelo scanner consumir a cota da API key, bloqueando o executor na mesma fila. Agora cada um tem sua própria lane e sua própria key.
 
 **Para ativar separação de keys:** adicionar `GMGN_SCANNER_API_KEY` nos serviços **web E worker** no Railway.
 
