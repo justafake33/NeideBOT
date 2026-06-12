@@ -9,6 +9,7 @@ import db
 
 drop_real_bp = Blueprint("drop_real", __name__)
 
+
 @drop_real_bp.route("/analise/drop-real")
 def analise_drop_real():
     """
@@ -26,6 +27,7 @@ def analise_drop_real():
     tp_pct = float(request.args.get("tp", "0.75"))
     sl_pct = float(request.args.get("sl", "0.15"))
     min_sample = int(request.args.get("min_sample", "10"))
+    live_hours = int(request.args.get("live_hours", "24"))
     BRT   = timezone(timedelta(hours=-3))
     time_filter_sql = "AND m.ts_migration >= NOW() - %(interval)s::interval" if hours else ""
 
@@ -162,6 +164,26 @@ def analise_drop_real():
             for t in cur.fetchall():
                 ticks_by_mint.setdefault(t["mint"], []).append(dict(t))
 
+        cur.execute("""
+            SELECT
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE status = 'tp') AS tp,
+                COUNT(*) FILTER (WHERE status = 'sl') AS sl,
+                COUNT(*) FILTER (WHERE status = 'trailing_active') AS trailing_active,
+                COUNT(*) FILTER (WHERE status = 'open') AS open,
+                COUNT(*) FILTER (WHERE status = 'expired') AS expired,
+                COUNT(*) FILTER (WHERE status NOT IN ('tp','sl','trailing_active','open','expired')) AS other,
+                AVG(config_bounce_drop_min) AS avg_drop_cfg,
+                AVG(config_bounce_min_pct) AS avg_bounce_cfg,
+                AVG(drop_from_mig_signal) AS avg_drop_signal,
+                AVG(bounce_pct_signal) AS avg_bounce_signal,
+                AVG(CASE WHEN mc_bottom > 0 AND mc_at_signal > 0
+                         THEN (mc_at_signal - mc_bottom) / mc_bottom END) AS avg_signal_above_bottom
+            FROM trades
+            WHERE created_at >= NOW() - %(live_interval)s::interval
+        """, {"live_interval": f"{live_hours} hours"})
+        live_stats = dict(cur.fetchone() or {})
+
         cur.close()
         conn.close()
     except Exception as e:
@@ -249,19 +271,29 @@ def analise_drop_real():
         n_tokens = len(items)
         entries = [x for x in items if x["status"] in ("tp", "sl", "aberto")]
         tp_n = sum(1 for x in entries if x["status"] == "tp")
-        sl_n = sum(1 for x in entries if x["status"] == "sl")
+        actual_sl_n = sum(1 for x in entries if x["status"] == "sl")
         open_n = sum(1 for x in entries if x["status"] == "aberto")
+        # Conservador: toda entrada que não bateu TP dentro da janela vira perda.
+        # Assim, "aberto" conta como SL nas colunas, WR e EV, em vez de inflar
+        # a métrica resolvida/EV com posições sem desfecho.
+        sl_n = actual_sl_n + open_n
         no_entry_n = sum(1 for x in items if x["status"] == "sem_entry")
         resolved = tp_n + sl_n
         wr_resolved = tp_n / resolved if resolved else None
         wr_entries = tp_n / len(entries) if entries else None
-        pnl_vals = [x.get("pnl") for x in entries if x.get("pnl") is not None]
+        pnl_vals = []
+        for x in entries:
+            if x["status"] == "tp":
+                pnl_vals.append(tp_pct)
+            else:
+                pnl_vals.append(-sl_pct)
         ev = sum(pnl_vals) / len(pnl_vals) if pnl_vals else None
         return {
             "tokens": n_tokens,
             "entries": len(entries),
             "tp": tp_n,
             "sl": sl_n,
+            "actual_sl": actual_sl_n,
             "open": open_n,
             "no_entry": no_entry_n,
             "resolved": resolved,
@@ -368,7 +400,7 @@ def analise_drop_real():
 </style></head><body>
 """
     period_label = f"últimas {hours}h" if hours else "todo o histórico"
-    h += f"<h2>📉 WR por drop real — entrada no bounce do fundo</h2>"
+    h += f"<h2>📉 Shadow WR por drop real — não é WR real dos trades</h2>"
     h += f"<p class='sub'>Migrations de {period_label}; tabela histórica abaixo filtra tokens que <b>subiram ≥20%</b> · "
     h += f"{total_all} tokens vencedores na tabela histórica · base WR: {overall_sim['tokens']} tokens com fundo · "
     h += f"entry bounce={entry_pct:.0%} · TP={tp_pct:.0%} · SL={sl_pct:.0%} · "
@@ -386,42 +418,54 @@ def analise_drop_real():
     best_txt = "Sem amostra suficiente para recomendar drop."
     if best_drop:
         best_txt = (
-            f"Melhor BOUNCE_DROP_MIN nesta amostra: <b>{best_drop['drop_min']:.0%}</b> "
+            f"Melhor BOUNCE_DROP_MIN no shadow desta amostra: <b>{best_drop['drop_min']:.0%}</b> "
             f"(entries={best_drop['entries']}, TP={best_drop['tp']}, SL={best_drop['sl']}, "
-            f"WR entradas={_pct_html(best_drop['wr_entries'])}, EV={_ev_html(best_drop['ev'])})."
+            f"WR conservador={_pct_html(best_drop['wr_entries'])}, EV conservador={_ev_html(best_drop['ev'])})."
         )
 
-    h += f"<h3>Backtest por drop mínimo — entrada quando bounce chega a +{entry_pct:.0%} do fundo</h3>"
+    resolved_live = (live_stats.get("tp") or 0) + (live_stats.get("sl") or 0)
+    live_wr_resolved = (live_stats.get("tp") or 0) / resolved_live if resolved_live else None
+    live_wr_all = (live_stats.get("tp") or 0) / (live_stats.get("total") or 0) if live_stats.get("total") else None
+    h += "<h3>Trades reais recentes — comparação com o shadow</h3>"
+    h += "<div class='box'>"
+    h += f"Últimas {live_hours}h: <b>{live_stats.get('total') or 0} trades reais</b> · "
+    h += f"TP={live_stats.get('tp') or 0} · SL={live_stats.get('sl') or 0} · trailing_active={live_stats.get('trailing_active') or 0} · open={live_stats.get('open') or 0} · expired={live_stats.get('expired') or 0} · "
+    h += f"WR real resolvido={_pct_html(live_wr_resolved)} · WR real / total={_pct_html(live_wr_all)}.<br>"
+    h += f"Config/sinal médios: drop_cfg={_pct_html(live_stats.get('avg_drop_cfg'))} · bounce_cfg={_pct_html(live_stats.get('avg_bounce_cfg'))} · drop_sinal={_pct_html(live_stats.get('avg_drop_signal'))} · bounce_sinal={_pct_html(live_stats.get('avg_bounce_signal'))} · entrada acima do fundo={_pct_html(live_stats.get('avg_signal_above_bottom'))}."
+    h += "<br><b>Importante:</b> a tabela abaixo é um <u>shadow backtest idealizado</u>. Ela não usa fill real, slippage, fees, latência GMGN, Helius gate, nem trailing real. No shadow, entradas abertas agora são tratadas como SL para manter o cálculo conservador."
+    h += "</div>"
+
+    h += f"<h3>Shadow backtest por drop mínimo — entrada quando bounce chega a +{entry_pct:.0%} do fundo</h3>"
     h += "<div class='box'>"
     h += f"<b>{best_txt}</b><br>"
     h += f"Base: {overall_sim['tokens']} tokens com fundo calculável · {overall_sim['entries']} entradas acionadas por bounce ≥ {entry_pct:.0%} · "
-    h += f"TP={overall_sim['tp']} · SL={overall_sim['sl']} · abertos/sem TP-SL={overall_sim['open']} · sem entry={overall_sim['no_entry']} · "
-    h += f"WR entradas={_pct_html(overall_sim['wr_entries'])} · WR resolvido={_pct_html(overall_sim['wr_resolved'])} · EV={_ev_html(overall_sim['ev'])}."
+    h += f"TP={overall_sim['tp']} · SL conservador={overall_sim['sl']} (inclui {overall_sim['open']} abertos) · sem entry={overall_sim['no_entry']} · "
+    h += f"WR conservador={_pct_html(overall_sim['wr_entries'])} · EV conservador={_ev_html(overall_sim['ev'])}."
     h += "</div>"
 
-    h += "<table style='margin-bottom:20px'><tr><th>Drop mínimo</th><th>Tokens</th><th>Entradas</th><th>TP</th><th>SL</th><th>Aberto</th><th>Sem entry</th><th>WR entradas</th><th>WR TP/SL</th><th>EV médio</th></tr>"
+    h += "<table style='margin-bottom:20px'><tr><th>Drop mínimo</th><th>Tokens</th><th>Entradas shadow</th><th>TP shadow</th><th>SL shadow conservador</th><th>Abertos tratados como SL</th><th>Sem entry</th><th>Shadow WR conservador</th><th>EV conservador</th></tr>"
     for st in threshold_stats:
         cls = "green" if (st['wr_entries'] or 0) >= 0.30 else "yellow" if (st['wr_entries'] or 0) >= 0.20 else "red"
         best_mark = " ⭐" if best_drop and st['drop_min'] == best_drop['drop_min'] else ""
         h += "<tr>"
         h += f"<td><b>{st['drop_min']:.0%}{best_mark}</b></td>"
         h += f"<td>{st['tokens']}</td><td>{st['entries']}</td><td style='color:#4ade80'>{st['tp']}</td><td style='color:#f87171'>{st['sl']}</td><td>{st['open']}</td><td class='dim'>{st['no_entry']}</td>"
-        h += f"<td class='{cls}'>{_pct_html(st['wr_entries'])}</td><td>{_pct_html(st['wr_resolved'])}</td><td>{_ev_html(st['ev'])}</td>"
+        h += f"<td class='{cls}'>{_pct_html(st['wr_entries'])}</td><td>{_ev_html(st['ev'])}</td>"
         h += "</tr>"
     h += "</table>"
 
-    h += "<h3>WR por faixa real de drop</h3>"
-    h += "<table style='margin-bottom:20px'><tr><th>Faixa de drop</th><th>Tokens</th><th>Entradas</th><th>TP</th><th>SL</th><th>Aberto</th><th>Sem entry</th><th>WR entradas</th><th>WR TP/SL</th><th>EV médio</th></tr>"
+    h += "<h3>Shadow WR por faixa real de drop — abertos contam como SL</h3>"
+    h += "<table style='margin-bottom:20px'><tr><th>Faixa de drop</th><th>Tokens</th><th>Entradas shadow</th><th>TP shadow</th><th>SL shadow conservador</th><th>Abertos tratados como SL</th><th>Sem entry</th><th>Shadow WR conservador</th><th>EV conservador</th></tr>"
     for st in bucket_stats:
         label = f"{st['lo']:.0%}–{st['hi']:.0%}" if st['hi'] < 9 else f"≥{st['lo']:.0%}"
         cls = "green" if (st['wr_entries'] or 0) >= 0.30 else "yellow" if (st['wr_entries'] or 0) >= 0.20 else "red"
         h += "<tr>"
         h += f"<td><b>{label}</b></td><td>{st['tokens']}</td><td>{st['entries']}</td><td style='color:#4ade80'>{st['tp']}</td><td style='color:#f87171'>{st['sl']}</td><td>{st['open']}</td><td class='dim'>{st['no_entry']}</td>"
-        h += f"<td class='{cls}'>{_pct_html(st['wr_entries'])}</td><td>{_pct_html(st['wr_resolved'])}</td><td>{_ev_html(st['ev'])}</td>"
+        h += f"<td class='{cls}'>{_pct_html(st['wr_entries'])}</td><td>{_ev_html(st['ev'])}</td>"
         h += "</tr>"
     h += "</table>"
 
-    h += "<p class='sub'>Metodologia WR: para cada token com fundo, a entrada hipotética ocorre no primeiro tick após o fundo cujo high/MC toca fundo × " + f"{1+entry_pct:.2f}" + ". TP/SL são avaliados nos ticks seguintes até 70min pós-migração; velas kline usam high/low e ticks simples usam mc.</p>"
+    h += "<p class='sub'>Metodologia SHADOW conservadora: para cada token com fundo, a entrada hipotética ocorre no primeiro tick após o fundo cujo high/MC toca fundo × " + f"{1+entry_pct:.2f}" + ". TP/SL são avaliados nos ticks seguintes até 70min pós-migração; se a entrada fica aberta/sem TP-SL até o fim da janela, ela é contabilizada como SL. Velas kline usam high/low e ticks simples usam mc. Isto NÃO é o trade real: o bot real dispara em scanner.py com BOUNCE_DROP_MIN/BOUNCE_MIN_PCT, compra pelo GMGN, registra mc_at_signal/fill e o executor usa SL/TP/trailing sobre a entrada real/proxy.</p>"
 
     h += f"<div class='box'>{conclusao_html}</div>"
 
