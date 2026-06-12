@@ -102,4 +102,3 @@ def debug_trending_radar():
         h += "</tr>"
     h += "</table></body></html>"
     return h
-
