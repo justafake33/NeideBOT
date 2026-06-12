@@ -9,6 +9,7 @@ import db
 
 drop_real_bp = Blueprint("drop_real", __name__)
 
+
 @drop_real_bp.route("/analise/drop-real")
 def analise_drop_real():
     """
@@ -26,6 +27,7 @@ def analise_drop_real():
     tp_pct = float(request.args.get("tp", "0.75"))
     sl_pct = float(request.args.get("sl", "0.15"))
     min_sample = int(request.args.get("min_sample", "10"))
+    live_hours = int(request.args.get("live_hours", "24"))
     BRT   = timezone(timedelta(hours=-3))
     time_filter_sql = "AND m.ts_migration >= NOW() - %(interval)s::interval" if hours else ""
 
@@ -144,6 +146,26 @@ def analise_drop_real():
             (s.mc_migration - COALESCE(s.mc_min_early, s.mc_migration)) / NULLIF(s.mc_migration, 0) ASC
     """.format(time_filter_sql=time_filter_sql), {"interval": f"{hours} hours" if hours else None})
         all_rows = cur.fetchall()
+
+        # Audit de fundo: o fundo operacional (mc_min_early) pode ficar acima do
+        # menor tick observado depois. Ex.: sistema usa 13k, mas ticks mostram
+        # 10k; uma entrada teórica em +10% do fundo usado vira +43% do fundo real.
+        for r in all_rows:
+            bottom_used = float(r.get("mc_min_early") or 0)
+            tick_floor = float(r.get("mc_min_ticks") or 0)
+            if bottom_used and tick_floor:
+                audit_bottom = min(bottom_used, tick_floor)
+                bottom_gap = (bottom_used / tick_floor - 1) if tick_floor < bottom_used else 0.0
+            else:
+                audit_bottom = bottom_used or tick_floor or None
+                bottom_gap = None
+            r["mc_bottom_audit"] = audit_bottom
+            r["bottom_gap_pct"] = bottom_gap
+            r["effective_entry_bounce_pct"] = (
+                (bottom_used * (1 + entry_pct) / audit_bottom) - 1
+                if bottom_used and audit_bottom else None
+            )
+
         rows = [r for r in all_rows if r.get("gain_pct") is None or (r.get("gain_pct") or 0) >= 0.20]
 
         sim_rows = [r for r in all_rows if r.get("mc_min_early") and r.get("time_to_bottom") is not None]
@@ -161,6 +183,26 @@ def analise_drop_real():
             """, (sim_mints, ts_floor, ts_ceil))
             for t in cur.fetchall():
                 ticks_by_mint.setdefault(t["mint"], []).append(dict(t))
+
+        cur.execute("""
+            SELECT
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE status = 'tp') AS tp,
+                COUNT(*) FILTER (WHERE status = 'sl') AS sl,
+                COUNT(*) FILTER (WHERE status = 'trailing_active') AS trailing_active,
+                COUNT(*) FILTER (WHERE status = 'open') AS open,
+                COUNT(*) FILTER (WHERE status = 'expired') AS expired,
+                COUNT(*) FILTER (WHERE status NOT IN ('tp','sl','trailing_active','open','expired')) AS other,
+                AVG(config_bounce_drop_min) AS avg_drop_cfg,
+                AVG(config_bounce_min_pct) AS avg_bounce_cfg,
+                AVG(drop_from_mig_signal) AS avg_drop_signal,
+                AVG(bounce_pct_signal) AS avg_bounce_signal,
+                AVG(CASE WHEN mc_bottom > 0 AND mc_at_signal > 0
+                         THEN (mc_at_signal - mc_bottom) / mc_bottom END) AS avg_signal_above_bottom
+            FROM trades
+            WHERE created_at >= NOW() - %(live_interval)s::interval
+        """, {"live_interval": f"{live_hours} hours"})
+        live_stats = dict(cur.fetchone() or {})
 
         cur.close()
         conn.close()
@@ -183,6 +225,7 @@ def analise_drop_real():
     def _simulate_entry(row):
         mint = row["mint"]
         bottom = float(row.get("mc_min_early") or 0)
+        audit_bottom = float(row.get("mc_bottom_audit") or 0)
         drop = row.get("drop_pct")
         ts_mig = row.get("ts_migration")
         ttb = row.get("time_to_bottom")
@@ -193,6 +236,8 @@ def analise_drop_real():
         bottom_ts = ts_mig + timedelta(minutes=float(ttb))
         end_ts = ts_mig + timedelta(minutes=70)
         entry_mc = bottom * (1 + entry_pct)
+        effective_entry_bounce = (entry_mc / audit_bottom - 1) if audit_bottom else None
+        bottom_gap = row.get("bottom_gap_pct")
         tp_mc = entry_mc * (1 + tp_pct)
         sl_mc = entry_mc * (1 - sl_pct)
 
@@ -212,6 +257,7 @@ def analise_drop_real():
                 *_, last_mc = _tick_high_low(post_bottom[-1])
             return {
                 "row": row, "drop_pct": drop, "status": "sem_entry", "entry_mc": entry_mc,
+                "effective_entry_bounce": effective_entry_bounce, "bottom_gap_pct": bottom_gap,
                 "pnl": (last_mc / entry_mc - 1) if last_mc and entry_mc else None,
             }
 
@@ -225,12 +271,12 @@ def analise_drop_real():
             if tp_hit and sl_hit:
                 midpoint = (tp_mc + sl_mc) / 2
                 if open_mc >= midpoint:
-                    return {"row": row, "drop_pct": drop, "status": "tp", "entry_mc": entry_mc, "entry_elapsed": entry_elapsed, "pnl": tp_pct}
-                return {"row": row, "drop_pct": drop, "status": "sl", "entry_mc": entry_mc, "entry_elapsed": entry_elapsed, "pnl": -sl_pct}
+                    return {"row": row, "drop_pct": drop, "status": "tp", "entry_mc": entry_mc, "entry_elapsed": entry_elapsed, "effective_entry_bounce": effective_entry_bounce, "bottom_gap_pct": bottom_gap, "pnl": tp_pct}
+                return {"row": row, "drop_pct": drop, "status": "sl", "entry_mc": entry_mc, "entry_elapsed": entry_elapsed, "effective_entry_bounce": effective_entry_bounce, "bottom_gap_pct": bottom_gap, "pnl": -sl_pct}
             if tp_hit:
-                return {"row": row, "drop_pct": drop, "status": "tp", "entry_mc": entry_mc, "entry_elapsed": entry_elapsed, "pnl": tp_pct}
+                return {"row": row, "drop_pct": drop, "status": "tp", "entry_mc": entry_mc, "entry_elapsed": entry_elapsed, "effective_entry_bounce": effective_entry_bounce, "bottom_gap_pct": bottom_gap, "pnl": tp_pct}
             if sl_hit:
-                return {"row": row, "drop_pct": drop, "status": "sl", "entry_mc": entry_mc, "entry_elapsed": entry_elapsed, "pnl": -sl_pct}
+                return {"row": row, "drop_pct": drop, "status": "sl", "entry_mc": entry_mc, "entry_elapsed": entry_elapsed, "effective_entry_bounce": effective_entry_bounce, "bottom_gap_pct": bottom_gap, "pnl": -sl_pct}
 
         if post_entry:
             *_, last_mc = _tick_high_low(post_entry[-1])
@@ -239,7 +285,8 @@ def analise_drop_real():
             pnl = None
         return {
             "row": row, "drop_pct": drop, "status": "aberto", "entry_mc": entry_mc,
-            "entry_elapsed": entry_elapsed, "pnl": pnl,
+            "entry_elapsed": entry_elapsed, "effective_entry_bounce": effective_entry_bounce,
+            "bottom_gap_pct": bottom_gap, "pnl": pnl,
             "max_gain": (max_mc / entry_mc - 1) if entry_mc else None,
         }
 
@@ -249,25 +296,39 @@ def analise_drop_real():
         n_tokens = len(items)
         entries = [x for x in items if x["status"] in ("tp", "sl", "aberto")]
         tp_n = sum(1 for x in entries if x["status"] == "tp")
-        sl_n = sum(1 for x in entries if x["status"] == "sl")
+        actual_sl_n = sum(1 for x in entries if x["status"] == "sl")
         open_n = sum(1 for x in entries if x["status"] == "aberto")
+        # Conservador: toda entrada que não bateu TP dentro da janela vira perda.
+        # Assim, "aberto" conta como SL nas colunas, WR e EV, em vez de inflar
+        # a métrica resolvida/EV com posições sem desfecho.
+        sl_n = actual_sl_n + open_n
         no_entry_n = sum(1 for x in items if x["status"] == "sem_entry")
         resolved = tp_n + sl_n
         wr_resolved = tp_n / resolved if resolved else None
         wr_entries = tp_n / len(entries) if entries else None
-        pnl_vals = [x.get("pnl") for x in entries if x.get("pnl") is not None]
+        pnl_vals = []
+        for x in entries:
+            if x["status"] == "tp":
+                pnl_vals.append(tp_pct)
+            else:
+                pnl_vals.append(-sl_pct)
         ev = sum(pnl_vals) / len(pnl_vals) if pnl_vals else None
+        eff_vals = [x.get("effective_entry_bounce") for x in entries if x.get("effective_entry_bounce") is not None]
+        drift_entries = sum(1 for v in eff_vals if v > entry_pct + 0.05)
         return {
             "tokens": n_tokens,
             "entries": len(entries),
             "tp": tp_n,
             "sl": sl_n,
+            "actual_sl": actual_sl_n,
             "open": open_n,
             "no_entry": no_entry_n,
             "resolved": resolved,
             "wr_resolved": wr_resolved,
             "wr_entries": wr_entries,
             "ev": ev,
+            "avg_effective_entry_bounce": sum(eff_vals) / len(eff_vals) if eff_vals else None,
+            "drift_entries": drift_entries,
         }
 
     drop_thresholds = [0.00, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50, 0.60, 0.70, 0.80]
@@ -294,6 +355,36 @@ def analise_drop_real():
     )
 
     overall_sim = _summarize_results(sim_results)
+
+    def _avg(vals):
+        vals = [v for v in vals if v is not None]
+        return sum(vals) / len(vals) if vals else None
+
+    def _percentile(vals, p):
+        vals = sorted(v for v in vals if v is not None)
+        if not vals:
+            return None
+        idx = min(len(vals) - 1, max(0, int(round((len(vals) - 1) * p))))
+        return vals[idx]
+
+    bottom_audit_rows = [r for r in sim_rows if r.get("mc_min_early") and r.get("mc_bottom_audit")]
+    bottom_drift_rows = [r for r in bottom_audit_rows if (r.get("bottom_gap_pct") or 0) > 0.05]
+    bottom_gap_vals = [r.get("bottom_gap_pct") for r in bottom_drift_rows]
+    effective_bounce_vals = [r.get("effective_entry_bounce_pct") for r in bottom_audit_rows]
+    bottom_audit = {
+        "total": len(bottom_audit_rows),
+        "drift": len(bottom_drift_rows),
+        "drift_pct": len(bottom_drift_rows) / len(bottom_audit_rows) if bottom_audit_rows else None,
+        "avg_gap": _avg(bottom_gap_vals),
+        "p90_gap": _percentile(bottom_gap_vals, 0.90),
+        "max_gap": max(bottom_gap_vals) if bottom_gap_vals else None,
+        "avg_effective_bounce": _avg(effective_bounce_vals),
+    }
+    drift_examples = sorted(
+        bottom_drift_rows,
+        key=lambda r: (r.get("bottom_gap_pct") or 0),
+        reverse=True,
+    )[:15]
 
     # ── Classifica cada token em 5 categorias ────────────────────────────────
     CAT_UP    = "subiu_direto"   # nunca caiu abaixo da migração (drop <= 0)
@@ -340,7 +431,7 @@ def analise_drop_real():
 <span style='color:#60a5fa'>📉 {n_forte} tokens ({pct(n_forte)}) caíram >30% antes de subir</span> — a estratégia atual JÁ deveria capturar esses. Se não capturou, é outro problema (A.5, A.6, erpc, pool).<br>
 {"<span style='color:#8b949e'>⚠️ " + str(n_sem) + " tokens sem fundo na janela de 20min (nem token_ticks nem erpc/kline via mc_bottom).</span><br>" if n_sem else ""}
 <br>
-<b>Ação recomendada:</b> {'Baixar <code>BOUNCE_DROP_MIN</code> de 0.30 para 0.15 adicionaria <b>' + str(capturavel) + ' tokens</b> à janela de compra (' + pct(capturavel) + ' dos vencedores). Testar com os dados limpos atuais (n≥30).' if capturavel > 5 else 'Poucos tokens na zona 15–30%. Manter BOUNCE_DROP_MIN=0.30 por ora.'}
+<b>Ação recomendada:</b> não baixar <code>BOUNCE_DROP_MIN</code> só pelo shadow enquanto o fundo ainda divergir dos ticks reais. Primeiro corrigir/monitorar a captura do fundo; quando o bounce efetivo real estiver perto do alvo ({entry_pct:.0%}), aí sim reavaliar a zona 15–30% ({capturavel} tokens nesta amostra).
 """
 
     # ── HTML ─────────────────────────────────────────────────────────────────
@@ -363,12 +454,13 @@ def analise_drop_real():
   tr:hover td{background:#161b22}
   a{color:#58a6ff;text-decoration:none}
   .dim{color:#475569}
+  .green{color:#4ade80}.yellow{color:#fbbf24}.red{color:#f87171}
   .sep{background:#0d1117;color:#58a6ff;font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;padding:6px 10px;border-bottom:1px solid #21262d}
   code{background:#21262d;padding:1px 5px;border-radius:3px;font-size:12px}
 </style></head><body>
 """
     period_label = f"últimas {hours}h" if hours else "todo o histórico"
-    h += f"<h2>📉 WR por drop real — entrada no bounce do fundo</h2>"
+    h += f"<h2>📉 Shadow WR por drop real — não é WR real dos trades</h2>"
     h += f"<p class='sub'>Migrations de {period_label}; tabela histórica abaixo filtra tokens que <b>subiram ≥20%</b> · "
     h += f"{total_all} tokens vencedores na tabela histórica · base WR: {overall_sim['tokens']} tokens com fundo · "
     h += f"entry bounce={entry_pct:.0%} · TP={tp_pct:.0%} · SL={sl_pct:.0%} · "
@@ -386,42 +478,81 @@ def analise_drop_real():
     best_txt = "Sem amostra suficiente para recomendar drop."
     if best_drop:
         best_txt = (
-            f"Melhor BOUNCE_DROP_MIN nesta amostra: <b>{best_drop['drop_min']:.0%}</b> "
+            f"Maior EV no shadow desta amostra (não recomendar config ainda): <b>{best_drop['drop_min']:.0%}</b> "
             f"(entries={best_drop['entries']}, TP={best_drop['tp']}, SL={best_drop['sl']}, "
-            f"WR entradas={_pct_html(best_drop['wr_entries'])}, EV={_ev_html(best_drop['ev'])})."
+            f"WR conservador={_pct_html(best_drop['wr_entries'])}, EV conservador={_ev_html(best_drop['ev'])})."
         )
 
-    h += f"<h3>Backtest por drop mínimo — entrada quando bounce chega a +{entry_pct:.0%} do fundo</h3>"
+    h += "<h3>Auditoria do fundo — por que +10% pode virar +40%</h3>"
+    h += "<div class='box'>"
+    h += f"Base com fundo operacional: <b>{bottom_audit['total']}</b> tokens · "
+    h += f"fundo usado acima do menor tick em >5pp: <b>{bottom_audit['drift']}</b> ({_pct_html(bottom_audit['drift_pct'])}) · "
+    h += f"erro médio nos divergentes={_pct_html(bottom_audit['avg_gap'])} · p90={_pct_html(bottom_audit['p90_gap'])} · máximo={_pct_html(bottom_audit['max_gap'])}.<br>"
+    h += f"Entrada configurada: <b>+{entry_pct:.0%}</b> do fundo usado; bounce efetivo médio contra o menor tick observado: <b>{_pct_html(bottom_audit['avg_effective_bounce'])}</b>. "
+    h += "Quando o fundo usado fica alto demais (ex.: 13k vs tick real 10k), a compra que parecia +10% na verdade acontece muito mais alta."
+    h += "</div>"
+
+    if drift_examples:
+        h += "<table style='margin-bottom:20px'><tr><th>Token</th><th>Fundo usado</th><th>Menor tick 70m</th><th>Erro fundo</th><th>Entry shadow</th><th>Bounce efetivo</th><th>Fonte fundo</th><th>Dex</th></tr>"
+        for r in drift_examples:
+            mint = r["mint"]
+            nome = r.get("token_nome") or mint[:8]
+            used = r.get("mc_min_early") or 0
+            tick = r.get("mc_min_ticks") or 0
+            entry_mc_audit = used * (1 + entry_pct) if used else 0
+            gap = r.get("bottom_gap_pct")
+            eff = r.get("effective_entry_bounce_pct")
+            dex = f"https://dexscreener.com/solana/{mint}"
+            h += "<tr>"
+            h += f"<td>{nome}</td><td>${used:,.0f}</td><td>${tick:,.0f}</td><td style='color:#f87171'>{_pct_html(gap)}</td>"
+            h += f"<td>${entry_mc_audit:,.0f}</td><td style='color:#fbbf24'>{_pct_html(eff)}</td><td class='dim'>{r.get('bottom_source') or '—'}</td>"
+            h += f"<td><a href='{dex}' target='_blank'>dex</a></td>"
+            h += "</tr>"
+        h += "</table>"
+
+    resolved_live = (live_stats.get("tp") or 0) + (live_stats.get("sl") or 0)
+    live_wr_resolved = (live_stats.get("tp") or 0) / resolved_live if resolved_live else None
+    live_wr_all = (live_stats.get("tp") or 0) / (live_stats.get("total") or 0) if live_stats.get("total") else None
+    h += "<h3>Trades reais recentes — comparação com o shadow</h3>"
+    h += "<div class='box'>"
+    h += f"Últimas {live_hours}h: <b>{live_stats.get('total') or 0} trades reais</b> · "
+    h += f"TP={live_stats.get('tp') or 0} · SL={live_stats.get('sl') or 0} · trailing_active={live_stats.get('trailing_active') or 0} · open={live_stats.get('open') or 0} · expired={live_stats.get('expired') or 0} · other={live_stats.get('other') or 0} · "
+    h += f"WR real resolvido={_pct_html(live_wr_resolved)} · WR real / total={_pct_html(live_wr_all)}.<br>"
+    h += f"Config/sinal médios: drop_cfg={_pct_html(live_stats.get('avg_drop_cfg'))} · bounce_cfg={_pct_html(live_stats.get('avg_bounce_cfg'))} · drop_sinal={_pct_html(live_stats.get('avg_drop_signal'))} · bounce_sinal={_pct_html(live_stats.get('avg_bounce_signal'))} · entrada acima do fundo={_pct_html(live_stats.get('avg_signal_above_bottom'))}."
+    h += "<br><b>Importante:</b> a tabela abaixo é um <u>shadow backtest idealizado</u>. Ela não usa fill real, slippage, fees, latência GMGN, Helius gate, nem trailing real. No shadow, entradas abertas agora são tratadas como SL para manter o cálculo conservador."
+    h += "</div>"
+
+    h += f"<h3>Shadow backtest por drop mínimo — entrada quando bounce chega a +{entry_pct:.0%} do fundo</h3>"
     h += "<div class='box'>"
     h += f"<b>{best_txt}</b><br>"
     h += f"Base: {overall_sim['tokens']} tokens com fundo calculável · {overall_sim['entries']} entradas acionadas por bounce ≥ {entry_pct:.0%} · "
-    h += f"TP={overall_sim['tp']} · SL={overall_sim['sl']} · abertos/sem TP-SL={overall_sim['open']} · sem entry={overall_sim['no_entry']} · "
-    h += f"WR entradas={_pct_html(overall_sim['wr_entries'])} · WR resolvido={_pct_html(overall_sim['wr_resolved'])} · EV={_ev_html(overall_sim['ev'])}."
+    h += f"TP={overall_sim['tp']} · SL conservador={overall_sim['sl']} (inclui {overall_sim['open']} abertos) · sem entry={overall_sim['no_entry']} · "
+    h += f"WR conservador={_pct_html(overall_sim['wr_entries'])} · EV conservador={_ev_html(overall_sim['ev'])} · bounce efetivo médio={_pct_html(overall_sim['avg_effective_entry_bounce'])}."
     h += "</div>"
 
-    h += "<table style='margin-bottom:20px'><tr><th>Drop mínimo</th><th>Tokens</th><th>Entradas</th><th>TP</th><th>SL</th><th>Aberto</th><th>Sem entry</th><th>WR entradas</th><th>WR TP/SL</th><th>EV médio</th></tr>"
+    h += "<table style='margin-bottom:20px'><tr><th>Drop mínimo</th><th>Tokens</th><th>Entradas shadow</th><th>TP shadow</th><th>SL shadow conservador</th><th>Abertos tratados como SL</th><th>Sem entry</th><th>Shadow WR conservador</th><th>EV conservador</th><th>Bounce efetivo médio</th></tr>"
     for st in threshold_stats:
         cls = "green" if (st['wr_entries'] or 0) >= 0.30 else "yellow" if (st['wr_entries'] or 0) >= 0.20 else "red"
         best_mark = " ⭐" if best_drop and st['drop_min'] == best_drop['drop_min'] else ""
         h += "<tr>"
         h += f"<td><b>{st['drop_min']:.0%}{best_mark}</b></td>"
         h += f"<td>{st['tokens']}</td><td>{st['entries']}</td><td style='color:#4ade80'>{st['tp']}</td><td style='color:#f87171'>{st['sl']}</td><td>{st['open']}</td><td class='dim'>{st['no_entry']}</td>"
-        h += f"<td class='{cls}'>{_pct_html(st['wr_entries'])}</td><td>{_pct_html(st['wr_resolved'])}</td><td>{_ev_html(st['ev'])}</td>"
+        h += f"<td class='{cls}'>{_pct_html(st['wr_entries'])}</td><td>{_ev_html(st['ev'])}</td><td>{_pct_html(st['avg_effective_entry_bounce'])}</td>"
         h += "</tr>"
     h += "</table>"
 
-    h += "<h3>WR por faixa real de drop</h3>"
-    h += "<table style='margin-bottom:20px'><tr><th>Faixa de drop</th><th>Tokens</th><th>Entradas</th><th>TP</th><th>SL</th><th>Aberto</th><th>Sem entry</th><th>WR entradas</th><th>WR TP/SL</th><th>EV médio</th></tr>"
+    h += "<h3>Shadow WR por faixa real de drop — abertos contam como SL</h3>"
+    h += "<table style='margin-bottom:20px'><tr><th>Faixa de drop</th><th>Tokens</th><th>Entradas shadow</th><th>TP shadow</th><th>SL shadow conservador</th><th>Abertos tratados como SL</th><th>Sem entry</th><th>Shadow WR conservador</th><th>EV conservador</th><th>Bounce efetivo médio</th></tr>"
     for st in bucket_stats:
         label = f"{st['lo']:.0%}–{st['hi']:.0%}" if st['hi'] < 9 else f"≥{st['lo']:.0%}"
         cls = "green" if (st['wr_entries'] or 0) >= 0.30 else "yellow" if (st['wr_entries'] or 0) >= 0.20 else "red"
         h += "<tr>"
         h += f"<td><b>{label}</b></td><td>{st['tokens']}</td><td>{st['entries']}</td><td style='color:#4ade80'>{st['tp']}</td><td style='color:#f87171'>{st['sl']}</td><td>{st['open']}</td><td class='dim'>{st['no_entry']}</td>"
-        h += f"<td class='{cls}'>{_pct_html(st['wr_entries'])}</td><td>{_pct_html(st['wr_resolved'])}</td><td>{_ev_html(st['ev'])}</td>"
+        h += f"<td class='{cls}'>{_pct_html(st['wr_entries'])}</td><td>{_ev_html(st['ev'])}</td><td>{_pct_html(st['avg_effective_entry_bounce'])}</td>"
         h += "</tr>"
     h += "</table>"
 
-    h += "<p class='sub'>Metodologia WR: para cada token com fundo, a entrada hipotética ocorre no primeiro tick após o fundo cujo high/MC toca fundo × " + f"{1+entry_pct:.2f}" + ". TP/SL são avaliados nos ticks seguintes até 70min pós-migração; velas kline usam high/low e ticks simples usam mc.</p>"
+    h += "<p class='sub'>Metodologia SHADOW conservadora: para cada token com fundo operacional, a entrada hipotética ocorre no primeiro tick após esse fundo cujo high/MC toca fundo × " + f"{1+entry_pct:.2f}" + ". A auditoria compara esse fundo usado com o menor tick observado em até 70min para mostrar o bounce efetivo real: se o fundo usado foi 13k e o menor tick foi 10k, a entry em 14.3k não é +10%, é +43%. TP/SL são avaliados nos ticks seguintes; se a entrada fica aberta/sem TP-SL até o fim da janela, ela é contabilizada como SL. Velas kline usam high/low e ticks simples usam mc. Isto NÃO é o trade real: o bot real dispara em scanner.py com BOUNCE_DROP_MIN/BOUNCE_MIN_PCT, compra pelo GMGN, registra mc_at_signal/fill e o executor usa SL/TP/trailing sobre a entrada real/proxy.</p>"
 
     h += f"<div class='box'>{conclusao_html}</div>"
 
