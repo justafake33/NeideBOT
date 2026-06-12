@@ -6307,12 +6307,14 @@ def _start_services():
         db.backfill_data_quality()   # classifica dados históricos na inicialização
     else:
         logger.info("RUN_DB_MIGRATIONS=0 — pulando init_db/backfill_data_quality no startup")
-    gmgn      = GmgnClient()
+    gmgn      = GmgnClient()                                      # key de trade (GMGN_API_KEY)
+    _scanner_key = os.getenv("GMGN_SCANNER_API_KEY", "")
+    gmgn_scanner = GmgnClient(api_key=_scanner_key) if _scanner_key else gmgn  # key dedicada ao scanner
     executor  = TradeExecutor(gmgn)
     monitor   = TradeMonitor()
     scheduler = HeapScheduler()
-    hot       = HotMonitor(gmgn, scheduler, executor=executor)
-    scanner   = Scanner(gmgn, hot)
+    hot       = HotMonitor(gmgn_scanner, scheduler, executor=executor)
+    scanner   = Scanner(gmgn_scanner, hot)
     scheduler.start()
     hot.start()
     scanner.start()
@@ -6328,7 +6330,7 @@ def _start_services():
         except Exception as _e:
             logger.warning("TrendingRadar schema indisponível (DB em recovery?): %s — TrendingRadar desativado", _e)
         else:
-            _tr = TrendingRadar(gmgn)
+            _tr = TrendingRadar(gmgn_scanner)
             _tr_thread = _threading.Thread(target=_tr.start, daemon=True, name="trending-radar")
             _tr_thread.start()
             logger.info("TrendingRadar iniciado (poll=%ds)", _tr.poll_sec)

@@ -11,10 +11,11 @@ from urllib.parse import urlencode
 
 logger = logging.getLogger(__name__)
 
-GMGN_HOST           = os.getenv("GMGN_HOST",           "https://openapi.gmgn.ai")
-GMGN_API_KEY        = os.getenv("GMGN_API_KEY",        "")
-GMGN_PRIVATE_KEY    = os.getenv("GMGN_PRIVATE_KEY",    "")
-GMGN_WALLET_ADDRESS = os.getenv("GMGN_WALLET_ADDRESS", "")
+GMGN_HOST           = os.getenv("GMGN_HOST",            "https://openapi.gmgn.ai")
+GMGN_API_KEY        = os.getenv("GMGN_API_KEY",         "")
+GMGN_SCANNER_API_KEY = os.getenv("GMGN_SCANNER_API_KEY", "")  # key dedicada ao scanner (discovery)
+GMGN_PRIVATE_KEY    = os.getenv("GMGN_PRIVATE_KEY",     "")
+GMGN_WALLET_ADDRESS = os.getenv("GMGN_WALLET_ADDRESS",  "")
 
 SOL_NATIVE_MINT = "So11111111111111111111111111111111111111112"
 
@@ -136,13 +137,21 @@ def _wait_global_ban():
 
 
 class GmgnClient:
-    def __init__(self):
+    def __init__(self, api_key: str = None):
+        """
+        api_key: key a usar nos headers X-APIKEY.
+        Se None, usa GMGN_API_KEY (key de trade — padrão).
+        Para o scanner, passar GMGN_SCANNER_API_KEY para isolar o rate limit.
+        """
         self.host = GMGN_HOST.rstrip("/")
+        effective_key = api_key or GMGN_API_KEY
         self.session = requests.Session()
         self.session.headers.update({
-            "X-APIKEY": GMGN_API_KEY,
+            "X-APIKEY": effective_key,
             "Content-Type": "application/json",
         })
+        if api_key and api_key != GMGN_API_KEY:
+            logger.info("GmgnClient iniciado com key dedicada (scanner key)")
         self._private_key = _load_ed25519_key(GMGN_PRIVATE_KEY)
         if GMGN_PRIVATE_KEY and not self._private_key:
             logger.warning("GMGN_PRIVATE_KEY definida mas inválida — trade desabilitado")
