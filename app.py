@@ -49631,5 +49631,207 @@ def analise_holders_trades():
     return h
 
 
+@app.route("/debug/bottom-quality")
+def debug_bottom_quality():
+    """
+    Diagrama o quao preciso e o mc_bottom capturado vs verdade on-chain.
+    bottom_error_pct = (mc_bottom - mc_min_true) / mc_min_true
+    Positivo = bot viu fundo mais alto que o real (perdeu o fundo real).
+    Negativo = bot viu algo mais baixo (phantom ou pool secundaria).
+    """
+    import psycopg2, psycopg2.extras, traceback
+    days = int(request.args.get("days", 30))
+    conn = psycopg2.connect(db.DATABASE_URL)
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        cur.execute("""
+            WITH base AS (
+                SELECT
+                    m.mint, m.token_nome, m.ts_migration,
+                    m.mc_migration, m.mc_bottom, m.mc_min_true,
+                    m.bottom_error_pct, m.bottom_quality,
+                    t.status AS trade_status,
+                    bs.bounce_pct, bs.mc_at_signal
+                FROM migrations m
+                LEFT JOIN bounce_signals bs ON bs.mint = m.mint
+                LEFT JOIN LATERAL (
+                    SELECT status FROM trades WHERE mint = m.mint
+                    ORDER BY ts_signal DESC LIMIT 1
+                ) t ON TRUE
+                WHERE m.ts_migration >= NOW() - INTERVAL %(days)s
+                  AND m.mc_migration > 0
+            )
+            SELECT *,
+                CASE WHEN mc_bottom > 0 AND mc_migration > 0
+                     THEN (mc_migration - mc_bottom) / mc_migration END AS drop_pct_decision,
+                CASE WHEN mc_min_true > 0 AND mc_migration > 0
+                     THEN (mc_migration - mc_min_true) / mc_migration END AS drop_pct_true,
+                CASE WHEN mc_at_signal > 0 AND mc_min_true > 0
+                     THEN (mc_at_signal - mc_min_true) / mc_min_true END AS entry_above_true_bottom
+            FROM base
+            ORDER BY ts_migration DESC
+        """, {"days": f"{days} days"})
+        rows = cur.fetchall()
+    except Exception:
+        cur.close(); conn.close()
+        return f"<pre style='color:red'>{traceback.format_exc()}</pre>"
+    cur.close(); conn.close()
+
+    # Stats globais
+    with_truth = [r for r in rows if r["mc_min_true"] and r["mc_min_true"] > 0]
+    traded     = [r for r in rows if r["trade_status"] in ("tp","tp_hit","sl","sl_hit")]
+    traded_truth = [r for r in traded if r["mc_min_true"] and r["mc_min_true"] > 0]
+
+    def qual_dist(lst):
+        g = sum(1 for r in lst if r["bottom_quality"] == "good")
+        o = sum(1 for r in lst if r["bottom_quality"] == "ok")
+        b = sum(1 for r in lst if r["bottom_quality"] == "bad")
+        n = sum(1 for r in lst if r["bottom_quality"] is None)
+        return g, o, b, n
+
+    def avg(lst, key):
+        vals = [float(r[key]) for r in lst if r.get(key) is not None]
+        return sum(vals)/len(vals) if vals else None
+
+    css = """<style>
+      body{font-family:monospace;padding:20px;background:#0d0d0d;color:#e0e0e0}
+      h1{color:#fff;margin-bottom:4px;font-size:18px}
+      h2{color:#888;font-size:.83em;text-transform:uppercase;letter-spacing:.07em;margin:24px 0 6px}
+      p.sub{color:#555;font-size:.81em;margin:0 0 10px}
+      table{border-collapse:collapse;width:100%;font-size:.82em;margin-top:6px}
+      th{background:#111;color:#555;padding:5px 10px;text-align:right;border-bottom:1px solid #1e1e1e;white-space:nowrap}
+      th:first-child,th:nth-child(2){text-align:left}
+      td{padding:4px 10px;border-bottom:1px solid #141414;text-align:right}
+      td:first-child,td:nth-child(2){text-align:left}
+      tr:hover td{background:#111}
+      .pos{color:#4caf50}.neg{color:#f44336}.neu{color:#555}
+      .good{color:#4caf50}.ok{color:#f5a623}.bad{color:#f44336}.none{color:#555}
+      .cards{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0}
+      .card{background:#111;border:1px solid #222;border-radius:6px;padding:12px 16px;min-width:140px;text-align:center}
+      .card .v{font-size:24px;font-weight:700}
+      .card .l{font-size:10px;color:#555;margin-top:2px}
+      .note{background:#0f0f1a;border-left:3px solid #f5a623;padding:10px 14px;margin:12px 0;font-size:.83em;line-height:1.6}
+      .alert{background:#1f0a0a;border-left:3px solid #f44336;padding:10px 14px;margin:12px 0;font-size:.83em;line-height:1.6}
+    </style>"""
+
+    h = f"<html><head><meta charset='utf-8'><title>Bottom Quality</title>{css}</head><body>"
+    h += "<h1>Diagnostico: mc_bottom esta correto?</h1>"
+    h += f"<p class='sub'>Ultimos {days} dias | {len(rows)} tokens | {len(with_truth)} com mc_min_true on-chain | {len(traded)} com trade | "
+    h += " | ".join(f"<a href='?days={d}'>{d}d</a>" for d in [7,14,30,60]) + "</p>"
+
+    # Coverage warning
+    cov = len(with_truth)/len(rows)*100 if rows else 0
+    if cov < 50:
+        h += f"<div class='alert'>Cobertura mc_min_true: {cov:.0f}% ({len(with_truth)}/{len(rows)}) — "              f"maioria dos tokens ainda nao tem verificacao on-chain. Analise abaixo e parcial.</div>"
+    else:
+        h += f"<div class='note'>Cobertura mc_min_true: {cov:.0f}% ({len(with_truth)}/{len(rows)})</div>"
+
+    # Cards globais
+    g, o, b, n = qual_dist(with_truth)
+    tot = len(with_truth) or 1
+    h += "<h2>QUALIDADE DE CAPTURA (todos os tokens com mc_min_true)</h2>"
+    h += "<div class='cards'>"
+    h += f"<div class='card'><div class='v good'>{g}</div><div class='l'>GOOD (erro <=5%)</div><div class='l'>{g/tot*100:.0f}%</div></div>"
+    h += f"<div class='card'><div class='v ok'>{o}</div><div class='l'>OK (5-15%)</div><div class='l'>{o/tot*100:.0f}%</div></div>"
+    h += f"<div class='card'><div class='v bad'>{b}</div><div class='v' style='font-size:14px;color:#f44336'></div><div class='l'>BAD (erro >15%)</div><div class='l'>{b/tot*100:.0f}%</div></div>"
+    avg_err = avg(with_truth, "bottom_error_pct")
+    if avg_err is not None:
+        c = "#4caf50" if abs(avg_err) <= 0.05 else ("#f5a623" if abs(avg_err) <= 0.15 else "#f44336")
+        h += f"<div class='card'><div class='v' style='color:{c}'>{avg_err*100:+.1f}%</div><div class='l'>Erro medio</div><div class='l'>positivo=perdeu fundo</div></div>"
+    h += "</div>"
+
+    # Cards dos trades especificamente
+    if traded_truth:
+        tg, to_, tb, tn = qual_dist(traded_truth)
+        ttot = len(traded_truth) or 1
+        avg_err_t = avg(traded_truth, "bottom_error_pct")
+        avg_entry = avg(traded_truth, "entry_above_true_bottom")
+        h += "<h2>QUALIDADE NOS TOKENS COM TRADE (mais critico)</h2>"
+        h += "<div class='cards'>"
+        h += f"<div class='card'><div class='v good'>{tg}</div><div class='l'>GOOD</div><div class='l'>{tg/ttot*100:.0f}%</div></div>"
+        h += f"<div class='card'><div class='v ok'>{to_}</div><div class='l'>OK</div><div class='l'>{to_/ttot*100:.0f}%</div></div>"
+        h += f"<div class='card'><div class='v bad'>{tb}</div><div class='l'>BAD</div><div class='l'>{tb/ttot*100:.0f}%</div></div>"
+        if avg_err_t is not None:
+            c = "#4caf50" if abs(avg_err_t) <= 0.05 else ("#f5a623" if abs(avg_err_t) <= 0.15 else "#f44336")
+            h += f"<div class='card'><div class='v' style='color:{c}'>{avg_err_t*100:+.1f}%</div><div class='l'>Erro medio mc_bottom</div></div>"
+        if avg_entry is not None:
+            c = "#4caf50" if avg_entry <= 0.15 else ("#f5a623" if avg_entry <= 0.35 else "#f44336")
+            h += f"<div class='card'><div class='v' style='color:{c}'>{avg_entry*100:+.0f}%</div><div class='l'>Entrada acima fundo real</div><div class='l'>(0%=ideal)</div></div>"
+        h += "</div>"
+
+        # Veredicto
+        if avg_err_t is not None and abs(avg_err_t) > 0.15:
+            h += f"<div class='alert'>PROBLEMA CONFIRMADO: erro medio de {avg_err_t*100:+.1f}% no mc_bottom dos trades. "
+            if avg_err_t > 0:
+                h += "Bot esta vendo fundo MAIS ALTO que o real — provavelmente perdendo o fundo verdadeiro e comprando tarde."
+            else:
+                h += "Bot esta vendo fundo MAIS BAIXO que o real — possivel phantom de pool secundaria."
+            h += "</div>"
+        elif avg_err_t is not None and abs(avg_err_t) <= 0.05:
+            h += "<div class='note'>mc_bottom parece correto (erro medio <=5%). O problema pode ser outro (filtros, SL muito apertado, etc).</div>"
+        elif avg_err_t is not None:
+            h += f"<div class='note'>Erro medio {avg_err_t*100:+.1f}% — aceitavel mas monitorar. Verificar tokens BAD individualmente.</div>"
+
+    # Tabela individual
+    h += "<h2>TOKENS COM TRADE — detalhe</h2>"
+    h += "<table><tr><th>Token</th><th>Data</th><th>MC mig</th><th>mc_bottom (bot)</th><th>mc_min_true (chain)</th>"
+    h += "<th>Erro%</th><th>Qualidade</th><th>Entrada acima fundo</th><th>Bounce%</th><th>Trade</th></tr>"
+    for r in traded:
+        ts     = r.get("ts_migration")
+        ts_s   = ts.strftime("%m-%d %H:%M") if ts else "-"
+        nome   = r.get("token_nome") or r["mint"][:8]
+        mc_m   = r.get("mc_migration") or 0
+        mc_b   = r.get("mc_bottom") or 0
+        mc_t   = r.get("mc_min_true")
+        err    = r.get("bottom_error_pct")
+        qual   = r.get("bottom_quality") or "?"
+        bounce = r.get("bounce_pct")
+        entry  = r.get("entry_above_true_bottom")
+        status = r.get("trade_status","?")
+        sc     = "#4caf50" if status in ("tp","tp_hit") else "#f44336"
+        qc     = {"good":"#4caf50","ok":"#f5a623","bad":"#f44336"}.get(qual,"#555")
+
+        err_s   = f"<span style='color:{('#f44336' if err and abs(err)>0.15 else '#f5a623' if err and abs(err)>0.05 else '#4caf50')}'>{err*100:+.1f}%</span>" if err is not None else "<span class='neu'>sem dado</span>"
+        mc_t_s  = f"${mc_t:,.0f}" if mc_t else "<span class='neu'>?</span>"
+        entry_s = f"{entry*100:+.0f}%" if entry is not None else "?"
+        bounce_s= f"{bounce*100:.0f}%" if bounce else "?"
+        gmgn    = f"https://gmgn.ai/sol/token/{r['mint']}"
+
+        h += (f"<tr><td><a href='{gmgn}' target='_blank'>{nome}</a></td>"
+              f"<td class='neu'>{ts_s}</td>"
+              f"<td>${mc_m:,.0f}</td>"
+              f"<td>${mc_b:,.0f}</td>"
+              f"<td>{mc_t_s}</td>"
+              f"<td>{err_s}</td>"
+              f"<td style='color:{qc}'>{qual}</td>"
+              f"<td class='neu'>{entry_s}</td>"
+              f"<td class='neu'>{bounce_s}</td>"
+              f"<td style='color:{sc}'><b>{status}</b></td></tr>")
+
+    # Todos os tokens (nao so com trade) - distribuicao de erros
+    if with_truth:
+        h += "<h2>DISTRIBUICAO DE ERROS (todos os tokens com mc_min_true)</h2>"
+        buckets = {"<-30%":0, "-30 a -15%":0, "-15 a -5%":0, "GOOD (-5 a +5%)":0, "+5 a +15%":0, "+15 a +30%":0, ">+30%":0}
+        for r in with_truth:
+            e = r["bottom_error_pct"]
+            if e is None: continue
+            e *= 100
+            if e < -30:   buckets["<-30%"] += 1
+            elif e < -15: buckets["-30 a -15%"] += 1
+            elif e < -5:  buckets["-15 a -5%"] += 1
+            elif e <= 5:  buckets["GOOD (-5 a +5%)"] += 1
+            elif e <= 15: buckets["+5 a +15%"] += 1
+            elif e <= 30: buckets["+15 a +30%"] += 1
+            else:         buckets[">+30%"] += 1
+        h += "<table><tr><th>Faixa de erro</th><th>Tokens</th><th>%</th></tr>"
+        for label, cnt in buckets.items():
+            c = "#4caf50" if "GOOD" in label else ("#f44336" if (">" in label or "<" in label) else "#f5a623")
+            h += f"<tr><td style='color:{c}'>{label}</td><td class='neu'>{cnt}</td><td class='neu'>{cnt/len(with_truth)*100:.0f}%</td></tr>"
+        h += "</table>"
+
+    h += "</body></html>"
+    return h
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
