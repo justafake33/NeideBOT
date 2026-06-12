@@ -542,11 +542,11 @@ def analise_drop_real():
 # Registro idempotente: em produção o módulo pode ser importado/recarregado mais
 # de uma vez antes do blueprint ser registrado pelo app. Sem esta guarda, Flask
 # tenta mapear o mesmo endpoint duas vezes e derruba o worker com AssertionError.
-if not getattr(trending_radar_bp, "_drop_real_conservative_registered", False):
+if not getattr(trending_radar_bp, "_drop_real_analysis_registered", False):
     trending_radar_bp.add_url_rule(
         "/analise/drop-real",
-        endpoint="analise_drop_real_conservative",
+        endpoint="analise_drop_real_analysis",
         view_func=analise_drop_real,
     )
-    trending_radar_bp._drop_real_conservative_registered = True
+    trending_radar_bp._drop_real_analysis_registered = True
 
