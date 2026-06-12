@@ -1243,11 +1243,13 @@ class HotMonitor:
         # Calcula bottom_error_pct = (mc_min_decision - mc_min_true) / mc_min_true
         _mc_min_decision = state.get("mc_min", float("inf"))
         _ts_mig_unix     = ts_mig_unix
+        # Captura pool_pda AGORA (antes do unsubscribe deletar do dict)
+        _pool_pda_snap   = self._helius.get_pool_pda(mint) if self._helius else None
 
         def _run_bottom_truth():
             try:
                 import helius_rpc
-                pool_pda = self._helius.get_pool_pda(mint) if self._helius else None
+                pool_pda = _pool_pda_snap
                 if not pool_pda:
                     logger.debug("bottom_truth %s: pool_pda não disponível — skip", symbol)
                     return
