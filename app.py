@@ -49426,6 +49426,209 @@ def analise_holders():
     return h
 
 
+@app.route("/analise/holders-trades")
+def analise_holders_trades():
+    """
+    Cruza delta de holders durante o dump com outcomes reais de trades (TP/SL GMGN).
+    Pergunta: o sinal de holders prediz WR real, nao so o pico do token?
+    """
+    days = int(request.args.get("days", 60))
+
+    sql = """
+        WITH trade_outcomes AS (
+            SELECT t.mint,
+                   t.status,
+                   t.ts_signal,
+                   CASE WHEN t.status IN ('tp','tp_hit') THEN 1
+                        WHEN t.status IN ('sl','sl_hit') THEN 0
+                        ELSE NULL END AS is_tp
+            FROM trades t
+            WHERE t.ts_signal >= NOW() - INTERVAL '%(days)s days'
+              AND t.status IN ('tp','tp_hit','sl','sl_hit')
+        ),
+        mig_data AS (
+            SELECT m.mint, m.holders_count AS h_mig, m.mc_migration, m.ts_migration
+            FROM migrations m
+            WHERE m.ts_migration >= NOW() - INTERVAL '%(days)s days'
+              AND m.holders_count IS NOT NULL AND m.holders_count > 0
+        ),
+        bottom_tick AS (
+            SELECT DISTINCT ON (tt.mint) tt.mint,
+                   tt.holders_count AS h_bottom
+            FROM token_ticks tt
+            JOIN mig_data m ON m.mint = tt.mint
+            WHERE tt.tick_ts BETWEEN m.ts_migration + INTERVAL '90 seconds'
+                                 AND m.ts_migration + INTERVAL '25 minutes'
+              AND tt.mc > 0
+              AND tt.holders_count IS NOT NULL
+            ORDER BY tt.mint, COALESCE(NULLIF(tt.mc_low,0), tt.mc) ASC, tt.tick_ts ASC
+        )
+        SELECT
+            to2.mint,
+            to2.status,
+            to2.is_tp,
+            m.h_mig,
+            bt.h_bottom,
+            bt.h_bottom - m.h_mig AS delta_dump,
+            m.mc_migration,
+            m.ts_migration
+        FROM trade_outcomes to2
+        JOIN mig_data m ON m.mint = to2.mint
+        LEFT JOIN bottom_tick bt ON bt.mint = to2.mint
+        ORDER BY m.ts_migration DESC
+    """ % {"days": days}
+
+    rows = []
+    with db._cursor() as cur:
+        cur.execute(sql)
+        rows = cur.fetchall()
+
+    def bucket(d):
+        if d is None:  return "sem_dado"
+        if d < -10:    return "a_perdeu_muito"
+        if d < 0:      return "b_perdeu_pouco"
+        if d == 0:     return "c_flat"
+        if d <= 10:    return "d_ganhou_pouco"
+        if d <= 30:    return "e_ganhou_medio"
+        return         "f_ganhou_muito"
+
+    bucket_label = {
+        "a_perdeu_muito": "Perdeu >10 holders no dump",
+        "b_perdeu_pouco": "Perdeu 1-10 holders",
+        "c_flat":         "Holders estaveis",
+        "d_ganhou_pouco": "Ganhou 1-10 holders",
+        "e_ganhou_medio": "Ganhou 11-30 holders",
+        "f_ganhou_muito": "Ganhou >30 holders",
+        "sem_dado":       "Sem dado de holders",
+    }
+
+    from collections import defaultdict
+    by_bk = defaultdict(list)
+    for r in rows:
+        by_bk[bucket(r["delta_dump"])].append(r)
+
+    total_trades = len([r for r in rows if r["is_tp"] is not None])
+    total_tp     = sum(1 for r in rows if r["is_tp"] == 1)
+    base_wr      = total_tp / total_trades * 100 if total_trades else 0
+
+    ORDER = ["a_perdeu_muito","b_perdeu_pouco","c_flat","d_ganhou_pouco","e_ganhou_medio","f_ganhou_muito","sem_dado"]
+
+    css = """<style>
+        body{font-family:monospace;padding:20px;background:#0d0d0d;color:#e0e0e0}
+        h1{color:#fff;margin-bottom:4px}
+        h2{color:#888;font-size:.85em;text-transform:uppercase;letter-spacing:.08em;margin:28px 0 8px}
+        p.sub{color:#555;font-size:.82em;margin:0 0 10px}
+        table{border-collapse:collapse;width:100%;font-size:.83em;margin-top:8px}
+        th{background:#111;color:#555;padding:6px 10px;text-align:right;border-bottom:1px solid #1e1e1e;white-space:nowrap}
+        th:first-child{text-align:left}
+        td{padding:5px 10px;border-bottom:1px solid #141414;text-align:right}
+        td:first-child{text-align:left}
+        tr:hover td{background:#111}
+        .pos{color:#4caf50}.neg{color:#f44336}.neu{color:#555}
+        .best{background:#0a1f10!important}
+        .warn{background:#1f0a0a!important}
+        .bar{display:inline-block;height:8px;border-radius:2px;vertical-align:middle;margin-left:4px}
+        .note{background:#0f0f1a;border-left:3px solid #5ab4f0;padding:12px 16px;margin:16px 0;font-size:.84em;line-height:1.7}
+    </style>"""
+
+    h = f"<html><head><meta charset='utf-8'><title>Holders x Trades</title>{css}</head><body>"
+    h += "<h1>Holders delta x Outcome real dos trades (TP/SL GMGN)</h1>"
+    h += f"<p class='sub'>Ultimos {days} dias | {total_trades} trades com outcome | Base WR: <b>{base_wr:.1f}%</b> | "
+    h += " | ".join(f"<a href='?days={d}'>{d}d</a>" for d in [30,45,60,90]) + "</p>"
+
+    if total_trades < 10:
+        h += f"<div class='note'>Apenas {total_trades} trades com outcome. Acumular mais dados.</div>"
+
+    h += "<h2>WR REAL (GMGN) por variacao de holders durante o dump</h2>"
+    h += "<p class='sub'>Gate minimo: diferenca >=15pp + n>=10 por faixa.</p>"
+    h += "<table><tr><th>Faixa</th><th>n</th><th>TP</th><th>SL</th><th>WR</th><th>vs base</th><th>Sinal</th></tr>"
+
+    bk_stats = {}
+    for bk in ORDER:
+        lst = by_bk.get(bk, [])
+        n_tp = sum(1 for r in lst if r["is_tp"] == 1)
+        n_sl = sum(1 for r in lst if r["is_tp"] == 0)
+        n    = n_tp + n_sl
+        wr   = n_tp / n * 100 if n else None
+        bk_stats[bk] = (n, n_tp, n_sl, wr)
+
+    valid = [(bk, s) for bk, s in bk_stats.items() if s[0] >= 3 and s[3] is not None]
+    best_bk  = max(valid, key=lambda x: x[1][3])[0] if valid else None
+    worst_bk = min(valid, key=lambda x: x[1][3])[0] if valid else None
+
+    for bk in ORDER:
+        n, n_tp, n_sl, wr = bk_stats[bk]
+        if n == 0: continue
+        label = bucket_label.get(bk, bk)
+        if wr is None:
+            h += f"<tr><td>{label}</td><td class='neu'>{n}</td><td colspan='5' class='neu'>sem trades</td></tr>"
+            continue
+        diff  = wr - base_wr
+        diff_s = f"<span class='{'pos' if diff>0 else 'neg'}'>{diff:+.1f}pp</span>"
+        wr_c  = "#4caf50" if wr >= base_wr + 10 else ("#f44336" if wr <= base_wr - 10 else "#888")
+        bw    = int(wr * 0.7)
+        if n >= 10 and abs(diff) >= 15:
+            sinal = ("GATE+" if diff > 0 else "GATE-")
+        elif n >= 5 and abs(diff) >= 10:
+            sinal = "tendencia"
+        else:
+            sinal = f"n={n} insuf" if n < 10 else "diff pequena"
+        tr_cls = " class='best'" if bk == best_bk else (" class='warn'" if bk == worst_bk else "")
+        h += (f"<tr{tr_cls}><td><b>{label}</b></td>"
+              f"<td class='neu'>{n}</td><td class='pos'>{n_tp}</td><td class='neg'>{n_sl}</td>"
+              f"<td style='color:{wr_c}'><b>{wr:.0f}%</b>"
+              f"<span class='bar' style='width:{bw}px;background:{wr_c}'></span></td>"
+              f"<td>{diff_s}</td><td>{sinal}</td></tr>")
+    h += "</table>"
+
+    # Diagnostico
+    h += "<h2>DIAGNOSTICO</h2>"
+    h += "<div class='note'>"
+    if total_trades < 10:
+        h += f"N={total_trades} insuficiente. Gate minimo: n>=10 por faixa."
+    else:
+        valid_stats = [(bk, bk_stats[bk]) for bk in ORDER if bk_stats[bk][0] >= 5 and bk_stats[bk][3] is not None]
+        if len(valid_stats) >= 2:
+            bk_best  = max(valid_stats, key=lambda x: x[1][3])
+            bk_worst = min(valid_stats, key=lambda x: x[1][3])
+            spread   = bk_best[1][3] - bk_worst[1][3]
+            h += f"Melhor: <b>{bucket_label[bk_best[0]]}</b> -> WR {bk_best[1][3]:.0f}% ({bk_best[1][3]-base_wr:+.1f}pp)<br>"
+            h += f"Pior: <b>{bucket_label[bk_worst[0]]}</b> -> WR {bk_worst[1][3]:.0f}% ({bk_worst[1][3]-base_wr:+.1f}pp)<br>"
+            h += f"Spread: <b>{spread:.0f}pp</b> "
+            if spread >= 20:
+                h += "<span class='pos'>SINAL REAL (>=20pp)</span><br>"
+                if bk_best[1][0] >= 10 and abs(bk_best[1][3] - base_wr) >= 15:
+                    h += f"-> Candidato a GATE POSITIVO: bloquear quando delta_holders < -10 durante o dump."
+            else:
+                h += "<span class='neg'>sinal fraco (<20pp) - acumular mais dados</span>"
+        else:
+            h += "Poucos faixas com n>=5. Acumular mais trades."
+    h += "</div>"
+
+    # Tabela individual
+    h += "<h2>TRADES INDIVIDUAIS (por data)</h2>"
+    h += "<table><tr><th>Token</th><th>Data</th><th>H mig</th><th>H fundo</th><th>Delta</th><th>Outcome</th></tr>"
+    for r in rows:
+        mint  = r.get("mint","")[:8]
+        ts    = r.get("ts_migration")
+        ts_s  = ts.strftime("%m-%d") if ts else "-"
+        h_mig = r.get("h_mig") or 0
+        h_bot = r.get("h_bottom")
+        delta = r.get("delta_dump")
+        status= r.get("status","?")
+        is_tp = r.get("is_tp")
+        sc    = "#4caf50" if is_tp == 1 else "#f44336"
+        if delta is None:
+            d_s = f"<td class='neu'>{'?' if h_bot is None else h_bot}</td><td class='neu'>sem tick</td>"
+        else:
+            c   = "#4caf50" if delta > 0 else ("#f44336" if delta < 0 else "#888")
+            ico = "+" if delta > 0 else ("-" if delta < 0 else "=")
+            d_s = f"<td>{h_bot}</td><td style='color:{c}'>{ico}{abs(delta)}</td>"
+        h += (f"<tr><td>{mint}</td><td class='neu'>{ts_s}</td>"
+              f"<td>{h_mig}</td>" + d_s +
+              f"<td style='color:{sc}'><b>{status}</b></td></tr>")
+    h += "</table></body></html>"
+    return h
 
 
 if __name__ == "__main__":
