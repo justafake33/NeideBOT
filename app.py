@@ -49140,7 +49140,7 @@ def _analise_pre_rise_ticks_inner():
                     WHERE bs.mc_at_signal IS NOT NULL
                       AND bs.mc_at_signal > 0
                       AND bs.ts_signal >= %(since)s::timestamptz
-                    GROUP BY bs.mint, bs.token_nome, bs.mc_at_signal, bs.mc_min,
+                    GROUP BY bs.mint, bs.symbol, bs.mc_at_signal, bs.mc_min,
                              bs.bounce_pct, bs.ts_signal,
                              bs.net_sol_flow, bs.absorption_buy_vol, bs.absorption_sell_vol,
                              bs.absorption_events,
