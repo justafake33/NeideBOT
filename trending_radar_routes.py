@@ -9,6 +9,9 @@ import trending_radar_store as store
 
 trending_radar_bp = Blueprint("trending_radar", __name__)
 
+# Registra /analise/drop-real no blueprint sem tocar em app.py.
+import drop_real_conservative_routes  # noqa: E402,F401
+
 
 def _fmt_mc(v):
     if v is None:
@@ -100,5 +103,3 @@ def debug_trending_radar():
     h += "</table></body></html>"
     return h
 
-# Importa a rota conservadora /analise/drop-real no blueprint já registrado pelo app.
-import drop_real_conservative_routes  # noqa: E402,F401
