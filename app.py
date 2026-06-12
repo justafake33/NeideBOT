@@ -5254,6 +5254,10 @@ _TRADES_HTML = """
   .slow { color: #3fb950; }
   .thin { color: #f85149; }
   .thick { color: #3fb950; }
+  .h22-pos { color: #3fb950; }
+  .h22-neg { color: #f85149; }
+  .h22-none { color: #484f58; font-style: italic; }
+  .h22-zero { color: #8b949e; }
 </style>
 </head>
 <body>
@@ -5277,6 +5281,12 @@ _TRADES_HTML = """
   <div class="card"><div class="label">EV real</div><div class="val {% if ev_real > 0 %}green{% else %}red{% endif %}">{{ "%+.1f%%"|format(ev_real*100) }}</div></div>
   {% endif %}
   <div class="card"><div class="label">Meta calibração</div><div class="val">{{ calibration_max }} trades</div></div>
+  {% set h22_total = trades | selectattr('h22_events', 'ne', none) | list | length %}
+  {% set h22_with_data = trades | selectattr('h22_events', 'gt', 0) | list | length %}
+  <div class="card" title="H22: trades com dados de absorção Helius (60s antes do fundo)">
+    <div class="label">H22 cobertura</div>
+    <div class="val {% if h22_with_data > 10 %}green{% else %}yellow{% endif %}">{{ h22_with_data }}/{{ trades|length }}</div>
+  </div>
 </div>
 <div class="section">
 <table>
@@ -5285,6 +5295,7 @@ _TRADES_HTML = """
   <th>MC bottom</th><th>Entry REAL</th><th>+% above bot</th>
   <th>Pool SOL</th><th>Bounce%</th><th>Drop%</th>
   <th>Hold</th><th>Slippage</th><th>Latência</th>
+  <th title="H22 — absorção nos 60s antes do fundo&#10;ev = eventos | ↑ = buy SOL | ↓ = sell SOL&#10;Verde = net positivo, vermelho = net negativo">H22 (ev|↑|↓)</th>
   <th>P&L real</th>
 </tr></thead>
 <tbody>
@@ -5337,6 +5348,20 @@ _TRADES_HTML = """
   <td>{{ ("%+.2f%%"|format(t.slippage_pct*100)) if t.slippage_pct is not none else '—' }}</td>
   <td>{{ ("%.1fs"|format(t.latency_sec)) if t.latency_sec else '—' }}</td>
   <td>
+    {% set ev  = t.h22_events %}
+    {% set bv  = t.h22_buy_vol %}
+    {% set sv  = t.h22_sell_vol %}
+    {% if ev is none or ev == 0 %}
+      <span class="h22-none">no data</span>
+    {% else %}
+      {% set net = (bv or 0) - (sv or 0) %}
+      {% set cls = 'h22-pos' if net > 0 else 'h22-neg' %}
+      <span class="{{ cls }}" title="net {{ '%+.2f'|format(net) }} SOL">
+        {{ ev }}|{{ '%.1f'|format(bv or 0) }}|{{ '%.1f'|format(sv or 0) }}
+      </span>
+    {% endif %}
+  </td>
+  <td>
     {% if t.pnl_pct_real is not none %}
       <span class="{% if t.pnl_pct_real > 0 %}green{% else %}red{% endif %}">
         {{ "%+.1f%%"|format(t.pnl_pct_real*100) }}
@@ -5350,7 +5375,7 @@ _TRADES_HTML = """
   </td>
 </tr>
 {% else %}
-<tr><td colspan="14" style="text-align:center;color:#8b949e;padding:20px">
+<tr><td colspan="15" style="text-align:center;color:#8b949e;padding:20px">
   Nenhum trade ainda. Ative TRADING_ENABLED=true no Railway.
 </td></tr>
 {% endfor %}
@@ -5401,6 +5426,48 @@ def trades_dashboard():
         else:
             t["hold_sec"] = None
         t["exit_ts_brt"] = (ts_exit + BRT).strftime("%H:%M:%S") if ts_exit else None
+
+    # Fetch H22 absorption data from bounce_signals (JOIN por mint)
+    try:
+        mints = list({t["mint"] for t in trades_raw if t.get("mint")})
+        if mints:
+            import psycopg2
+            import psycopg2.extras
+            _h22_conn = psycopg2.connect(db.DATABASE_URL)
+            with _h22_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as _c:
+                _c.execute("""
+                    SELECT mint,
+                           absorption_events,
+                           absorption_buy_vol,
+                           absorption_sell_vol,
+                           absorption_buy_cnt,
+                           absorption_sell_cnt,
+                           absorption_lrg_buy,
+                           h23_window
+                    FROM bounce_signals
+                    WHERE mint = ANY(%s)
+                """, (mints,))
+                _h22_map = {r["mint"]: dict(r) for r in _c.fetchall()}
+            _h22_conn.close()
+            for t in trades_raw:
+                h22 = _h22_map.get(t.get("mint"), {})
+                t["h22_events"]   = h22.get("absorption_events")
+                t["h22_buy_vol"]  = h22.get("absorption_buy_vol")
+                t["h22_sell_vol"] = h22.get("absorption_sell_vol")
+                t["h22_buy_cnt"]  = h22.get("absorption_buy_cnt")
+                t["h22_sell_cnt"] = h22.get("absorption_sell_cnt")
+                t["h22_lrg_buy"]  = h22.get("absorption_lrg_buy")
+                t["h23_window"]   = h22.get("h23_window")
+        else:
+            for t in trades_raw:
+                t["h22_events"] = t["h22_buy_vol"] = t["h22_sell_vol"] = None
+                t["h22_buy_cnt"] = t["h22_sell_cnt"] = t["h22_lrg_buy"] = None
+                t["h23_window"] = None
+    except Exception:
+        for t in trades_raw:
+            t["h22_events"] = t["h22_buy_vol"] = t["h22_sell_vol"] = None
+            t["h22_buy_cnt"] = t["h22_sell_cnt"] = t["h22_lrg_buy"] = None
+            t["h23_window"] = None
 
     closed   = [t for t in trades_raw if t["status"] in TP_STATUSES + SL_STATUSES]
     tp_count = sum(1 for t in trades_raw if t["status"] in TP_STATUSES)
