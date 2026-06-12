@@ -1,6 +1,6 @@
 # NeideBOT — Roadmap
 
-**Atualizado:** 2026-06-12 (sessão 21)
+**Atualizado:** 2026-06-12 (sessão 22)
 **Estado:** Bot ATIVO · `TRADING_ENABLED=true` · branch ativo: `claude/relaxed-planck-H3Qg2`
 
 ---
@@ -203,6 +203,75 @@ A ideia central da V2 continua válida: filtros estáticos (smart count, bounce_
 ---
 
 ## 🔮 Visão Futura do Projeto
+
+---
+
+## 🚨 PRÓXIMA SESSÃO — Estratégia GMGN Trending (2026-06-12, observação manual)
+
+> **Observação do usuário (2026-06-12):** Acompanhando tokens em 80% BC até migração no trending da GMGN. Padrões identificados:
+> - Alguns não migram (morrem na BC)
+> - Alguns migram → dump → recovery bom
+> - Alguns **explodem** direto — pelo menos 10 tokens foram para 200k+ no dia
+>
+> O GMGN Trending mostra dois dados críticos que o scanner atual não usa:
+> 1. **Quantas pessoas estão olhando** o token (viewers em tempo real)
+> 2. **Volume movimentado** (momentum de interesse)
+>
+> Hipótese: tokens com alta visibilidade + volume crescendo antes da migração têm muito maior probabilidade de explodir pós-migração. A estratégia atual espera o dump — mas tokens virais podem nunca dumpar.
+
+### Por que é uma estratégia diferente da atual
+
+| | Estratégia atual (dip buying) | Estratégia trending (nova) |
+|---|---|---|
+| **Entrada** | Após dump ≥20% + bounce ≥30% | Na migração ou no trending (antes/durante) |
+| **Sinal** | Absorção de sellers (erpc pAMM) | Viewers + volume + posição trending |
+| **Edge** | Seller exhaustion + absorção real | Momentum de comunidade + atenção de mercado |
+| **Tokens alvo** | Qualquer pump.fun migrado | Tokens com tração viral visível |
+| **Risco** | Fundo falso / dump continuado | FOMO de compradores tardios após pico |
+| **Infra existente** | ✅ Completo | 🔴 trending_radar.py existe mas desativado |
+
+### O que já existe no codebase
+
+- **`trending_radar.py`** — já poleia `/v1/market/rank` com filtros de qualidade (pump-only, min BC sec)
+- **`gmgn_trending_snapshots` tabela** — snapshots de tokens trending
+- **`trending_at_bounce` campo** em `bounce_signals` — já detecta se token estava no trending antes do bounce
+
+### O que falta construir
+
+**Fase 1 — Entender o dado:**
+1. O que exatamente o GMGN Trending mostra? (viewers count, volume, rank, ΔMC?)
+2. Mapear os campos da resposta de `/v1/market/rank` que não estamos usando
+3. Verificar se existe endpoint de "tokens próximos de migrar no trending" (near_completion + trending)
+4. Quantificar: dos tokens que foram a 200k+ no dia, quantos estavam no trending antes de migrar?
+
+**Fase 2 — Dataset de validação:**
+5. Reativar `trending_radar.py` e coletar snapshots por 3-5 dias
+6. Cruzar com `migrations`: dos tokens que apareceram no trending, qual % migrou? qual % explodiu vs dumped?
+7. Identificar o threshold de viewers/volume que separa "vai explodir" de "vai morrer"
+
+**Fase 3 — Estratégia de entrada (só após Fase 2):**
+8. Decidir: comprar na migração direta (momentum) ou ainda esperar bounce de 10-15%?
+9. TP/SL diferentes da estratégia atual (provavelmente TP maior, SL mais apertado — token viral ou não vai)
+10. Separar completamente do scanner atual — não misturar as duas estratégias
+
+### Perguntas a responder na próxima sessão
+
+- O GMGN Trending mostra viewers em tempo real ou é contagem histórica?
+- Existe algum campo que indique "crescimento de interesse" (ΔViewers nas últimas 1h)?
+- O trending da GMGN captura tokens nas primeiras horas pós-migração ou só depois de estabelecidos?
+- Dos 10 tokens que foram para 200k+ hoje — todos estavam no trending antes de migrar?
+
+### Estrutura sugerida para amanhã
+
+```
+SESSÃO DE AMANHÃ:
+1. Abrir GMGN trending manualmente e mapear todos os campos visíveis
+2. Checar resposta JSON de /v1/market/rank (já temos no trending_radar.py)
+3. Reativar trending_radar com coleta agressiva (mais campos, mais frequência)
+4. Esperar 24h de dados antes de qualquer código de trading
+```
+
+---
 
 ### Próxima grande alavanca de código: seller exhaustion (H24)
 
