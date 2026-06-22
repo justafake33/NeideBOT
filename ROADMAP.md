@@ -1,7 +1,8 @@
 # NeideBOT — Roadmap
 
-**Atualizado:** 2026-06-12 (sessão 21)
-**Estado:** Bot ATIVO · `TRADING_ENABLED=true` · branch ativo: `claude/relaxed-planck-H3Qg2`
+**Atualizado:** 2026-06-22 (sessão 23)
+**Estado:** Bot ATIVO · `TRADING_ENABLED=true` · branch ativo: `claude/laughing-cray-2gr2bh` · **Modo Helius** (erpc desativado)
+**Infra Railway:** ~$6/mês (welcoming-miracle + intelligent-spirit PostgreSQL) · cozy-growth + beautiful-heart deletados · Sócio saiu
 
 ---
 
@@ -99,6 +100,7 @@
 | **Pool SOL + Bounce% + Drop% + Hold no /trades** | 2026-06-12 | Dashboard `/trades` agora mostra 4 novas colunas: Pool SOL (verde ≥40, vermelho <20), Bounce%, Drop% da migração, Hold time (SLs em vermelho se <60s, indicando reversion de AMM). Diagnóstico de SLs rápidos (RARE 11s, FIFACOIN 8s, World Cup 12s) — correlacionar com Pool SOL para calibrar `POOL_MIN_SOL_BOUNCE`. |
 | **Priority lane para swap — bypass global ban** | 2026-06-12 | `_post_trade()` e `_get_trade()` recebem `priority=True`. `swap()` e `query_order()` passam `priority=True` → `_wait_global_ban()` pulado. Executor executa swap imediatamente independente de rate limit do scanner. Log visível quando bypass ocorre durante ban ativo. Causa raiz do timing inconsistente (10s a 5min) identificada e corrigida. Commit `d41feca`. |
 | **API key dedicada ao scanner — `GMGN_SCANNER_API_KEY`** | 2026-06-12 | `GmgnClient.__init__` aceita `api_key` opcional. Scanner/HotMonitor/TrendingRadar usam `GMGN_SCANNER_API_KEY`. Executor usa `GMGN_API_KEY` (key de trade). Rate limit completamente isolado entre scanner e executor. Fallback para `GMGN_API_KEY` se env var não configurada. **Configurar em web E worker no Railway.** Commit `1cad17c`. |
+| **erpc 401 → Helius fallback + redução de custos** | 2026-06-22 | Bot ficou off por alguns dias — erpc.global com 0 créditos → 401 Unauthorized. Tentativa dRPC falhou: `logsSubscribe` com `{"mentions": [mint]}` é extensão proprietária do Helius, não suportada por providers padrão. Bot voltou para Helius free tier (logsSubscribe per-mint). **`WS_RPC_URL` adicionada em `helius_ws.py`** (commit `56bacd7`): permite URL WSS customizada para compatibilidade futura. **Custos Railway reduzidos de ~$80/mês para ~$6/mês**: deletados `cozy-growth` ($52, sistema de copy pausado) + `beautiful-heart` ($15, banco antigo substituído). Projetos ativos: `welcoming-miracle` (web+worker) + `intelligent-spirit` (PostgreSQL). **Sócio saiu do projeto** — solo a partir desta data. **Decisão erpc**: só volta quando WR ≥20% confirmado em ≥50 trades limpos. |
 
 > ⚠️ **WR REAL CORRIGIDO (2026-05-14 sessão 5):** banco tinha dados fictícios — TradeMonitor inferia saídas de MC snapshots, não da blockchain. Auditoria via Helius revelou WR real de **10.1%** (14 TP / 125 SL / 139 trades). WR anterior de 32% era inflado por falsos TPs. `/debug/sell-recovery` executado: 139 correções persistidas.
 > ⚠️ **DADOS HISTÓRICOS SUSPEITOS (sessão 9):** mc_min de todos os tokens antes do fix (elapsed_sec < 90) pode estar corrompido pelo candle de transição. Análises de WR baseadas em `mc_min` histórico (bounce_pct, entry_ratio, drop_from_mig) devem ser tratadas com cautela.
@@ -108,16 +110,19 @@
 
 ## 🔬 V2 — Reestruturação de Microestrutura
 
-### Estado atual (2026-06-12)
+### Estado atual (2026-06-22)
 
-**Bot ATIVO** · `TRADING_ENABLED=true` · Branch: `main`
+**Bot ATIVO** · `TRADING_ENABLED=true` · Branch: `claude/laughing-cray-2gr2bh` · **Modo Helius** (erpc desativado)
 
-Filtros recalibrados na sessão 21 com base em análise real do banco novo (07/06). Três filtros estavam bloqueando os melhores tokens — ajustados no Railway. Gate H23 (`H23_NET_MIN`) desativado (n=13, insuficiente). Acumular ~200 bounces limpos antes de ativar qualquer gate de fluxo. Priority lane para swap + API key dedicada ao scanner deployadas em 2026-06-12.
+Filtros recalibrados na sessão 21. Gate H23 (`H23_NET_MIN`) desativado (n=13, insuficiente). RISE gate (`RISE_NET_MIN=0`) implementado na sessão 22 — aguardando n≥30 bounces para avaliar impacto. Bot voltou para Helius logsSubscribe per-mint após falha do erpc (0 créditos). Operação solo a partir de 2026-06-22.
 
-**Filtros ativos (Railway) pós-sessão 21:**
+**Implicação do modo Helius**: gap de ~10-30s entre detecção do token e início do feed WS. Fundos em V-bottom muito rápido (<30s pós-migração) podem ser perdidos pelo Helius antes do subscribe. Kline hot-precise (5s) e trenches (5s) cobrem como fallback. Impacto real medido: 3/15 trades históricos afetados (learning window — tradeoff intencional). Para fundos mais lentos (>2min), Helius cobre normalmente.
+
+**Filtros ativos (Railway) pós-sessão 21/22:**
 - `BOUNCE_DROP_MIN=0.20` (era 0.30 — bloqueava rec75 de 38-46%)
 - `TRADE_MAX_ELAPSED_SEC=900` (era 300 — bloqueava 74% dos sinais)
 - `BOTTOM_FRESHNESS_SEC=600` (era 180 — cortava zona 3-10min com 33% rec75)
+- `RISE_NET_MIN=0` (sessão 22 — RISE net < 0 → rec75=9%, sl25=91%)
 
 A ideia central da V2 continua válida: filtros estáticos (smart count, bounce_pct, elapsed, creator_status) entregam no máximo +7pp de WR. O edge real está em **quem comprou o fundo e com que força** — e só conseguimos responder isso com dados de fluxo de ordens em granularidade de segundos.
 
