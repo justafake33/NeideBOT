@@ -39,8 +39,9 @@ logger = logging.getLogger(__name__)
 # ── Endpoints ────────────────────────────────────────────────────────────────
 ERPC_API_KEY   = os.getenv("ERPC_API_KEY", "")
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
+_WS_RPC_URL    = os.getenv("WS_RPC_URL", "")  # URL WSS customizada (dRPC, QuickNode, etc.)
 _ERPC_WS_URL   = f"wss://edge.erpc.global?api-key={ERPC_API_KEY}"
-_HELIUS_WS_URL = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+_HELIUS_WS_URL = _WS_RPC_URL if _WS_RPC_URL else f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 
 # Mantido para compatibilidade com referências externas (_WS_URL era público)
 _WS_URL = _HELIUS_WS_URL
