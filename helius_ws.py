@@ -463,15 +463,26 @@ class HeliusWS:
         logger.info("HeliusWS iniciado (url=%s...)", self._ws_url[:55])
 
     def _init_sol_usd(self):
+        """Refresh periódico do SOL/USD. Crítico no modo erpc: se _sol_usd_cached
+        ficar 0, _tier1_process descarta TODO evento (linha ~801) → nenhum bounce.
+        get_sol_usd() tem cache interno de 5min — chamar a cada 60s é barato e
+        auto-cura uma falha de fetch no boot."""
         global _sol_usd_cached
-        try:
-            from gmgn_client import get_sol_usd
-            price = get_sol_usd()
-            if price:
-                _sol_usd_cached = price
-                logger.debug("HeliusWS: SOL/USD inicializado = $%.2f", price)
-        except Exception as e:
-            logger.debug("HeliusWS: _init_sol_usd: %s", e)
+        from gmgn_client import get_sol_usd
+        first = True
+        while self._running:
+            try:
+                price = get_sol_usd()
+                if price:
+                    _sol_usd_cached = price
+                    if first:
+                        logger.info("HeliusWS: SOL/USD inicializado = $%.2f", price)
+                        first = False
+                elif _sol_usd_cached <= 0:
+                    logger.warning("HeliusWS: SOL/USD ainda indisponível — eventos serão descartados")
+            except Exception as e:
+                logger.debug("HeliusWS: _init_sol_usd: %s", e)
+            time.sleep(60)
 
     def subscribe(self, mint: str, total_supply: float):
         """Registra o mint para monitoramento. No modo erpc, nenhuma mensagem WS é enviada."""
@@ -695,6 +706,25 @@ class HeliusWS:
                            len(tx_array[0] if isinstance(tx_array, list) else tx_array))
             return
 
+        # Resolve endereços carregados via Address Lookup Tables (ALT).
+        # Swaps modernos do pump.fun pAMM são transações versioned (v0): o mint e as
+        # contas da pool ficam nas lookup tables, NÃO no wire estático. Sem isto,
+        # _parse_account_keys_from_tx retorna apenas programa+signer+system → o mint
+        # nunca aparece → o match com _mint_supply falha em toda tx → _tier1_process
+        # nunca roda → mc_min nunca atualiza → nenhum bounce dispara.
+        # Ordem canônica Solana: [static keys][loaded writable][loaded readonly].
+        loaded   = meta.get("loadedAddresses") or {}
+        loaded_w = loaded.get("writable") or []
+        loaded_r = loaded.get("readonly") or []
+        n_static = len(accounts)
+        if loaded_w or loaded_r:
+            accounts = accounts + list(loaded_w) + list(loaded_r)
+
+        # Diagnóstico: confirma se loadedAddresses está chegando do erpc.
+        if self._erpc_tx_count <= 5:
+            logger.info("HeliusWS erpc: pAMM tx #%d — static=%d loaded=%d total_accounts=%d",
+                        self._erpc_tx_count, n_static, len(loaded_w) + len(loaded_r), len(accounts))
+
         # Identifica o mint monitorado cruzando accounts com _mint_supply.
         with self._lock:
             monitored = set(self._mint_supply.keys())
@@ -707,8 +737,9 @@ class HeliusWS:
 
         if not mint:
             if monitored:
-                logger.debug("HeliusWS erpc: pAMM tx sem mint monitorado (monitored=%d, accounts=%d)",
-                             len(monitored), len(accounts))
+                logger.debug("HeliusWS erpc: pAMM tx sem mint monitorado "
+                             "(monitored=%d, static=%d, loaded=%d, accounts=%d)",
+                             len(monitored), n_static, len(loaded_w) + len(loaded_r), len(accounts))
             return
 
         with self._lock:
