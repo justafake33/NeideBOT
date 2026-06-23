@@ -475,7 +475,10 @@ class HeliusWS:
         elif ERPC_API_KEY:
             self._mode   = "erpc"
             self._ws_url = _ERPC_WS_URL
-            logger.info("HeliusWS: modo ERPC (global transactionSubscribe)")
+            if _ERPC_GLOBAL:
+                logger.info("HeliusWS: modo ERPC global (transactionSubscribe pAMM — legado)")
+            else:
+                logger.info("HeliusWS: modo ERPC per-mint (transactionSubscribe por token)")
         elif HELIUS_API_KEY:
             self._mode   = "helius"
             self._ws_url = _HELIUS_WS_URL
