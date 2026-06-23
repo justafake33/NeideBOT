@@ -187,8 +187,9 @@ class HotMonitor:
             except Exception as e:
                 logger.debug("helius.subscribe %s: %s", mint[:8], e)
 
-        # erpc global (pAMM) é a única fonte de mc_min — captura TODOS os swaps
-        # em tempo real sem gap. _precise_bottom_single removido: kline não escreve mc_min.
+        # erpc per-mint (transactionSubscribe filtrado pelo mint) é a fonte de mc_min
+        # em tempo real — uma subscrição por token ativo, sem firehose. _precise_bottom_single
+        # removido: kline não escreve mc_min. (ERPC_GLOBAL=1 volta ao firehose global legado.)
 
     def cancel(self, mint: str):
         with self._lock:
