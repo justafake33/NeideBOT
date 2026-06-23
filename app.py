@@ -6821,6 +6821,35 @@ def _executor_status_inner():
     return h
 
 
+@app.route("/debug/ws-health")
+def debug_ws_health():
+    """Snapshot determinístico do HeliusWS — diagnostica feed mudo sem depender de log.
+
+    ATENÇÃO: o HeliusWS roda no WORKER (RUN_BOT_SERVICES=1), não no web. Se este
+    endpoint é servido pelo web, `scanner` será None aqui. Bater no domínio do worker.
+    """
+    import json as _json
+    out = {
+        "scanner_present": bool(scanner),
+        "hot_present":     bool(scanner and hasattr(scanner, "hot")),
+    }
+    try:
+        if scanner and hasattr(scanner, "hot") and scanner.hot._helius:
+            out["helius"] = scanner.hot._helius.get_health()
+        else:
+            out["helius"] = None
+            out["note"]   = ("HeliusWS é None neste processo. Se este é o WEB, "
+                             "normal — o WS roda no WORKER. Verifique ERPC_API_KEY/"
+                             "HELIUS_API_KEY no serviço worker.")
+    except Exception as e:
+        import traceback
+        out["error"] = str(e)
+        out["trace"] = traceback.format_exc()
+    return app.response_class(
+        _json.dumps(out, indent=2, ensure_ascii=False),
+        content_type="application/json")
+
+
 @app.route("/debug/my-ip")
 def debug_my_ip():
     """Retorna o IP de saída deste processo (web ou worker).

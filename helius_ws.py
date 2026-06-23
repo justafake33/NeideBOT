@@ -600,12 +600,25 @@ class HeliusWS:
     def get_health(self) -> dict:
         """Retorna diagnóstico do WebSocket para health check periódico."""
         with self._lock:
-            n_active = len(self._mint_supply)
+            n_active     = len(self._mint_supply)
+            n_sub_ok     = len(self._sub_id_mint)
+            n_sub_pend   = len(self._req_mint)
+            n_pool_conf  = len(self._pool_account)
+            active_mints = [m[:8] for m in list(self._mint_supply.keys())[:20]]
         return {
-            "mode":       self._mode,
-            "connected":  self._connected,
-            "n_active":   n_active,
-            "tx_count":   self._erpc_tx_count,
+            "mode":          self._mode,
+            "erpc_global":   _ERPC_GLOBAL,
+            "ws_url":        (self._ws_url[:55] + "...") if self._ws_url else "",
+            "connected":     self._connected,
+            "running":       self._running,
+            "n_active":      n_active,
+            "n_sub_confirmed": n_sub_ok,
+            "n_sub_pending": n_sub_pend,
+            "n_pool_confirmed": n_pool_conf,
+            "tx_count":      self._erpc_tx_count,       # transactionNotifications processados
+            "ws_msg_count":  self._ws_msg_count,        # TODAS as msgs cruas recebidas
+            "queue_size":    self._msg_queue.qsize(),
+            "active_mints":  active_mints,
         }
 
     def stop(self):
