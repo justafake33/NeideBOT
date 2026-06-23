@@ -28,6 +28,7 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import struct
 import threading
 import time
@@ -40,6 +41,13 @@ logger = logging.getLogger(__name__)
 ERPC_API_KEY   = os.getenv("ERPC_API_KEY", "")
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
 _WS_MODE       = os.getenv("WS_MODE", "").lower().strip()  # "erpc" | "helius" | "" (auto)
+# ERPC_GLOBAL=1 → comportamento legado: UMA subscrição global no programa pAMM
+# (firehose de ~100-450 evt/s). Default (off) → modo per-mint: uma subscrição
+# transactionSubscribe filtrada por mint (accounts.include=[mint]), stream pequeno.
+# O firehose global saturava a thread única de leitura do websocket-client → o
+# ping/pong (checado na mesma thread) estourava o timeout e a conexão morria muda
+# logo após a confirmação da subscrição. Per-mint elimina a saturação.
+_ERPC_GLOBAL   = os.getenv("ERPC_GLOBAL", "").lower().strip() in ("1", "true", "yes")
 _WS_RPC_URL    = os.getenv("WS_RPC_URL", "")  # URL WSS customizada (dRPC, QuickNode, etc.)
 _ERPC_WS_URL   = f"wss://edge.erpc.global?api-key={ERPC_API_KEY}"
 _HELIUS_WS_URL = _WS_RPC_URL if _WS_RPC_URL else f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
@@ -442,6 +450,12 @@ class HeliusWS:
         self._erpc_tx_count = 0    # contador de transactionNotifications recebidos
         self._ws_msg_count  = 0    # contador de TODAS as mensagens cruas do WS
 
+        # Fila desacopla a leitura do WS (thread única, sensível a ping/pong) do
+        # processamento pesado (parse Anchor, k-gate, callbacks). _on_message só faz
+        # json.loads + put; o worker dedicado drena e processa em FIFO. Mantém a thread
+        # de leitura sempre rápida → ping/pong nunca estoura mesmo em rajadas.
+        self._msg_queue = queue.Queue(maxsize=20000)
+
     # ──────────────────────────────────────────────────────────────────
     # API pública
     # ──────────────────────────────────────────────────────────────────
@@ -472,8 +486,9 @@ class HeliusWS:
 
         self._running = True
         threading.Thread(target=self._init_sol_usd, daemon=True, name="helius-sol-init").start()
+        threading.Thread(target=self._process_loop, daemon=True, name="helius-proc").start()
         threading.Thread(target=self._run_loop,     daemon=True, name="helius-ws").start()
-        logger.info("HeliusWS iniciado (url=%s...)", self._ws_url[:55])
+        logger.info("HeliusWS iniciado (url=%s... global=%s)", self._ws_url[:55], _ERPC_GLOBAL)
 
     def _init_sol_usd(self):
         """Refresh periódico do SOL/USD. Crítico no modo erpc: se _sol_usd_cached
@@ -528,12 +543,20 @@ class HeliusWS:
 
         if self._mode == "helius" and self._connected:
             self._send_helius_subscribe(mint)
+        elif self._mode == "erpc" and not _ERPC_GLOBAL and self._connected:
+            # Per-mint: subscrição transactionSubscribe filtrada pelo mint.
+            # Se ainda não conectado, _on_open resubscreve todos os mints ativos.
+            self._send_erpc_mint_subscribe(mint)
 
         logger.info("HeliusWS: subscribe %s... (modo=%s)", mint[:8], self._mode)
 
     def unsubscribe(self, mint: str):
-        """Remove o mint do monitoramento. No modo erpc, nenhuma mensagem WS é enviada."""
+        """Remove o mint do monitoramento.
+        Helius → logsUnsubscribe. erpc per-mint → transactionUnsubscribe.
+        erpc global → nenhuma mensagem WS (a subscrição é única e global)."""
         sub_id_to_remove = None
+        unsub_method     = None
+        per_mint_erpc    = self._mode == "erpc" and not _ERPC_GLOBAL
         with self._lock:
             self._mint_supply.pop(mint, None)
             self._last_fetch.pop(mint, None)
@@ -545,18 +568,23 @@ class HeliusWS:
             self._pool_candidates.pop(mint, None)
             self._pre_confirm_min.pop(mint, None)
             self._ts_subscribe.pop(mint, None)
-            if self._mode == "helius":
+            if self._mode == "helius" or per_mint_erpc:
+                # Remove subscrições pendentes ainda não confirmadas
+                for rid, m in list(self._req_mint.items()):
+                    if m == mint:
+                        del self._req_mint[rid]
                 for sid, m in list(self._sub_id_mint.items()):
                     if m == mint:
                         sub_id_to_remove = sid
                         del self._sub_id_mint[sid]
                         break
+                unsub_method = "logsUnsubscribe" if self._mode == "helius" else "transactionUnsubscribe"
 
-        if sub_id_to_remove is not None:
+        if sub_id_to_remove is not None and unsub_method:
             self._ws_send({
                 "jsonrpc": "2.0",
                 "id":      self._next_req_id(),
-                "method":  "logsUnsubscribe",
+                "method":  unsub_method,
                 "params":  [sub_id_to_remove],
             })
         logger.info("HeliusWS: unsubscribe %s", mint[:8])
@@ -620,8 +648,17 @@ class HeliusWS:
 
     def _on_open(self, ws):
         self._connected = True
-        if self._mode == "erpc":
+        if self._mode == "erpc" and _ERPC_GLOBAL:
             self._send_erpc_global_subscribe()
+        elif self._mode == "erpc":
+            # Per-mint: resubscreve todos os mints ativos via transactionSubscribe filtrado.
+            with self._lock:
+                self._sub_id_mint.clear()
+                self._req_mint.clear()
+                active = list(self._mint_supply.keys())
+            logger.info("HeliusWS erpc per-mint: conectado — resubscrevendo %d tokens", len(active))
+            for mint in active:
+                self._send_erpc_mint_subscribe(mint)
         else:
             # Helius: resubscreve todos os mints ativos
             with self._lock:
@@ -633,42 +670,62 @@ class HeliusWS:
                 self._send_helius_subscribe(mint)
 
     def _on_message(self, ws, message):
+        """Roda na thread única de leitura do websocket-client. Mantida MÍNIMA
+        (json.loads + enqueue) para não saturar a leitura nem o ping/pong."""
         try:
             data = json.loads(message)
         except Exception:
             return
 
-        # Diagnóstico cru: confirma se o erpc está mesmo entregando mensagens
-        # depois da confirmação da subscrição, e com qual "method".
-        # Se este log nunca mostrar method=transactionNotification, o erpc está
-        # confirmando a subscrição mas não fazendo streaming dos eventos.
+        # Diagnóstico cru: confirma se o WS está entregando mensagens e com qual method.
         self._ws_msg_count += 1
         if self._ws_msg_count <= 10 or self._ws_msg_count % 2000 == 0:
-            logger.info("HeliusWS _on_message #%d: method=%s keys=%s",
-                        self._ws_msg_count, data.get("method"), list(data.keys()))
+            logger.info("HeliusWS _on_message #%d: method=%s keys=%s qsize=%d",
+                        self._ws_msg_count, data.get("method"), list(data.keys()),
+                        self._msg_queue.qsize())
+
+        try:
+            self._msg_queue.put_nowait(data)
+        except queue.Full:
+            logger.warning("HeliusWS: fila de mensagens cheia — descartando (qsize=%d)",
+                           self._msg_queue.qsize())
+
+    def _process_loop(self):
+        """Worker dedicado: drena a fila e processa cada mensagem em FIFO.
+        Desacopla o processamento pesado da thread de leitura do WS."""
+        while self._running:
+            try:
+                data = self._msg_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            try:
+                self._route_message(data)
+            except Exception as e:
+                logger.warning("HeliusWS _route_message erro: %s | keys=%s",
+                               e, list(data.keys()) if isinstance(data, dict) else type(data))
+
+    def _route_message(self, data: dict):
+        per_mint_erpc = self._mode == "erpc" and not _ERPC_GLOBAL
 
         # Confirmação de subscrição
         if isinstance(data.get("result"), int) and "id" in data:
-            if self._mode == "helius":
-                req_id = data["id"]
-                sub_id = data["result"]
+            req_id = data["id"]
+            sub_id = data["result"]
+            if self._mode == "helius" or per_mint_erpc:
                 with self._lock:
                     mint = self._req_mint.pop(req_id, None)
                     if mint:
                         self._sub_id_mint[sub_id] = mint
-                logger.debug("HeliusWS: sub confirmada %s sub_id=%d", (mint or "?")[:8], sub_id)
+                logger.info("HeliusWS: sub confirmada %s sub_id=%d (req=%d, modo=%s)",
+                            (mint or "?")[:8], sub_id, req_id, self._mode)
             else:
-                logger.info("HeliusWS erpc: transactionSubscribe confirmado id=%d", data["result"])
+                logger.info("HeliusWS erpc: transactionSubscribe global confirmado id=%d", sub_id)
             return
 
         method = data.get("method")
 
         if method == "transactionNotification" and self._mode == "erpc":
-            try:
-                self._handle_transaction_notification(data)
-            except Exception as e:
-                logger.warning("HeliusWS _handle_transaction_notification erro: %s | data keys: %s",
-                               e, list(data.get("params", {}).get("result", {}).keys()))
+            self._handle_transaction_notification(data)
         elif method == "logsNotification" and self._mode == "helius":
             self._handle_logs_notification(data)
 
@@ -686,14 +743,20 @@ class HeliusWS:
     def _handle_transaction_notification(self, data: dict):
         """
         Processa uma transactionNotification do erpc.
-        Identifica o mint monitorado cruzando os accountKeys da tx com _mint_supply.
+
+        Per-mint (default): identifica o mint pela subscription id — robusto, imune a ALT.
+        Global (ERPC_GLOBAL=1): identifica cruzando os accountKeys da tx com _mint_supply.
+
+        Em ambos os modos os accountKeys (incl. ALT loadedAddresses) são parseados e
+        passados a _tier1_process, que mantém a defesa contra secondary pools
+        (k-gate + A.9 + intersecção de 5 TXs).
         """
         self._erpc_tx_count += 1
-        # Log do primeiro evento e depois a cada 500 para confirmar que o pipe está ativo
         if self._erpc_tx_count <= 3 or self._erpc_tx_count % 500 == 0:
             logger.info("HeliusWS erpc: tx #%d recebida", self._erpc_tx_count)
 
         params  = data.get("params", {})
+        sub_id  = params.get("subscription")
         result  = params.get("result", {})
         value   = result.get("value", result)   # erpc envolve em "value"
         tx_data = value.get("transaction", {})
@@ -705,7 +768,6 @@ class HeliusWS:
 
         logs = meta.get("logMessages", [])
         if not logs:
-            # Log ocasional: ajuda a diagnosticar se logMessages não está chegando
             if self._erpc_tx_count <= 10:
                 logger.warning("HeliusWS erpc tx #%d: logMessages vazio — meta keys: %s",
                                self._erpc_tx_count, list(meta.keys()))
@@ -715,53 +777,39 @@ class HeliusWS:
         if not any(PUMP_AMM_PROGRAM in log for log in logs):
             return
 
-        # Extrai account keys da transação para identificar o mint
-        tx_array = tx_data.get("transaction", [])
-        if not tx_array:
-            logger.warning("HeliusWS erpc: pAMM tx sem transaction[] — tx_data keys: %s",
-                           list(tx_data.keys()))
-            return
-        accounts = _parse_account_keys_from_tx(tx_array[0] if isinstance(tx_array, list) else tx_array)
-        if not accounts:
-            logger.warning("HeliusWS erpc: _parse_account_keys falhou — tx_array[0] type=%s len=%d",
-                           type(tx_array[0] if isinstance(tx_array, list) else tx_array).__name__,
-                           len(tx_array[0] if isinstance(tx_array, list) else tx_array))
-            return
-
-        # Resolve endereços carregados via Address Lookup Tables (ALT).
-        # Swaps modernos do pump.fun pAMM são transações versioned (v0): o mint e as
-        # contas da pool ficam nas lookup tables, NÃO no wire estático. Sem isto,
-        # _parse_account_keys_from_tx retorna apenas programa+signer+system → o mint
-        # nunca aparece → o match com _mint_supply falha em toda tx → _tier1_process
-        # nunca roda → mc_min nunca atualiza → nenhum bounce dispara.
-        # Ordem canônica Solana: [static keys][loaded writable][loaded readonly].
-        loaded   = meta.get("loadedAddresses") or {}
-        loaded_w = loaded.get("writable") or []
-        loaded_r = loaded.get("readonly") or []
-        n_static = len(accounts)
-        if loaded_w or loaded_r:
-            accounts = accounts + list(loaded_w) + list(loaded_r)
-
-        # Diagnóstico: confirma se loadedAddresses está chegando do erpc.
-        if self._erpc_tx_count <= 5:
-            logger.info("HeliusWS erpc: pAMM tx #%d — static=%d loaded=%d total_accounts=%d",
-                        self._erpc_tx_count, n_static, len(loaded_w) + len(loaded_r), len(accounts))
-
-        # Identifica o mint monitorado cruzando accounts com _mint_supply.
-        with self._lock:
-            monitored = set(self._mint_supply.keys())
-
+        # Identificação por subscription id (per-mint): a subscrição já é por mint.
         mint = None
-        for account in accounts:
-            if account in monitored:
-                mint = account
-                break
+        if sub_id is not None:
+            with self._lock:
+                mint = self._sub_id_mint.get(sub_id)
+
+        # Extrai account keys da transação (necessário para pool-confirmation em ambos
+        # os modos; no per-mint também serve de fallback de identificação).
+        tx_array = tx_data.get("transaction", [])
+        accounts = []
+        if tx_array:
+            accounts = _parse_account_keys_from_tx(
+                tx_array[0] if isinstance(tx_array, list) else tx_array)
+            # Resolve endereços carregados via Address Lookup Tables (ALT).
+            # Swaps modernos do pAMM são versioned (v0): mint e contas da pool ficam
+            # nas lookup tables, não no wire estático. Ordem canônica Solana:
+            # [static keys][loaded writable][loaded readonly].
+            loaded   = meta.get("loadedAddresses") or {}
+            loaded_w = loaded.get("writable") or []
+            loaded_r = loaded.get("readonly") or []
+            if loaded_w or loaded_r:
+                accounts = accounts + list(loaded_w) + list(loaded_r)
+
+        # Fallback de identificação por accountKeys (modo global, ou sub_id desconhecido).
+        if mint is None:
+            with self._lock:
+                monitored = set(self._mint_supply.keys())
+            for account in accounts:
+                if account in monitored:
+                    mint = account
+                    break
 
         if not mint:
-            if monitored:
-                logger.debug("HeliusWS erpc: pAMM tx sem mint monitorado "
-                             "(monitored=%d, static=%d, loaded=%d, accounts=%d)",
-                             len(monitored), n_static, len(loaded_w) + len(loaded_r), len(accounts))
             return
 
         with self._lock:
@@ -1273,8 +1321,43 @@ class HeliusWS:
     # Helpers internos
     # ──────────────────────────────────────────────────────────────────
 
+    def _send_erpc_mint_subscribe(self, mint: str):
+        """Envia transactionSubscribe filtrado pelo mint (modo erpc per-mint).
+
+        accounts.include=[mint] entrega apenas as transações que tocam aquele token
+        (incl. ALT-resolvidas, igual ao logsSubscribe(mentions) do Helius). Stream
+        pequeno (poucos evt/s) em vez do firehose do programa inteiro. A identidade
+        da pool primária continua sendo confirmada por k-gate + A.9 + intersecção em
+        _tier1_process — secondary pools do mesmo mint seguem filtradas."""
+        req_id = self._next_req_id()
+        with self._lock:
+            self._req_mint[req_id] = mint
+        self._ws_send({
+            "jsonrpc": "2.0",
+            "id":      req_id,
+            "method":  "transactionSubscribe",
+            "params":  [
+                {
+                    "vote":     False,
+                    "failed":   False,
+                    "accounts": {
+                        "include": [mint],
+                    },
+                },
+                {
+                    "commitment":                    "processed",
+                    "encoding":                      "base64",
+                    "transactionDetails":            "full",
+                    "showRewards":                   False,
+                    "maxSupportedTransactionVersion": 0,
+                },
+            ],
+        })
+        logger.info("HeliusWS erpc per-mint: transactionSubscribe %s... (req_id=%d)",
+                    mint[:8], req_id)
+
     def _send_erpc_global_subscribe(self):
-        """Envia UMA subscrição global no pAMM (modo erpc)."""
+        """Envia UMA subscrição global no pAMM (modo erpc — legado, ERPC_GLOBAL=1)."""
         req_id = self._next_req_id()
         self._ws_send({
             "jsonrpc": "2.0",
