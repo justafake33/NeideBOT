@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 # ── Endpoints ────────────────────────────────────────────────────────────────
 ERPC_API_KEY   = os.getenv("ERPC_API_KEY", "")
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
+_WS_MODE       = os.getenv("WS_MODE", "").lower().strip()  # "erpc" | "helius" | "" (auto)
 _WS_RPC_URL    = os.getenv("WS_RPC_URL", "")  # URL WSS customizada (dRPC, QuickNode, etc.)
 _ERPC_WS_URL   = f"wss://edge.erpc.global?api-key={ERPC_API_KEY}"
 _HELIUS_WS_URL = _WS_RPC_URL if _WS_RPC_URL else f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
@@ -439,13 +440,25 @@ class HeliusWS:
         self._mode      = "none"   # "erpc" | "helius" | "none"
         self._ws_url    = ""
         self._erpc_tx_count = 0    # contador de transactionNotifications recebidos
+        self._ws_msg_count  = 0    # contador de TODAS as mensagens cruas do WS
 
     # ──────────────────────────────────────────────────────────────────
     # API pública
     # ──────────────────────────────────────────────────────────────────
 
     def start(self):
-        if ERPC_API_KEY:
+        # Override manual via WS_MODE (Railway). Útil quando o erpc confirma a
+        # subscrição mas não faz streaming (ex: rate limit do plano free) — força
+        # Helius logsSubscribe por mint, que cabe folgado em planos de baixa taxa.
+        if _WS_MODE == "helius" and HELIUS_API_KEY:
+            self._mode   = "helius"
+            self._ws_url = _HELIUS_WS_URL
+            logger.info("HeliusWS: modo Helius FORÇADO (WS_MODE=helius)")
+        elif _WS_MODE == "erpc" and ERPC_API_KEY:
+            self._mode   = "erpc"
+            self._ws_url = _ERPC_WS_URL
+            logger.info("HeliusWS: modo ERPC FORÇADO (WS_MODE=erpc)")
+        elif ERPC_API_KEY:
             self._mode   = "erpc"
             self._ws_url = _ERPC_WS_URL
             logger.info("HeliusWS: modo ERPC (global transactionSubscribe)")
@@ -624,6 +637,15 @@ class HeliusWS:
             data = json.loads(message)
         except Exception:
             return
+
+        # Diagnóstico cru: confirma se o erpc está mesmo entregando mensagens
+        # depois da confirmação da subscrição, e com qual "method".
+        # Se este log nunca mostrar method=transactionNotification, o erpc está
+        # confirmando a subscrição mas não fazendo streaming dos eventos.
+        self._ws_msg_count += 1
+        if self._ws_msg_count <= 10 or self._ws_msg_count % 2000 == 0:
+            logger.info("HeliusWS _on_message #%d: method=%s keys=%s",
+                        self._ws_msg_count, data.get("method"), list(data.keys()))
 
         # Confirmação de subscrição
         if isinstance(data.get("result"), int) and "id" in data:
