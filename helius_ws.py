@@ -983,8 +983,20 @@ class HeliusWS:
             # está confirmada por intersecção de 5 TXs. Antes disso, eventos podem vir
             # de secondary pools que passaram pelo k-gate. Rolling window (H22) já foi
             # preenchida acima — não é afetada por este gate.
-            # Pré-confirmação: bufferiza (mc, event_ts) para replay quando pool confirmar.
+            #
+            # Modo Helius (logsSubscribe): accounts=None → logsSubscribe já filtra por mint,
+            # não há secondary pool problem. Bypass do gate de confirmação — k-gate é proteção.
             event_ts = time.time()
+
+            if accounts is None:
+                # Modo Helius: emite diretamente sem gate de pool confirmation.
+                logger.info("HeliusWS price(helius) %s: $%.0f MC [%s %.4f SOL pool=%.1f]",
+                            mint[:8], event["mc"], event["side"], event["sol"], pq_check)
+                self._on_price(mint, event["mc"])
+                return True
+
+            # Modo erpc: garante que a pool primária foi confirmada antes de emitir mc_min.
+            # Pré-confirmação: bufferiza (mc, event_ts) para replay quando pool confirmar.
             # Guarda accounts desta TX junto com mc para validar no replay.
             # Evita que secondary pools (que passaram A.9 e k-gate) contaminem o mc_min.
             event_accounts = set(accounts) if accounts else set()
