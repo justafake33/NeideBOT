@@ -82,7 +82,7 @@ HOT_WINDOW_MIN     = 60
 F_RUG_MAX        = float(os.getenv("FILTER_RUG_MAX",        "0.50"))  # score interno GMGN (raramente >0.5)
 F_BUNDLER_MAX    = float(os.getenv("FILTER_BUNDLER_MAX",    "0.60"))  # dados: >60% recovery cai para 14%
 F_BOT_MAX        = float(os.getenv("FILTER_BOT_MAX",        "0.80"))  # dados: sweet spot 30-60%, só bloquear extremo
-F_SNIPER_MAX     = float(os.getenv("FILTER_SNIPER_MAX",     "0.10"))  # 10% default — revalidar com dados limpos via /analise/token-outcome-clean
+F_SNIPER_MAX     = float(os.getenv("FILTER_SNIPER_MAX",     "0.50"))  # 50% default — não validado com dados limpos; 10% anterior bloqueava quase tudo
 F_RAT_MAX        = float(os.getenv("FILTER_RAT_MAX",        "0.20"))
 F_TOP10_MAX      = float(os.getenv("FILTER_TOP10_MAX",      "0.80"))  # volta ao original: 0.50 era análise em recovery corrompido
 F_SMART_MIN      = int(os.getenv(  "FILTER_SMART_MIN",      "2"))     # live: smart=1 → 0% WR (n=6). smart=2 → 20%, smart=3 → 57%
@@ -284,9 +284,9 @@ class HotMonitor:
 
     BOUNCE_MIN_PCT       = float(os.getenv("BOUNCE_MIN_PCT",         "0.30"))  # A.7: bounce mínimo 30% (live WR 9.1% abaixo disso)
     BOUNCE_MAX_PCT       = float(os.getenv("BOUNCE_MAX_PCT",         "9.99"))  # desativado por padrão — sem validação GMGN para threshold máximo (nota 87 CLAUDE.md)
-    BOUNCE_DROP_MIN      = float(os.getenv("BOUNCE_DROP_MIN",        "0.30"))  # queda mínima da migração
+    BOUNCE_DROP_MIN      = float(os.getenv("BOUNCE_DROP_MIN",        "0.20"))  # queda mínima da migração (sessão 21: drop 10-30% tem rec75 38-46%, melhor quartil)
     BOUNCE_TIME_MAX      = float(os.getenv("BOUNCE_TIME_MAX",        "20.0"))  # A.5: janela 30→20min (100% TPs em ≤20min)
-    BOTTOM_FRESHNESS_SEC = int(os.getenv(  "BOTTOM_FRESHNESS_SEC",  "300"))   # A.6: máx 5min desde o último mc_min
+    BOTTOM_FRESHNESS_SEC = int(os.getenv(  "BOTTOM_FRESHNESS_SEC",  "600"))   # A.6: máx 10min desde o último mc_min (sessão 21: 180s era muito restritivo)
 
     def _check_bounce(self, mint: str, state: dict, mc: float, elapsed_sec: int):
         """Detecta bounce em tempo real. Fase A: filtros A.2, A.3, A.6.

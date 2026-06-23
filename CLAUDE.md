@@ -572,6 +572,7 @@ SENTRY_DSN=xxxx              # DSN padrão (não o obsoleto)
 FILTER_RUG_MAX=0.15          # máx token["rug_ratio"] (score interno GMGN, 0-1)
 FILTER_BUNDLER_MAX=0.20      # máx bundler_trader_amount_rate (% bundlers real)
 FILTER_BOT_MAX=0.80          # máx bot_degen_rate (default código=0.80, não discrimina WR em live trades)
+FILTER_SNIPER_MAX=0.50       # máx top70_sniper_hold_rate — default código=0.50 (não validado ainda; 10% anterior bloqueava quase tudo). Revalidar via /analise/token-outcome-clean
 FILTER_RAT_MAX=0.20          # máx rat_trader_amount_rate
 FILTER_TOP10_MAX=0.80        # máx top_10_holder_rate
 FILTER_SMART_MIN=3           # mín smart_degen_count (smart=1→0% WR, smart=2→20%, smart=3→57% — dado live GMGN)
