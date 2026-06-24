@@ -41,13 +41,20 @@ logger = logging.getLogger(__name__)
 ERPC_API_KEY   = os.getenv("ERPC_API_KEY", "")
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
 _WS_MODE       = os.getenv("WS_MODE", "").lower().strip()  # "erpc" | "helius" | "" (auto)
-# ERPC_GLOBAL=1 → comportamento legado: UMA subscrição global no programa pAMM
-# (firehose de ~100-450 evt/s). Default (off) → modo per-mint: uma subscrição
-# transactionSubscribe filtrada por mint (accounts.include=[mint]), stream pequeno.
-# O firehose global saturava a thread única de leitura do websocket-client → o
-# ping/pong (checado na mesma thread) estourava o timeout e a conexão morria muda
-# logo após a confirmação da subscrição. Per-mint elimina a saturação.
-_ERPC_GLOBAL   = os.getenv("ERPC_GLOBAL", "").lower().strip() in ("1", "true", "yes")
+# ERPC_GLOBAL (default ON) → UMA subscrição global no programa pAMM (firehose de
+# ~100-450 evt/s). É a ÚNICA config de erpc comprovada streaming (sessão 12,
+# "testado e validado 2026-05-20: 450 evt/4s"). O mint é identificado cruzando os
+# accountKeys (incl. ALT loadedAddresses) com _mint_supply.
+#
+# ERPC_GLOBAL=0 → modo per-mint experimental: transactionSubscribe filtrado por
+# conta. PROVADO NÃO FUNCIONAR (2026-06-24): nem accounts.include=[mint] nem
+# =[pool_pda] entregam eventos — o mint não é direct account key num swap e o PDA
+# derivado por _derive_pool_pda está errado (getSignaturesForAddress retorna vazio).
+#
+# A suspeita de starvation do firehose (ping/pong na mesma thread de leitura) foi
+# mitigada: _on_message agora só faz json.loads + enqueue; o worker _process_loop
+# drena e processa. Logo o firehose global volta protegido.
+_ERPC_GLOBAL   = os.getenv("ERPC_GLOBAL", "1").lower().strip() in ("1", "true", "yes")
 _WS_RPC_URL    = os.getenv("WS_RPC_URL", "")  # URL WSS customizada (dRPC, QuickNode, etc.)
 _ERPC_WS_URL   = f"wss://edge.erpc.global?api-key={ERPC_API_KEY}"
 _HELIUS_WS_URL = _WS_RPC_URL if _WS_RPC_URL else f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
