@@ -516,7 +516,9 @@ class HeliusWS:
             time.sleep(60)
 
     def subscribe(self, mint: str, total_supply: float):
-        """Registra o mint para monitoramento. No modo erpc, nenhuma mensagem WS é enviada."""
+        """Registra o mint para monitoramento.
+        No modo erpc per-mint, envia transactionSubscribe filtrado pelo pool PDA.
+        """
         with self._lock:
             if mint in self._mint_supply:
                 return
@@ -526,32 +528,32 @@ class HeliusWS:
             self._pool_quote_last[mint] = 0.0
             self._ts_subscribe[mint]    = time.time()
 
-        # Deriva PDA da pool primária em thread própria (não bloqueia o caller).
-        # Ao confirmar o PDA, pre-seed _pool_account para que a validação de pool-account
-        # Deriva o PDA da pool primária para uso pelo helius_rpc (get_pool_bottom).
-        # NÃO seta _pool_account — a validação de pool account só é ativada após
-        # confirmação via intersecção de 5 TXs reais. Setar _pool_account aqui causaria
-        # rejeição de TODOS os eventos se o PDA não aparecer nos raw accounts da TX
-        # (ocorre quando a conta está em um Address Lookup Table — ALTs não são resolvidos).
-        def _derive_async():
-            pda = _derive_pool_pda(mint)
-            if pda:
-                with self._lock:
-                    self._pool_pda[mint] = pda
-                logger.info("HeliusWS: PDA %s... → %s... (pool pda known, learning window activo)",
-                            mint[:8], pda[:8])
-            else:
-                logger.warning("HeliusWS: falha ao derivar PDA para %s", mint[:8])
-        threading.Thread(target=_derive_async, daemon=True, name=f"pda-{mint[:8]}").start()
+        # Deriva PDA da pool primária. No modo erpc per-mint usamos o PDA como filtro
+        # (accounts.include=[pool_pda]) em vez do mint porque o SPL token mint address
+        # NÃO aparece como direct account key nas transações de swap do pAMM — apenas o
+        # pool state PDA, os vaults e os ATAs do usuário. accounts.include=[mint] entrega
+        # zero eventos (confirmado em produção: sub_ok=2 mas ws_msgs ficou em 2 em 60s).
+        # O PDA aparece em 100% dos swaps como direct account key — é o state account
+        # do pAMM que armazena pool_base/pool_quote. Derivação é ~5ms (256 SHA256).
+        pda = _derive_pool_pda(mint)
+        if pda:
+            with self._lock:
+                self._pool_pda[mint] = pda
+            logger.info("HeliusWS: PDA %s... → %s... (usando PDA como filtro erpc)",
+                        mint[:8], pda[:8])
+        else:
+            logger.warning("HeliusWS: falha ao derivar PDA para %s — erpc usará mint (pode não funcionar)",
+                           mint[:8])
 
         if self._mode == "helius" and self._connected:
             self._send_helius_subscribe(mint)
         elif self._mode == "erpc" and not _ERPC_GLOBAL and self._connected:
-            # Per-mint: subscrição transactionSubscribe filtrada pelo mint.
+            # Per-mint: subscrição transactionSubscribe filtrada pelo pool PDA.
             # Se ainda não conectado, _on_open resubscreve todos os mints ativos.
-            self._send_erpc_mint_subscribe(mint)
+            self._send_erpc_mint_subscribe(mint, pda=pda)
 
-        logger.info("HeliusWS: subscribe %s... (modo=%s)", mint[:8], self._mode)
+        logger.info("HeliusWS: subscribe %s... (modo=%s pda=%s)",
+                    mint[:8], self._mode, (pda or "none")[:8])
 
     def unsubscribe(self, mint: str):
         """Remove o mint do monitoramento.
@@ -668,13 +670,19 @@ class HeliusWS:
             self._send_erpc_global_subscribe()
         elif self._mode == "erpc":
             # Per-mint: resubscreve todos os mints ativos via transactionSubscribe filtrado.
+            # Usa o PDA já derivado (se disponível) — mesmo filtro usado em subscribe().
             with self._lock:
                 self._sub_id_mint.clear()
                 self._req_mint.clear()
-                active = list(self._mint_supply.keys())
+                active   = list(self._mint_supply.keys())
+                pda_snap = dict(self._pool_pda)
             logger.info("HeliusWS erpc per-mint: conectado — resubscrevendo %d tokens", len(active))
             for mint in active:
-                self._send_erpc_mint_subscribe(mint)
+                pda = pda_snap.get(mint) or _derive_pool_pda(mint)
+                if pda and mint not in pda_snap:
+                    with self._lock:
+                        self._pool_pda[mint] = pda
+                self._send_erpc_mint_subscribe(mint, pda=pda)
         else:
             # Helius: resubscreve todos os mints ativos
             with self._lock:
@@ -1337,14 +1345,17 @@ class HeliusWS:
     # Helpers internos
     # ──────────────────────────────────────────────────────────────────
 
-    def _send_erpc_mint_subscribe(self, mint: str):
-        """Envia transactionSubscribe filtrado pelo mint (modo erpc per-mint).
+    def _send_erpc_mint_subscribe(self, mint: str, pda: str = None):
+        """Envia transactionSubscribe filtrado pelo pool PDA do mint (modo erpc per-mint).
 
-        accounts.include=[mint] entrega apenas as transações que tocam aquele token
-        (incl. ALT-resolvidas, igual ao logsSubscribe(mentions) do Helius). Stream
-        pequeno (poucos evt/s) em vez do firehose do programa inteiro. A identidade
-        da pool primária continua sendo confirmada por k-gate + A.9 + intersecção em
-        _tier1_process — secondary pools do mesmo mint seguem filtradas."""
+        Usa accounts.include=[pool_pda] e NÃO accounts.include=[mint] porque o SPL token
+        mint address não aparece como direct account key nas transações de swap do pAMM.
+        O pool state PDA (que armazena pool_base/pool_quote) aparece em 100% dos swaps.
+        Sem o PDA (falha de derivação), cai de volta para o mint como último recurso."""
+        filter_account = pda or mint
+        if not pda:
+            logger.warning("HeliusWS: PDA não disponível para %s — usando mint como filtro (pode não entregar eventos)",
+                           mint[:8])
         req_id = self._next_req_id()
         with self._lock:
             self._req_mint[req_id] = mint
@@ -1357,7 +1368,7 @@ class HeliusWS:
                     "vote":     False,
                     "failed":   False,
                     "accounts": {
-                        "include": [mint],
+                        "include": [filter_account],
                     },
                 },
                 {
@@ -1369,8 +1380,8 @@ class HeliusWS:
                 },
             ],
         })
-        logger.info("HeliusWS erpc per-mint: transactionSubscribe %s... (req_id=%d)",
-                    mint[:8], req_id)
+        logger.info("HeliusWS erpc per-mint: transactionSubscribe %s... via pda=%s... (req_id=%d)",
+                    mint[:8], filter_account[:8], req_id)
 
     def _send_erpc_global_subscribe(self):
         """Envia UMA subscrição global no pAMM (modo erpc — legado, ERPC_GLOBAL=1)."""
