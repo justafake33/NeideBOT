@@ -87,6 +87,29 @@ def _heartbeat_loop():
             logger.info("Worker heartbeat: ip=%s hostname=%s pid=%d", ip, hostname, pid)
         except Exception as e:
             logger.warning("Heartbeat failed: %s", e)
+
+        # Linha distinta 1x/min com a saúde do WebSocket de preço. Permite diagnosticar
+        # "feed mudo" sem pescar logs do scanner: se ws_msg_count para de crescer ou
+        # tx_count fica em 0 com n_active>0, o feed real-time não está entregando eventos.
+        try:
+            sc = getattr(_app_module, "scanner", None)
+            hw = getattr(getattr(sc, "hot", None), "_helius", None)
+            if hw:
+                h = hw.get_health()
+                logger.info(
+                    "WS health: mode=%s global=%s connected=%s active=%d "
+                    "sub_ok=%d sub_pend=%d pool_conf=%d ws_msgs=%d tx=%d qsize=%d",
+                    h.get("mode"), h.get("erpc_global"), h.get("connected"),
+                    h.get("n_active", 0), h.get("n_sub_confirmed", 0),
+                    h.get("n_sub_pending", 0), h.get("n_pool_confirmed", 0),
+                    h.get("ws_msg_count", 0), h.get("tx_count", 0),
+                    h.get("queue_size", 0),
+                )
+            else:
+                logger.info("WS health: HeliusWS=None (scanner=%s)", bool(sc))
+        except Exception as e:
+            logger.warning("WS health log failed: %s", e)
+
         time.sleep(_HEARTBEAT_INTERVAL)
 
 
