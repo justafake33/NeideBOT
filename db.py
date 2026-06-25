@@ -59,7 +59,7 @@ REQUIRED_RUNTIME_SCHEMA = {
     },
     "runtime_heartbeats": {
         "runtime_name", "service_type", "outbound_ip", "hostname", "pid",
-        "metadata", "updated_at",
+        "metadata", "ws_health", "updated_at",
     },
 }
 
@@ -695,8 +695,13 @@ def _do_init_db():
                 hostname      TEXT,
                 pid           INT,
                 metadata      JSONB,
+                ws_health     JSONB,
                 updated_at    TIMESTAMPTZ DEFAULT NOW()
             )
+        """)
+        cur.execute("""
+            ALTER TABLE runtime_heartbeats
+                ADD COLUMN IF NOT EXISTS ws_health JSONB
         """)
 
     logger.info("DB inicializado")
@@ -729,24 +734,28 @@ def upsert_runtime_heartbeat(
     hostname: str | None = None,
     pid: int | None = None,
     metadata: dict | None = None,
+    ws_health: dict | None = None,
 ) -> None:
     """Atualiza heartbeat do processo Railway (web ou worker). Upsert por runtime_name."""
     import json as _json
-    meta_json = _json.dumps(metadata) if metadata else None
+    meta_json     = _json.dumps(metadata)  if metadata  else None
+    ws_health_json = _json.dumps(ws_health) if ws_health else None
     try:
         with _cursor() as cur:
             cur.execute("""
                 INSERT INTO runtime_heartbeats
-                    (runtime_name, service_type, outbound_ip, hostname, pid, metadata, updated_at)
+                    (runtime_name, service_type, outbound_ip, hostname, pid,
+                     metadata, ws_health, updated_at)
                 VALUES
                     (%(name)s, %(stype)s, %(ip)s, %(host)s, %(pid)s,
-                     %(meta)s::jsonb, NOW())
+                     %(meta)s::jsonb, %(ws)s::jsonb, NOW())
                 ON CONFLICT (runtime_name) DO UPDATE SET
                     service_type = EXCLUDED.service_type,
                     outbound_ip  = EXCLUDED.outbound_ip,
                     hostname     = EXCLUDED.hostname,
                     pid          = EXCLUDED.pid,
                     metadata     = EXCLUDED.metadata,
+                    ws_health    = EXCLUDED.ws_health,
                     updated_at   = NOW()
             """, {
                 "name":  runtime_name,
@@ -755,6 +764,7 @@ def upsert_runtime_heartbeat(
                 "host":  hostname,
                 "pid":   pid,
                 "meta":  meta_json,
+                "ws":    ws_health_json,
             })
     except Exception as e:
         logger.warning("upsert_runtime_heartbeat %s: %s", runtime_name, e)
@@ -766,7 +776,7 @@ def get_runtime_heartbeats() -> list:
         with _cursor() as cur:
             cur.execute("""
                 SELECT runtime_name, service_type, outbound_ip, hostname, pid,
-                       metadata, updated_at
+                       metadata, ws_health, updated_at
                   FROM runtime_heartbeats
                  ORDER BY runtime_name
             """)
@@ -774,6 +784,27 @@ def get_runtime_heartbeats() -> list:
     except Exception as e:
         logger.warning("get_runtime_heartbeats: %s", e)
         return []
+
+
+def get_worker_ws_health() -> dict:
+    """Lê o último ws_health do worker persistido no DB. Usado pelo web service."""
+    try:
+        with _cursor() as cur:
+            cur.execute("""
+                SELECT ws_health, updated_at
+                  FROM runtime_heartbeats
+                 WHERE runtime_name = 'worker'
+            """)
+            row = cur.fetchone()
+            if not row or not row["ws_health"]:
+                return {}
+            import json as _json
+            h = row["ws_health"] if isinstance(row["ws_health"], dict) else _json.loads(row["ws_health"])
+            h["_db_updated_at"] = row["updated_at"].isoformat() if row["updated_at"] else None
+            return h
+    except Exception as e:
+        logger.warning("get_worker_ws_health: %s", e)
+        return {}
 
 
 def upsert_watchlist(data: dict):
@@ -1930,7 +1961,7 @@ REQUIRED_RUNTIME_SCHEMA = {
     },
     "runtime_heartbeats": {
         "runtime_name", "service_type", "outbound_ip", "hostname", "pid",
-        "metadata", "updated_at",
+        "metadata", "ws_health", "updated_at",
     },
 }
 
