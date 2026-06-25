@@ -41,13 +41,25 @@ logger = logging.getLogger(__name__)
 ERPC_API_KEY   = os.getenv("ERPC_API_KEY", "")
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
 _WS_MODE       = os.getenv("WS_MODE", "").lower().strip()  # "erpc" | "helius" | "" (auto)
-# ERPC_GLOBAL=1 → comportamento legado: UMA subscrição global no programa pAMM
-# (firehose de ~100-450 evt/s). Default (off) → modo per-mint: uma subscrição
-# transactionSubscribe filtrada por mint (accounts.include=[mint]), stream pequeno.
-# O firehose global saturava a thread única de leitura do websocket-client → o
-# ping/pong (checado na mesma thread) estourava o timeout e a conexão morria muda
-# logo após a confirmação da subscrição. Per-mint elimina a saturação.
-_ERPC_GLOBAL   = os.getenv("ERPC_GLOBAL", "").lower().strip() in ("1", "true", "yes")
+# ERPC_GLOBAL — modo de subscrição erpc.
+# Default ON (global): UMA subscrição no programa pAMM entrega TODAS as transações.
+# Per-mint (ERPC_GLOBAL=0): accounts.include=[pool_pda] como filtro server-side.
+#
+# Por que global é o default e per-mint está desativado:
+#   Transações pump.fun pAMM modernas são Solana v0 com Address Lookup Tables (ALT).
+#   O pool PDA fica nas loadedAddresses (ALT), não nos static accountKeys do wire format.
+#   O filtro server-side erpc verifica apenas os static accountKeys → nunca bate →
+#   sub confirmada (ws_msg_count=1) mas tx_count=0 para sempre.
+#   PUMP_AMM_PROGRAM é sempre um static account key (é o programa invocado) →
+#   accounts.include=[PUMP_AMM_PROGRAM] bate em 100% das txs do pAMM.
+#
+# Por que o global não satura mais:
+#   O problema original (~450 evt/s saturava a thread de leitura → ping/pong timeout)
+#   foi resolvido pela fila queue.Queue(maxsize=20000) + _process_loop dedicado.
+#   _on_message agora só faz json.loads + put_nowait (~5µs), nunca bloqueia leitura.
+#
+# Para forçar per-mint (não recomendado): ERPC_GLOBAL=0
+_ERPC_GLOBAL   = os.getenv("ERPC_GLOBAL", "1").lower().strip() not in ("0", "false", "no")
 _WS_RPC_URL    = os.getenv("WS_RPC_URL", "")  # URL WSS customizada (dRPC, QuickNode, etc.)
 _ERPC_WS_URL   = f"wss://edge.erpc.global?api-key={ERPC_API_KEY}"
 _HELIUS_WS_URL = _WS_RPC_URL if _WS_RPC_URL else f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
@@ -450,6 +462,9 @@ class HeliusWS:
         self._erpc_tx_count = 0    # contador de transactionNotifications recebidos
         self._ws_msg_count  = 0    # contador de TODAS as mensagens cruas do WS
         self._last_event_ts: float = 0.0  # unix ts do último evento parseado com sucesso
+        self._erpc_global_confirmed = False  # True quando a sub global erpc foi confirmada
+        self._reconnect_now = threading.Event()  # acorda _run_loop sem esperar backoff
+        self._reconnect_backoff: float = 2.0     # exposto para get_health()
 
         # Fila desacopla a leitura do WS (thread única, sensível a ping/pong) do
         # processamento pesado (parse Anchor, k-gate, callbacks). _on_message só faz
@@ -551,11 +566,16 @@ class HeliusWS:
             self._send_helius_subscribe(mint)
         elif self._mode == "erpc" and not _ERPC_GLOBAL and self._connected:
             # Per-mint: subscrição transactionSubscribe filtrada pelo pool PDA.
-            # Se ainda não conectado, _on_open resubscreve todos os mints ativos.
             self._send_erpc_mint_subscribe(mint, pda=pda)
+        elif not self._connected:
+            # WS desconectado (nenhum token ativo → servidor fechou a conexão ociosa).
+            # Acorda _run_loop imediatamente para reconectar, sem esperar o backoff.
+            self._reconnect_now.set()
+            logger.info("HeliusWS: subscribe %s... — WS offline, poke reconexão imediata",
+                        mint[:8])
 
-        logger.info("HeliusWS: subscribe %s... (modo=%s pda=%s)",
-                    mint[:8], self._mode, (pda or "none")[:8])
+        logger.info("HeliusWS: subscribe %s... (modo=%s pda=%s connected=%s)",
+                    mint[:8], self._mode, (pda or "none")[:8], self._connected)
 
     def unsubscribe(self, mint: str):
         """Remove o mint do monitoramento.
@@ -612,22 +632,27 @@ class HeliusWS:
         now = time.time()
         last = self._last_event_ts
         silence_sec = int(now - last) if last else None
+        # n_sub_confirmed só é relevante no modo Helius/per-mint erpc.
+        # No modo erpc global, a confirmação é rastreada por erpc_global_confirmed.
+        sub_confirmed = self._erpc_global_confirmed if (_ERPC_GLOBAL and self._mode == "erpc") else n_sub_ok
         return {
-            "mode":              self._mode,
-            "erpc_global":       _ERPC_GLOBAL,
-            "ws_url":            (self._ws_url[:55] + "...") if self._ws_url else "",
-            "connected":         self._connected,
-            "running":           self._running,
-            "n_active":          n_active,
-            "n_sub_confirmed":   n_sub_ok,
-            "n_sub_pending":     n_sub_pend,
-            "n_pool_confirmed":  n_pool_conf,
-            "tx_count":          self._erpc_tx_count,
-            "ws_msg_count":      self._ws_msg_count,
-            "queue_size":        self._msg_queue.qsize(),
-            "active_mints":      active_mints,
-            "last_event":        datetime.fromtimestamp(last, tz=timezone.utc).isoformat() if last else None,
-            "silence_sec":       silence_sec,
+            "mode":                  self._mode,
+            "erpc_global":           _ERPC_GLOBAL,
+            "erpc_global_confirmed": self._erpc_global_confirmed,
+            "ws_url":                (self._ws_url[:55] + "...") if self._ws_url else "",
+            "connected":             self._connected,
+            "running":               self._running,
+            "reconnect_backoff":     int(self._reconnect_backoff),
+            "n_active":              n_active,
+            "n_sub_confirmed":       sub_confirmed,
+            "n_sub_pending":         n_sub_pend,
+            "n_pool_confirmed":      n_pool_conf,
+            "tx_count":              self._erpc_tx_count,
+            "ws_msg_count":          self._ws_msg_count,
+            "queue_size":            self._msg_queue.qsize(),
+            "active_mints":          active_mints,
+            "last_event":            datetime.fromtimestamp(last, tz=timezone.utc).isoformat() if last else None,
+            "silence_sec":           silence_sec,
         }
 
     def stop(self):
@@ -692,7 +717,8 @@ class HeliusWS:
             logger.error("websocket-client não instalado — pip install websocket-client")
             return
 
-        backoff = 2.0
+        self._reconnect_backoff = 2.0
+        self._reconnect_now.clear()
         while self._running:
             try:
                 ws = _ws_lib.WebSocketApp(
@@ -704,14 +730,24 @@ class HeliusWS:
                 )
                 with self._ws_lock:
                     self._ws = ws
-                ws.run_forever(ping_interval=20, ping_timeout=8)
-                backoff = min(backoff * 2, 60)
+                ws.run_forever(ping_interval=20, ping_timeout=10)
+                # Only increase backoff if we're not being poked by subscribe()
+                if not self._reconnect_now.is_set():
+                    self._reconnect_backoff = min(self._reconnect_backoff * 2, 60)
             except Exception as e:
                 logger.warning("HeliusWS loop: %s", e)
+                if not self._reconnect_now.is_set():
+                    self._reconnect_backoff = min(self._reconnect_backoff * 2, 60)
 
             if self._running:
-                logger.info("HeliusWS reconectando em %.0fs...", backoff)
-                time.sleep(backoff)
+                # Interruptible sleep: subscribe() sets _reconnect_now to wake us immediately
+                woken_early = self._reconnect_now.wait(timeout=self._reconnect_backoff)
+                self._reconnect_now.clear()
+                if woken_early:
+                    logger.info("HeliusWS reconectando imediatamente (subscribe solicitado)")
+                    self._reconnect_backoff = 2.0  # reset backoff on eager reconnect
+                else:
+                    logger.info("HeliusWS reconectando em %.0fs...", self._reconnect_backoff)
 
     def _on_open(self, ws):
         self._connected = True
@@ -792,6 +828,7 @@ class HeliusWS:
                 logger.info("HeliusWS: sub confirmada %s sub_id=%d (req=%d, modo=%s)",
                             (mint or "?")[:8], sub_id, req_id, self._mode)
             else:
+                self._erpc_global_confirmed = True
                 logger.info("HeliusWS erpc: transactionSubscribe global confirmado id=%d", sub_id)
             return
 
@@ -807,6 +844,7 @@ class HeliusWS:
 
     def _on_close(self, ws, code, msg):
         self._connected = False
+        self._erpc_global_confirmed = False  # reset para indicar que precisa re-confirmar
         logger.info("HeliusWS fechado (code=%s)", code)
 
     # ──────────────────────────────────────────────────────────────────
@@ -817,8 +855,8 @@ class HeliusWS:
         """
         Processa uma transactionNotification do erpc.
 
-        Per-mint (default): identifica o mint pela subscription id — robusto, imune a ALT.
-        Global (ERPC_GLOBAL=1): identifica cruzando os accountKeys da tx com _mint_supply.
+        Global (default): identifica o mint cruzando os accountKeys (incl. ALT loadedAddresses) com _mint_supply.
+        Per-mint (ERPC_GLOBAL=0, não recomendado): identifica pela subscription id — não funciona com txs ALT.
 
         Em ambos os modos os accountKeys (incl. ALT loadedAddresses) são parseados e
         passados a _tier1_process, que mantém a defesa contra secondary pools
