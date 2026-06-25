@@ -665,13 +665,19 @@ class HeliusWS:
                     pass
 
     # ── Watchdog de silêncio ──────────────────────────────────────────
-    _SILENCE_ALERT_SEC  = 300   # alerta após 5 min sem evento com tokens ativos
-    _SILENCE_CHECK_SEC  = 60    # checa a cada 1 min
-    _SILENCE_REPEAT_SEC = 900   # não repetir o alerta por 15 min
+    _SILENCE_ALERT_SEC        = 300   # alerta após 5 min sem evento com tokens ativos
+    _SILENCE_CHECK_SEC        = 60    # checa a cada 1 min
+    _SILENCE_REPEAT_SEC       = 900   # não repetir o alerta por 15 min
+    _SILENCE_ERPC_FALLBACK_SEC = 120  # fallback erpc→Helius após 2 min de silêncio
 
     def _silence_watchdog(self):
-        """Thread daemon que alerta via Telegram quando o WebSocket fica silencioso."""
+        """Thread daemon que alerta via Telegram quando o WebSocket fica silencioso.
+
+        Também faz fallback automático erpc→Helius quando erpc confirma a subscrição
+        mas não entrega eventos — comportamento típico de cota esgotada no erpc.global.
+        """
         last_alert_ts: float = 0.0
+        _erpc_fallback_done   = False  # faz fallback apenas uma vez por sessão
         while self._running:
             time.sleep(self._SILENCE_CHECK_SEC)
             try:
@@ -681,6 +687,54 @@ class HeliusWS:
                 if h["n_active"] == 0:
                     continue  # sem tokens monitorados, silêncio é normal
                 silence = h["silence_sec"]
+
+                # Auto-fallback erpc→Helius: erpc confirmou sub mas não entrega eventos.
+                # Ocorre quando a cota erpc.global está esgotada: a conexão é aceita e a
+                # confirmação de subscrição é enviada, mas as transactionNotifications
+                # nunca chegam. Solução: reconectar em modo Helius logsSubscribe por mint.
+                #
+                # silence is None quando nenhum evento foi recebido desde o startup
+                # (_last_event_ts == 0). Nesse caso o fallback usa o tempo desde o
+                # subscribe mais antigo como proxy de silêncio. Por isso NÃO fazemos
+                # early-continue em silence is None — precisamos avaliar o fallback primeiro.
+                _ts_oldest_sub = min(self._ts_subscribe.values()) if self._ts_subscribe else 0
+                _silence_since_sub = int(time.time() - _ts_oldest_sub) if _ts_oldest_sub else 0
+                _effective_silence = silence if silence is not None else _silence_since_sub
+                if (not _erpc_fallback_done
+                        and h["mode"] == "erpc"
+                        and h.get("erpc_global_confirmed")
+                        and h["tx_count"] == 0
+                        and _effective_silence >= self._SILENCE_ERPC_FALLBACK_SEC
+                        and HELIUS_API_KEY):
+                    _erpc_fallback_done = True
+                    logger.warning(
+                        "HeliusWS watchdog: erpc sub_confirmed mas tx_count=0 por %ds "
+                        "(%d tokens ativos) — cota possivelmente esgotada. "
+                        "Fallback automático para Helius logsSubscribe.",
+                        _effective_silence, h["n_active"],
+                    )
+                    self._mode   = "helius"
+                    self._ws_url = _HELIUS_WS_URL
+                    # Fecha o WS para forçar reconexão; _run_loop reconecta com novo url.
+                    with self._ws_lock:
+                        if self._ws:
+                            try:
+                                self._ws.close()
+                            except Exception:
+                                pass
+                    try:
+                        from telegram_bot import send_alert
+                        send_alert(
+                            "⚠️ *HeliusWS: fallback erpc→Helius*\n"
+                            f"erpc silencioso por `{_effective_silence}s` com `{h['n_active']}` tokens\n"
+                            "Cota erpc possivelmente esgotada — reconectando via Helius."
+                        )
+                    except Exception:
+                        pass
+                    continue
+
+                # Para os alertas de silêncio normais, silence=None significa que nunca
+                # houve evento — silêncio é esperado se o bot acabou de iniciar.
                 if silence is None or silence < self._SILENCE_ALERT_SEC:
                     continue
                 now = time.time()
