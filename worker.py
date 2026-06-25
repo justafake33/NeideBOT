@@ -70,32 +70,14 @@ def _heartbeat_loop():
     git_sha = os.getenv("RAILWAY_GIT_COMMIT_SHA", "")[:8]
 
     while _running:
-        try:
-            ip = _get_outbound_ip()
-            db.upsert_runtime_heartbeat(
-                runtime_name="worker",
-                service_type="worker",
-                outbound_ip=ip,
-                hostname=hostname,
-                pid=pid,
-                metadata={
-                    "railway_env": railway_env,
-                    "git_sha": git_sha,
-                    "run_bot_services": os.getenv("RUN_BOT_SERVICES", "1"),
-                },
-            )
-            logger.info("Worker heartbeat: ip=%s hostname=%s pid=%d", ip, hostname, pid)
-        except Exception as e:
-            logger.warning("Heartbeat failed: %s", e)
-
-        # Linha distinta 1x/min com a saúde do WebSocket de preço. Permite diagnosticar
-        # "feed mudo" sem pescar logs do scanner: se ws_msg_count para de crescer ou
-        # tx_count fica em 0 com n_active>0, o feed real-time não está entregando eventos.
+        # Collect WS health first (used both for logging and DB persistence)
+        ws_health_snapshot = None
         try:
             sc = getattr(_app_module, "scanner", None)
             hw = getattr(getattr(sc, "hot", None), "_helius", None)
             if hw:
-                h = hw.get_health()
+                ws_health_snapshot = hw.get_health()
+                h = ws_health_snapshot
                 logger.info(
                     "WS health: mode=%s global=%s connected=%s active=%d "
                     "sub_ok=%d sub_pend=%d pool_conf=%d ws_msgs=%d tx=%d qsize=%d",
@@ -109,6 +91,25 @@ def _heartbeat_loop():
                 logger.info("WS health: HeliusWS=None (scanner=%s)", bool(sc))
         except Exception as e:
             logger.warning("WS health log failed: %s", e)
+
+        try:
+            ip = _get_outbound_ip()
+            db.upsert_runtime_heartbeat(
+                runtime_name="worker",
+                service_type="worker",
+                outbound_ip=ip,
+                hostname=hostname,
+                pid=pid,
+                metadata={
+                    "railway_env": railway_env,
+                    "git_sha": git_sha,
+                    "run_bot_services": os.getenv("RUN_BOT_SERVICES", "1"),
+                },
+                ws_health=ws_health_snapshot,
+            )
+            logger.info("Worker heartbeat: ip=%s hostname=%s pid=%d", ip, hostname, pid)
+        except Exception as e:
+            logger.warning("Heartbeat failed: %s", e)
 
         time.sleep(_HEARTBEAT_INTERVAL)
 

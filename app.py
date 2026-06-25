@@ -6488,10 +6488,16 @@ else:
 
 @app.route("/debug/ws-status")
 def debug_ws_status():
-    """Estado do WebSocket erpc/Helius em tempo real."""
+    """Estado do WebSocket erpc/Helius em tempo real.
+
+    Web service (RUN_BOT_SERVICES=0) has no HeliusWS — falls back to DB snapshot
+    written by the worker heartbeat every 60s.
+    """
     import json as _json
     h = {}
+    source_label = ""
     try:
+        # Try in-process first (available in worker service)
         hw = getattr(scanner, "_hot", None) or getattr(scanner, "hot", None)
         helius = None
         if hw:
@@ -6500,13 +6506,23 @@ def debug_ws_status():
             helius = getattr(scanner, "_helius", None)
         if helius:
             h = helius.get_health()
+            source_label = "live"
+        else:
+            # Web service: read last snapshot persisted by worker heartbeat
+            h = db.get_worker_ws_health()
+            db_ts = h.pop("_db_updated_at", None)
+            if h:
+                source_label = f"DB snapshot · worker @ {(db_ts or '')[:19]}"
+            else:
+                source_label = "sem dados do worker (heartbeat ainda não escreveu)"
     except Exception as e:
         h = {"error": str(e)}
+        source_label = "erro"
 
     silence = h.get("silence_sec")
     status_color = "#4caf50"  # verde
     status_label = "OK"
-    if h.get("mode") == "none":
+    if h.get("mode") == "none" or not h:
         status_color = "#888"
         status_label = "DESATIVADO"
     elif not h.get("connected"):
@@ -6531,6 +6547,7 @@ table{{border-collapse:collapse;width:500px}}
 tr:nth-child(even){{background:#161b22}}
 </style></head><body>
 <h2>WebSocket Status <span style='color:{status_color};font-size:14px'>● {status_label}</span></h2>
+<p style='color:#555;font-size:12px'>fonte: {source_label}</p>
 <table>{rows}</table>
 <p style='color:#444;font-size:11px'>Auto-refresh 15s</p>
 </body></html>"""
