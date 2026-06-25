@@ -450,6 +450,8 @@ class HeliusWS:
         self._erpc_tx_count = 0    # contador de transactionNotifications recebidos
         self._ws_msg_count  = 0    # contador de TODAS as mensagens cruas do WS
         self._last_event_ts: float = 0.0  # unix ts do último evento parseado com sucesso
+        self._reconnect_now = threading.Event()  # acorda _run_loop sem esperar backoff
+        self._reconnect_backoff: float = 2.0     # exposto para get_health()
 
         # Fila desacopla a leitura do WS (thread única, sensível a ping/pong) do
         # processamento pesado (parse Anchor, k-gate, callbacks). _on_message só faz
@@ -551,11 +553,16 @@ class HeliusWS:
             self._send_helius_subscribe(mint)
         elif self._mode == "erpc" and not _ERPC_GLOBAL and self._connected:
             # Per-mint: subscrição transactionSubscribe filtrada pelo pool PDA.
-            # Se ainda não conectado, _on_open resubscreve todos os mints ativos.
             self._send_erpc_mint_subscribe(mint, pda=pda)
+        elif not self._connected:
+            # WS desconectado (nenhum token ativo → servidor fechou a conexão ociosa).
+            # Acorda _run_loop imediatamente para reconectar, sem esperar o backoff.
+            self._reconnect_now.set()
+            logger.info("HeliusWS: subscribe %s... — WS offline, poke reconexão imediata",
+                        mint[:8])
 
-        logger.info("HeliusWS: subscribe %s... (modo=%s pda=%s)",
-                    mint[:8], self._mode, (pda or "none")[:8])
+        logger.info("HeliusWS: subscribe %s... (modo=%s pda=%s connected=%s)",
+                    mint[:8], self._mode, (pda or "none")[:8], self._connected)
 
     def unsubscribe(self, mint: str):
         """Remove o mint do monitoramento.
@@ -618,6 +625,7 @@ class HeliusWS:
             "ws_url":            (self._ws_url[:55] + "...") if self._ws_url else "",
             "connected":         self._connected,
             "running":           self._running,
+            "reconnect_backoff": int(self._reconnect_backoff),
             "n_active":          n_active,
             "n_sub_confirmed":   n_sub_ok,
             "n_sub_pending":     n_sub_pend,
@@ -692,7 +700,8 @@ class HeliusWS:
             logger.error("websocket-client não instalado — pip install websocket-client")
             return
 
-        backoff = 2.0
+        self._reconnect_backoff = 2.0
+        self._reconnect_now.clear()
         while self._running:
             try:
                 ws = _ws_lib.WebSocketApp(
@@ -704,14 +713,24 @@ class HeliusWS:
                 )
                 with self._ws_lock:
                     self._ws = ws
-                ws.run_forever(ping_interval=20, ping_timeout=8)
-                backoff = min(backoff * 2, 60)
+                ws.run_forever(ping_interval=20, ping_timeout=10)
+                # Only increase backoff if we're not being poked by subscribe()
+                if not self._reconnect_now.is_set():
+                    self._reconnect_backoff = min(self._reconnect_backoff * 2, 60)
             except Exception as e:
                 logger.warning("HeliusWS loop: %s", e)
+                if not self._reconnect_now.is_set():
+                    self._reconnect_backoff = min(self._reconnect_backoff * 2, 60)
 
             if self._running:
-                logger.info("HeliusWS reconectando em %.0fs...", backoff)
-                time.sleep(backoff)
+                # Interruptible sleep: subscribe() sets _reconnect_now to wake us immediately
+                woken_early = self._reconnect_now.wait(timeout=self._reconnect_backoff)
+                self._reconnect_now.clear()
+                if woken_early:
+                    logger.info("HeliusWS reconectando imediatamente (subscribe solicitado)")
+                    self._reconnect_backoff = 2.0  # reset backoff on eager reconnect
+                else:
+                    logger.info("HeliusWS reconectando em %.0fs...", self._reconnect_backoff)
 
     def _on_open(self, ws):
         self._connected = True
