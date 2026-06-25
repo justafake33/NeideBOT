@@ -449,6 +449,7 @@ class HeliusWS:
         self._ws_url    = ""
         self._erpc_tx_count = 0    # contador de transactionNotifications recebidos
         self._ws_msg_count  = 0    # contador de TODAS as mensagens cruas do WS
+        self._last_event_ts: float = 0.0  # unix ts do último evento parseado com sucesso
 
         # Fila desacopla a leitura do WS (thread única, sensível a ping/pong) do
         # processamento pesado (parse Anchor, k-gate, callbacks). _on_message só faz
@@ -488,9 +489,10 @@ class HeliusWS:
             return
 
         self._running = True
-        threading.Thread(target=self._init_sol_usd, daemon=True, name="helius-sol-init").start()
-        threading.Thread(target=self._process_loop, daemon=True, name="helius-proc").start()
-        threading.Thread(target=self._run_loop,     daemon=True, name="helius-ws").start()
+        threading.Thread(target=self._init_sol_usd,      daemon=True, name="helius-sol-init").start()
+        threading.Thread(target=self._process_loop,      daemon=True, name="helius-proc").start()
+        threading.Thread(target=self._run_loop,          daemon=True, name="helius-ws").start()
+        threading.Thread(target=self._silence_watchdog,  daemon=True, name="helius-watchdog").start()
         logger.info("HeliusWS iniciado (url=%s... global=%s)", self._ws_url[:55], _ERPC_GLOBAL)
 
     def _init_sol_usd(self):
@@ -607,20 +609,25 @@ class HeliusWS:
             n_sub_pend   = len(self._req_mint)
             n_pool_conf  = len(self._pool_account)
             active_mints = [m[:8] for m in list(self._mint_supply.keys())[:20]]
+        now = time.time()
+        last = self._last_event_ts
+        silence_sec = int(now - last) if last else None
         return {
-            "mode":          self._mode,
-            "erpc_global":   _ERPC_GLOBAL,
-            "ws_url":        (self._ws_url[:55] + "...") if self._ws_url else "",
-            "connected":     self._connected,
-            "running":       self._running,
-            "n_active":      n_active,
-            "n_sub_confirmed": n_sub_ok,
-            "n_sub_pending": n_sub_pend,
-            "n_pool_confirmed": n_pool_conf,
-            "tx_count":      self._erpc_tx_count,       # transactionNotifications processados
-            "ws_msg_count":  self._ws_msg_count,        # TODAS as msgs cruas recebidas
-            "queue_size":    self._msg_queue.qsize(),
-            "active_mints":  active_mints,
+            "mode":              self._mode,
+            "erpc_global":       _ERPC_GLOBAL,
+            "ws_url":            (self._ws_url[:55] + "...") if self._ws_url else "",
+            "connected":         self._connected,
+            "running":           self._running,
+            "n_active":          n_active,
+            "n_sub_confirmed":   n_sub_ok,
+            "n_sub_pending":     n_sub_pend,
+            "n_pool_confirmed":  n_pool_conf,
+            "tx_count":          self._erpc_tx_count,
+            "ws_msg_count":      self._ws_msg_count,
+            "queue_size":        self._msg_queue.qsize(),
+            "active_mints":      active_mints,
+            "last_event":        datetime.fromtimestamp(last, tz=timezone.utc).isoformat() if last else None,
+            "silence_sec":       silence_sec,
         }
 
     def stop(self):
@@ -631,6 +638,48 @@ class HeliusWS:
                     self._ws.close()
                 except Exception:
                     pass
+
+    # ── Watchdog de silêncio ──────────────────────────────────────────
+    _SILENCE_ALERT_SEC  = 300   # alerta após 5 min sem evento com tokens ativos
+    _SILENCE_CHECK_SEC  = 60    # checa a cada 1 min
+    _SILENCE_REPEAT_SEC = 900   # não repetir o alerta por 15 min
+
+    def _silence_watchdog(self):
+        """Thread daemon que alerta via Telegram quando o WebSocket fica silencioso."""
+        last_alert_ts: float = 0.0
+        while self._running:
+            time.sleep(self._SILENCE_CHECK_SEC)
+            try:
+                h = self.get_health()
+                if h["mode"] == "none":
+                    continue
+                if h["n_active"] == 0:
+                    continue  # sem tokens monitorados, silêncio é normal
+                silence = h["silence_sec"]
+                if silence is None or silence < self._SILENCE_ALERT_SEC:
+                    continue
+                now = time.time()
+                if now - last_alert_ts < self._SILENCE_REPEAT_SEC:
+                    continue  # já alertou recentemente
+                last_alert_ts = now
+                msg = (
+                    f"⚠️ *HeliusWS SILENCIOSO*\n"
+                    f"Modo: `{h['mode']}`\n"
+                    f"Conectado: `{h['connected']}`\n"
+                    f"Tokens ativos: `{h['n_active']}`\n"
+                    f"Sem evento há: `{silence // 60}min {silence % 60}s`\n"
+                    f"Txs recebidas: `{h['tx_count']}`\n"
+                    f"Último evento: `{h['last_event'] or 'nunca'}`"
+                )
+                logger.warning("HeliusWS watchdog: silêncio de %ds com %d tokens ativos",
+                               silence, h["n_active"])
+                try:
+                    from telegram_bot import send_alert
+                    send_alert(msg)
+                except Exception as e:
+                    logger.warning("HeliusWS watchdog: falha ao enviar alerta Telegram: %s", e)
+            except Exception as e:
+                logger.warning("HeliusWS watchdog erro: %s", e)
 
     # ──────────────────────────────────────────────────────────────────
     # WebSocket interno
@@ -839,6 +888,7 @@ class HeliusWS:
         with self._lock:
             supply = self._mint_supply.get(mint) or 1_000_000_000
 
+        self._last_event_ts = time.time()
         self._tier1_process(mint, logs, supply, accounts)
 
     # ──────────────────────────────────────────────────────────────────
@@ -878,6 +928,8 @@ class HeliusWS:
 
         if not self._tier1_process(mint, logs, supply):
             self._tier2_dexscreener(mint, supply)
+        else:
+            self._last_event_ts = time.time()
 
     # ──────────────────────────────────────────────────────────────────
     # Tier 1 — parse Anchor inline (ambos os modos)

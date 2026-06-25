@@ -6486,6 +6486,56 @@ else:
     logger.info("RUN_BOT_SERVICES=0 — web-only mode, bot services not started")
 
 
+@app.route("/debug/ws-status")
+def debug_ws_status():
+    """Estado do WebSocket erpc/Helius em tempo real."""
+    import json as _json
+    h = {}
+    try:
+        hw = getattr(scanner, "_hot", None) or getattr(scanner, "hot", None)
+        helius = None
+        if hw:
+            helius = getattr(hw, "_helius", None)
+        if helius is None:
+            helius = getattr(scanner, "_helius", None)
+        if helius:
+            h = helius.get_health()
+    except Exception as e:
+        h = {"error": str(e)}
+
+    silence = h.get("silence_sec")
+    status_color = "#4caf50"  # verde
+    status_label = "OK"
+    if h.get("mode") == "none":
+        status_color = "#888"
+        status_label = "DESATIVADO"
+    elif not h.get("connected"):
+        status_color = "#f44336"
+        status_label = "DESCONECTADO"
+    elif silence and silence > 300 and h.get("n_active", 0) > 0:
+        status_color = "#ff9800"
+        status_label = f"SILENCIOSO ({silence//60}min)"
+    elif h.get("tx_count", 0) == 0:
+        status_color = "#ff9800"
+        status_label = "CONECTADO — SEM EVENTOS"
+
+    rows = "".join(
+        f"<tr><td style='color:#8b949e;padding:6px 12px'>{k}</td>"
+        f"<td style='padding:6px 12px;font-family:monospace'>{v}</td></tr>"
+        for k, v in h.items()
+    )
+    return f"""<!DOCTYPE html><html><head><title>WS Status</title>
+<meta http-equiv="refresh" content="15">
+<style>body{{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:24px}}
+table{{border-collapse:collapse;width:500px}}
+tr:nth-child(even){{background:#161b22}}
+</style></head><body>
+<h2>WebSocket Status <span style='color:{status_color};font-size:14px'>● {status_label}</span></h2>
+<table>{rows}</table>
+<p style='color:#444;font-size:11px'>Auto-refresh 15s</p>
+</body></html>"""
+
+
 @app.route("/debug/open-trades")
 def debug_open_trades():
     """Diagnóstico de trades abertos — mostra por que TradeMonitor não detectou saída.
