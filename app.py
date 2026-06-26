@@ -1,4 +1,5 @@
 import os
+import time
 import logging
 import statistics
 from datetime import datetime, timezone, timedelta
@@ -46493,6 +46494,173 @@ windows: {', '.join(available_windows)}</p>
         import traceback
         return f"<pre>Erro: {e}\n\n{traceback.format_exc()}</pre>", 500
 
+
+
+@app.route("/debug/scanner-health")
+def debug_scanner_health():
+    """Diagnóstico completo do pipeline: scanner → filtros → HotMonitor → DB."""
+
+    now_ts = time.time()
+
+    def age(ts):
+        if ts is None:
+            return "nunca"
+        s = int(now_ts - ts)
+        if s < 60:
+            return f"{s}s atrás"
+        return f"{s//60}m{s%60:02d}s atrás"
+
+    def fmt_ts(ts):
+        if ts is None:
+            return "—"
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M:%S UTC")
+
+    # ── Scanner stats ──────────────────────────────────────────────────────────
+    st = scanner.stats if scanner else {}
+    last_poll_age  = now_ts - st.get("last_poll_ts", 0) if st.get("last_poll_ts") else None
+    last_ok_age    = now_ts - st.get("last_poll_ok_ts", 0) if st.get("last_poll_ok_ts") else None
+
+    scanner_ok  = last_poll_age is not None and last_poll_age < 30
+    poll_ok     = last_ok_age   is not None and last_ok_age   < 30
+
+    # ── HotMonitor ────────────────────────────────────────────────────────────
+    hot_count = 0
+    hot_tokens_list = []
+    if scanner and hasattr(scanner, "hot"):
+        with scanner.hot._lock:
+            hot_count = len(scanner.hot._tokens)
+            for m, s in scanner.hot._tokens.items():
+                sym   = s.get("symbol", m[:8])
+                mc    = s.get("mc_last") or s.get("mc_migration", 0)
+                ts_m  = s.get("ts_migration")
+                elapsed = int((datetime.now(timezone.utc) - ts_m).total_seconds() / 60) if ts_m else "?"
+                hot_tokens_list.append(f"{sym} ({m[:8]}…) elapsed={elapsed}min mc=${mc:,.0f}")
+
+    # ── Helius ────────────────────────────────────────────────────────────────
+    helius_subs = 0
+    helius_ok   = False
+    helius_info = "sem Helius"
+    if scanner and hasattr(scanner, "hot") and scanner.hot._helius:
+        h = scanner.hot._helius
+        health = h.get_health() if hasattr(h, "get_health") else {}
+        helius_subs = health.get("subscriptions", 0)
+        helius_ok   = health.get("connected", False)
+        helius_info = f"connected={helius_ok} subs={helius_subs} errors={health.get('errors', '?')}"
+
+    # ── DB check ──────────────────────────────────────────────────────────────
+    db_ok = False
+    db_last_migration = None
+    db_last_bounce    = None
+    db_total_mig_today = 0
+    try:
+        with db._cursor() as cur:
+            cur.execute("SELECT 1")
+            db_ok = True
+            cur.execute("""
+                SELECT token_nome, ts_migration
+                FROM migrations
+                ORDER BY ts_migration DESC NULLS LAST
+                LIMIT 1
+            """)
+            row = cur.fetchone()
+            if row:
+                db_last_migration = f"{row['token_nome']} @ {row['ts_migration'].strftime('%H:%M:%S UTC') if row['ts_migration'] else '?'}"
+            cur.execute("""
+                SELECT symbol, ts_signal
+                FROM bounce_signals
+                ORDER BY ts_signal DESC NULLS LAST
+                LIMIT 1
+            """)
+            row = cur.fetchone()
+            if row:
+                db_last_bounce = f"{row['symbol']} @ {row['ts_signal'].strftime('%H:%M:%S UTC') if row['ts_signal'] else '?'}"
+            cur.execute("""
+                SELECT COUNT(*) AS n FROM migrations
+                WHERE ts_migration > NOW() - INTERVAL '24 hours'
+            """)
+            row = cur.fetchone()
+            db_total_mig_today = row['n'] if row else 0
+    except Exception as e:
+        db_last_migration = f"ERRO DB: {e}"
+
+    # ── Filtros activos ───────────────────────────────────────────────────────
+    filtros = {
+        "FILTER_PUMP_ONLY":  os.getenv("FILTER_PUMP_ONLY", "false"),
+        "FILTER_MC_MIN":     os.getenv("FILTER_MC_MIN", "5000"),
+        "FILTER_MC_MAX":     os.getenv("FILTER_MC_MAX", "85000"),
+        "FILTER_LIQ_MIN":    os.getenv("FILTER_LIQ_MIN", "10000"),
+        "FILTER_RUG_MAX":    os.getenv("FILTER_RUG_MAX", "0.15"),
+        "FILTER_BUNDLER_MAX":os.getenv("FILTER_BUNDLER_MAX", "0.20"),
+        "FILTER_SMART_MIN":  os.getenv("FILTER_SMART_MIN", "1"),
+        "FILTER_SNIPER_MAX": os.getenv("FILTER_SNIPER_MAX", "0.10"),
+        "FILTER_WASH_BLOCK": os.getenv("FILTER_WASH_BLOCK", "true"),
+    }
+
+    def badge(ok, label_ok="OK", label_fail="FALHOU"):
+        color = "#22c55e" if ok else "#ef4444"
+        label = label_ok if ok else label_fail
+        return f'<span style="background:{color};color:#fff;padding:2px 8px;border-radius:4px;font-size:12px">{label}</span>'
+
+    rows_hot = "".join(f"<li>{t}</li>" for t in hot_tokens_list) or "<li><em>nenhum token ativo</em></li>"
+    rows_filtros = "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in filtros.items())
+
+    scanner_stats_html = ""
+    if st:
+        scanner_stats_html = f"""
+        <tr><td>Polls totais</td><td>{st.get('poll_count',0)}</td></tr>
+        <tr><td>Último poll iniciado</td><td>{fmt_ts(st.get('last_poll_ts'))} ({age(st.get('last_poll_ts'))})</td></tr>
+        <tr><td>Último poll OK</td><td>{fmt_ts(st.get('last_poll_ok_ts'))} ({age(st.get('last_poll_ok_ts'))})</td></tr>
+        <tr><td>near_completion (último ciclo)</td><td>{st.get('near_completion_seen',0)}</td></tr>
+        <tr><td>completed (último ciclo)</td><td>{st.get('completed_seen',0)}</td></tr>
+        <tr><td>Watchlist adicionados</td><td>{st.get('watchlist_added',0)}</td></tr>
+        <tr><td>Migrações aceitas</td><td>{st.get('migrations_ok',0)}</td></tr>
+        <tr><td>Migrações rejeitadas</td><td>{st.get('migrations_rejected',0)}</td></tr>
+        <tr><td>Último aceito</td><td>{st.get('last_migration_sym') or '—'} ({age(st.get('last_migration_ts'))})</td></tr>
+        <tr><td>Último rejeitado</td><td>{st.get('last_reject_sym') or '—'} — {st.get('last_reject_reason') or '—'}</td></tr>
+        <tr><td>Último erro</td><td style="color:#ef4444">{st.get('last_error_msg') or '—'} ({age(st.get('last_error_ts'))})</td></tr>
+        """
+
+    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+    <meta http-equiv="refresh" content="10">
+    <title>Scanner Health</title>
+    <style>
+      body{{font-family:monospace;background:#0f172a;color:#e2e8f0;padding:24px}}
+      h2{{color:#94a3b8;margin-top:24px}}
+      table{{border-collapse:collapse;width:100%;max-width:700px;margin-bottom:16px}}
+      td{{padding:6px 10px;border-bottom:1px solid #1e293b}}
+      td:first-child{{color:#94a3b8;width:260px}}
+      ul{{margin:0;padding-left:20px}}
+      li{{margin:3px 0}}
+    </style></head><body>
+    <h1>🩺 Scanner Health <small style="font-size:14px;color:#64748b">auto-refresh 10s</small></h1>
+
+    <h2>Pipeline</h2>
+    <table>
+      <tr><td>Scanner thread</td><td>{badge(scanner_ok, "ATIVO", "SEM POLL >30s")}</td></tr>
+      <tr><td>Último ciclo completo</td><td>{badge(poll_ok, "OK", "SEM CICLO OK >30s")}</td></tr>
+      <tr><td>DB conectado</td><td>{badge(db_ok)}</td></tr>
+      <tr><td>Helius WS</td><td>{badge(helius_ok)} {helius_info}</td></tr>
+      <tr><td>HotMonitor tokens ativos</td><td>{hot_count}</td></tr>
+    </table>
+
+    <h2>Scanner Stats</h2>
+    <table>{scanner_stats_html}</table>
+
+    <h2>Banco de Dados</h2>
+    <table>
+      <tr><td>Última migração no DB</td><td>{db_last_migration or '—'}</td></tr>
+      <tr><td>Último bounce no DB</td><td>{db_last_bounce or '—'}</td></tr>
+      <tr><td>Migrações últimas 24h</td><td>{db_total_mig_today}</td></tr>
+    </table>
+
+    <h2>HotMonitor ({hot_count} tokens)</h2>
+    <ul>{rows_hot}</ul>
+
+    <h2>Filtros Ativos (Railway)</h2>
+    <table>{rows_filtros}</table>
+    </body></html>"""
+
+    return html
 
 
 @app.route("/debug/env-check")
