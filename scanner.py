@@ -161,24 +161,25 @@ class HotMonitor:
 
     def add(self, mint: str, mc_migration: float, ts_migration: datetime,
             symbol: str, total_supply: float = 1_000_000_000, exchange: str = None,
-            time_to_migrate_sec: int = None):
+            time_to_migrate_sec: int = None, trending_at_migration: bool = None):
         added = False
         with self._lock:
             if mint not in self._tokens and mint not in self._cancelled:
                 self._tokens[mint] = {
-                    "mc_migration":        mc_migration,
-                    "ts_mig_unix":         int(ts_migration.timestamp()),
-                    "ts_migration":        ts_migration,
-                    "symbol":              symbol,
-                    "exchange":            exchange,
-                    "mc_min":              mc_migration,
-                    "time_min":            0.0,
-                    "ts_min":              ts_migration,
-                    "mc_max":              mc_migration,
-                    "time_max":            0.0,
-                    "mc_last":             mc_migration,
-                    "total_supply":        total_supply,
-                    "time_to_migrate_sec": time_to_migrate_sec,
+                    "mc_migration":           mc_migration,
+                    "ts_mig_unix":            int(ts_migration.timestamp()),
+                    "ts_migration":           ts_migration,
+                    "symbol":                 symbol,
+                    "exchange":               exchange,
+                    "mc_min":                 mc_migration,
+                    "time_min":               0.0,
+                    "ts_min":                 ts_migration,
+                    "mc_max":                 mc_migration,
+                    "time_max":               0.0,
+                    "mc_last":                mc_migration,
+                    "total_supply":           total_supply,
+                    "time_to_migrate_sec":    time_to_migrate_sec,
+                    "trending_at_migration":  trending_at_migration,
                 }
                 added = True
 
@@ -543,19 +544,8 @@ class HotMonitor:
 
         symbol = mint_state.get("symbol", mint[:8])
         time_to_migrate_sec = mint_state.get("time_to_migrate_sec")
-
-        # H27 — trending check pontual: token está no GMGN market/rank agora?
-        # Uma chamada por bounce (evento raro). Evita armazenar snapshots globais.
-        trending_at_bounce = None
-        if self.gmgn:
-            try:
-                rank_list = self.gmgn.get_market_rank(limit=100)
-                trending_mints = {t.get("address") or t.get("mint") for t in rank_list if t}
-                trending_at_bounce = mint in trending_mints
-                if trending_at_bounce:
-                    logger.info("BOUNCE %s — trending=TRUE (aparece no market/rank)", symbol)
-            except Exception as e:
-                logger.debug("trending check %s: %s", mint[:8], e)
+        # trending_at_bounce = valor coletado no momento da migração (pump.fun 5m trending)
+        trending_at_bounce = mint_state.get("trending_at_migration")
 
         try:
             db.insert_bounce_signal({
@@ -1774,26 +1764,44 @@ class Scanner:
             **quality,
         }
 
+        # H29 — trending check na migração: token aparece no pump.fun trending agora?
+        # Tokens que migraram com hype real já estarão no ranking de curto prazo.
+        # Uma chamada por migração. Intervalo 5m = atividade recente no pump.fun.
+        trending_at_migration = None
+        try:
+            rank_list = self.gmgn.get_market_trending(interval="5m", limit=100,
+                                                       platforms=["Pump.fun"])
+            trending_mints = {t.get("address") or t.get("mint") for t in rank_list if t}
+            trending_at_migration = mint in trending_mints
+            if trending_at_migration:
+                logger.info("Migracao %s (%s) — trending=TRUE no pump.fun 5m", symbol if 'symbol' in dir() else mint[:8], mint[:8])
+        except Exception as e:
+            logger.debug("trending check migracao %s: %s", mint[:8], e)
+
+        entry["trending_at_migration"] = trending_at_migration
         db.upsert_migration(entry)
 
         symbol = token.get("symbol") or mint[:8]
         smart  = entry.get("smart_wallets") or 0
         rug    = entry.get("rug_ratio") or 0
         exch   = token.get("exchange") or "?"
+        trend_str = " 🔥trending" if trending_at_migration else ""
 
         send_alert(
             f"\U0001f514 *Migracao: {symbol}*\n"
             f"MC oficial: ${mc_migration:,.0f} ({src}) | Liq: ${liq:,.0f}\n"
-            f"Exchange: {exch}\n"
+            f"Exchange: {exch}{trend_str}\n"
             f"Smart: {smart} | Rug: {rug:.0%}"
         )
         delay_str = f" delay={capture_delay_sec}s" if capture_delay_sec is not None else ""
-        logger.info("Migracao %s (%s) MC_oficial=$%.0f[%s] MC_obs=$%.0f[%s] liq=$%.0f exch=%s smart=%d%s",
-                    symbol, mint[:8], mc_migration, src, mc_observed, src_observed, liq, exch, smart, delay_str)
+        logger.info("Migracao %s (%s) MC_oficial=$%.0f[%s] MC_obs=$%.0f[%s] liq=$%.0f exch=%s smart=%d%s trending=%s",
+                    symbol, mint[:8], mc_migration, src, mc_observed, src_observed, liq, exch, smart, delay_str,
+                    trending_at_migration)
 
         self.hot.add(mint, mc_migration, ts_mig_real, symbol, total_supply,
                      exchange=token.get("exchange"),
-                     time_to_migrate_sec=time_to_migrate_sec)
+                     time_to_migrate_sec=time_to_migrate_sec,
+                     trending_at_migration=trending_at_migration)
 
 
 # ==============================================================================

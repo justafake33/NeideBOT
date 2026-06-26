@@ -50914,8 +50914,8 @@ def _analise_migration_quality_inner():
       <div class="stat"><div class="val">{sum(1 for r in rows if r['time_to_migrate_sec'] and r['time_to_migrate_sec'] < 60)}</div><div class="lbl">migrou &lt;1min</div></div>
     </div>
 
-    <h2>1️⃣ Token estava em trending no momento do bounce?</h2>
-    <p style="color:#8b949e">Fonte: /v1/market/rank top-100 GMGN no instante do sinal. Coletado a partir de 2026-06-26.</p>
+    <h2>1️⃣ Token estava em trending no momento da migração?</h2>
+    <p style="color:#8b949e">Fonte: /v1/market/rank pump.fun 5min no momento da migração. TRUE = token tinha hype real ao completar a bonding curve. Coletado a partir de 2026-06-26.</p>
     {trending_table}
 
     <h2>2️⃣ Velocidade de migração (bonding curve → pool)</h2>

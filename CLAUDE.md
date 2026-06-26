@@ -223,6 +223,15 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO)
             └─ condition_orders no body do swap: trailing TP (ativ. 75%, drawdown 30%) + SL fixo
 ```
 
+### Resumo simplificado do pipeline (6 passos)
+
+1. **Watchlist** — Scanner vê tokens com ≥80% da bonding curve preenchida → filtra qualidade (rug, bundlers, wash, snipers) → subscreve feed Helius em tempo real.
+2. **Migração detectada** — Token completa bonding curve e aparece como `completed` no trenches → filtros de MC ($5k-$85k), liquidez (≥$10k) → salva no banco → começa a monitorar por 60 minutos. Também captura: velocidade de migração (`time_to_migrate_sec`) e se estava em trending do Pump.fun (`trending_at_migration`).
+3. **Rastreamento do fundo** — HotMonitor atualiza MC a cada 5s via Helius (eventos de compra/venda on-chain em ~5ms) + kline 1m de fallback. Registra MC mínimo, máximo e último a cada momento.
+4. **Detecção do bounce** — Se o token caiu ≥30% e subiu ≥10% do fundo em menos de 20 minutos → sinal de bounce disparado. Verifica também se a pool tem liquidez suficiente (≥20 SOL).
+5. **Execução do trade** — Swap via GMGN API (entrada imediata) com stop-loss fixo (-25%) e trailing TP (ativa em +75%, vende se recuar 30% do pico).
+6. **Análise pós-trade** — Outcome registrado no banco · WR acumulado via `/analise/wr-breakdown` · fundos reais verificados on-chain via Helius (`mc_min_true`).
+
 ---
 
 ## 🔍 ESTADO ATUAL
@@ -323,6 +332,8 @@ WR: **29%** (9 TPs / 22 SLs) confirmado GMGN · Net P/L: **+$0.12** · Payoff 2.
 | H24 | Seller exhaustion (top-3 > 70% dump_vol) → WR maior | ⏳ | PENDENTE — hipótese central pós H21 |
 | H25 | Pool depth < 20 SOL → SL é ruído de AMM | 🟡 | pool>90 SOL NÃO é sinal positivo (WR=17.5% em decision_entry). Pool<10 SOL = ruído = C3 válido. |
 | H26 | Buy concentration (largest_buy/buy_vol) alta → WR maior | ⏳ | PENDENTE CORRELAÇÃO — campo calculável dos dados existentes |
+| H27 | trending_at_migration=TRUE → recovery ≥15pp maior | ⏳ | DATA COLLECTION — coleta iniciada 2026-06-26 via /v1/market/rank pump.fun 5m no momento da migração |
+| H28 | time_to_migrate_sec < 60 → manipulação ou runner absoluto (WR diferente) | ⏳ | DATA COLLECTION — campo complete_cost_time já em migrations, propagado para bounce_signals |
 
 ---
 
@@ -543,6 +554,7 @@ RETENTION_DRY_RUN=true       # simular sem deletar
 | `/debug/h23-wr` | H23 WR por faixa de net_sol_flow. `?since=2026-05-26` para dados limpos. |
 | `/debug/sell-exhaustion` | Sell exhaustion detector — ratio sell_5s/sell_5_15s por token |
 | `/debug/test-swap` | Teste manual de swap. `?mint=<mint>&amount=<usd>`. Com TRADING_ENABLED=false simula. |
+| `/analise/migration-quality` | H27/H28 — trending_at_migration (pump.fun 5m) + velocidade de migração vs rec75. `?since=YYYY-MM-DD&min_ticks=N` |
 | `/export/csv` | Export completo do banco |
 | `/health` | Health check |
 

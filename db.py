@@ -388,6 +388,8 @@ def _do_init_db():
             "ADD COLUMN IF NOT EXISTS trending_at_bounce BOOLEAN",
             # H28 — velocidade de migração (segundos da criação até migrar)
             "ADD COLUMN IF NOT EXISTS time_to_migrate_sec INT",
+            # H29 — token estava no trending pump.fun no momento da migração?
+            "ADD COLUMN IF NOT EXISTS trending_at_migration BOOLEAN",
         ]:
             cur.execute(f"ALTER TABLE bounce_signals {col}")
 
@@ -890,7 +892,8 @@ def upsert_migration(data: dict):
                 bot_degen_rate, entrapment_ratio, lock_percent, burn_status,
                 cto_flag, has_social, x_follower_count,
                 exchange, rat_trader_rate, total_fee_sol,
-                bc_progress_migration, complete_timestamp
+                bc_progress_migration, complete_timestamp,
+                trending_at_migration
             ) VALUES (
                 %(mint)s, %(token_nome)s, %(ts_detected)s, %(bc_progress_at_detection)s,
                 %(ts_migration)s, %(mc_migration)s,
@@ -905,7 +908,8 @@ def upsert_migration(data: dict):
                 %(bot_degen_rate)s, %(entrapment_ratio)s, %(lock_percent)s, %(burn_status)s,
                 %(cto_flag)s, %(has_social)s, %(x_follower_count)s,
                 %(exchange)s, %(rat_trader_rate)s, %(total_fee_sol)s,
-                %(bc_progress_migration)s, %(complete_timestamp)s
+                %(bc_progress_migration)s, %(complete_timestamp)s,
+                %(trending_at_migration)s
             )
             ON CONFLICT (mint) DO UPDATE SET
                 ts_migration           = EXCLUDED.ts_migration,
@@ -946,7 +950,8 @@ def upsert_migration(data: dict):
                 burn_status            = COALESCE(migrations.burn_status, EXCLUDED.burn_status),
                 cto_flag               = COALESCE(migrations.cto_flag, EXCLUDED.cto_flag),
                 has_social             = COALESCE(migrations.has_social, EXCLUDED.has_social),
-                x_follower_count       = COALESCE(migrations.x_follower_count, EXCLUDED.x_follower_count)
+                x_follower_count       = COALESCE(migrations.x_follower_count, EXCLUDED.x_follower_count),
+                trending_at_migration  = COALESCE(migrations.trending_at_migration, EXCLUDED.trending_at_migration)
         """, {
             "mint":                   data.get("mint"),
             "token_nome":             data.get("token_nome"),
@@ -990,7 +995,8 @@ def upsert_migration(data: dict):
             "rat_trader_rate":        data.get("rat_trader_rate"),
             "total_fee_sol":          data.get("total_fee_sol"),
             "bc_progress_migration":  data.get("bc_progress_migration"),
-            "complete_timestamp":     data.get("complete_timestamp"),
+            "complete_timestamp":       data.get("complete_timestamp"),
+            "trending_at_migration":    data.get("trending_at_migration"),
         })
 
 
