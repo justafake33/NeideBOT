@@ -1451,19 +1451,6 @@ class Scanner:
         self.stats["near_completion_seen"] = len(near_completion_list)
         self.stats["completed_seen"]       = len(completed_list)
 
-        # H27 — trending check: UMA chamada por tick, resultado compartilhado entre
-        # todos os tokens completed novos desse ciclo. Evita N chamadas por tick que
-        # disparam rate limit e bloqueiam o scanner inteiro.
-        trending_mints: set = set()
-        new_completed = [t for t in completed_list if t.get("address") and t["address"] not in self._seen]
-        if new_completed:
-            try:
-                rank_list = self.gmgn.get_market_trending(interval="5m", limit=100,
-                                                           platforms=["Pump.fun"])
-                trending_mints = {t.get("address") or t.get("mint") for t in rank_list if t}
-            except Exception as e:
-                logger.debug("trending tick check: %s", e)
-
         # near_completion: ignora tokens já conhecidos sem chamar _safe (sem sleep)
         for token in near_completion_list:
             mint = token.get("address")
@@ -1471,6 +1458,22 @@ class Scanner:
                 if mint and (mint in self._watchlist or mint in self._seen):
                     continue
             self._safe(self._handle_near_completion, token)
+
+        # H27 — trending check: 1 chamada por tick (peso=1, capacity=20 → custo mínimo).
+        # Pega top-100 pump.fun no último 1min. Tokens ativos durante a graduação da bonding
+        # curve aparecem aqui antes de migrarem — indica hype real no momento da migração.
+        # Resultado compartilhado entre todos os tokens novos desse tick.
+        trending_mints: set = set()
+        new_completed = [t for t in completed_list
+                         if t.get("address") and t["address"] not in self._seen]
+        if new_completed:
+            try:
+                rank_list = self.gmgn.get_market_trending(
+                    interval="1m", limit=100, platforms=["Pump.fun"]
+                )
+                trending_mints = {t.get("address") or t.get("mint") for t in rank_list if t}
+            except Exception as e:
+                logger.debug("trending tick check: %s", e)
 
         # completed: tokens já vistos → apenas push_mc (sem sleep)
         #            tokens novos → _safe com stagger normal
@@ -1809,10 +1812,11 @@ class Scanner:
             **quality,
         }
 
-        # H27 — trending check: usa o set coletado UMA VEZ no _tick(), não por token
+        # H27 — trending check: set coletado 1x por tick em _tick() com interval=1m.
+        # pump.fun 5m trending inclui tokens pequenos ativos durante a bonding curve.
         trending_at_migration = (mint in trending_mints) if trending_mints else None
         if trending_at_migration:
-            logger.info("Migracao %s (%s) — trending=TRUE no pump.fun 5m", symbol, mint[:8])
+            logger.info("Migracao %s (%s) — trending=TRUE no pump.fun 1m", symbol, mint[:8])
 
         entry["trending_at_migration"] = trending_at_migration
         db.upsert_migration(entry)
