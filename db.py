@@ -264,6 +264,8 @@ def _do_init_db():
             "ADD COLUMN IF NOT EXISTS bottom_quality    TEXT",
             # Tiering de qualidade de dados
             "ADD COLUMN IF NOT EXISTS data_quality      TEXT",
+            # H27 — token estava no trending pump.fun 5m no momento da migração?
+            "ADD COLUMN IF NOT EXISTS trending_at_migration BOOLEAN",
         ]:
             cur.execute(f"ALTER TABLE migrations {col}")
 
