@@ -1663,8 +1663,8 @@ class Scanner:
             self.stats["migrations_rejected"] += 1
             self.stats["last_reject_reason"]   = reason
             self.stats["last_reject_sym"]      = sym
-            with self._lock:
-                self._seen.discard(mint)
+            # NÃO discard do _seen — token rejeitado fica marcado como visto
+            # para não ser reprocessado a cada tick (busy-loop de rejeições)
 
         if not watchlist_entry:
             ok, motivo = _passes_filter(token)
