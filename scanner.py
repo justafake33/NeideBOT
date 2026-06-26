@@ -160,23 +160,25 @@ class HotMonitor:
                 logger.warning("HeliusWS não iniciado: %s", e)
 
     def add(self, mint: str, mc_migration: float, ts_migration: datetime,
-            symbol: str, total_supply: float = 1_000_000_000, exchange: str = None):
+            symbol: str, total_supply: float = 1_000_000_000, exchange: str = None,
+            time_to_migrate_sec: int = None):
         added = False
         with self._lock:
             if mint not in self._tokens and mint not in self._cancelled:
                 self._tokens[mint] = {
-                    "mc_migration": mc_migration,
-                    "ts_mig_unix":  int(ts_migration.timestamp()),
-                    "ts_migration": ts_migration,
-                    "symbol":       symbol,
-                    "exchange":     exchange,
-                    "mc_min":       mc_migration,
-                    "time_min":     0.0,
-                    "ts_min":       ts_migration,   # timestamp quando mc_min foi visto pela última vez
-                    "mc_max":       mc_migration,
-                    "time_max":     0.0,
-                    "mc_last":      mc_migration,
-                    "total_supply": total_supply,
+                    "mc_migration":        mc_migration,
+                    "ts_mig_unix":         int(ts_migration.timestamp()),
+                    "ts_migration":        ts_migration,
+                    "symbol":              symbol,
+                    "exchange":            exchange,
+                    "mc_min":              mc_migration,
+                    "time_min":            0.0,
+                    "ts_min":              ts_migration,
+                    "mc_max":              mc_migration,
+                    "time_max":            0.0,
+                    "mc_last":             mc_migration,
+                    "total_supply":        total_supply,
+                    "time_to_migrate_sec": time_to_migrate_sec,
                 }
                 added = True
 
@@ -540,6 +542,20 @@ class HotMonitor:
                 return
 
         symbol = mint_state.get("symbol", mint[:8])
+        time_to_migrate_sec = mint_state.get("time_to_migrate_sec")
+
+        # H27 — trending check pontual: token está no GMGN market/rank agora?
+        # Uma chamada por bounce (evento raro). Evita armazenar snapshots globais.
+        trending_at_bounce = None
+        if self.gmgn:
+            try:
+                rank_list = self.gmgn.get_market_rank(limit=100)
+                trending_mints = {t.get("address") or t.get("mint") for t in rank_list if t}
+                trending_at_bounce = mint in trending_mints
+                if trending_at_bounce:
+                    logger.info("BOUNCE %s — trending=TRUE (aparece no market/rank)", symbol)
+            except Exception as e:
+                logger.debug("trending check %s: %s", mint[:8], e)
 
         try:
             db.insert_bounce_signal({
@@ -560,22 +576,26 @@ class HotMonitor:
                 "absorption_sell_cnt": absorption_window.get("sell_count"),
                 "absorption_lrg_buy":  absorption_window.get("largest_buy"),
                 "absorption_events":   absorption_window.get("total_events"),
-                "net_sol_flow": net_sol_flow,
+                "net_sol_flow":        net_sol_flow,
                 "h23_window":          "bottom",
                 # Janela RISE: [ts_min → ts_signal]
-                "rise_buy_vol":  rise_window.get("buy_vol_sol"),
-                "rise_sell_vol": rise_window.get("sell_vol_sol"),
-                "rise_net_flow": rise_net_flow,
-                "rise_events":   rise_window.get("total_events"),
-                "rise_lrg_buy":  rise_window.get("largest_buy"),
+                "rise_buy_vol":        rise_window.get("buy_vol_sol"),
+                "rise_sell_vol":       rise_window.get("sell_vol_sol"),
+                "rise_net_flow":       rise_net_flow,
+                "rise_events":         rise_window.get("total_events"),
+                "rise_lrg_buy":        rise_window.get("largest_buy"),
                 # H25 — pool depth
-                "pool_quote_at_signal": pool_quote_at_signal,
+                "pool_quote_at_signal":  pool_quote_at_signal,
                 # H24 — seller concentration durante o dump
-                "dump_seller_count":    dump_concentration.get("seller_count"),
-                "dump_seller_hhi":      dump_concentration.get("seller_hhi"),
-                "dump_top_seller_frac": dump_concentration.get("top_seller_frac"),
+                "dump_seller_count":     dump_concentration.get("seller_count"),
+                "dump_seller_hhi":       dump_concentration.get("seller_hhi"),
+                "dump_top_seller_frac":  dump_concentration.get("top_seller_frac"),
                 # H26 — buyer concentration na subida
-                "buy_concentration":    buy_concentration,
+                "buy_concentration":     buy_concentration,
+                # H27 — trending no momento do bounce
+                "trending_at_bounce":    trending_at_bounce,
+                # H28 — velocidade de migração
+                "time_to_migrate_sec":   time_to_migrate_sec,
             })
         except Exception as e:
             logger.warning("insert_bounce_signal %s: %s", mint[:8], e)
@@ -1771,7 +1791,9 @@ class Scanner:
         logger.info("Migracao %s (%s) MC_oficial=$%.0f[%s] MC_obs=$%.0f[%s] liq=$%.0f exch=%s smart=%d%s",
                     symbol, mint[:8], mc_migration, src, mc_observed, src_observed, liq, exch, smart, delay_str)
 
-        self.hot.add(mint, mc_migration, ts_mig_real, symbol, total_supply, exchange=token.get("exchange"))
+        self.hot.add(mint, mc_migration, ts_mig_real, symbol, total_supply,
+                     exchange=token.get("exchange"),
+                     time_to_migrate_sec=time_to_migrate_sec)
 
 
 # ==============================================================================

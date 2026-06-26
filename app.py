@@ -50718,5 +50718,215 @@ def analise_h22_h26():
     return h
 
 
+@app.route("/analise/migration-quality")
+def analise_migration_quality():
+    import traceback
+    try:
+        return _analise_migration_quality_inner()
+    except Exception:
+        tb = traceback.format_exc()
+        return f"<pre style='background:#0d1117;color:#f85149;padding:20px'>{tb}</pre>", 500
+
+def _analise_migration_quality_inner():
+    import psycopg2
+    import psycopg2.extras
+
+    since = request.args.get("since", "2026-06-26")
+    min_ticks = int(request.args.get("min_ticks", 1))
+
+    conn = psycopg2.connect(db.DATABASE_URL)
+    conn.autocommit = True
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                WITH base AS (
+                    SELECT
+                        bs.mint,
+                        bs.symbol,
+                        bs.ts_signal,
+                        bs.bounce_pct,
+                        bs.elapsed_sec,
+                        bs.trending_at_bounce,
+                        bs.time_to_migrate_sec,
+                        bs.mc_at_signal,
+                        bs.mc_migration,
+                        MAX(COALESCE(tt.mc_high, tt.mc)) AS max_mc_60,
+                        COUNT(tt.id) AS n_ticks
+                    FROM bounce_signals bs
+                    LEFT JOIN token_ticks tt
+                        ON tt.mint = bs.mint
+                        AND tt.tick_ts > bs.ts_signal
+                        AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
+                    WHERE bs.mc_at_signal > 0
+                      AND bs.ts_signal >= %(since)s::timestamptz
+                    GROUP BY bs.mint, bs.symbol, bs.ts_signal, bs.bounce_pct,
+                             bs.elapsed_sec, bs.trending_at_bounce,
+                             bs.time_to_migrate_sec, bs.mc_at_signal, bs.mc_migration
+                    HAVING COUNT(tt.id) >= %(min_ticks)s
+                )
+                SELECT *,
+                    (max_mc_60 >= mc_at_signal * 1.75) AS rec75
+                FROM base
+                ORDER BY ts_signal DESC
+            """, {"since": since, "min_ticks": min_ticks})
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    total = len(rows)
+    wr_base = sum(1 for r in rows if r["rec75"]) / total if total else 0
+
+    def bucket_stats(group):
+        n = len(group)
+        if n == 0:
+            return {"n": 0, "rec75": None, "sl": None}
+        rec = sum(1 for r in group if r["rec75"])
+        return {"n": n, "rec75": rec / n, "sl": 1 - rec / n}
+
+    def pct(v):
+        if v is None: return "—"
+        return f"{v:.0%}"
+
+    def wr_color(v):
+        if v is None: return "#888"
+        if v >= 0.30: return "#3fb950"
+        if v >= 0.20: return "#d29922"
+        return "#f85149"
+
+    def row_color(rec75):
+        return "#1a2f1a" if rec75 else "#2f1a1a"
+
+    # ── Trending breakdown ──────────────────────────────────────────
+    trending_true  = [r for r in rows if r["trending_at_bounce"] is True]
+    trending_false = [r for r in rows if r["trending_at_bounce"] is False]
+    trending_null  = [r for r in rows if r["trending_at_bounce"] is None]
+
+    st = bucket_stats(trending_true)
+    sf = bucket_stats(trending_false)
+    sn = bucket_stats(trending_null)
+
+    trending_table = f"""
+    <table><tr>
+      <th>Trending</th><th>n</th><th>rec75 (WR)</th><th>sl25</th>
+    </tr>
+    <tr><td>✅ TRUE (estava no top-100)</td>
+        <td>{st['n']}</td>
+        <td style="color:{wr_color(st['rec75'])}">{pct(st['rec75'])}</td>
+        <td>{pct(st['sl'])}</td></tr>
+    <tr><td>❌ FALSE (fora do ranking)</td>
+        <td>{sf['n']}</td>
+        <td style="color:{wr_color(sf['rec75'])}">{pct(sf['rec75'])}</td>
+        <td>{pct(sf['sl'])}</td></tr>
+    <tr><td>? NULL (sem dados)</td>
+        <td>{sn['n']}</td>
+        <td style="color:{wr_color(sn['rec75'])}">{pct(sn['rec75'])}</td>
+        <td>{pct(sn['sl'])}</td></tr>
+    </table>"""
+
+    # ── Migration speed breakdown ───────────────────────────────────
+    def speed_bucket(sec):
+        if sec is None: return "? (sem dado)"
+        if sec < 60:    return "⚡ <1min (runner/manip?)"
+        if sec < 300:   return "🟢 1-5min"
+        if sec < 900:   return "🟡 5-15min"
+        return "🔵 >15min"
+
+    from collections import defaultdict
+    speed_groups = defaultdict(list)
+    for r in rows:
+        speed_groups[speed_bucket(r["time_to_migrate_sec"])].append(r)
+
+    speed_order = ["⚡ <1min (runner/manip?)", "🟢 1-5min", "🟡 5-15min", "🔵 >15min", "? (sem dado)"]
+    speed_rows = ""
+    for label in speed_order:
+        g = speed_groups.get(label, [])
+        if not g: continue
+        s = bucket_stats(g)
+        avg_sec = sum(r["time_to_migrate_sec"] for r in g if r["time_to_migrate_sec"]) / max(1, sum(1 for r in g if r["time_to_migrate_sec"]))
+        speed_rows += f"""<tr>
+          <td>{label}</td>
+          <td>{s['n']}</td>
+          <td style="color:{wr_color(s['rec75'])}">{pct(s['rec75'])}</td>
+          <td>{pct(s['sl'])}</td>
+          <td>{avg_sec:.0f}s avg</td>
+        </tr>"""
+
+    speed_table = f"""
+    <table><tr>
+      <th>Velocidade de migração</th><th>n</th><th>rec75</th><th>sl25</th><th>avg tempo</th>
+    </tr>{speed_rows}</table>"""
+
+    # ── Tabela de bounces recentes ──────────────────────────────────
+    detail_rows = ""
+    for r in rows[:50]:
+        ts = r["ts_signal"].strftime("%m/%d %H:%M") if r["ts_signal"] else "—"
+        spd = f"{r['time_to_migrate_sec']}s" if r["time_to_migrate_sec"] else "—"
+        trend = "✅" if r["trending_at_bounce"] is True else ("❌" if r["trending_at_bounce"] is False else "?")
+        bp = f"{r['bounce_pct']*100:.0f}%" if r["bounce_pct"] else "—"
+        elapsed = f"{r['elapsed_sec']//60}min" if r["elapsed_sec"] else "—"
+        rec = "✅" if r["rec75"] else "❌"
+        bg = row_color(r["rec75"])
+        detail_rows += f"""<tr style="background:{bg}">
+          <td>{r['symbol'] or r['mint'][:8]}</td>
+          <td>{ts}</td>
+          <td>{trend}</td>
+          <td>{spd}</td>
+          <td>{bp}</td>
+          <td>{elapsed}</td>
+          <td>{rec}</td>
+        </tr>"""
+
+    detail_table = f"""
+    <table><tr>
+      <th>Token</th><th>Data</th><th>Trending</th><th>Migrou em</th>
+      <th>Bounce%</th><th>Elapsed</th><th>rec75</th>
+    </tr>{detail_rows}</table>"""
+
+    css = """<style>
+      body{background:#0d1117;color:#e6edf3;font-family:monospace;padding:20px}
+      h1,h2{color:#58a6ff}
+      table{border-collapse:collapse;margin:12px 0;width:100%}
+      th{background:#161b22;color:#8b949e;padding:8px 12px;text-align:left;border-bottom:1px solid #30363d}
+      td{padding:6px 12px;border-bottom:1px solid #21262d}
+      .stat{display:inline-block;background:#161b22;border:1px solid #30363d;
+            border-radius:8px;padding:12px 20px;margin:8px;text-align:center}
+      .stat .val{font-size:2em;font-weight:bold}
+      .stat .lbl{color:#8b949e;font-size:0.85em}
+    </style>"""
+
+    since_links = " · ".join(
+        f'<a href="?since={d}&min_ticks={min_ticks}" style="color:#58a6ff">{d}</a>'
+        for d in ["2026-06-26", "2026-06-01", "2026-05-26"]
+    )
+    ticks_links = " · ".join(
+        f'<a href="?since={since}&min_ticks={t}" style="color:#58a6ff">min_ticks={t}</a>'
+        for t in [1, 3, 5]
+    )
+
+    h = f"""{css}<body>
+    <h1>📊 Migration Quality — Trending & Velocidade</h1>
+    <p style="color:#8b949e">desde {since} · {since_links} | {ticks_links}</p>
+
+    <div>
+      <div class="stat"><div class="val">{total}</div><div class="lbl">bounces</div></div>
+      <div class="stat"><div class="val" style="color:{wr_color(wr_base)}">{pct(wr_base)}</div><div class="lbl">WR base (rec75)</div></div>
+      <div class="stat"><div class="val">{sum(1 for r in rows if r['trending_at_bounce'] is True)}</div><div class="lbl">trending=TRUE</div></div>
+      <div class="stat"><div class="val">{sum(1 for r in rows if r['time_to_migrate_sec'] and r['time_to_migrate_sec'] < 60)}</div><div class="lbl">migrou &lt;1min</div></div>
+    </div>
+
+    <h2>1️⃣ Token estava em trending no momento do bounce?</h2>
+    <p style="color:#8b949e">Fonte: /v1/market/rank top-100 GMGN no instante do sinal. Coletado a partir de 2026-06-26.</p>
+    {trending_table}
+
+    <h2>2️⃣ Velocidade de migração (bonding curve → pool)</h2>
+    <p style="color:#8b949e">Tokens que migraram em &lt;1min podem ser runners legítimos (hype viral) ou manipulação coordenada.</p>
+    {speed_table}
+
+    <h2>3️⃣ Bounces recentes (últimos 50)</h2>
+    {detail_table}
+    </body></html>"""
+    return h
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
