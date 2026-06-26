@@ -1396,6 +1396,24 @@ class Scanner:
         self._lock = threading.Lock()
         self._signal_ban_until: float = 0.0  # unix ts — aguarda antes de chamar token_signal
 
+        # Diagnóstico — contadores atualizados a cada ciclo
+        self.stats: dict = {
+            "last_poll_ts":         None,   # timestamp do último _tick() iniciado
+            "last_poll_ok_ts":      None,   # timestamp do último _tick() concluído sem erro
+            "last_error_ts":        None,
+            "last_error_msg":       None,
+            "poll_count":           0,
+            "near_completion_seen": 0,      # tokens vistos no near_completion
+            "completed_seen":       0,      # tokens vistos no completed
+            "watchlist_added":      0,      # tokens adicionados à watchlist
+            "migrations_ok":        0,      # tokens que passaram todos os filtros
+            "migrations_rejected":  0,      # tokens descartados em _handle_completed
+            "last_migration_ts":    None,
+            "last_migration_sym":   None,
+            "last_reject_reason":   None,
+            "last_reject_sym":      None,
+        }
+
     def start(self):
         thread = threading.Thread(target=self._loop, daemon=True, name="scanner")
         thread.start()
@@ -1414,16 +1432,27 @@ class Scanner:
             except RateLimitError as e:
                 wait = max(1.0, e.reset_at - time.time()) + 1
                 logger.warning("Rate limit global, aguardando %.1fs", wait)
+                self.stats["last_error_ts"]  = time.time()
+                self.stats["last_error_msg"] = f"RateLimit — aguarda {wait:.0f}s"
                 time.sleep(wait)
             except Exception as e:
                 logger.exception("Scanner erro: %s", e)
+                self.stats["last_error_ts"]  = time.time()
+                self.stats["last_error_msg"] = f"{type(e).__name__}: {e}"
             time.sleep(POLL_INTERVAL)
 
     def _tick(self):
+        self.stats["last_poll_ts"] = time.time()
+        self.stats["poll_count"]  += 1
         data = self.gmgn.get_trenches(types=["near_completion", "completed"])
 
+        near_completion_list = data.get("pump", [])
+        completed_list       = data.get("completed", [])
+        self.stats["near_completion_seen"] = len(near_completion_list)
+        self.stats["completed_seen"]       = len(completed_list)
+
         # near_completion: ignora tokens já conhecidos sem chamar _safe (sem sleep)
-        for token in data.get("pump", []):
+        for token in near_completion_list:
             mint = token.get("address")
             with self._lock:
                 if mint and (mint in self._watchlist or mint in self._seen):
@@ -1432,7 +1461,7 @@ class Scanner:
 
         # completed: tokens já vistos → apenas push_mc (sem sleep)
         #            tokens novos → _safe com stagger normal
-        for token in data.get("completed", []):
+        for token in completed_list:
             mint = token.get("address")
             mc   = _float(token.get("usd_market_cap")) or _float(token.get("market_cap"))
             with self._lock:
@@ -1445,6 +1474,7 @@ class Scanner:
                 if mint and mc and F_MC_MIN <= mc <= F_MC_MAX:
                     self.hot.push_mc(mint, mc, token)
 
+        self.stats["last_poll_ok_ts"] = time.time()
         self._poll_signals()
 
     def _poll_signals(self):
@@ -1568,6 +1598,7 @@ class Scanner:
 
         with self._lock:
             self._watchlist[mint] = entry
+            self.stats["watchlist_added"] += 1
 
         db.upsert_watchlist(entry)
 
@@ -1612,13 +1643,19 @@ class Scanner:
         with self._lock:
             watchlist_entry = self._watchlist.get(mint)
 
+        def _reject(sym, reason):
+            self.stats["migrations_rejected"] += 1
+            self.stats["last_reject_reason"]   = reason
+            self.stats["last_reject_sym"]      = sym
+            with self._lock:
+                self._seen.discard(mint)
+
         if not watchlist_entry:
             ok, motivo = _passes_filter(token)
             if not ok:
                 logger.info("Migracao descartada %s (%s): %s",
                             token.get("symbol"), mint[:8], motivo)
-                with self._lock:
-                    self._seen.discard(mint)
+                _reject(token.get("symbol"), motivo)
                 return
 
         mc       = _float(token.get("usd_market_cap")) or _float(token.get("market_cap"))
@@ -1626,34 +1663,29 @@ class Scanner:
         exchange = (token.get("exchange") or "").lower()
 
         if F_PUMP_ONLY and "pump" not in exchange:
-            logger.info("Migracao descartada %s (%s): exchange=%s (FILTER_PUMP_ONLY=true)",
-                        token.get("symbol"), mint[:8], exchange or "unknown")
-            with self._lock:
-                self._seen.discard(mint)
+            motivo = f"exchange={exchange or 'unknown'} (FILTER_PUMP_ONLY)"
+            logger.info("Migracao descartada %s (%s): %s", token.get("symbol"), mint[:8], motivo)
+            _reject(token.get("symbol"), motivo)
             return
 
         if not mc or mc < F_MC_MIN or mc > F_MC_MAX:
             motivo = (f"mc=${mc:.0f}<${F_MC_MIN:.0f}" if mc and mc < F_MC_MIN
                       else f"mc=${mc:.0f}>${F_MC_MAX:.0f}" if mc else "mc=0")
-            logger.info("Migracao descartada %s (%s): %s",
-                        token.get("symbol"), mint[:8], motivo)
-            with self._lock:
-                self._seen.discard(mint)
+            logger.info("Migracao descartada %s (%s): %s", token.get("symbol"), mint[:8], motivo)
+            _reject(token.get("symbol"), motivo)
             return
 
         if liq < F_LIQ_MIN:
-            logger.info("Migracao descartada %s (%s): liq=$%.0f<$%.0f",
-                        token.get("symbol"), mint[:8], liq, F_LIQ_MIN)
-            with self._lock:
-                self._seen.discard(mint)
+            motivo = f"liq=${liq:.0f}<${F_LIQ_MIN:.0f}"
+            logger.info("Migracao descartada %s (%s): %s", token.get("symbol"), mint[:8], motivo)
+            _reject(token.get("symbol"), motivo)
             return
 
         fee = _float(token.get("total_fee")) or 0
         if fee < F_FEE_MIN:
-            logger.info("Migracao descartada %s (%s): total_fee=%.4f<%.1f SOL",
-                        token.get("symbol"), mint[:8], fee, F_FEE_MIN)
-            with self._lock:
-                self._seen.discard(mint)
+            motivo = f"total_fee={fee:.4f}<{F_FEE_MIN:.1f}SOL"
+            logger.info("Migracao descartada %s (%s): %s", token.get("symbol"), mint[:8], motivo)
+            _reject(token.get("symbol"), motivo)
             return
 
         # Token passou todos os filtros — agora remove da watchlist
@@ -1797,6 +1829,10 @@ class Scanner:
         logger.info("Migracao %s (%s) MC_oficial=$%.0f[%s] MC_obs=$%.0f[%s] liq=$%.0f exch=%s smart=%d%s trending=%s",
                     symbol, mint[:8], mc_migration, src, mc_observed, src_observed, liq, exch, smart, delay_str,
                     trending_at_migration)
+
+        self.stats["migrations_ok"]        += 1
+        self.stats["last_migration_ts"]     = time.time()
+        self.stats["last_migration_sym"]    = symbol
 
         self.hot.add(mint, mc_migration, ts_mig_real, symbol, total_supply,
                      exchange=token.get("exchange"),
