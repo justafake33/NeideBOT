@@ -161,7 +161,8 @@ class HotMonitor:
 
     def add(self, mint: str, mc_migration: float, ts_migration: datetime,
             symbol: str, total_supply: float = 1_000_000_000, exchange: str = None,
-            time_to_migrate_sec: int = None, trending_at_migration: bool = None):
+            time_to_migrate_sec: int = None, trending_at_migration: bool = None,
+            tradeable: bool = True):
         added = False
         with self._lock:
             if mint not in self._tokens and mint not in self._cancelled:
@@ -180,6 +181,7 @@ class HotMonitor:
                     "total_supply":           total_supply,
                     "time_to_migrate_sec":    time_to_migrate_sec,
                     "trending_at_migration":  trending_at_migration,
+                    "tradeable":              tradeable,
                 }
                 added = True
 
@@ -638,7 +640,7 @@ class HotMonitor:
         logger.info("BOUNCE %s: fundo=$%.2f drop=%.0f%% bounce=%.0f%% em %.1fmin",
                     symbol, mc_min, drop_from_mig * 100, bounce_pct * 100, elapsed_min)
 
-        if self._executor:
+        if self._executor and mint_state.get("tradeable", True):
             try:
                 self._executor.on_bounce(
                     mint=mint,
@@ -1816,33 +1818,38 @@ class Scanner:
         entry["passed_filters"] = passed_filters
         db.upsert_migration(entry)
 
-        if not passed_filters:
-            return
-
         smart  = entry.get("smart_wallets") or 0
         rug    = entry.get("rug_ratio") or 0
         exch   = token.get("exchange") or "?"
         trend_str = " 🔥trending" if trending_at_migration else ""
+        filter_str = "" if passed_filters else " [fora filtro]"
 
-        send_alert(
-            f"\U0001f514 *Migracao: {symbol}*\n"
-            f"MC oficial: ${mc_migration:,.0f} ({src}) | Liq: ${liq:,.0f}\n"
-            f"Exchange: {exch}{trend_str}\n"
-            f"Smart: {smart} | Rug: {rug:.0%}"
-        )
+        # Telegram alert: apenas para tokens que passaram filtros
+        if passed_filters:
+            send_alert(
+                f"\U0001f514 *Migracao: {symbol}*\n"
+                f"MC oficial: ${mc_migration:,.0f} ({src}) | Liq: ${liq:,.0f}\n"
+                f"Exchange: {exch}{trend_str}\n"
+                f"Smart: {smart} | Rug: {rug:.0%}"
+            )
+
         delay_str = f" delay={capture_delay_sec}s" if capture_delay_sec is not None else ""
-        logger.info("Migracao %s (%s) MC_oficial=$%.0f[%s] MC_obs=$%.0f[%s] liq=$%.0f exch=%s smart=%d%s trending=%s",
+        logger.info("Migracao %s (%s) MC_oficial=$%.0f[%s] MC_obs=$%.0f[%s] liq=$%.0f exch=%s smart=%d%s trending=%s%s",
                     symbol, mint[:8], mc_migration, src, mc_observed, src_observed, liq, exch, smart, delay_str,
-                    trending_at_migration)
+                    trending_at_migration, filter_str)
 
-        self.stats["migrations_ok"]        += 1
-        self.stats["last_migration_ts"]     = time.time()
-        self.stats["last_migration_sym"]    = symbol
+        if passed_filters:
+            self.stats["migrations_ok"] += 1
+        self.stats["last_migration_ts"]  = time.time()
+        self.stats["last_migration_sym"] = symbol
 
+        # hot.add() para TODOS os tokens pump.fun — coleta de dados (token_ticks, mc_bottom, mc_peak).
+        # tradeable=False impede TradeExecutor.on_bounce() mas mantém HotMonitor ativo para pesquisa.
         self.hot.add(mint, mc_migration, ts_mig_real, symbol, total_supply,
                      exchange=token.get("exchange"),
                      time_to_migrate_sec=time_to_migrate_sec,
-                     trending_at_migration=trending_at_migration)
+                     trending_at_migration=trending_at_migration,
+                     tradeable=passed_filters)
 
 
 # ==============================================================================
