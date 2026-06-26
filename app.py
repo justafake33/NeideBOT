@@ -46630,14 +46630,24 @@ def debug_scanner_health():
     # ── Helius detail ──────────────────────────────────────────────────────────
     helius_rows = ""
     if ws_h:
+        backoff = ws_h.get('reconnect_backoff', '?')
+        running = ws_h.get('running', '?')
+        last_event = ws_h.get('last_event') or '—'
+        silence = ws_h.get('silence_sec')
+        silence_str = f"{silence}s" if silence is not None else '—'
+        url_display = ws_h.get('ws_url', '?')
         helius_rows = f"""
         <tr><td>connected</td><td>{badge(ws_h.get('connected'), 'SIM', 'NÃO')}</td></tr>
+        <tr><td>running (thread ativa)</td><td>{badge(running is True, 'SIM', str(running))}</td></tr>
+        <tr><td>reconnect_backoff</td><td>{backoff}s {'⚠️ em loop de retry (backoff máx=60s)' if backoff == 60 else ''}</td></tr>
+        <tr><td>Mode</td><td>{ws_h.get('mode','?')}</td></tr>
+        <tr><td>URL WS</td><td style="font-size:11px">{url_display}</td></tr>
         <tr><td>Subscriptions ativas</td><td>{ws_h.get('n_active', ws_h.get('subscriptions', '?'))}</td></tr>
         <tr><td>sub_confirmed / sub_pending</td><td>{ws_h.get('n_sub_confirmed','?')} / {ws_h.get('n_sub_pending','?')}</td></tr>
         <tr><td>WS msgs recebidas</td><td>{ws_h.get('ws_msg_count','?')}</td></tr>
         <tr><td>Transações processadas</td><td>{ws_h.get('tx_count','?')}</td></tr>
-        <tr><td>Erros WS</td><td>{ws_h.get('errors','?')}</td></tr>
-        <tr><td>Mode</td><td>{ws_h.get('mode','?')}</td></tr>
+        <tr><td>Último evento Helius</td><td>{last_event}</td></tr>
+        <tr><td>Silêncio desde último evento</td><td>{silence_str}</td></tr>
         """
     else:
         helius_rows = "<tr><td colspan='2' style='color:#94a3b8'>Sem dados Helius no último heartbeat</td></tr>"
