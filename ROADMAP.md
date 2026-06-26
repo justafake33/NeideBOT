@@ -1,6 +1,6 @@
 # NeideBOT — Roadmap
 
-**Atualizado:** 2026-06-25 (sessão 23)
+**Atualizado:** 2026-06-26 (sessão 23)
 **Estado:** Bot ATIVO · `TRADING_ENABLED=true` · branch ativo: `claude/magical-cerf-3wjq5o` · **Modo Helius** (erpc desativado — 0 créditos)
 **Infra Railway:** ~$6/mês (welcoming-miracle + intelligent-spirit PostgreSQL) · Solo desde 2026-06-22
 
@@ -134,6 +134,24 @@ Com n<200, qualquer bucket tem <50 amostras — ruído, não sinal. Prioridade: 
 ### Fase 0 — Validar captura do fundo ✅ CONCLUÍDA (sessão 16, 2026-05-26)
 
 Auditoria manual n=15: 10/15 precisos (≤3%), 3/15 learning window (tradeoff intencional), 2/15 phantoms corrigidos (MILLION, Multipad — bug ALT tx). `mc_min_true` preenchido async via `helius_rpc.get_pool_bottom()`. `bottom_error_pct` e `bottom_quality` persistidos em `migrations`.
+
+### H27/H28 — Qualidade da migração ← DATA COLLECTION (iniciado 2026-06-26)
+
+**H27:** Token estava em trending do Pump.fun (5min) no momento da migração → rec75 ≥15pp maior?
+**H28:** Migração em <60s → manipulação ou runner absoluto → WR diferente?
+
+**Fonte dos dados:**
+- `trending_at_migration`: `/v1/market/rank` com `platform=Pump.fun, interval=5m` chamado NO MOMENTO da migração. Pump.fun 5min captura tokens com <$85k MC que nunca aparecem no top-100 global. Propagado para `bounce_signals.trending_at_bounce`.
+- `time_to_migrate_sec`: campo `complete_cost_time` do trenches. Já em `migrations`. Propagado para `bounce_signals.time_to_migrate_sec` e HotMonitor state.
+
+**Endpoint de análise:** `/analise/migration-quality` — rec75 por trending TRUE/FALSE/NULL + buckets de velocidade.
+
+**Gate para decisão:** n≥30 bounces com `trending_at_migration IS NOT NULL` por grupo. Enquanto n insuficiente: apenas coleta, sem gate ativo.
+
+**Ação potencial (pós-gate):**
+- Se H27 confirmar: adicionar `trending_at_migration=TRUE` como filtro de qualidade extra (ou peso positivo no sinal).
+- Se H28 confirmar que <60s = runners (WR muito maior): priorizar esses tokens.
+- Se H28 confirmar que <60s = manipulação (WR menor): adicionar filtro `MIN_MIGRATE_SEC=60`.
 
 ### Fase 1 — ENTRY_MAX_BOUNCE_PCT ← PRÓXIMO CÓDIGO
 
