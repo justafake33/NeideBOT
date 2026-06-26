@@ -46496,6 +46496,39 @@ windows: {', '.join(available_windows)}</p>
 
 
 
+def _scanner_stats_html(stats: dict, now_ts: float) -> str:
+    if not stats:
+        return "<p style='color:#64748b'>Sem dados — worker ainda não enviou stats (aguarde próximo heartbeat em 60s)</p>"
+
+    def age(ts):
+        if not ts:
+            return "nunca"
+        s = int(now_ts - ts)
+        if s < 0: return "agora"
+        if s < 60: return f"{s}s atrás"
+        return f"{s//60}m{s%60:02d}s atrás"
+
+    last_ok = stats.get("last_poll_ok_ts")
+    last_err = stats.get("last_error_ts")
+    last_err_msg = stats.get("last_error_msg") or "—"
+    poll_stale = last_ok and (now_ts - last_ok) > 30
+
+    ok_color = "#ef4444" if poll_stale else "#22c55e"
+    ok_label = f"⚠️ PARADO ({age(last_ok)})" if poll_stale else f"OK ({age(last_ok)})"
+
+    rows = f"""
+    <tr><td>Polls realizados</td><td>{stats.get('poll_count', 0)}</td></tr>
+    <tr><td>Último poll OK</td><td style="color:{ok_color}">{ok_label}</td></tr>
+    <tr><td>Último erro</td><td style="color:{'#ef4444' if last_err else '#64748b'}">{age(last_err)} — {last_err_msg}</td></tr>
+    <tr><td>near_completion vistos</td><td>{stats.get('near_completion_seen', 0)}</td></tr>
+    <tr><td>completed vistos</td><td>{stats.get('completed_seen', 0)}</td></tr>
+    <tr><td>Migrações aceitas</td><td>{stats.get('migrations_ok', 0)}</td></tr>
+    <tr><td>Migrações rejeitadas</td><td>{stats.get('migrations_rejected', 0)}</td></tr>
+    <tr><td>Último rejeitado</td><td>{stats.get('last_reject_sym') or '—'} — {stats.get('last_reject_reason') or '—'}</td></tr>
+    """
+    return f"<table>{rows}</table>"
+
+
 @app.route("/debug/scanner-health")
 def debug_scanner_health():
     """Diagnóstico completo do pipeline. Lê do banco — funciona no web service."""
@@ -46614,8 +46647,10 @@ def debug_scanner_health():
 
     # ── Heartbeat detail ──────────────────────────────────────────────────────
     worker_rows = ""
+    scanner_stats = {}
     if worker_hb and "_error" not in worker_hb:
         meta = worker_hb.get("metadata") or {}
+        scanner_stats = meta.get("scanner_stats") or {}
         worker_rows = f"""
         <tr><td>Último heartbeat</td><td>{worker_hb['updated_at'].strftime('%H:%M:%S UTC') if worker_hb.get('updated_at') else '?'} ({worker_age_s}s atrás)</td></tr>
         <tr><td>IP de saída (GMGN whitelist)</td><td>{worker_hb.get('outbound_ip') or '?'}</td></tr>
@@ -46696,6 +46731,9 @@ def debug_scanner_health():
 
     <h2>Helius WS (snapshot do último heartbeat)</h2>
     <table>{helius_rows}</table>
+
+    <h2>Scanner Stats (último heartbeat)</h2>
+    {_scanner_stats_html(scanner_stats, now_ts)}
 
     <h2>Últimas 8 migrações no DB</h2>
     <table>
