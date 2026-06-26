@@ -1659,52 +1659,46 @@ class Scanner:
         with self._lock:
             watchlist_entry = self._watchlist.get(mint)
 
-        def _reject(sym, reason):
-            self.stats["migrations_rejected"] += 1
-            self.stats["last_reject_reason"]   = reason
-            self.stats["last_reject_sym"]      = sym
-            # NÃO discard do _seen — token rejeitado fica marcado como visto
-            # para não ser reprocessado a cada tick (busy-loop de rejeições)
-
-        if not watchlist_entry:
-            ok, motivo = _passes_filter(token)
-            if not ok:
-                logger.info("Migracao descartada %s (%s): %s",
-                            token.get("symbol"), mint[:8], motivo)
-                _reject(token.get("symbol"), motivo)
-                return
-
+        symbol   = token.get("symbol") or mint[:8]
         mc       = _float(token.get("usd_market_cap")) or _float(token.get("market_cap"))
         liq      = _float(token.get("liquidity")) or 0
         exchange = (token.get("exchange") or "").lower()
+        fee      = _float(token.get("total_fee")) or 0
 
+        # PUMP_ONLY é gate de visibilidade total — tokens não-pump não interessam ao bot
         if F_PUMP_ONLY and "pump" not in exchange:
-            motivo = f"exchange={exchange or 'unknown'} (FILTER_PUMP_ONLY)"
-            logger.info("Migracao descartada %s (%s): %s", token.get("symbol"), mint[:8], motivo)
-            _reject(token.get("symbol"), motivo)
+            logger.debug("Migracao ignorada %s (%s): exchange=%s (FILTER_PUMP_ONLY)",
+                         symbol, mint[:8], exchange or "unknown")
             return
 
-        if not mc or mc < F_MC_MIN or mc > F_MC_MAX:
-            motivo = (f"mc=${mc:.0f}<${F_MC_MIN:.0f}" if mc and mc < F_MC_MIN
-                      else f"mc=${mc:.0f}>${F_MC_MAX:.0f}" if mc else "mc=0")
-            logger.info("Migracao descartada %s (%s): %s", token.get("symbol"), mint[:8], motivo)
-            _reject(token.get("symbol"), motivo)
-            return
+        # Avalia filtros de qualidade — NÃO gateiam mais o upsert, apenas hot.add()
+        # Assim todos os tokens pump.fun aparecem no /scanner independente dos filtros.
+        if not watchlist_entry:
+            quality_ok, quality_reason = _passes_filter(token)
+        else:
+            quality_ok, quality_reason = True, ""
 
-        if liq < F_LIQ_MIN:
-            motivo = f"liq=${liq:.0f}<${F_LIQ_MIN:.0f}"
-            logger.info("Migracao descartada %s (%s): %s", token.get("symbol"), mint[:8], motivo)
-            _reject(token.get("symbol"), motivo)
-            return
+        mc_ok  = bool(mc and F_MC_MIN <= mc <= F_MC_MAX)
+        liq_ok = liq >= F_LIQ_MIN
+        fee_ok = fee >= F_FEE_MIN
+        passed_filters = quality_ok and mc_ok and liq_ok and fee_ok
 
-        fee = _float(token.get("total_fee")) or 0
-        if fee < F_FEE_MIN:
-            motivo = f"total_fee={fee:.4f}<{F_FEE_MIN:.1f}SOL"
-            logger.info("Migracao descartada %s (%s): %s", token.get("symbol"), mint[:8], motivo)
-            _reject(token.get("symbol"), motivo)
-            return
+        if not passed_filters:
+            if not quality_ok:
+                filter_motivo = quality_reason
+            elif not mc_ok:
+                filter_motivo = (f"mc=${mc:.0f}<${F_MC_MIN:.0f}" if mc and mc < F_MC_MIN
+                                 else f"mc=${mc:.0f}>${F_MC_MAX:.0f}" if mc else "mc=0")
+            elif not liq_ok:
+                filter_motivo = f"liq=${liq:.0f}<${F_LIQ_MIN:.0f}"
+            else:
+                filter_motivo = f"total_fee={fee:.4f}<{F_FEE_MIN:.1f}SOL"
+            logger.info("Migracao salva (fora filtro) %s (%s): %s", symbol, mint[:8], filter_motivo)
+            self.stats["migrations_rejected"] += 1
+            self.stats["last_reject_reason"]   = filter_motivo
+            self.stats["last_reject_sym"]      = symbol
 
-        # Token passou todos os filtros — agora remove da watchlist
+        # Remove da watchlist
         with self._lock:
             watchlist_entry = self._watchlist.pop(mint, watchlist_entry)
 
@@ -1819,9 +1813,12 @@ class Scanner:
             logger.info("Migracao %s (%s) — trending=TRUE no pump.fun 1m", symbol, mint[:8])
 
         entry["trending_at_migration"] = trending_at_migration
+        entry["passed_filters"] = passed_filters
         db.upsert_migration(entry)
 
-        symbol = token.get("symbol") or mint[:8]
+        if not passed_filters:
+            return
+
         smart  = entry.get("smart_wallets") or 0
         rug    = entry.get("rug_ratio") or 0
         exch   = token.get("exchange") or "?"

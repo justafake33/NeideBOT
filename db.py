@@ -266,6 +266,8 @@ def _do_init_db():
             "ADD COLUMN IF NOT EXISTS data_quality      TEXT",
             # H27 — token estava no trending pump.fun 5m no momento da migração?
             "ADD COLUMN IF NOT EXISTS trending_at_migration BOOLEAN",
+            # Visibilidade vs filtros de trading — passou todos os filtros de qualidade/MC/liq?
+            "ADD COLUMN IF NOT EXISTS passed_filters        BOOLEAN",
         ]:
             cur.execute(f"ALTER TABLE migrations {col}")
 
@@ -895,7 +897,7 @@ def upsert_migration(data: dict):
                 cto_flag, has_social, x_follower_count,
                 exchange, rat_trader_rate, total_fee_sol,
                 bc_progress_migration, complete_timestamp,
-                trending_at_migration
+                trending_at_migration, passed_filters
             ) VALUES (
                 %(mint)s, %(token_nome)s, %(ts_detected)s, %(bc_progress_at_detection)s,
                 %(ts_migration)s, %(mc_migration)s,
@@ -911,7 +913,7 @@ def upsert_migration(data: dict):
                 %(cto_flag)s, %(has_social)s, %(x_follower_count)s,
                 %(exchange)s, %(rat_trader_rate)s, %(total_fee_sol)s,
                 %(bc_progress_migration)s, %(complete_timestamp)s,
-                %(trending_at_migration)s
+                %(trending_at_migration)s, %(passed_filters)s
             )
             ON CONFLICT (mint) DO UPDATE SET
                 ts_migration           = EXCLUDED.ts_migration,
@@ -953,7 +955,8 @@ def upsert_migration(data: dict):
                 cto_flag               = COALESCE(migrations.cto_flag, EXCLUDED.cto_flag),
                 has_social             = COALESCE(migrations.has_social, EXCLUDED.has_social),
                 x_follower_count       = COALESCE(migrations.x_follower_count, EXCLUDED.x_follower_count),
-                trending_at_migration  = COALESCE(migrations.trending_at_migration, EXCLUDED.trending_at_migration)
+                trending_at_migration  = COALESCE(migrations.trending_at_migration, EXCLUDED.trending_at_migration),
+                passed_filters         = EXCLUDED.passed_filters
         """, {
             "mint":                   data.get("mint"),
             "token_nome":             data.get("token_nome"),
@@ -999,6 +1002,7 @@ def upsert_migration(data: dict):
             "bc_progress_migration":  data.get("bc_progress_migration"),
             "complete_timestamp":       data.get("complete_timestamp"),
             "trending_at_migration":    data.get("trending_at_migration"),
+            "passed_filters":           data.get("passed_filters"),
         })
 
 
