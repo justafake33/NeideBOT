@@ -110,6 +110,10 @@ DASHBOARD_HTML = """
     <div class="stat-value red">{{ not_recovered }}</div></div>
   <div class="stat"><div class="stat-label">Pendentes</div>
     <div class="stat-value yellow">{{ pending }}</div></div>
+  <div class="stat"><div class="stat-label">Passou filtros</div>
+    <div class="stat-value green">{{ passed_count }}</div></div>
+  <div class="stat"><div class="stat-label">Bloqueados</div>
+    <div class="stat-value red">{{ blocked_count }}</div></div>
 </div>
 
 <div class="wrap">
@@ -120,7 +124,7 @@ DASHBOARD_HTML = """
   <th>Fundo</th><th>Queda</th><th>T/Fundo</th>
   <th>1h</th><th>4h</th><th>24h</th>
   <th>Smart</th><th>Sniper</th><th>Rug%</th><th>Top10</th>
-  <th>Wash</th><th>HP</th><th>Recovery</th>
+  <th>Wash</th><th>HP</th><th>Filtros</th><th>Recovery</th>
 </tr></thead>
 <tbody>
 {% for r in rows %}
@@ -154,6 +158,11 @@ DASHBOARD_HTML = """
   <td class="{{ 'red' if r.wash else '' }}">{{ r.wash_lbl }}</td>
   <td>{{ r.hp }}</td>
   <td>
+    {% if r.passed == True %}<span class="badge b-green">✅</span>
+    {% elif r.passed == False %}<span class="badge b-red">✗</span>
+    {% else %}<span class="muted">—</span>{% endif %}
+  </td>
+  <td>
     {% if r.rec == True %}<span class="badge b-green">✅ SIM</span>
     {% elif r.rec == False %}<span class="badge b-red">❌ NÃO</span>
     {% else %}<span class="badge b-yellow">⏳ —</span>{% endif %}
@@ -181,6 +190,8 @@ def scanner_dashboard():
     recovered    = sum(1 for r in rows_raw if r.get("recovery") is True)
     not_recovered = sum(1 for r in rows_raw if r.get("recovery") is False)
     pending      = total - recovered - not_recovered
+    passed_count = sum(1 for r in rows_raw if r.get("passed_filters") is True)
+    blocked_count = sum(1 for r in rows_raw if r.get("passed_filters") is False)
 
     rows = []
     for r in rows_raw:
@@ -229,11 +240,13 @@ def scanner_dashboard():
             "wash_lbl":   "⚠️" if wash else ("✅" if wash is False else "—"),
             "hp":         "\U0001f6ab" if r.get("is_honeypot") else ("✅" if r.get("is_honeypot") is False else "—"),
             "rec":        r.get("recovery"),
+            "passed":     r.get("passed_filters"),
         })
 
     return render_template_string(
         DASHBOARD_HTML, rows=rows, total=total,
         recovered=recovered, not_recovered=not_recovered, pending=pending,
+        passed_count=passed_count, blocked_count=blocked_count,
     )
 
 
