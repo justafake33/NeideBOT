@@ -386,6 +386,8 @@ def _do_init_db():
             "ADD COLUMN IF NOT EXISTS data_quality      TEXT",
             # H27 — token apareceu no GMGN trending nos 15min antes do bounce?
             "ADD COLUMN IF NOT EXISTS trending_at_bounce BOOLEAN",
+            # H28 — velocidade de migração (segundos da criação até migrar)
+            "ADD COLUMN IF NOT EXISTS time_to_migrate_sec INT",
         ]:
             cur.execute(f"ALTER TABLE bounce_signals {col}")
 
@@ -1245,7 +1247,7 @@ def insert_bounce_signal(data: dict):
                  rise_buy_vol, rise_sell_vol, rise_net_flow, rise_events, rise_lrg_buy,
                  pool_quote_at_signal,
                  dump_seller_count, dump_seller_hhi, dump_top_seller_frac,
-                 buy_concentration, data_quality, trending_at_bounce)
+                 buy_concentration, data_quality, trending_at_bounce, time_to_migrate_sec)
             VALUES
                 (%(mint)s, %(symbol)s, %(exchange)s, %(elapsed_sec)s, %(mc_migration)s, %(mc_min)s,
                  %(mc_at_signal)s, %(drop_from_mig)s, %(bounce_pct)s,
@@ -1259,11 +1261,7 @@ def insert_bounce_signal(data: dict):
                  %(pool_quote_at_signal)s,
                  %(dump_seller_count)s, %(dump_seller_hhi)s, %(dump_top_seller_frac)s,
                  %(buy_concentration)s, %(data_quality)s,
-                 (SELECT EXISTS(
-                     SELECT 1 FROM gmgn_trending_snapshots
-                     WHERE mint = %(mint)s
-                       AND ts_snapshot >= NOW() - INTERVAL '15 minutes'
-                 )))
+                 %(trending_at_bounce)s, %(time_to_migrate_sec)s)
             ON CONFLICT (mint) DO UPDATE SET
                 absorption_score       = EXCLUDED.absorption_score,
                 absorption_grade       = EXCLUDED.absorption_grade,
@@ -1284,7 +1282,9 @@ def insert_bounce_signal(data: dict):
                 dump_seller_count      = EXCLUDED.dump_seller_count,
                 dump_seller_hhi        = EXCLUDED.dump_seller_hhi,
                 dump_top_seller_frac   = EXCLUDED.dump_top_seller_frac,
-                buy_concentration      = EXCLUDED.buy_concentration
+                buy_concentration      = EXCLUDED.buy_concentration,
+                trending_at_bounce     = COALESCE(bounce_signals.trending_at_bounce, EXCLUDED.trending_at_bounce),
+                time_to_migrate_sec    = COALESCE(bounce_signals.time_to_migrate_sec, EXCLUDED.time_to_migrate_sec)
             WHERE bounce_signals.absorption_events IS NULL
         """, {
             **data,
@@ -1310,6 +1310,8 @@ def insert_bounce_signal(data: dict):
             "dump_top_seller_frac":  data.get("dump_top_seller_frac"),
             "buy_concentration":     data.get("buy_concentration"),
             "data_quality":          _trade_data_quality(data.get("ts_signal"), data.get("mint", "")),
+            "trending_at_bounce":    data.get("trending_at_bounce"),
+            "time_to_migrate_sec":   data.get("time_to_migrate_sec"),
         })
 
 
