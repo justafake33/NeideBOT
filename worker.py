@@ -94,6 +94,13 @@ def _heartbeat_loop():
 
         try:
             ip = _get_outbound_ip()
+            scanner_stats = None
+            try:
+                sc = getattr(_app_module, "scanner", None)
+                if sc and hasattr(sc, "stats"):
+                    scanner_stats = dict(sc.stats)
+            except Exception:
+                pass
             db.upsert_runtime_heartbeat(
                 runtime_name="worker",
                 service_type="worker",
@@ -104,6 +111,7 @@ def _heartbeat_loop():
                     "railway_env": railway_env,
                     "git_sha": git_sha,
                     "run_bot_services": os.getenv("RUN_BOT_SERVICES", "1"),
+                    "scanner_stats": scanner_stats,
                 },
                 ws_health=ws_health_snapshot,
             )
