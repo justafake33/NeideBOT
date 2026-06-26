@@ -47,11 +47,19 @@ signal.signal(signal.SIGINT, _stop)
 
 
 def _get_outbound_ip() -> str:
-    """Obtém IP público de saída do processo atual."""
+    """Obtém IP público de saída do processo atual.
+    Usa requests (mesma lib do GMGN swap) para refletir o IP real que o GMGN vê.
+    """
     try:
-        import urllib.request
-        with urllib.request.urlopen("https://ifconfig.me/ip", timeout=5) as resp:
-            return resp.read().decode().strip()
+        import requests as _req
+        r = _req.get("https://ifconfig.me/ip", timeout=5, headers={"User-Agent": "curl/7.64"})
+        return r.text.strip()
+    except Exception:
+        pass
+    try:
+        import requests as _req
+        r = _req.get("https://api.ipify.org", timeout=5)
+        return r.text.strip()
     except Exception:
         pass
     try:
