@@ -46498,166 +46498,205 @@ windows: {', '.join(available_windows)}</p>
 
 @app.route("/debug/scanner-health")
 def debug_scanner_health():
-    """Diagnóstico completo do pipeline: scanner → filtros → HotMonitor → DB."""
+    """Diagnóstico completo do pipeline. Lê do banco — funciona no web service."""
+    now = datetime.now(timezone.utc)
+    now_ts = now.timestamp()
 
-    now_ts = time.time()
-
-    def age(ts):
-        if ts is None:
+    def age_dt(dt):
+        if dt is None:
             return "nunca"
-        s = int(now_ts - ts)
+        s = int((now - dt).total_seconds())
+        if s < 0:
+            return "agora"
         if s < 60:
             return f"{s}s atrás"
         return f"{s//60}m{s%60:02d}s atrás"
 
-    def fmt_ts(ts):
-        if ts is None:
-            return "—"
-        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M:%S UTC")
+    def badge(ok, label_ok="OK", label_fail="FALHOU"):
+        color = "#22c55e" if ok else "#ef4444"
+        label = label_ok if ok else label_fail
+        return f'<span style="background:{color};color:#fff;padding:2px 8px;border-radius:4px;font-size:12px;font-weight:bold">{label}</span>'
 
-    # ── Scanner stats ──────────────────────────────────────────────────────────
-    st = scanner.stats if scanner else {}
-    last_poll_age  = now_ts - st.get("last_poll_ts", 0) if st.get("last_poll_ts") else None
-    last_ok_age    = now_ts - st.get("last_poll_ok_ts", 0) if st.get("last_poll_ok_ts") else None
+    def warn(cond, label):
+        color = "#f59e0b" if cond else "#64748b"
+        return f'<span style="color:{color}">{label}</span>'
 
-    scanner_ok  = last_poll_age is not None and last_poll_age < 30
-    poll_ok     = last_ok_age   is not None and last_ok_age   < 30
+    # ── Worker heartbeat (fonte de verdade do worker) ─────────────────────────
+    worker_hb = None
+    worker_age_s = None
+    ws_h = {}
+    try:
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT runtime_name, outbound_ip, hostname, pid,
+                       metadata, ws_health, updated_at
+                  FROM runtime_heartbeats
+                 WHERE runtime_name = 'worker'
+            """)
+            row = cur.fetchone()
+            if row:
+                worker_hb = dict(row)
+                worker_age_s = int((now - row['updated_at']).total_seconds())
+                ws_h = row['ws_health'] or {}
+    except Exception as e:
+        worker_hb = {"_error": str(e)}
 
-    # ── HotMonitor ────────────────────────────────────────────────────────────
-    hot_count = 0
-    hot_tokens_list = []
-    if scanner and hasattr(scanner, "hot"):
-        with scanner.hot._lock:
-            hot_count = len(scanner.hot._tokens)
-            for m, s in scanner.hot._tokens.items():
-                sym   = s.get("symbol", m[:8])
-                mc    = s.get("mc_last") or s.get("mc_migration", 0)
-                ts_m  = s.get("ts_migration")
-                elapsed = int((datetime.now(timezone.utc) - ts_m).total_seconds() / 60) if ts_m else "?"
-                hot_tokens_list.append(f"{sym} ({m[:8]}…) elapsed={elapsed}min mc=${mc:,.0f}")
+    worker_alive = worker_age_s is not None and worker_age_s < 180  # heartbeat a cada 60s
+    helius_connected = ws_h.get("connected", False)
 
-    # ── Helius ────────────────────────────────────────────────────────────────
-    helius_subs = 0
-    helius_ok   = False
-    helius_info = "sem Helius"
-    if scanner and hasattr(scanner, "hot") and scanner.hot._helius:
-        h = scanner.hot._helius
-        health = h.get_health() if hasattr(h, "get_health") else {}
-        helius_subs = health.get("subscriptions", 0)
-        helius_ok   = health.get("connected", False)
-        helius_info = f"connected={helius_ok} subs={helius_subs} errors={health.get('errors', '?')}"
-
-    # ── DB check ──────────────────────────────────────────────────────────────
+    # ── DB stats ──────────────────────────────────────────────────────────────
     db_ok = False
-    db_last_migration = None
-    db_last_bounce    = None
-    db_total_mig_today = 0
+    last_mig_sym = last_mig_ts = last_mig_age = "—"
+    last_bounce_sym = last_bounce_ts = last_bounce_age = "—"
+    mig_1h = mig_6h = mig_24h = 0
+    bounce_24h = 0
+    recent_migs = []
+    recent_rejects_raw = []
     try:
         with db._cursor() as cur:
             cur.execute("SELECT 1")
             db_ok = True
+
             cur.execute("""
-                SELECT token_nome, ts_migration
-                FROM migrations
-                ORDER BY ts_migration DESC NULLS LAST
-                LIMIT 1
+                SELECT token_nome, ts_migration, mc_migration, exchange
+                  FROM migrations
+                 ORDER BY ts_migration DESC NULLS LAST
+                 LIMIT 1
             """)
             row = cur.fetchone()
             if row:
-                db_last_migration = f"{row['token_nome']} @ {row['ts_migration'].strftime('%H:%M:%S UTC') if row['ts_migration'] else '?'}"
-            cur.execute("""
-                SELECT symbol, ts_signal
-                FROM bounce_signals
-                ORDER BY ts_signal DESC NULLS LAST
-                LIMIT 1
-            """)
-            row = cur.fetchone()
-            if row:
-                db_last_bounce = f"{row['symbol']} @ {row['ts_signal'].strftime('%H:%M:%S UTC') if row['ts_signal'] else '?'}"
+                last_mig_sym = row['token_nome'] or "?"
+                last_mig_ts  = row['ts_migration'].strftime("%H:%M:%S UTC") if row['ts_migration'] else "?"
+                last_mig_age = age_dt(row['ts_migration'])
+
             cur.execute("""
                 SELECT COUNT(*) AS n FROM migrations
-                WHERE ts_migration > NOW() - INTERVAL '24 hours'
+                 WHERE ts_migration > NOW() - INTERVAL '1 hour'
+            """)
+            mig_1h = (cur.fetchone() or {}).get('n', 0)
+            cur.execute("""
+                SELECT COUNT(*) AS n FROM migrations
+                 WHERE ts_migration > NOW() - INTERVAL '6 hours'
+            """)
+            mig_6h = (cur.fetchone() or {}).get('n', 0)
+            cur.execute("""
+                SELECT COUNT(*) AS n FROM migrations
+                 WHERE ts_migration > NOW() - INTERVAL '24 hours'
+            """)
+            mig_24h = (cur.fetchone() or {}).get('n', 0)
+
+            cur.execute("""
+                SELECT symbol, ts_signal FROM bounce_signals
+                 ORDER BY ts_signal DESC NULLS LAST LIMIT 1
             """)
             row = cur.fetchone()
-            db_total_mig_today = row['n'] if row else 0
+            if row:
+                last_bounce_sym = row['symbol'] or "?"
+                last_bounce_ts  = row['ts_signal'].strftime("%H:%M:%S UTC") if row['ts_signal'] else "?"
+                last_bounce_age = age_dt(row['ts_signal'])
+            cur.execute("""
+                SELECT COUNT(*) AS n FROM bounce_signals
+                 WHERE ts_signal > NOW() - INTERVAL '24 hours'
+            """)
+            bounce_24h = (cur.fetchone() or {}).get('n', 0)
+
+            cur.execute("""
+                SELECT token_nome, ts_migration, mc_migration, exchange, liq_migration,
+                       smart_wallets, rug_ratio
+                  FROM migrations
+                 ORDER BY ts_migration DESC NULLS LAST
+                 LIMIT 8
+            """)
+            recent_migs = [dict(r) for r in cur.fetchall()]
+
     except Exception as e:
-        db_last_migration = f"ERRO DB: {e}"
+        last_mig_sym = f"ERRO DB: {e}"
 
-    # ── Filtros activos ───────────────────────────────────────────────────────
-    filtros = {
-        "FILTER_PUMP_ONLY":  os.getenv("FILTER_PUMP_ONLY", "false"),
-        "FILTER_MC_MIN":     os.getenv("FILTER_MC_MIN", "5000"),
-        "FILTER_MC_MAX":     os.getenv("FILTER_MC_MAX", "85000"),
-        "FILTER_LIQ_MIN":    os.getenv("FILTER_LIQ_MIN", "10000"),
-        "FILTER_RUG_MAX":    os.getenv("FILTER_RUG_MAX", "0.15"),
-        "FILTER_BUNDLER_MAX":os.getenv("FILTER_BUNDLER_MAX", "0.20"),
-        "FILTER_SMART_MIN":  os.getenv("FILTER_SMART_MIN", "1"),
-        "FILTER_SNIPER_MAX": os.getenv("FILTER_SNIPER_MAX", "0.10"),
-        "FILTER_WASH_BLOCK": os.getenv("FILTER_WASH_BLOCK", "true"),
-    }
-
-    def badge(ok, label_ok="OK", label_fail="FALHOU"):
-        color = "#22c55e" if ok else "#ef4444"
-        label = label_ok if ok else label_fail
-        return f'<span style="background:{color};color:#fff;padding:2px 8px;border-radius:4px;font-size:12px">{label}</span>'
-
-    rows_hot = "".join(f"<li>{t}</li>" for t in hot_tokens_list) or "<li><em>nenhum token ativo</em></li>"
-    rows_filtros = "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in filtros.items())
-
-    scanner_stats_html = ""
-    if st:
-        scanner_stats_html = f"""
-        <tr><td>Polls totais</td><td>{st.get('poll_count',0)}</td></tr>
-        <tr><td>Último poll iniciado</td><td>{fmt_ts(st.get('last_poll_ts'))} ({age(st.get('last_poll_ts'))})</td></tr>
-        <tr><td>Último poll OK</td><td>{fmt_ts(st.get('last_poll_ok_ts'))} ({age(st.get('last_poll_ok_ts'))})</td></tr>
-        <tr><td>near_completion (último ciclo)</td><td>{st.get('near_completion_seen',0)}</td></tr>
-        <tr><td>completed (último ciclo)</td><td>{st.get('completed_seen',0)}</td></tr>
-        <tr><td>Watchlist adicionados</td><td>{st.get('watchlist_added',0)}</td></tr>
-        <tr><td>Migrações aceitas</td><td>{st.get('migrations_ok',0)}</td></tr>
-        <tr><td>Migrações rejeitadas</td><td>{st.get('migrations_rejected',0)}</td></tr>
-        <tr><td>Último aceito</td><td>{st.get('last_migration_sym') or '—'} ({age(st.get('last_migration_ts'))})</td></tr>
-        <tr><td>Último rejeitado</td><td>{st.get('last_reject_sym') or '—'} — {st.get('last_reject_reason') or '—'}</td></tr>
-        <tr><td>Último erro</td><td style="color:#ef4444">{st.get('last_error_msg') or '—'} ({age(st.get('last_error_ts'))})</td></tr>
+    # ── Heartbeat detail ──────────────────────────────────────────────────────
+    worker_rows = ""
+    if worker_hb and "_error" not in worker_hb:
+        meta = worker_hb.get("metadata") or {}
+        worker_rows = f"""
+        <tr><td>Último heartbeat</td><td>{worker_hb['updated_at'].strftime('%H:%M:%S UTC') if worker_hb.get('updated_at') else '?'} ({worker_age_s}s atrás)</td></tr>
+        <tr><td>IP de saída (GMGN whitelist)</td><td>{worker_hb.get('outbound_ip') or '?'}</td></tr>
+        <tr><td>Hostname / PID</td><td>{worker_hb.get('hostname') or '?'} / {worker_hb.get('pid') or '?'}</td></tr>
+        <tr><td>Git SHA</td><td>{meta.get('git_sha') or '?'}</td></tr>
         """
+    elif worker_hb and "_error" in worker_hb:
+        worker_rows = f"<tr><td colspan='2' style='color:#ef4444'>Erro lendo heartbeat: {worker_hb['_error']}</td></tr>"
+    else:
+        worker_rows = "<tr><td colspan='2' style='color:#ef4444'>Nenhum heartbeat no banco — worker nunca iniciou ou nunca conectou ao DB</td></tr>"
+
+    # ── Helius detail ──────────────────────────────────────────────────────────
+    helius_rows = ""
+    if ws_h:
+        helius_rows = f"""
+        <tr><td>connected</td><td>{badge(ws_h.get('connected'), 'SIM', 'NÃO')}</td></tr>
+        <tr><td>Subscriptions ativas</td><td>{ws_h.get('n_active', ws_h.get('subscriptions', '?'))}</td></tr>
+        <tr><td>sub_confirmed / sub_pending</td><td>{ws_h.get('n_sub_confirmed','?')} / {ws_h.get('n_sub_pending','?')}</td></tr>
+        <tr><td>WS msgs recebidas</td><td>{ws_h.get('ws_msg_count','?')}</td></tr>
+        <tr><td>Transações processadas</td><td>{ws_h.get('tx_count','?')}</td></tr>
+        <tr><td>Erros WS</td><td>{ws_h.get('errors','?')}</td></tr>
+        <tr><td>Mode</td><td>{ws_h.get('mode','?')}</td></tr>
+        """
+    else:
+        helius_rows = "<tr><td colspan='2' style='color:#94a3b8'>Sem dados Helius no último heartbeat</td></tr>"
+
+    # ── Últimas migrações ─────────────────────────────────────────────────────
+    mig_rows = ""
+    for r in recent_migs:
+        ts_str = r['ts_migration'].strftime("%H:%M:%S") if r.get('ts_migration') else "?"
+        age_str = age_dt(r['ts_migration'])
+        mc_str = f"${r['mc_migration']:,.0f}" if r.get('mc_migration') else "?"
+        liq_str = f"${r['liq_migration']:,.0f}" if r.get('liq_migration') else "?"
+        mig_rows += f"<tr><td>{ts_str} ({age_str})</td><td>{r['token_nome'] or '?'}</td><td>{mc_str}</td><td>{liq_str}</td><td>{r['exchange'] or '?'}</td></tr>"
+    if not mig_rows:
+        mig_rows = "<tr><td colspan='5' style='color:#64748b'>Nenhuma migração recente</td></tr>"
 
     html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
-    <meta http-equiv="refresh" content="10">
+    <meta http-equiv="refresh" content="15">
     <title>Scanner Health</title>
     <style>
-      body{{font-family:monospace;background:#0f172a;color:#e2e8f0;padding:24px}}
-      h2{{color:#94a3b8;margin-top:24px}}
-      table{{border-collapse:collapse;width:100%;max-width:700px;margin-bottom:16px}}
-      td{{padding:6px 10px;border-bottom:1px solid #1e293b}}
-      td:first-child{{color:#94a3b8;width:260px}}
-      ul{{margin:0;padding-left:20px}}
-      li{{margin:3px 0}}
+      body{{font-family:monospace;background:#0f172a;color:#e2e8f0;padding:24px;font-size:13px}}
+      h2{{color:#94a3b8;margin-top:24px;margin-bottom:8px;border-bottom:1px solid #1e293b;padding-bottom:4px}}
+      table{{border-collapse:collapse;width:100%;max-width:760px;margin-bottom:16px}}
+      td{{padding:5px 10px;border-bottom:1px solid #1e293b}}
+      td:first-child{{color:#94a3b8;width:240px}}
+      th{{padding:5px 10px;text-align:left;color:#64748b;font-weight:normal;border-bottom:1px solid #334155}}
+      .note{{color:#64748b;font-size:11px;margin-top:-8px;margin-bottom:16px}}
     </style></head><body>
-    <h1>🩺 Scanner Health <small style="font-size:14px;color:#64748b">auto-refresh 10s</small></h1>
+    <h1>🩺 Scanner Health <small style="font-size:12px;color:#64748b">auto-refresh 15s · {now.strftime('%H:%M:%S UTC')}</small></h1>
+    <p class="note">Este endpoint lê do banco de dados — reflete o estado do worker, não do web.</p>
 
     <h2>Pipeline</h2>
     <table>
-      <tr><td>Scanner thread</td><td>{badge(scanner_ok, "ATIVO", "SEM POLL >30s")}</td></tr>
-      <tr><td>Último ciclo completo</td><td>{badge(poll_ok, "OK", "SEM CICLO OK >30s")}</td></tr>
-      <tr><td>DB conectado</td><td>{badge(db_ok)}</td></tr>
-      <tr><td>Helius WS</td><td>{badge(helius_ok)} {helius_info}</td></tr>
-      <tr><td>HotMonitor tokens ativos</td><td>{hot_count}</td></tr>
+      <tr><td>Worker (heartbeat DB)</td><td>{badge(worker_alive, "ATIVO", f"SEM HEARTBEAT há {worker_age_s if worker_age_s else '?'}s")}</td></tr>
+      <tr><td>DB conectado (web)</td><td>{badge(db_ok)}</td></tr>
+      <tr><td>Helius WS (via heartbeat)</td><td>{badge(helius_connected, "CONECTADO", "DESCONECTADO")}</td></tr>
+      <tr><td>Migrações última 1h</td><td>{mig_1h} {'✅' if mig_1h > 0 else warn(True, '⚠️ zero — pipeline pode estar parado')}</td></tr>
+      <tr><td>Migrações últimas 6h</td><td>{mig_6h}</td></tr>
+      <tr><td>Migrações últimas 24h</td><td>{mig_24h}</td></tr>
+      <tr><td>Bounces últimas 24h</td><td>{bounce_24h}</td></tr>
     </table>
 
-    <h2>Scanner Stats</h2>
-    <table>{scanner_stats_html}</table>
+    <h2>Worker Heartbeat</h2>
+    <p class="note">Atualizado pelo worker a cada 60s. Se desatualizado, worker travou ou não deployou.</p>
+    <table>{worker_rows}</table>
 
-    <h2>Banco de Dados</h2>
+    <h2>Helius WS (snapshot do último heartbeat)</h2>
+    <table>{helius_rows}</table>
+
+    <h2>Últimas 8 migrações no DB</h2>
     <table>
-      <tr><td>Última migração no DB</td><td>{db_last_migration or '—'}</td></tr>
-      <tr><td>Último bounce no DB</td><td>{db_last_bounce or '—'}</td></tr>
-      <tr><td>Migrações últimas 24h</td><td>{db_total_mig_today}</td></tr>
+      <tr><th>Hora</th><th>Token</th><th>MC</th><th>Liq</th><th>Exchange</th></tr>
+      {mig_rows}
     </table>
 
-    <h2>HotMonitor ({hot_count} tokens)</h2>
-    <ul>{rows_hot}</ul>
-
-    <h2>Filtros Ativos (Railway)</h2>
-    <table>{rows_filtros}</table>
+    <h2>Últimos eventos</h2>
+    <table>
+      <tr><td>Última migração</td><td>{last_mig_sym} @ {last_mig_ts} ({last_mig_age})</td></tr>
+      <tr><td>Último bounce</td><td>{last_bounce_sym} @ {last_bounce_ts} ({last_bounce_age})</td></tr>
+    </table>
     </body></html>"""
 
     return html
