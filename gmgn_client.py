@@ -395,15 +395,17 @@ class GmgnClient:
         return self._get_trade("/v1/trade/query_order",
                                {"order_id": order_id, "chain": chain}, priority=True)
 
-    def get_trenches(self, types: list = None, chain: str = "sol") -> dict:
+    def get_trenches(self, types: list = None, chain: str = "sol",
+                     platforms: list = None) -> dict:
         """
         POST /v1/trenches — chain como query param, body version=v2.
         near_completion -> data['pump'] | completed -> data['completed']
+        platforms: lista opcional para sobrescrever _PLATFORMS (ex: ["Pump.fun"] para FILTER_PUMP_ONLY).
         """
         selected = types or ["near_completion", "completed"]
         section = {
             "filters": ["offchain", "onchain"],
-            "launchpad_platform": _PLATFORMS.get(chain, []),
+            "launchpad_platform": platforms if platforms is not None else _PLATFORMS.get(chain, []),
             "quote_address_type": _QUOTE_ADDRESS_TYPES.get(chain, []),
             "launchpad_platform_v2": True,
             "limit": 80,

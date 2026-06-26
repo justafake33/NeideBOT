@@ -1446,7 +1446,8 @@ class Scanner:
     def _tick(self):
         self.stats["last_poll_ts"] = time.time()
         self.stats["poll_count"]  += 1
-        data = self.gmgn.get_trenches(types=["near_completion", "completed"])
+        platforms = ["Pump.fun"] if F_PUMP_ONLY else None
+        data = self.gmgn.get_trenches(types=["near_completion", "completed"], platforms=platforms)
 
         near_completion_list = data.get("pump", [])
         completed_list       = data.get("completed", [])
