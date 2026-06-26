@@ -1459,6 +1459,22 @@ class Scanner:
                     continue
             self._safe(self._handle_near_completion, token)
 
+        # H27 — trending check: 1 chamada por tick (peso=1, capacity=20 → custo mínimo).
+        # Pega top-100 pump.fun no último 1min. Tokens ativos durante a graduação da bonding
+        # curve aparecem aqui antes de migrarem — indica hype real no momento da migração.
+        # Resultado compartilhado entre todos os tokens novos desse tick.
+        trending_mints: set = set()
+        new_completed = [t for t in completed_list
+                         if t.get("address") and t["address"] not in self._seen]
+        if new_completed:
+            try:
+                rank_list = self.gmgn.get_market_trending(
+                    interval="1m", limit=100, platforms=["Pump.fun"]
+                )
+                trending_mints = {t.get("address") or t.get("mint") for t in rank_list if t}
+            except Exception as e:
+                logger.debug("trending tick check: %s", e)
+
         # completed: tokens já vistos → apenas push_mc (sem sleep)
         #            tokens novos → _safe com stagger normal
         for token in completed_list:
@@ -1470,7 +1486,7 @@ class Scanner:
                 if mint and mc:
                     self.hot.push_mc(mint, mc, token)
             else:
-                self._safe(self._handle_completed, token)
+                self._safe(self._handle_completed, token, trending_mints)
                 if mint and mc and F_MC_MIN <= mc <= F_MC_MAX:
                     self.hot.push_mc(mint, mc, token)
 
@@ -1527,9 +1543,9 @@ class Scanner:
             except Exception as e:
                 logger.warning("insert_signal_batch: %s", e)
 
-    def _safe(self, fn, token: dict):
+    def _safe(self, fn, token: dict, *args):
         try:
-            fn(token)
+            fn(token, *args)
             time.sleep(0.3)
         except RateLimitError:
             raise
@@ -1617,7 +1633,7 @@ class Scanner:
     # Migração — MC e qualidade do trenches, zero chamadas de API
     # --------------------------------------------------------------------------
 
-    def _handle_completed(self, token: dict):
+    def _handle_completed(self, token: dict, trending_mints: set = None):
         mint = token.get("address")
         if not mint:
             return
@@ -1796,10 +1812,11 @@ class Scanner:
             **quality,
         }
 
-        # H27 — trending_at_migration: metodologia inviável via market/rank
-        # Tokens de $5k-$85k MC nunca aparecem no top-100 do GMGN (dominado por tokens
-        # de milhões). Campo fica NULL — coluna mantida no schema para futuras alternativas.
-        trending_at_migration = None
+        # H27 — trending check: set coletado 1x por tick em _tick() com interval=1m.
+        # pump.fun 5m trending inclui tokens pequenos ativos durante a bonding curve.
+        trending_at_migration = (mint in trending_mints) if trending_mints else None
+        if trending_at_migration:
+            logger.info("Migracao %s (%s) — trending=TRUE no pump.fun 1m", symbol, mint[:8])
 
         entry["trending_at_migration"] = trending_at_migration
         db.upsert_migration(entry)
