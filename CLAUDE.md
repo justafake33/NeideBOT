@@ -240,10 +240,11 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO)
 **⚠️ Modo Helius:** gap de ~10-30s entre detecção do token e início do feed WS. Fundos em V-bottom muito rápido (<30s pós-migração) podem ser perdidos. Kline hot-precise (5s) e trenches (5s) cobrem como fallback. Impacto real medido: 3/15 trades históricos afetados.
 
 **Pipeline ativo:**
-`TRADING_ENABLED=true` · `CALIBRATION_AMOUNT_USD=1.0` · `CALIBRATION_MAX_TRADES=999999`
-`TRADE_SL_PCT=0.25` · `FILTER_SMART_MIN=3` · `BOUNCE_MIN_PCT=0.10` · `BOUNCE_MAX_PCT=1.00`
-`MIN_POOL_SOL=10` · `BOUNCE_DROP_MIN=0.20` · `TRADE_MAX_ELAPSED_SEC=900` · `BOTTOM_FRESHNESS_SEC=600`
-`RISE_NET_MIN=0` (RISE gate ativo) · `GMGN_SCANNER_API_KEY` (pendente configurar no Railway)
+`TRADING_ENABLED=true` · `CALIBRATION_AMOUNT_USD=1.0` · `CALIBRATION_MAX_TRADES=5000000`
+`TRADE_SL_PCT=0.25` · `FILTER_SMART_MIN=1` · `BOUNCE_MIN_PCT=0.10` · `BOUNCE_MAX_PCT=1.00`
+`MIN_POOL_SOL=10` · `BOUNCE_DROP_MIN=0.30` · `TRADE_MAX_ELAPSED_SEC=900` · `BOTTOM_FRESHNESS_SEC=600`
+`POOL_MIN_SOL_BOUNCE=20` · `TRADE_MIN_POOL_SOL=40` · `FILTER_PUMP_ONLY=true`
+`RISE_NET_MIN` **não configurado (gate desativado)** · `GMGN_SCANNER_API_KEY` (pendente configurar no Railway)
 
 **Resultado período 2026-05-21 a 2026-05-24 (31 trades, $1/trade):**
 WR: **29%** (9 TPs / 22 SLs) confirmado GMGN · Net P/L: **+$0.12** · Payoff 2.49×
@@ -442,16 +443,16 @@ HELIUS_API_KEY=xxxx          # Helius free tier (logsSubscribe per-mint) — mod
 # Filtros do Scanner (configuráveis sem redeploy)
 FILTER_RUG_MAX=0.15          # máx token["rug_ratio"] (score interno GMGN, 0-1)
 FILTER_BUNDLER_MAX=0.20      # máx bundler_trader_amount_rate (% bundlers real)
-FILTER_BOT_MAX=0.80          # máx bot_degen_rate (default código=0.80)
-FILTER_SNIPER_MAX=0.50       # máx top70_sniper_hold_rate
+FILTER_BOT_MAX=0.60          # máx bot_degen_rate
+FILTER_SNIPER_MAX=0.10       # máx top70_sniper_hold_rate (rígido — snipers que ainda seguram)
 FILTER_RAT_MAX=0.20          # máx rat_trader_amount_rate
-FILTER_TOP10_MAX=0.80        # máx top_10_holder_rate
-FILTER_SMART_MIN=3           # mín smart_degen_count
+FILTER_TOP10_MAX=0.70        # máx top_10_holder_rate
+FILTER_SMART_MIN=1           # mín smart_degen_count (1 = pelo menos 1 smart viu o token)
 FILTER_WASH_BLOCK=true       # bloquear is_wash_trading
 FILTER_MC_MIN=5000           # MC mínimo USD
-FILTER_MC_MAX=200000         # MC máximo USD
+FILTER_MC_MAX=85000          # MC máximo USD
 FILTER_LIQ_MIN=10000         # liquidez mínima USD
-FILTER_FEE_MIN=1.0           # fee mínimo em SOL
+FILTER_PUMP_ONLY=true        # só tokens Pump.fun — descarta Meteora/Raydium direto
 BC_MIN_WATCHLIST=80          # % BC mínimo para watchlist
 MAX_MIG_AGE_SEC=600          # ignorar migrações > 10min no restart
 POLL_INTERVAL_SEC=5          # intervalo do scanner
@@ -460,27 +461,35 @@ MIGRATION_SOL_UNITS=410      # SOL teórico da bonding curve → mc_migration_bc
 MIN_POOL_SOL=10              # filtro A.9 — pool mínima para eventos Helius (secondary pool filter)
 
 # Bounce detector (configuráveis sem redeploy)
-BOUNCE_MIN_PCT=0.10          # bounce mínimo do fundo para disparar sinal (intencional — captura tokens corredores)
-BOUNCE_MAX_PCT=1.00          # bounce máximo — bloqueia entradas tardias (guard corrigido: < 9.99)
-BOUNCE_DROP_MIN=0.20         # drop mínimo da migração para considerar (era 0.30)
+BOUNCE_MIN_PCT=0.10          # bounce mínimo do fundo para disparar sinal
+BOUNCE_MAX_PCT=1.00          # bounce máximo — bloqueia entradas tardias (guard: < 9.99)
+BOUNCE_DROP_MIN=0.30         # drop mínimo da migração para considerar
 BOUNCE_TIME_MAX=20.0         # A.5: janela máxima em minutos
-BOTTOM_FRESHNESS_SEC=600     # A.6: máx 10min desde o último mc_min (era 180s — cortava zona 3-10min)
-POOL_MIN_SOL_BOUNCE=10       # C3: pool depth mínima no momento do bounce
-RISE_NET_MIN=0               # RISE gate: rejeita se RISE net flow < threshold (rec75=9% com RISE<0)
+BOTTOM_FRESHNESS_SEC=600     # A.6: máx 10min desde o último mc_min
+POOL_MIN_SOL_BOUNCE=20       # C3: pool depth mínima no momento do bounce
+BOUNCE_RECORD_MIN_POOL_SOL=5 # pool mínima para registrar bounce_signal (menor que C3)
+# RISE_NET_MIN=0             # RISE gate — NÃO configurado no Railway (desativado). Ver /analise/pre-rise-ticks para avaliar.
 # H23_NET_MIN=0              # H23 gate (DESATIVADO — n insuficiente). Adicionar no Railway para ativar.
-TRADE_MAX_ELAPSED_SEC=900    # descarta token se elapsed_to_bottom > 15min (era 300 — bloqueava 74% dos sinais)
+TRADE_MAX_ELAPSED_SEC=900    # descarta token se elapsed_to_bottom > 15min
 
 # Fase 6 — Execução de trades (configuráveis sem redeploy)
 TRADING_ENABLED=true         # true para ativar trades reais
 CALIBRATION_AMOUNT_USD=1.0   # tamanho de cada trade em USD
-CALIBRATION_MAX_TRADES=999999 # sem limite prático
-TRADE_SL_PCT=0.25            # stop loss — 15% disparava em segundos por volatilidade do pAMM
+CALIBRATION_MAX_TRADES=5000000
+TRADE_SL_PCT=0.25            # stop loss
 TRAILING_ACTIVATION_PCT=75   # trailing: gain% mínimo para ativar
 TRAILING_DRAWDOWN_PCT=30     # trailing: recuo máximo do pico antes de vender
 TRADE_SLIPPAGE_BPS=500       # slippage máximo em basis points (5%)
 ORDER_POLL_SEC=2             # intervalo de poll do fill (segundos)
 ORDER_TIMEOUT_SEC=60         # timeout do fill (segundos)
 TRADE_MIN_NET_SOL_FLOW=-999  # gate H23 legado no executor — manter em -999 (desativado)
+
+# Gate executor — checagens finais antes de executar swap
+TRADE_GATE_ENABLED=true               # habilita o gate final do executor
+TRADE_REQUIRE_HELIUS_FEATURES=true    # exige helius_context, pool_quote e net_sol_flow preenchidos
+TRADE_REQUIRE_H23_BOTTOM=true         # exige h23_window="bottom" — sempre true na prática (hardcoded)
+TRADE_MIN_POOL_SOL=40                 # pool mínima no momento do bounce para executar swap
+SOL_USD_FALLBACK=65                   # fallback de preço SOL/USD se CoinGecko falhar
 
 # Helius RPC (leitura on-chain direta — fill data + detecção de posição fechada)
 HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxxx  # HTTP JSON-RPC (diferente do WSS)
@@ -603,7 +612,7 @@ RETENTION_DRY_RUN=true       # simular sem deletar
 
 31. **H23_NET_MIN gate deployado mas desativado**: código em `scanner.py` verifica se env var existe. Sem `H23_NET_MIN` no Railway = desativado. Adicionar `H23_NET_MIN=0` para bloquear net_flow negativo. Dados atuais: 86% dos bounces têm net<0, n=13 positivos — insuficiente para gate.
 
-32. **RISE gate (RISE_NET_MIN=0) ativo**: bloqueia bounce se RISE net flow < 0. Dados sessão 22 (n=61): RISE<0 → rec75=9%, sl25=91%. Ativo no Railway. Analisar resultados após n≥30 novos bounces via `/analise/pre-rise-ticks?since=2026-06-12`.
+32. **RISE gate desativado no Railway**: `RISE_NET_MIN` não está configurado → gate não executa (código só roda se env var existe). Dados históricos (n=61): RISE<0 → rec75=9%, sl25=91%. Para reativar: adicionar `RISE_NET_MIN=0` no Railway. Avaliar via `/analise/pre-rise-ticks?since=2026-06-12`.
 
 33. **GMGN_PRIVATE_KEY é chave de assinatura GMGN, NÃO a chave da wallet Solana**: a GMGN emite uma Ed25519 PEM key separada. A PEM key NÃO deriva o mesmo endereço que GMGN_WALLET_ADDRESS — isso é esperado.
 
