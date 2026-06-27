@@ -43906,17 +43906,33 @@ def debug_trending_tokens():
             return f'<span style="color:{color}">✓</span>'
         return '<span style="color:#666">—</span>'
 
-    # Identify which filter is blocking each token
-    F_RUG    = float(os.getenv("FILTER_RUG_MAX",    "0.15"))
-    F_BUND   = float(os.getenv("FILTER_BUNDLER_MAX","0.20"))
-    F_BOT    = float(os.getenv("FILTER_BOT_MAX",    "0.60"))
-    F_SNIP   = float(os.getenv("FILTER_SNIPER_MAX", "0.10"))
-    F_RAT    = float(os.getenv("FILTER_RAT_MAX",    "0.20"))
-    F_TOP10  = float(os.getenv("FILTER_TOP10_MAX",  "0.70"))
-    F_SMART  = int(os.getenv("FILTER_SMART_MIN",    "1"))
-    F_MC_MIN = float(os.getenv("FILTER_MC_MIN",     "5000"))
-    F_MC_MAX = float(os.getenv("FILTER_MC_MAX",     "85000"))
-    F_LIQ    = float(os.getenv("FILTER_LIQ_MIN",    "10000"))
+    # Thresholds: lê do último heartbeat do worker (fonte real) com fallback p/ env vars da web
+    _wf = {}
+    try:
+        import psycopg2 as _pg2, psycopg2.extras as _pg2e, json as _json2
+        _wconn = _pg2.connect(db.DATABASE_URL)
+        _wconn.autocommit = True
+        with _wconn.cursor(cursor_factory=_pg2e.RealDictCursor) as _wc:
+            _wc.execute("SELECT metadata FROM runtime_heartbeats WHERE runtime_name='worker' LIMIT 1")
+            _wr = _wc.fetchone()
+            if _wr and _wr["metadata"]:
+                _meta = _wr["metadata"] if isinstance(_wr["metadata"], dict) else _json2.loads(_wr["metadata"])
+                _wf = _meta.get("filters") or {}
+        _wconn.close()
+    except Exception:
+        pass
+
+    F_RUG    = _wf.get("rug_max",     float(os.getenv("FILTER_RUG_MAX",    "0.15")))
+    F_BUND   = _wf.get("bundler_max", float(os.getenv("FILTER_BUNDLER_MAX","0.20")))
+    F_BOT    = _wf.get("bot_max",     float(os.getenv("FILTER_BOT_MAX",    "0.60")))
+    F_SNIP   = _wf.get("sniper_max",  float(os.getenv("FILTER_SNIPER_MAX", "0.10")))
+    F_RAT    = _wf.get("rat_max",     float(os.getenv("FILTER_RAT_MAX",    "0.20")))
+    F_TOP10  = _wf.get("top10_max",   float(os.getenv("FILTER_TOP10_MAX",  "0.70")))
+    F_SMART  = int(_wf.get("smart_min",  int(os.getenv("FILTER_SMART_MIN", "1"))))
+    F_MC_MIN = _wf.get("mc_min",      float(os.getenv("FILTER_MC_MIN",     "5000")))
+    F_MC_MAX = _wf.get("mc_max",      float(os.getenv("FILTER_MC_MAX",     "85000")))
+    F_LIQ    = _wf.get("liq_min",     float(os.getenv("FILTER_LIQ_MIN",    "10000")))
+    _thresholds_from = "worker heartbeat" if _wf else "web env vars (worker heartbeat indisponível)"
 
     def get_block_reasons(r):
         reasons = []
@@ -43951,9 +43967,11 @@ def debug_trending_tokens():
         if reasons:
             block_html = '<br><span style="color:#f85149;font-size:11px">' + " · ".join(reasons) + '</span>'
 
+        gmgn_link = f'<a href="https://gmgn.ai/sol/token/{r["mint"]}" target="_blank" style="color:#58a6ff;font-size:11px">GMGN</a>'
         rows_html += f"""<tr>
             <td style="white-space:nowrap">{str(r['ts_migration'])[:16]}</td>
             <td><b>{r['symbol'] or '?'}</b>{block_html}</td>
+            <td>{gmgn_link}</td>
             <td>{passed_badge(r['passed_filters'])}</td>
             <td>{fmt_mc(r['mc_migration'])}</td>
             <td>{fmt_mc(r['liq_migration'])}</td>
@@ -43998,10 +44016,13 @@ a{{color:#58a6ff}}
   <span class="stat"><div class="n">{n_bounce}</div><div class="l">bounce detectado</div></span>
   <span class="stat"><div class="n">{n_trade}</div><div class="l">trade executado</div></span>
 </div>
-<p style="color:#8b949e;font-size:12px">Filtros ativos: rug≤{F_RUG*100:.0f}% · bundler≤{F_BUND*100:.0f}% · bot≤{F_BOT*100:.0f}% · sniper≤{F_SNIP*100:.0f}% · rat≤{F_RAT*100:.0f}% · top10≤{F_TOP10*100:.0f}% · smart≥{F_SMART} · MC ${F_MC_MIN:,.0f}–${F_MC_MAX:,.0f} · liq≥${F_LIQ:,.0f}</p>
+<p style="color:#8b949e;font-size:12px">
+  Filtros do <b style="color:#58a6ff">{_thresholds_from}</b>:
+  rug≤{F_RUG*100:.0f}% · bundler≤{F_BUND*100:.0f}% · bot≤{F_BOT*100:.0f}% · sniper≤{F_SNIP*100:.0f}% · rat≤{F_RAT*100:.0f}% · top10≤{F_TOP10*100:.0f}% · smart≥{F_SMART} · MC ${F_MC_MIN:,.0f}–${F_MC_MAX:,.0f} · liq≥${F_LIQ:,.0f}
+</p>
 <table>
 <tr>
-  <th>Data</th><th>Token</th><th>Filtro</th>
+  <th>Data</th><th>Token</th><th>GMGN</th><th>Filtro</th>
   <th>MC migr.</th><th>Liq</th>
   <th>Rug</th><th>Bundler</th><th>Bot</th><th>Sniper</th><th>Rat</th><th>Top10</th><th>Smart</th><th>Wash</th>
   <th>Dump</th><th>Bounce</th>
