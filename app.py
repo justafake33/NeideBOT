@@ -52004,6 +52004,380 @@ def analise_h22_h26():
     return h
 
 
+# ==============================================================================
+# /analise/trending-deep — análise profunda de trending_at_migration
+# ==============================================================================
+@app.route("/analise/trending-deep")
+def analise_trending_deep():
+    import traceback
+    try:
+        return _analise_trending_deep_inner()
+    except Exception:
+        return "<pre style='background:#1a0000;color:#f88;padding:20px'>" + traceback.format_exc() + "</pre>", 500
+
+
+def _analise_trending_deep_inner():
+    import psycopg2, psycopg2.extras, time as _time
+
+    since_str = request.args.get("since", "2026-05-26") or "2026-05-26"
+    TP  = float(request.args.get("tp", 0.75))
+    SL  = float(request.args.get("sl", 0.25))
+    TP_MULT = 1 + TP
+    SL_MULT = 1 - SL
+    BE = SL / (TP + SL)
+    MIN_TICKS = 3
+
+    t0 = _time.time()
+    conn = psycopg2.connect(db.DATABASE_URL)
+    conn.autocommit = True
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    # ── 0. Cobertura do campo trending_at_migration ───────────────────────────
+    cur.execute("""
+        SELECT
+            COUNT(*)                                          AS total,
+            COUNT(*) FILTER (WHERE trending_at_migration IS TRUE)  AS n_true,
+            COUNT(*) FILTER (WHERE trending_at_migration IS FALSE) AS n_false,
+            COUNT(*) FILTER (WHERE trending_at_migration IS NULL)  AS n_null,
+            MIN(ts_migration) FILTER (WHERE trending_at_migration IS NOT NULL) AS first_with_data,
+            MAX(ts_migration)                                 AS last_migration
+        FROM migrations
+        WHERE ts_migration >= %(since)s::timestamptz
+    """, {"since": since_str})
+    cov = dict(cur.fetchone())
+
+    # ── 1. Dados principais: bounces com simulação TP/SL ─────────────────────
+    cur.execute("""
+        WITH sim AS (
+            SELECT
+                bs.mint,
+                bs.symbol,
+                bs.ts_signal,
+                bs.elapsed_sec,
+                bs.bounce_pct,
+                bs.drop_from_mig,
+                bs.pool_quote_at_signal,
+                bs.mc_at_signal                                   AS entry_mc,
+                bs.mc_migration                                   AS bs_mc_mig,
+                m.trending_at_migration,
+                m.mc_migration                                    AS m_mc_mig,
+                m.liq_migration,
+                m.smart_wallets,
+                m.time_to_bottom,
+                m.complete_cost_time,
+                m.exchange,
+                MAX(COALESCE(tt.mc_high, tt.mc))                  AS max_mc,
+                MIN(COALESCE(tt.mc_low,  tt.mc))                  AS min_mc,
+                COUNT(tt.id)                                      AS tick_count
+            FROM bounce_signals bs
+            JOIN token_ticks tt ON tt.mint = bs.mint
+                AND tt.tick_ts > bs.ts_signal
+                AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
+            LEFT JOIN migrations m ON m.mint = bs.mint
+            WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+              AND bs.ts_signal >= %(since)s::timestamptz
+            GROUP BY bs.mint, bs.symbol, bs.ts_signal, bs.elapsed_sec,
+                     bs.bounce_pct, bs.drop_from_mig, bs.pool_quote_at_signal,
+                     bs.mc_at_signal, bs.mc_migration,
+                     m.trending_at_migration, m.mc_migration, m.liq_migration,
+                     m.smart_wallets, m.time_to_bottom, m.complete_cost_time, m.exchange
+            HAVING COUNT(tt.id) >= %(min_ticks)s
+        )
+        SELECT * FROM sim ORDER BY ts_signal DESC
+    """, {"since": since_str, "min_ticks": MIN_TICKS})
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    t_sql = _time.time() - t0
+
+    N = len(rows)
+    if N == 0:
+        return "<p>Sem dados.</p>"
+
+    def is_tp(r): return r["max_mc"] is not None and r["max_mc"] >= r["entry_mc"] * TP_MULT
+    def is_sl(r): return (r["min_mc"] is not None and r["min_mc"] <= r["entry_mc"] * SL_MULT
+                          and not is_tp(r))
+
+    def sim(subset):
+        if not subset: return 0, 0, 0, None, None
+        n_tp  = sum(1 for r in subset if is_tp(r))
+        n_sl  = sum(1 for r in subset if is_sl(r))
+        n_dec = n_tp + n_sl
+        if not n_dec: return len(subset), 0, 0, None, None
+        wr = n_tp / n_dec
+        ev = wr * TP - (1 - wr) * SL
+        return len(subset), n_tp, n_sl, wr, ev
+
+    def row_html(label, subset, bold=False, highlight=False):
+        n, ntp, nsl, wr, ev = sim(subset)
+        freq = n / N
+        b = "<b>" if bold else ""
+        eb = "</b>" if bold else ""
+        bg = " style='background:#1a2f1a'" if highlight else ""
+        if wr is None:
+            return f"<tr{bg}><td>{b}{label}{eb}</td><td>{n}</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>{freq:.0%}</td></tr>"
+        wr_cls = "tp" if wr >= BE else "sl"
+        ev_cls = "pos" if ev > 0 else "neg"
+        return (f"<tr{bg}><td>{b}{label}{eb}</td><td>{n}</td><td>{ntp+nsl}</td>"
+                f"<td class='tp'>{ntp}</td><td class='sl'>{nsl}</td>"
+                f"<td class='{wr_cls}'>{wr:.1%}</td>"
+                f"<td class='{ev_cls}'>{ev:+.1%}</td>"
+                f"<td>{freq:.0%}</td></tr>")
+
+    def table_header():
+        return ("<table class='wide'><tr>"
+                "<th>Filtro</th><th>n</th><th>dec</th>"
+                "<th>TP</th><th>SL</th><th>WR</th><th>EV</th><th>freq</th></tr>")
+
+    # Subsets principais
+    all_b    = rows
+    trend_t  = [r for r in rows if r["trending_at_migration"] is True]
+    trend_f  = [r for r in rows if r["trending_at_migration"] is False]
+    trend_n  = [r for r in rows if r["trending_at_migration"] is None]
+
+    # ── CSS & cabeçalho ───────────────────────────────────────────────────────
+    CSS = """<style>
+    body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:12px}
+    h2{color:#58a6ff}h3{color:#79c0ff;margin:24px 0 4px}h4{color:#d2a8ff;margin:16px 0 4px}
+    p.sub{color:#8b949e;font-size:11px;margin:2px 0 10px}
+    table{border-collapse:collapse;margin-bottom:16px}
+    .wide{width:100%}
+    th{background:#161b22;color:#8b949e;padding:5px 8px;border:1px solid #30363d;
+       text-align:right;font-size:11px}
+    th:first-child{text-align:left}
+    td{padding:3px 8px;border:1px solid #21262d;text-align:right;font-size:11px;white-space:nowrap}
+    td:first-child{text-align:left}
+    .tp{color:#3fb950;font-weight:bold}.sl{color:#f85149}
+    .pos{color:#3fb950;font-weight:bold}.neg{color:#f85149}
+    .sep{background:#161b22;color:#484f58;font-style:italic}
+    .note{background:#1a1f2e;padding:8px 12px;border-left:3px solid #388bfd;margin:8px 0;font-size:11px}
+    .warn{background:#2f1f0a;padding:8px 12px;border-left:3px solid #e3b341;margin:8px 0;font-size:11px}
+    .good{background:#0a2f0a;padding:8px 12px;border-left:3px solid #3fb950;margin:8px 0;font-size:11px}
+    nav a{color:#58a6ff;margin-right:12px;font-size:12px;text-decoration:none}
+    a{color:#58a6ff}
+    </style>"""
+
+    H = CSS + "<nav>"
+    H += "<a href='/analise'>Análise</a>"
+    H += "<a href='/analise/h9-gate'>H9 Gate</a>"
+    H += "<a href='/analise/migration-quality'>Migration Quality</a>"
+    H += "<a href='/analise/quality-grid'>Quality Grid</a>"
+    H += "</nav>"
+    H += "<h2>📈 Trending Deep — Análise completa de trending_at_migration</h2>"
+    H += f"<p class='sub'>desde {since_str} · TP{TP:.0%}/SL{SL:.0%} · break-even {BE:.1%} · SQL {t_sql:.1f}s</p>"
+    H += f"<p><a href='?since=2026-05-26'>≥26/mai</a> | <a href='?since=2026-06-01'>01/jun</a> | "
+    H += f"<a href='?since=2026-06-20'>20/jun</a> | "
+    H += f"<a href='?since={since_str}&tp=0.75&sl=0.25'>TP75</a> | "
+    H += f"<a href='?since={since_str}&tp=1.00&sl=0.25'>TP100</a> | "
+    H += f"<a href='?since={since_str}&tp=0.50&sl=0.25'>TP50</a></p>"
+
+    # ── Seção 0: cobertura ────────────────────────────────────────────────────
+    H += "<h3>🗓 Seção 0 — Cobertura do campo trending_at_migration</h3>"
+    total_m  = cov["total"] or 0
+    n_true   = cov["n_true"] or 0
+    n_false  = cov["n_false"] or 0
+    n_null   = cov["n_null"] or 0
+    coverage = (n_true + n_false) / total_m if total_m else 0
+    first_dt = cov["first_with_data"]
+    first_s  = first_dt.strftime("%Y-%m-%d %H:%M UTC") if first_dt else "desconhecido"
+
+    H += "<div class='note'>"
+    H += f"<b>Migrações no período:</b> {total_m} · "
+    H += f"trending=TRUE: <b>{n_true}</b> ({n_true/total_m:.0%}) · "
+    H += f"trending=FALSE: <b>{n_false}</b> ({n_false/total_m:.0%}) · "
+    H += f"NULL (sem dado): <b>{n_null}</b> ({n_null/total_m:.0%})<br>"
+    H += f"<b>Primeira migração com dado:</b> {first_s} · "
+    H += f"<b>Cobertura:</b> {coverage:.0%}"
+    H += "</div>"
+    if coverage < 0.5:
+        H += "<div class='warn'>⚠️ Cobertura < 50% — dados de trending ainda insuficientes para conclusões definitivas. Resultados abaixo são indicativos.</div>"
+    elif coverage >= 0.8:
+        H += "<div class='good'>✅ Cobertura ≥ 80% — dados de trending confiáveis para análise.</div>"
+
+    # ── Seção 1: baseline trending vs não-trending ─────────────────────────────
+    H += "<h3>🔵 Seção 1 — Trending vs Não-Trending (baseline)</h3>"
+    H += table_header()
+    H += row_html("Todos os bounces (baseline)", all_b, bold=True)
+    H += row_html("✅ trending_at_migration = TRUE", trend_t, bold=True, highlight=True)
+    H += row_html("❌ trending_at_migration = FALSE", trend_f)
+    H += row_html("? trending_at_migration = NULL", trend_n)
+    H += "</table>"
+
+    if len(trend_t) < 5:
+        H += "<div class='warn'>⚠️ n insuficiente em trending=TRUE para análise confiável.</div>"
+        return H
+
+    # ── Seção 2: TP/SL grid para trending tokens ──────────────────────────────
+    H += "<h3>💰 Seção 2 — Otimização TP/SL para trending tokens</h3>"
+    H += "<p class='sub'>Mesmo grupo trending=TRUE, variando o payoff alvo.</p>"
+    H += "<table class='wide'>"
+    H += "<tr><th>TP/SL</th><th>n</th><th>dec</th><th>TP</th><th>SL</th><th>WR</th><th>EV</th><th>break-even</th></tr>"
+    for tp_v, sl_v in [(0.50, 0.25), (0.75, 0.25), (1.00, 0.25), (1.50, 0.25), (2.00, 0.25),
+                        (0.75, 0.15), (1.00, 0.15), (0.75, 0.20)]:
+        be_v = sl_v / (tp_v + sl_v)
+        sub = trend_t
+        n_tp_v = sum(1 for r in sub if r["max_mc"] is not None and r["max_mc"] >= r["entry_mc"] * (1 + tp_v))
+        n_sl_v = sum(1 for r in sub
+                     if r["min_mc"] is not None and r["min_mc"] <= r["entry_mc"] * (1 - sl_v)
+                     and not (r["max_mc"] is not None and r["max_mc"] >= r["entry_mc"] * (1 + tp_v)))
+        nd = n_tp_v + n_sl_v
+        if nd == 0:
+            continue
+        wr_v = n_tp_v / nd
+        ev_v = wr_v * tp_v - (1 - wr_v) * sl_v
+        is_cur = (abs(tp_v - TP) < 0.01 and abs(sl_v - SL) < 0.01)
+        wr_cls = "tp" if wr_v >= be_v else "sl"
+        ev_cls = "pos" if ev_v > 0 else "neg"
+        cur_mark = " ◀ atual" if is_cur else ""
+        H += (f"<tr{'  style=background:#1f2d3d' if is_cur else ''}>"
+              f"<td>TP{tp_v:.0%}/SL{sl_v:.0%}{cur_mark}</td>"
+              f"<td>{len(sub)}</td><td>{nd}</td>"
+              f"<td class='tp'>{n_tp_v}</td><td class='sl'>{n_sl_v}</td>"
+              f"<td class='{wr_cls}'>{wr_v:.1%}</td>"
+              f"<td class='{ev_cls}'>{ev_v:+.1%}</td>"
+              f"<td>{be_v:.1%}</td></tr>")
+    H += "</table>"
+
+    # ── Seção 3: dentro de trending — dimensões ───────────────────────────────
+    H += "<h3>🔬 Seção 3 — Dentro de trending=TRUE: qual dimensão discrimina mais?</h3>"
+    H += "<p class='sub'>Todos os subconjuntos são subset de trending=TRUE.</p>"
+
+    def sub_table(title, splits):
+        out = f"<h4>{title}</h4>{table_header()}"
+        out += row_html("trending=TRUE (baseline)", trend_t, bold=True)
+        for label, subset in splits:
+            out += row_html(label, subset)
+        return out + "</table>"
+
+    # Elapsed
+    H += sub_table("⏱ Tempo pós-migração até bounce (elapsed_sec)", [
+        ("elapsed < 5min",    [r for r in trend_t if r["elapsed_sec"] is not None and r["elapsed_sec"] < 300]),
+        ("elapsed 5–10min",   [r for r in trend_t if r["elapsed_sec"] is not None and 300 <= r["elapsed_sec"] < 600]),
+        ("elapsed 10–15min",  [r for r in trend_t if r["elapsed_sec"] is not None and 600 <= r["elapsed_sec"] < 900]),
+        ("elapsed 15–20min",  [r for r in trend_t if r["elapsed_sec"] is not None and 900 <= r["elapsed_sec"] < 1200]),
+    ])
+
+    # Drop depth
+    H += sub_table("📉 Profundidade do dump (drop_from_mig)", [
+        ("drop < 40%",        [r for r in trend_t if r["drop_from_mig"] is not None and r["drop_from_mig"] < 0.40]),
+        ("drop 40–55%",       [r for r in trend_t if r["drop_from_mig"] is not None and 0.40 <= r["drop_from_mig"] < 0.55]),
+        ("drop 55–70%",       [r for r in trend_t if r["drop_from_mig"] is not None and 0.55 <= r["drop_from_mig"] < 0.70]),
+        ("drop 70–80%",       [r for r in trend_t if r["drop_from_mig"] is not None and 0.70 <= r["drop_from_mig"] < 0.80]),
+        ("drop > 80%",        [r for r in trend_t if r["drop_from_mig"] is not None and r["drop_from_mig"] >= 0.80]),
+    ])
+
+    # Bounce pct
+    H += sub_table("📈 Tamanho do bounce detectado (bounce_pct)", [
+        ("bounce 10–20%",     [r for r in trend_t if r["bounce_pct"] is not None and r["bounce_pct"] < 0.20]),
+        ("bounce 20–40%",     [r for r in trend_t if r["bounce_pct"] is not None and 0.20 <= r["bounce_pct"] < 0.40]),
+        ("bounce 40–70%",     [r for r in trend_t if r["bounce_pct"] is not None and 0.40 <= r["bounce_pct"] < 0.70]),
+        ("bounce > 70%",      [r for r in trend_t if r["bounce_pct"] is not None and r["bounce_pct"] >= 0.70]),
+    ])
+
+    # Pool depth
+    H += sub_table("💧 Pool depth no momento do bounce (SOL)", [
+        ("pool < 20 SOL",     [r for r in trend_t if r["pool_quote_at_signal"] is not None and r["pool_quote_at_signal"] < 20]),
+        ("pool 20–50 SOL",    [r for r in trend_t if r["pool_quote_at_signal"] is not None and 20 <= r["pool_quote_at_signal"] < 50]),
+        ("pool 50–100 SOL",   [r for r in trend_t if r["pool_quote_at_signal"] is not None and 50 <= r["pool_quote_at_signal"] < 100]),
+        ("pool > 100 SOL",    [r for r in trend_t if r["pool_quote_at_signal"] is not None and r["pool_quote_at_signal"] >= 100]),
+        ("pool NULL",         [r for r in trend_t if r["pool_quote_at_signal"] is None]),
+    ])
+
+    # MC migration
+    H += sub_table("💰 MC na migração (USD)", [
+        ("MC < $20k",         [r for r in trend_t if (r["m_mc_mig"] or r["bs_mc_mig"] or 0) < 20000]),
+        ("MC $20k–$50k",      [r for r in trend_t if 20000 <= (r["m_mc_mig"] or r["bs_mc_mig"] or 0) < 50000]),
+        ("MC $50k–$85k",      [r for r in trend_t if 50000 <= (r["m_mc_mig"] or r["bs_mc_mig"] or 0) < 85000]),
+        ("MC > $85k",         [r for r in trend_t if (r["m_mc_mig"] or r["bs_mc_mig"] or 0) >= 85000]),
+    ])
+
+    # Smart wallets
+    H += sub_table("🧠 Smart wallets (smart_degen_count)", [
+        ("smart = 0",         [r for r in trend_t if (r["smart_wallets"] or 0) == 0]),
+        ("smart = 1",         [r for r in trend_t if (r["smart_wallets"] or 0) == 1]),
+        ("smart = 2",         [r for r in trend_t if (r["smart_wallets"] or 0) == 2]),
+        ("smart ≥ 3",         [r for r in trend_t if (r["smart_wallets"] or 0) >= 3]),
+    ])
+
+    # Velocidade de migração (H28)
+    H += sub_table("⚡ Velocidade de migração — complete_cost_time (seg)", [
+        ("mig < 60s (runner?)", [r for r in trend_t if r["complete_cost_time"] is not None and r["complete_cost_time"] < 60]),
+        ("mig 60–300s",        [r for r in trend_t if r["complete_cost_time"] is not None and 60 <= r["complete_cost_time"] < 300]),
+        ("mig 300–900s",       [r for r in trend_t if r["complete_cost_time"] is not None and 300 <= r["complete_cost_time"] < 900]),
+        ("mig > 900s",         [r for r in trend_t if r["complete_cost_time"] is not None and r["complete_cost_time"] >= 900]),
+        ("mig NULL",           [r for r in trend_t if r["complete_cost_time"] is None]),
+    ])
+
+    # ── Seção 4: combinações dentro de trending ───────────────────────────────
+    H += "<h3>🎯 Seção 4 — Combinações de critérios dentro de trending=TRUE</h3>"
+    H += table_header()
+    H += row_html("trending=TRUE (baseline)", trend_t, bold=True)
+    H += "<tr class='sep'><td colspan=8>— por elapsed —</td></tr>"
+    H += row_html("trending + elapsed < 10min",
+                  [r for r in trend_t if r["elapsed_sec"] is not None and r["elapsed_sec"] < 600])
+    H += row_html("trending + elapsed < 5min",
+                  [r for r in trend_t if r["elapsed_sec"] is not None and r["elapsed_sec"] < 300])
+    H += "<tr class='sep'><td colspan=8>— por pool —</td></tr>"
+    H += row_html("trending + pool > 20 SOL",
+                  [r for r in trend_t if r["pool_quote_at_signal"] is not None and r["pool_quote_at_signal"] >= 20])
+    H += row_html("trending + pool > 50 SOL",
+                  [r for r in trend_t if r["pool_quote_at_signal"] is not None and r["pool_quote_at_signal"] >= 50])
+    H += "<tr class='sep'><td colspan=8>— combinadas —</td></tr>"
+    H += row_html("trending + elapsed < 10min + pool > 20 SOL",
+                  [r for r in trend_t if r["elapsed_sec"] is not None and r["elapsed_sec"] < 600
+                   and r["pool_quote_at_signal"] is not None and r["pool_quote_at_signal"] >= 20])
+    H += row_html("trending + elapsed < 5min + drop > 55%",
+                  [r for r in trend_t if r["elapsed_sec"] is not None and r["elapsed_sec"] < 300
+                   and r["drop_from_mig"] is not None and r["drop_from_mig"] >= 0.55])
+    H += row_html("trending + drop > 55% + pool > 20 SOL",
+                  [r for r in trend_t if r["drop_from_mig"] is not None and r["drop_from_mig"] >= 0.55
+                   and r["pool_quote_at_signal"] is not None and r["pool_quote_at_signal"] >= 20])
+    H += row_html("trending + elapsed < 10min + drop > 40% + pool > 20 SOL",
+                  [r for r in trend_t if r["elapsed_sec"] is not None and r["elapsed_sec"] < 600
+                   and r["drop_from_mig"] is not None and r["drop_from_mig"] >= 0.40
+                   and r["pool_quote_at_signal"] is not None and r["pool_quote_at_signal"] >= 20])
+    H += row_html("trending + smart ≥ 1 + elapsed < 10min",
+                  [r for r in trend_t if (r["smart_wallets"] or 0) >= 1
+                   and r["elapsed_sec"] is not None and r["elapsed_sec"] < 600])
+    H += "</table>"
+
+    # ── Seção 5: tabela individual de trending tokens ─────────────────────────
+    H += f"<h3>📋 Seção 5 — Todos os bounces trending=TRUE ({len(trend_t)} tokens)</h3>"
+    H += "<table class='wide'>"
+    H += ("<tr><th>data</th><th>símbolo</th><th>elapsed</th><th>drop</th>"
+          "<th>bounce</th><th>pool SOL</th><th>smart</th><th>MC mig</th>"
+          "<th>entry MC</th><th>max MC 60min</th><th>TP75?</th><th>P/L sim</th></tr>")
+    for r in trend_t:
+        tp_hit  = is_tp(r)
+        sl_hit  = is_sl(r)
+        outcome = "✅" if tp_hit else ("💀" if sl_hit else "—")
+        mc_mig  = r["m_mc_mig"] or r["bs_mc_mig"]
+        max_mc  = r["max_mc"]
+        pnl_sim = ((max_mc / r["entry_mc"]) - 1) if max_mc and r["entry_mc"] else None
+        pnl_s   = f"{pnl_sim:+.0%}" if pnl_sim is not None else "—"
+        pnl_cls = "tp" if (pnl_sim or 0) >= TP else ("sl" if (pnl_sim or 0) < 0 else "")
+        dt      = r["ts_signal"].strftime("%m/%d %H:%M") if r.get("ts_signal") else "—"
+        el_s    = f"{r['elapsed_sec']//60}m" if r["elapsed_sec"] else "—"
+        dr_s    = f"{r['drop_from_mig']:.0%}" if r["drop_from_mig"] else "—"
+        bo_s    = f"{r['bounce_pct']:.0%}" if r["bounce_pct"] else "—"
+        po_s    = f"{r['pool_quote_at_signal']:.0f}" if r["pool_quote_at_signal"] else "—"
+        sm_s    = str(r["smart_wallets"] or 0)
+        mc_m_s  = f"${mc_mig/1000:.0f}k" if mc_mig else "—"
+        en_s    = f"${r['entry_mc']/1000:.0f}k" if r["entry_mc"] else "—"
+        mx_s    = f"${max_mc/1000:.0f}k" if max_mc else "—"
+        sym     = r["symbol"] or (r["mint"][:8] if r.get("mint") else "—")
+        row_bg  = " style='background:#1a2f1a'" if tp_hit else (" style='background:#2f1a1a'" if sl_hit else "")
+        H += (f"<tr{row_bg}>"
+              f"<td>{dt}</td><td>{sym}</td>"
+              f"<td>{el_s}</td><td>{dr_s}</td><td>{bo_s}</td>"
+              f"<td>{po_s}</td><td>{sm_s}</td>"
+              f"<td>{mc_m_s}</td><td>{en_s}</td><td>{mx_s}</td>"
+              f"<td>{outcome}</td><td class='{pnl_cls}'>{pnl_s}</td>"
+              f"</tr>")
+    H += "</table>"
+    H += f"<p class='sub'>entry=mc_at_signal · P/L sim = max_mc/entry - 1 (não considera SL intra-60min) · TP{TP:.0%}/SL{SL:.0%}</p>"
+    return H
+
+
 @app.route("/analise/migration-quality")
 def analise_migration_quality():
     import traceback
