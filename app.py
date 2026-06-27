@@ -30935,6 +30935,311 @@ def _analise_grid_search_inner():
 
 
 # ==============================================================================
+# /analise/h9-gate — simula H9 como gate obrigatório sobre todos os bounces
+# ==============================================================================
+@app.route("/analise/h9-gate")
+def analise_h9_gate():
+    """
+    Simula o efeito de exigir sinal H9 (SmartDegenBuy type 12) antes de executar
+    qualquer bounce. Usa bounce_signals + token_ticks (entry=mc_at_signal, TP75/SL25).
+
+    Seção 1: Trades reais — H9 presente vs ausente nos trades já executados.
+    Seção 2: Todos os bounces (simulação) — se H9 fosse gate, qual seria WR e frequência?
+    Seção 3: Combinação H9 + elapsed rápido (H10) + trending_at_migration (H27).
+
+    Params:
+      since=YYYY-MM-DD  (padrão: 2026-05-26)
+      tp=0.75           TP multiplier
+      sl=0.25           SL multiplier
+    """
+    import time as _time
+    import psycopg2.extras
+
+    since_str = request.args.get("since", "2026-05-26") or "2026-05-26"
+    TP = float(request.args.get("tp", 0.75))
+    SL = float(request.args.get("sl", 0.25))
+    TP_MULT = 1 + TP
+    SL_MULT = 1 - SL
+    MIN_TICKS = 3
+    BE = SL / (TP + SL)  # break-even WR
+
+    t0 = _time.time()
+    conn = psycopg2.connect(db.DATABASE_URL)
+    conn.autocommit = True
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    # ── Seção 1: trades reais com/sem H9 ─────────────────────────────────────
+    cur.execute("""
+        SELECT
+            t.id,
+            t.symbol,
+            t.status,
+            t.exit_type,
+            t.pnl_pct_real,
+            t.ts_signal,
+            t.created_at,
+            (
+                SELECT COUNT(*)
+                FROM token_signals ts
+                WHERE ts.mint = t.mint
+                  AND TO_TIMESTAMP(ts.trigger_at) <= COALESCE(t.ts_signal, t.created_at)
+            ) AS n_h9,
+            (
+                SELECT MIN(ts.trigger_mc / NULLIF(m2.mc_migration, 0))
+                FROM token_signals ts
+                JOIN migrations m2 ON m2.mint = ts.mint
+                WHERE ts.mint = t.mint
+                  AND TO_TIMESTAMP(ts.trigger_at) <= COALESCE(t.ts_signal, t.created_at)
+            ) AS h9_ratio
+        FROM trades t
+        WHERE t.status IN ('tp','tp_hit','trailing_active','sl','sl_hit')
+          AND t.created_at >= %(since)s::timestamptz
+        ORDER BY t.id ASC
+    """, {"since": since_str})
+    trade_rows = [dict(r) for r in cur.fetchall()]
+
+    TP_S = ('tp','tp_hit','trailing_active')
+    SL_S = ('sl','sl_hit')
+    def is_tp_t(t): return t["status"] in TP_S or t["exit_type"] in TP_S
+    def is_sl_t(t): return t["status"] in SL_S or t["exit_type"] in SL_S
+
+    closed_trades = [t for t in trade_rows if is_tp_t(t) or is_sl_t(t)]
+
+    # ── Seção 2: todos os bounces simulados ───────────────────────────────────
+    cur.execute("""
+        WITH ticks AS (
+            SELECT
+                bs.mint,
+                bs.mc_at_signal                                       AS entry_mc,
+                bs.elapsed_sec / 60.0                                 AS elapsed_min,
+                bs.bounce_pct,
+                m.trending_at_migration,
+                MAX(COALESCE(tt.mc_high, tt.mc))                      AS max_mc,
+                MIN(COALESCE(tt.mc_low,  tt.mc))                      AS min_mc,
+                COUNT(tt.id)                                          AS tick_count,
+                -- melhor sinal H9 antes do bounce
+                (
+                    SELECT MIN(ts.trigger_mc / NULLIF(m.mc_migration, 0))
+                    FROM token_signals ts
+                    WHERE ts.mint = bs.mint
+                      AND TO_TIMESTAMP(ts.trigger_at) <= bs.ts_signal
+                ) AS h9_ratio,
+                (
+                    SELECT COUNT(*)
+                    FROM token_signals ts
+                    WHERE ts.mint = bs.mint
+                      AND TO_TIMESTAMP(ts.trigger_at) <= bs.ts_signal
+                ) AS n_h9
+            FROM bounce_signals bs
+            JOIN token_ticks tt ON tt.mint = bs.mint
+                AND tt.tick_ts > bs.ts_signal
+                AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
+            LEFT JOIN migrations m ON m.mint = bs.mint
+            WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+              AND bs.ts_signal >= %(since)s::timestamptz
+            GROUP BY bs.mint, bs.mc_at_signal, bs.elapsed_sec, bs.bounce_pct,
+                     m.trending_at_migration, m.mc_migration
+            HAVING COUNT(tt.id) >= %(min_ticks)s
+        )
+        SELECT * FROM ticks
+    """, {"since": since_str, "min_ticks": MIN_TICKS})
+    bounces = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    t_sql = _time.time() - t0
+
+    N = len(bounces)
+
+    def sim(subset):
+        if not subset:
+            return 0, 0, 0, None, None
+        n_tp = sum(1 for b in subset
+                   if b["max_mc"] is not None and b["max_mc"] >= b["entry_mc"] * TP_MULT)
+        n_sl = sum(1 for b in subset
+                   if b["min_mc"] is not None and b["min_mc"] <= b["entry_mc"] * SL_MULT
+                   and not (b["max_mc"] is not None and b["max_mc"] >= b["entry_mc"] * TP_MULT))
+        n_dec = n_tp + n_sl
+        if n_dec == 0:
+            return len(subset), 0, 0, None, None
+        wr = n_tp / n_dec
+        ev = wr * TP - (1 - wr) * SL
+        return len(subset), n_tp, n_sl, wr, ev
+
+    # Subconjuntos de bounces por critério H9
+    b_all          = bounces
+    b_no_h9        = [b for b in bounces if not b["n_h9"]]
+    b_any_h9       = [b for b in bounces if b["n_h9"]]
+    b_h9_lt080     = [b for b in bounces if b["h9_ratio"] is not None and b["h9_ratio"] < 0.80]
+    b_h9_lt100     = [b for b in bounces if b["h9_ratio"] is not None and b["h9_ratio"] < 1.00]
+    b_h9_ge100     = [b for b in bounces if b["h9_ratio"] is not None and b["h9_ratio"] >= 1.00]
+
+    # Combinações H9 + H10 (elapsed rápido) + H27 (trending)
+    b_h9_fast      = [b for b in b_h9_lt080 if b["elapsed_min"] is not None and b["elapsed_min"] < 20]
+    b_h9_trending  = [b for b in b_h9_lt080 if b.get("trending_at_migration")]
+    b_h9_fast_trend = [b for b in b_h9_fast if b.get("trending_at_migration")]
+    b_fast         = [b for b in bounces if b["elapsed_min"] is not None and b["elapsed_min"] < 20]
+    b_trending     = [b for b in bounces if b.get("trending_at_migration")]
+    b_fast_trend   = [b for b in b_fast if b.get("trending_at_migration")]
+
+    rows_sim = [
+        ("Todos os bounces (baseline)",                b_all),
+        ("Sem sinal H9",                               b_no_h9),
+        ("Com H9 (qualquer ratio)",                    b_any_h9),
+        ("H9 ratio < 1.00 (antes da migração)",        b_h9_lt100),
+        ("H9 ratio < 0.80 (deep — smart no dump)",     b_h9_lt080),
+        ("H9 ratio ≥ 1.00 (pós-bounce — tarde demais)",b_h9_ge100),
+        ("— — — combinações — — —",                   None),
+        ("Elapsed < 20min (H10 gate)",                 b_fast),
+        ("Trending at migration (H27)",                b_trending),
+        ("Trending + Elapsed < 20min",                 b_fast_trend),
+        ("H9 < 0.80 + Elapsed < 20min",               b_h9_fast),
+        ("H9 < 0.80 + Trending",                       b_h9_trending),
+        ("H9 < 0.80 + Elapsed < 20min + Trending",    b_h9_fast_trend),
+    ]
+
+    # ── HTML ──────────────────────────────────────────────────────────────────
+    CSS = """<style>
+    body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:12px}
+    h2{color:#58a6ff}h3{color:#79c0ff;margin:24px 0 6px}
+    p.sub{color:#8b949e;font-size:11px;margin:2px 0 10px}
+    table{border-collapse:collapse;margin-bottom:20px}
+    .wide{width:100%}
+    th{background:#161b22;color:#8b949e;padding:5px 8px;border:1px solid #30363d;text-align:right;font-size:11px}
+    th:first-child{text-align:left}
+    td{padding:3px 8px;border:1px solid #21262d;text-align:right;font-size:11px;white-space:nowrap}
+    td:first-child{text-align:left}
+    .tp{color:#3fb950;font-weight:bold}.sl{color:#f85149}
+    .pos{color:#3fb950;font-weight:bold}.neg{color:#f85149}
+    .hi{background:#1a2f1a;font-weight:bold}.lo{background:#2f1a1a}
+    .mid{background:#1f2516}
+    .sep{background:#161b22;color:#484f58;font-style:italic}
+    .note{background:#1a1f2e;padding:8px 12px;border-left:3px solid #388bfd;margin:8px 0;font-size:11px}
+    nav a{color:#58a6ff;margin-right:12px;font-size:12px;text-decoration:none}
+    a{color:#58a6ff}
+    </style>"""
+
+    H = CSS + "<nav>"
+    H += "<a href='/analise'>Análise</a>"
+    H += "<a href='/analise/h9'>H9 (recovery)</a>"
+    H += "<a href='/analise/wr-breakdown'>WR Breakdown</a>"
+    H += "<a href='/analise/quality-grid'>Quality Grid</a>"
+    H += "</nav>"
+    H += "<h2>🧠 H9 Gate — Simulação de SmartDegenBuy como filtro obrigatório</h2>"
+    H += f"<p class='sub'>desde {since_str} · TP{TP:.0%}/SL{SL:.0%} · break-even WR = {BE:.1%} · SQL {t_sql:.1f}s</p>"
+
+    H += "<div class='note'>"
+    H += f"Break-even neste TP/SL: <b>{BE:.1%}</b>. "
+    H += "WR verde = acima do break-even. "
+    H += "H9 ratio = trigger_mc / mc_migration. Ratio &lt;0.80 = smart money comprando DURANTE o dump."
+    H += "</div>"
+
+    H += f"<p><a href='?since=2026-05-26'>✅ ≥26/mai</a> | "
+    H += f"<a href='?since=2026-06-01'>01/jun</a> | "
+    H += f"<a href='?since={since_str}&tp=0.75&sl=0.25'>TP75/SL25</a> | "
+    H += f"<a href='?since={since_str}&tp=1.00&sl=0.25'>TP100/SL25</a></p>"
+
+    # ── Seção 1: trades reais ─────────────────────────────────────────────────
+    H += "<h3>📊 Seção 1 — Trades reais executados</h3>"
+    if not closed_trades:
+        H += "<p>Nenhum trade fechado no período.</p>"
+    else:
+        def trade_group(label, grp):
+            n = len(grp)
+            if n == 0: return f"<tr><td>{label}</td><td colspan=5>—</td></tr>"
+            tp = sum(1 for t in grp if is_tp_t(t))
+            sl = sum(1 for t in grp if is_sl_t(t))
+            dec = tp + sl
+            wr = tp/dec if dec else None
+            ev = (wr*TP - (1-wr)*SL) if wr is not None else None
+            wr_cls = "tp" if (wr or 0) >= BE else "sl"
+            ev_cls = "pos" if (ev or 0) > 0 else "neg"
+            return (f"<tr>"
+                    f"<td>{label}</td><td>{n}</td><td>{dec}</td>"
+                    f"<td class='tp'>{tp}</td><td class='sl'>{sl}</td>"
+                    f"<td class='{wr_cls}'>{wr:.1%}</td>"
+                    f"<td class='{ev_cls}'>{ev:+.1%}</td>"
+                    f"</tr>" if wr is not None else
+                    f"<tr><td>{label}</td><td>{n}</td><td>0</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>")
+
+        H += "<table class='wide'>"
+        H += "<tr><th>Grupo</th><th>n trades</th><th>dec</th><th>TP</th><th>SL</th><th>WR</th><th>EV</th></tr>"
+        H += trade_group("Todos os trades (baseline)",         closed_trades)
+        H += trade_group("Sem H9 antes do bounce",             [t for t in closed_trades if not t["n_h9"]])
+        H += trade_group("Com H9 (qualquer ratio)",            [t for t in closed_trades if t["n_h9"]])
+        H += trade_group("H9 ratio < 0.80",                    [t for t in closed_trades if t["h9_ratio"] and t["h9_ratio"] < 0.80])
+        H += trade_group("H9 ratio 0.80–1.00",                 [t for t in closed_trades if t["h9_ratio"] and 0.80 <= t["h9_ratio"] < 1.00])
+        H += trade_group("H9 ratio ≥ 1.00 (tarde demais)",    [t for t in closed_trades if t["h9_ratio"] and t["h9_ratio"] >= 1.00])
+        H += "</table>"
+
+        # Tabela individual
+        H += "<details><summary style='cursor:pointer;color:#58a6ff'>Ver todos os trades individuais</summary>"
+        H += "<table class='wide' style='margin-top:8px'>"
+        H += "<tr><th>#</th><th>símbolo</th><th>data</th><th>outcome</th><th>H9 signals</th><th>H9 ratio</th><th>P&amp;L</th></tr>"
+        for t in closed_trades:
+            out_cls = "tp" if is_tp_t(t) else "sl"
+            out_txt = "TP ✅" if is_tp_t(t) else "SL 💀"
+            pnl = f"{t['pnl_pct_real']*100:+.1f}%" if t.get("pnl_pct_real") else "—"
+            dt  = t["created_at"].strftime("%m/%d %H:%M") if t.get("created_at") else "—"
+            h9r = f"{t['h9_ratio']:.2f}" if t["h9_ratio"] else "—"
+            H += (f"<tr>"
+                  f"<td>{t['id']}</td>"
+                  f"<td>{t['symbol'] or t['mint'][:8] if t.get('mint') else '—'}</td>"
+                  f"<td>{dt}</td>"
+                  f"<td class='{out_cls}'>{out_txt}</td>"
+                  f"<td>{int(t['n_h9'] or 0)}</td>"
+                  f"<td>{h9r}</td>"
+                  f"<td>{pnl}</td>"
+                  f"</tr>")
+        H += "</table></details>"
+
+    # ── Seção 2: simulação em todos os bounces ────────────────────────────────
+    H += f"<h3>🔬 Seção 2 — Simulação em todos os bounces (n={N})</h3>"
+    H += "<p class='sub'>entry=mc_at_signal · max/min de token_ticks 60min · TP e SL simulados</p>"
+
+    H += "<table class='wide'>"
+    H += "<tr><th>Filtro</th><th>n bounces</th><th>dec</th><th>TP</th><th>SL</th><th>WR</th><th>EV</th><th>freq%</th></tr>"
+
+    for label, subset in rows_sim:
+        if subset is None:
+            H += f"<tr class='sep'><td colspan=8>{label}</td></tr>"
+            continue
+        n, n_tp, n_sl, wr, ev = sim(subset)
+        freq = n / N if N else 0
+        if wr is None:
+            H += f"<tr><td>{label}</td><td>{n}</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>{freq:.1%}</td></tr>"
+            continue
+        ev_cls = "pos" if ev > 0 else "neg"
+        wr_cls = "tp" if wr >= BE else "sl"
+        # Determine row highlight
+        if ev > 0.05:
+            row_cls = "hi"
+        elif ev > 0 and label == "Todos os bounces (baseline)":
+            row_cls = ""
+        elif ev < -0.05:
+            row_cls = "lo"
+        elif ev >= 0:
+            row_cls = "mid"
+        else:
+            row_cls = ""
+        H += (f"<tr class='{row_cls}'>"
+              f"<td>{label}</td>"
+              f"<td>{n}</td><td>{n_tp+n_sl}</td>"
+              f"<td class='tp'>{n_tp}</td><td class='sl'>{n_sl}</td>"
+              f"<td class='{wr_cls}'>{wr:.1%}</td>"
+              f"<td class='{ev_cls}'>{ev:+.1%}</td>"
+              f"<td>{freq:.1%}</td>"
+              f"</tr>")
+    H += "</table>"
+
+    H += "<div class='note'>"
+    H += "<b>Como ler:</b> freq% = quantos bounces passariam por esse gate (vs total). "
+    H += "Se H9&lt;0.80 tem WR alto mas freq baixa → gate funciona mas precisa de paciência. "
+    H += "Se WR é similar com e sem H9 → sinal não discrimina nada."
+    H += "</div>"
+
+    return H
+
+
+# ==============================================================================
 # /analise/quality-grid — grid de filtros de qualidade vs WR real (TP/SL)
 # ==============================================================================
 @app.route("/analise/quality-grid")
