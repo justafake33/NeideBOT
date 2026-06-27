@@ -624,23 +624,26 @@ class HotMonitor:
             self.scheduler.schedule(30, _snap30)
             self.scheduler.schedule(60, _snap60)
 
-        msg = (
-            f"🔔 BOUNCE {symbol}\n"
-            f"  Migração: ${mc_migration:,.0f}\n"
-            f"  Fundo:    ${mc_min:,.2f} (-{drop_from_mig:.0%})\n"
-            f"  Agora:    ${mc:,.0f} (+{bounce_pct:.0%} do fundo)\n"
-            f"  Tempo:    {elapsed_min:.1f}min\n"
-            f"  Mint: {mint}"
-        )
-        try:
-            send_alert(msg)
-        except Exception as e:
-            logger.warning("send_alert bounce %s: %s", mint[:8], e)
+        tradeable = mint_state.get("tradeable", True)
 
-        logger.info("BOUNCE %s: fundo=$%.2f drop=%.0f%% bounce=%.0f%% em %.1fmin",
-                    symbol, mc_min, drop_from_mig * 100, bounce_pct * 100, elapsed_min)
+        if tradeable:
+            msg = (
+                f"🔔 BOUNCE {symbol}\n"
+                f"  Migração: ${mc_migration:,.0f}\n"
+                f"  Fundo:    ${mc_min:,.2f} (-{drop_from_mig:.0%})\n"
+                f"  Agora:    ${mc:,.0f} (+{bounce_pct:.0%} do fundo)\n"
+                f"  Tempo:    {elapsed_min:.1f}min\n"
+                f"  Mint: {mint}"
+            )
+            try:
+                send_alert(msg)
+            except Exception as e:
+                logger.warning("send_alert bounce %s: %s", mint[:8], e)
 
-        if self._executor and mint_state.get("tradeable", True):
+        logger.info("BOUNCE %s: fundo=$%.2f drop=%.0f%% bounce=%.0f%% em %.1fmin (tradeable=%s)",
+                    symbol, mc_min, drop_from_mig * 100, bounce_pct * 100, elapsed_min, tradeable)
+
+        if self._executor and tradeable:
             try:
                 self._executor.on_bounce(
                     mint=mint,
