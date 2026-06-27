@@ -30939,6 +30939,14 @@ def _analise_grid_search_inner():
 # ==============================================================================
 @app.route("/analise/h9-gate")
 def analise_h9_gate():
+    import traceback
+    try:
+        return _analise_h9_gate_inner()
+    except Exception:
+        return "<pre style='background:#1a0000;color:#f88;padding:20px'>" + traceback.format_exc() + "</pre>", 500
+
+
+def _analise_h9_gate_inner():
     """
     Simula o efeito de exigir sinal H9 (SmartDegenBuy type 12) antes de executar
     qualquer bounce. Usa bounce_signals + token_ticks (entry=mc_at_signal, TP75/SL25).
