@@ -52064,7 +52064,7 @@ def _analise_trending_deep_inner():
                 m.liq_migration,
                 m.smart_wallets,
                 m.time_to_bottom,
-                m.complete_cost_time,
+                m.time_to_migrate_sec,
                 m.exchange,
                 MAX(COALESCE(tt.mc_high, tt.mc))                  AS max_mc,
                 MIN(COALESCE(tt.mc_low,  tt.mc))                  AS min_mc,
@@ -52080,7 +52080,7 @@ def _analise_trending_deep_inner():
                      bs.bounce_pct, bs.drop_from_mig, bs.pool_quote_at_signal,
                      bs.mc_at_signal, bs.mc_migration,
                      m.trending_at_migration, m.mc_migration, m.liq_migration,
-                     m.smart_wallets, m.time_to_bottom, m.complete_cost_time, m.exchange
+                     m.smart_wallets, m.time_to_bottom, m.time_to_migrate_sec, m.exchange
             HAVING COUNT(tt.id) >= %(min_ticks)s
         )
         SELECT * FROM sim ORDER BY ts_signal DESC
@@ -52299,12 +52299,12 @@ def _analise_trending_deep_inner():
     ])
 
     # Velocidade de migração (H28)
-    H += sub_table("⚡ Velocidade de migração — complete_cost_time (seg)", [
-        ("mig < 60s (runner?)", [r for r in trend_t if r["complete_cost_time"] is not None and r["complete_cost_time"] < 60]),
-        ("mig 60–300s",        [r for r in trend_t if r["complete_cost_time"] is not None and 60 <= r["complete_cost_time"] < 300]),
-        ("mig 300–900s",       [r for r in trend_t if r["complete_cost_time"] is not None and 300 <= r["complete_cost_time"] < 900]),
-        ("mig > 900s",         [r for r in trend_t if r["complete_cost_time"] is not None and r["complete_cost_time"] >= 900]),
-        ("mig NULL",           [r for r in trend_t if r["complete_cost_time"] is None]),
+    H += sub_table("⚡ Velocidade de migração — time_to_migrate_sec", [
+        ("mig < 60s (runner?)", [r for r in trend_t if r["time_to_migrate_sec"] is not None and r["time_to_migrate_sec"] < 60]),
+        ("mig 60–300s",        [r for r in trend_t if r["time_to_migrate_sec"] is not None and 60 <= r["time_to_migrate_sec"] < 300]),
+        ("mig 300–900s",       [r for r in trend_t if r["time_to_migrate_sec"] is not None and 300 <= r["time_to_migrate_sec"] < 900]),
+        ("mig > 900s",         [r for r in trend_t if r["time_to_migrate_sec"] is not None and r["time_to_migrate_sec"] >= 900]),
+        ("mig NULL",           [r for r in trend_t if r["time_to_migrate_sec"] is None]),
     ])
 
     # ── Seção 4: combinações dentro de trending ───────────────────────────────
