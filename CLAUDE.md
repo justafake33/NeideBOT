@@ -314,7 +314,7 @@ WR: **29%** (9 TPs / 22 SLs) confirmado GMGN · Net P/L: **+$0.12** · Payoff 2.
 | H4 | sniper ≥30% → recovery <30% | ❌ | levemente positivo — dados corrompidos |
 | H7 | liq_migration <$5k → slippage inaceitável >$50 | ⏳ | pendente validação em execução |
 | H8 | is_wash_trading=TRUE → recovery ≥20pp menor | ❌ | -0.1pp — não discrimina |
-| H9 | signal type 12 trigger_mc < 80% mig → recovery ≥20pp maior | 🟡 | +11.8pp histórico (n=14) · 75% WR live (n=4 ratio<0.80) |
+| H9 | signal type 12 trigger_mc < 80% mig → recovery ≥20pp maior | ❌ ANTICORRELADO | Com H9: 6.7% WR (n=17 bounces). Sem H9: 26.7% WR (n=111). H9 prediz FALHA, não sucesso. NÃO usar como gate positivo. Avaliar como gate NEGATIVO (bloquear). Live trades: com H9 WR 16.7%, sem H9 WR 18.4%. |
 | H10 | time_to_bottom < 25min → recovery ≥20pp maior | ✅ | +21.8pp (61.2% vs 39.3%, n=425) — único preditor robusto |
 | H11 | Deceleração de preço precede fundo em recovery tokens | ❌ | Invertido — recovery = capitulação brusca |
 | H12 | dump_depth + time_elapsed → zona P(recovery)>50% | ⚠️ | Parcial — time domina sobre depth |
@@ -332,8 +332,8 @@ WR: **29%** (9 TPs / 22 SLs) confirmado GMGN · Net P/L: **+$0.12** · Payoff 2.
 | H24 | Seller exhaustion (top-3 > 70% dump_vol) → WR maior | ⏳ | PENDENTE — hipótese central pós H21 |
 | H25 | Pool depth < 20 SOL → SL é ruído de AMM | 🟡 | pool>90 SOL NÃO é sinal positivo (WR=17.5% em decision_entry). Pool<10 SOL = ruído = C3 válido. |
 | H26 | Buy concentration (largest_buy/buy_vol) alta → WR maior | ⏳ | PENDENTE CORRELAÇÃO — campo calculável dos dados existentes |
-| H27 | trending_at_migration=TRUE → recovery ≥15pp maior | ⏳ | DATA COLLECTION — coleta iniciada 2026-06-26 via /v1/market/rank pump.fun 1m no momento da migração |
-| H28 | time_to_migrate_sec < 60 → manipulação ou runner absoluto (WR diferente) | ⏳ | DATA COLLECTION — campo complete_cost_time já em migrations, propagado para bounce_signals |
+| H27 | trending_at_migration=TRUE → recovery ≥15pp maior | 🟡 PRELIMINAR | WR 30.3%, EV +5.3% (n=46 bounces, apenas 2 dias: 2026-06-26/27). TP50/SL25 ótimo: WR 50%, EV +12.5%. mig<60s → WR 0% (runners). smart≥3+trending → WR 60%. Best combo: trending+smart≥1+elapsed<10min → WR 38.9%, EV +13.9% (n=22). Cobertura 13% das migrações. Aguardar n≥100 (≈2 semanas). |
+| H28 | time_to_migrate_sec < 60 → manipulação ou runner absoluto (WR diferente) | 🟡 CONFIRMADO NEGATIVO (trending) | Dentro de trending=TRUE: mig<60s → WR 0% (n=7). mig 300-900s → WR 60% (n=8). Bloquear time_to_migrate_sec < 60 como pré-filtro quando trending gate ativo. |
 
 ---
 
@@ -541,6 +541,8 @@ RETENTION_DRY_RUN=true       # simular sem deletar
 | `/analise/filter-impact` | Resumo do impacto dos filtros ativos sobre rec75 e frequência |
 | `/analise/grid-search` | Grid search de parâmetros de filtro vs WR/frequência |
 | `/analise/quality-grid` | **Grid de filtros de qualidade** — WR real (TP/SL) por combinação de bundler/sniper/rug/bot/top10/smart. Responde: relaxar threshold melhora ou piora WR? Config Railway destacada em azul. `?since=YYYY-MM-DD` |
+| `/analise/h9-gate` | **H9 como gate** — Seção 1: trades reais com/sem H9 ativo. Seção 2: simulação sobre todos os bounces com H9 gate + combinações com H10 e H27. Confirma anticorrelação. |
+| `/analise/trending-deep` | **Análise profunda de trending** — Cobertura, TP/SL grid 6×4, 6 dimensões internas (smart, elapsed, mig_speed, bounce, drop, pool), combinações, tabela individual por token. `?since=YYYY-MM-DD` |
 | `/analise/v2-shadow-live` | V2.1 Shadow Live — gate ativo sobre micro_absorption_snapshots. Dry-run only. |
 | `/analise/v2-brain-report` | V2 Brain Report — grid cartesiano. `mode=fast` (padrão) ou `mode=full`. |
 | `/debug/signal-live` | Fase 2 — chama get_token_signal(), mostra matches com HotMonitor |
@@ -632,6 +634,12 @@ RETENTION_DRY_RUN=true       # simular sem deletar
 34. **Threading**: heap scheduler — nunca `threading.Timer` por evento. `scheduler.schedule(delay_sec, fn, *args)`.
 
 35. **Global rate limit gate `_global_ban_until`** em `gmgn_client.py`: variável module-level. Qualquer 429 chama `_set_global_ban(reset_at)` → todas as threads bloqueiam. swap/query_order têm `priority=True` e ignoram o ban.
+
+36. **H9 INVERTIDO (confirmado 2026-06-27)**: n=128 bounces + n=50 trades live confirmam SmartDegenBuy ANTES do bounce é sinal negativo. Com H9: WR 6.7%. Sem H9: WR 26.7%. O valor "75% WR n=4" no CLAUDE.md era ruído de amostra pequena. Hipótese: smart money entra no dump, vende no bounce — o bot fica do lado errado. NÃO implementar H9 como gate positivo.
+
+37. **Filtros de qualidade não discriminam WR (confirmado 2026-06-27)**: análise `/analise/quality-grid` com curvas marginais 0→100% mostra teto de WR em ~25.3% independente de combinação de bundler/sniper/rug/bot/top10/smart. Railway `FILTER_BUNDLER_MAX=0.20` é o PIOR ponto da curva (WR 11.1%, n=9). Recomendado: `FILTER_BUNDLER_MAX=0.50`. Sniper/top10 são quase no-ops (maioria NULL no DB).
+
+38. **trending_at_migration é o primeiro sinal com EV positivo (preliminar 2026-06-27)**: cobertura 13% das migrações. WR 30.3%, EV +5.3% (TP75/SL25). TP50/SL25 ótimo: WR 50%, EV +12.5%. mig<60s bloqueia (WR 0%). Dados de apenas 2 dias — aguardar n≥100 bounces trending antes de ativar gate.
 
 ---
 
