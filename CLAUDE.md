@@ -540,6 +540,7 @@ RETENTION_DRY_RUN=true       # simular sem deletar
 | `/analise/filtros-simples` | Linguagem simples — explica cada filtro, taxa de bloqueio, se está ajudando ou atrapalhando |
 | `/analise/filter-impact` | Resumo do impacto dos filtros ativos sobre rec75 e frequência |
 | `/analise/grid-search` | Grid search de parâmetros de filtro vs WR/frequência |
+| `/analise/quality-grid` | **Grid de filtros de qualidade** — WR real (TP/SL) por combinação de bundler/sniper/rug/bot/top10/smart. Responde: relaxar threshold melhora ou piora WR? Config Railway destacada em azul. `?since=YYYY-MM-DD` |
 | `/analise/v2-shadow-live` | V2.1 Shadow Live — gate ativo sobre micro_absorption_snapshots. Dry-run only. |
 | `/analise/v2-brain-report` | V2 Brain Report — grid cartesiano. `mode=fast` (padrão) ou `mode=full`. |
 | `/debug/signal-live` | Fase 2 — chama get_token_signal(), mostra matches com HotMonitor |
