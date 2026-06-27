@@ -30935,6 +30935,259 @@ def _analise_grid_search_inner():
 
 
 # ==============================================================================
+# /analise/quality-grid — grid de filtros de qualidade vs WR real (TP/SL)
+# ==============================================================================
+@app.route("/analise/quality-grid")
+def analise_quality_grid():
+    """
+    Para cada combinação de thresholds de qualidade (bundler, sniper, rug, bot, top10, smart),
+    calcula WR real usando bounce_signals + token_ticks (TP+75%/SL-25%, janela 60min).
+
+    Responde: vale relaxar BUNDLER_MAX de 0.20 para 0.60? O WR cai ou mantém?
+    Se o grupo que entra com bundler 0.20-0.60 tem WR similar ao grupo <0.20 → relaxar faz sentido.
+    Se WR cai → filtro está protegendo tokens ruins, manter restritivo.
+
+    Params:
+      since=YYYY-MM-DD  (padrão: 2026-05-26)
+      min_n=5           mínimo de bounces no subconjunto
+      min_dec=3         mínimo de decididos (TP ou SL)
+      top=300           linhas a mostrar
+    """
+    import itertools, time as _time
+    import psycopg2.extras
+
+    since_str = request.args.get("since", "2026-05-26") or "2026-05-26"
+    MIN_N   = int(request.args.get("min_n",   5))
+    MIN_DEC = int(request.args.get("min_dec", 3))
+    TOP     = int(request.args.get("top",   300))
+
+    # ── Dimensões do grid ─────────────────────────────────────────────────────
+    BUNDLER_VALUES = [0.20, 0.40, 0.60, 0.80]
+    SNIPER_VALUES  = [0.10, 0.25, 0.50, 0.75]
+    RUG_VALUES     = [0.15, 0.30, 0.50]
+    BOT_VALUES     = [0.60, 0.80, 1.00]
+    TOP10_VALUES   = [0.60, 0.70, 0.80, 0.90]
+    SMART_VALUES   = [0, 1, 2, 3]
+    TP_SL_VALUES   = [(0.75, 0.25), (1.00, 0.25)]
+
+    # Ler config atual do worker (via heartbeat) para destacar linha equivalente
+    cur_bundler = 0.20; cur_sniper = 0.10; cur_rug = 0.15
+    cur_bot = 0.60; cur_top10 = 0.70; cur_smart = 1
+    try:
+        with db._cursor() as _c:
+            _c.execute("""
+                SELECT metadata->'filters' AS f
+                FROM runtime_heartbeats
+                WHERE runtime_name = 'worker'
+                ORDER BY last_seen DESC LIMIT 1
+            """)
+            _r = _c.fetchone()
+            if _r and _r["f"]:
+                _f = _r["f"]
+                cur_bundler = float(_f.get("bundler_max", cur_bundler))
+                cur_sniper  = float(_f.get("sniper_max",  cur_sniper))
+                cur_rug     = float(_f.get("rug_max",     cur_rug))
+                cur_bot     = float(_f.get("bot_max",     cur_bot))
+                cur_top10   = float(_f.get("top10_max",   cur_top10))
+                cur_smart   = int(_f.get("smart_min",     cur_smart))
+    except Exception:
+        pass
+
+    # ── Carregar dados 1× do banco ────────────────────────────────────────────
+    t0 = _time.time()
+    conn = psycopg2.connect(db.DATABASE_URL)
+    conn.autocommit = True
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        WITH base AS (
+            SELECT
+                bs.mint,
+                bs.mc_at_signal                              AS entry_mc,
+                COALESCE(m.smart_wallets, 0)                 AS smart,
+                m.bundler_trader_amount_rate                 AS bundler,
+                m.top70_sniper_hold_rate                     AS sniper,
+                m.rug_ratio                                  AS rug,
+                m.bot_degen_rate                             AS bot,
+                m.top10_holder_rate                          AS top10,
+                MAX(COALESCE(tt.mc_high, tt.mc))             AS max_mc,
+                MIN(COALESCE(tt.mc_low,  tt.mc))             AS min_mc,
+                COUNT(tt.id)                                 AS tick_count
+            FROM bounce_signals bs
+            JOIN token_ticks tt ON tt.mint = bs.mint
+                AND tt.tick_ts > bs.ts_signal
+                AND tt.tick_ts < bs.ts_signal + INTERVAL '60 minutes'
+            LEFT JOIN migrations m ON m.mint = bs.mint
+            WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+              AND bs.bounce_pct   IS NOT NULL
+              AND bs.ts_signal >= %(since)s::timestamptz
+            GROUP BY bs.mint, bs.mc_at_signal,
+                     m.smart_wallets, m.bundler_trader_amount_rate,
+                     m.top70_sniper_hold_rate, m.rug_ratio,
+                     m.bot_degen_rate, m.top10_holder_rate
+            HAVING COUNT(tt.id) >= 3
+        )
+        SELECT * FROM base
+    """, {"since": since_str})
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    t_sql = _time.time() - t0
+
+    N = len(rows)
+    if N == 0:
+        return "<p>Sem dados suficientes para o período selecionado.</p>", 200
+
+    # ── Pré-computar máscaras ─────────────────────────────────────────────────
+    # NULL em qualidade → passa o filtro (mesma lógica do scanner)
+    def q_mask(field, max_val):
+        return [(r[field] is None or r[field] <= max_val) for r in rows]
+
+    bundler_masks = {b: q_mask("bundler", b) for b in BUNDLER_VALUES}
+    sniper_masks  = {s: q_mask("sniper",  s) for s in SNIPER_VALUES}
+    rug_masks     = {r: q_mask("rug",     r) for r in RUG_VALUES}
+    bot_masks     = {b: q_mask("bot",     b) for b in BOT_VALUES}
+    top10_masks   = {t: q_mask("top10",   t) for t in TOP10_VALUES}
+    smart_masks   = {s: [(r["smart"] or 0) >= s for r in rows] for s in SMART_VALUES}
+
+    tp_sl_masks = {}
+    for tp, sl in TP_SL_VALUES:
+        tp_mult = 1 + tp; sl_mult = 1 - sl
+        tp_sl_masks[(tp, sl)] = (
+            [r["max_mc"] is not None and r["max_mc"] >= r["entry_mc"] * tp_mult for r in rows],
+            [r["min_mc"] is not None and r["min_mc"] <= r["entry_mc"] * sl_mult for r in rows],
+        )
+
+    # ── Grid search com deduplicação ──────────────────────────────────────────
+    t1 = _time.time()
+    seen_subsets = {}
+
+    for bundler, sniper, rug, bot, top10, smart in itertools.product(
+        BUNDLER_VALUES, SNIPER_VALUES, RUG_VALUES, BOT_VALUES, TOP10_VALUES, SMART_VALUES
+    ):
+        base_mask = [
+            bundler_masks[bundler][i]
+            and sniper_masks[sniper][i]
+            and rug_masks[rug][i]
+            and bot_masks[bot][i]
+            and top10_masks[top10][i]
+            and smart_masks[smart][i]
+            for i in range(N)
+        ]
+        n_base = sum(base_mask)
+        if n_base < MIN_N:
+            continue
+
+        idx     = tuple(i for i, m in enumerate(base_mask) if m)
+        idx_key = frozenset(idx)
+
+        for tp, sl in TP_SL_VALUES:
+            tp_hits, sl_hits = tp_sl_masks[(tp, sl)]
+            n_tp  = sum(1 for i in idx if tp_hits[i])
+            n_sl  = sum(1 for i in idx if sl_hits[i] and not tp_hits[i])
+            n_dec = n_tp + n_sl
+            if n_dec < MIN_DEC:
+                continue
+            wr = n_tp / n_dec
+            ev = wr * tp - (1 - wr) * sl
+            seen_subsets[(idx_key, tp, sl)] = (
+                ev, wr, n_base, n_dec, n_tp, n_sl,
+                bundler, sniper, rug, bot, top10, smart, tp, sl
+            )
+
+    results = sorted(seen_subsets.values(), key=lambda x: -x[0])
+    t_py = _time.time() - t1
+
+    total_combos = (len(BUNDLER_VALUES) * len(SNIPER_VALUES) * len(RUG_VALUES)
+                    * len(BOT_VALUES) * len(TOP10_VALUES) * len(SMART_VALUES) * len(TP_SL_VALUES))
+
+    # ── HTML ──────────────────────────────────────────────────────────────────
+    CSS = """<style>
+    body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:12px}
+    h2{color:#58a6ff}p.sub{color:#8b949e;font-size:11px;margin:2px 0 10px}
+    table{border-collapse:collapse;width:100%;margin-bottom:20px}
+    th{background:#161b22;color:#8b949e;padding:5px 8px;border:1px solid #30363d;text-align:right;font-size:11px}
+    th:first-child{text-align:left}
+    td{padding:3px 8px;border:1px solid #21262d;text-align:right;font-size:11px;white-space:nowrap}
+    td:first-child{text-align:left;color:#8b949e}
+    .tp{color:#3fb950;font-weight:bold}.sl{color:#f85149}
+    .pos{color:#3fb950;font-weight:bold}.neg{color:#f85149}
+    .hi{background:#1a2f1a}.lo{background:#2f1a1a}
+    .cur{background:#1f2d3d;outline:2px solid #388bfd}
+    .note{background:#1a1f2e;padding:8px 12px;border-left:3px solid #388bfd;margin:8px 0;font-size:11px}
+    nav a{color:#58a6ff;margin-right:12px;font-size:12px;text-decoration:none}
+    a{color:#58a6ff}
+    </style>"""
+
+    H = CSS
+    H += "<nav>"
+    H += "<a href='/analise'>Análise</a>"
+    H += "<a href='/analise/grid-search'>Grid Search</a>"
+    H += "<a href='/analise/quality-grid'>Quality Grid</a>"
+    H += "<a href='/analise/filter-ranges'>Filter Ranges</a>"
+    H += "</nav>"
+    H += "<h2>🔬 Quality Grid — WR real por threshold de filtro de qualidade</h2>"
+
+    data_flag = "✅ dados limpos (pós-phantom-fix)" if since_str >= "2026-05-26" else "⚠️ inclui dados anteriores"
+    H += f"<p class='sub'><strong>{data_flag}</strong> · desde {since_str}</p>"
+    H += f"<p class='sub'>{N} bounces · {total_combos:,} combinações · <strong>{len(results)} subconjuntos únicos</strong> · SQL {t_sql:.1f}s · grid {t_py:.1f}s</p>"
+
+    H += "<div class='note'>"
+    H += f"<b>Config atual do worker (Railway):</b> "
+    H += f"bundler≤{cur_bundler:.0%} · sniper≤{cur_sniper:.0%} · rug≤{cur_rug:.0%} · "
+    H += f"bot≤{cur_bot:.0%} · top10≤{cur_top10:.0%} · smart≥{cur_smart} "
+    H += f"— linha <span style='color:#58a6ff'>destacada em azul</span> = config equivalente mais próxima."
+    H += "<br>NULL em qualidade → passa o filtro (igual ao scanner). "
+    H += "Se a linha atual tem EV menor que linhas com filtros mais relaxados → Railway está restritivo demais.</div>"
+
+    H += f"<p><a href='?since=2026-05-26&min_n=5&min_dec=3&top=500'>✅ Limpos ≥26/05</a> | "
+    H += f"<a href='?since=2026-06-01&min_n=5&min_dec=3&top=500'>01/jun</a> | "
+    H += f"<a href='?since={since_str}&min_n={MIN_N}&min_dec={MIN_DEC}&top=9999'>Ver tudo</a></p>"
+
+    if not results:
+        H += "<p>Nenhuma combinação com dados suficientes.</p>"
+        return H
+
+    top_rows = results[:TOP]
+    H += f"<p>Mostrando <strong>{min(TOP, len(results))}</strong> de <strong>{len(results)}</strong>, por EV decrescente.</p>"
+    H += "<table>"
+    H += ("<tr><th>#</th><th>bundler≤</th><th>sniper≤</th><th>rug≤</th>"
+          "<th>bot≤</th><th>top10≤</th><th>smart≥</th><th>TP/SL</th>"
+          "<th>n</th><th>dec</th><th>TP</th><th>SL</th><th>WR</th><th>EV</th></tr>")
+
+    be_map = {(0.75, 0.25): 0.25 / 1.00, (1.00, 0.25): 0.25 / 1.25}
+
+    for rank, r in enumerate(top_rows, 1):
+        ev, wr, n, nd, ntp, nsl, bundler, sniper, rug, bot, top10, smart, tp, sl = r
+        be = be_map.get((tp, sl), 0.25)
+        ev_cls  = "pos" if ev > 0 else "neg"
+        wr_cls  = "tp"  if wr >= be else ("sl" if wr < be * 0.8 else "")
+        row_cls = "hi"  if ev >= 0.20 else ("lo" if ev < 0 else "")
+        # Highlight row matching current Railway config
+        is_cur = (bundler == cur_bundler and sniper == cur_sniper and rug == cur_rug
+                  and bot == cur_bot and top10 == cur_top10 and smart == cur_smart)
+        if is_cur:
+            row_cls = "cur"
+        H += (f"<tr class='{row_cls}'>"
+              f"<td>{rank}</td>"
+              f"<td>{bundler:.0%}</td>"
+              f"<td>{sniper:.0%}</td>"
+              f"<td>{rug:.0%}</td>"
+              f"<td>{bot:.0%}</td>"
+              f"<td>{top10:.0%}</td>"
+              f"<td>≥{smart}</td>"
+              f"<td>{tp:.0%}/{sl:.0%}</td>"
+              f"<td>{n}</td><td>{nd}</td>"
+              f"<td class='tp'>{ntp}</td><td class='sl'>{nsl}</td>"
+              f"<td class='{wr_cls}'>{wr:.1%}</td>"
+              f"<td class='{ev_cls}'>{ev:+.1%}</td>"
+              f"</tr>")
+    H += "</table>"
+    H += "<p class='sub'>entry=mc_at_signal · TP e SL simulados com token_ticks 60min · "
+    H += "NULL em métricas de qualidade = passa o filtro (igual ao scanner) · "
+    H += "deduplicado por subconjunto real de tokens</p>"
+    return H
+
+
+# ==============================================================================
 # /analise/feature-grid — grid multidimensional de features com base H23
 # ==============================================================================
 @app.route("/analise/feature-grid")
