@@ -137,11 +137,11 @@ Auditoria manual n=15: 10/15 precisos (≤3%), 3/15 learning window (tradeoff in
 
 ### H27/H28 — Qualidade da migração ← DATA COLLECTION (iniciado 2026-06-26)
 
-**H27:** Token estava em trending do Pump.fun (5min) no momento da migração → rec75 ≥15pp maior?
+**H27:** Token estava em trending do Pump.fun (1min) no momento da migração → rec75 ≥15pp maior?
 **H28:** Migração em <60s → manipulação ou runner absoluto → WR diferente?
 
 **Fonte dos dados:**
-- `trending_at_migration`: `/v1/market/rank` com `platform=Pump.fun, interval=5m` chamado NO MOMENTO da migração. Pump.fun 5min captura tokens com <$85k MC que nunca aparecem no top-100 global. Propagado para `bounce_signals.trending_at_bounce`.
+- `trending_at_migration`: `/v1/market/rank` com `platform=Pump.fun, interval=1m` chamado NO MOMENTO da migração. Pump.fun 1min captura tokens com hype imediato — momentum dos últimos 60s antes de migrar. Propagado para `bounce_signals.trending_at_bounce`.
 - `time_to_migrate_sec`: campo `complete_cost_time` do trenches. Já em `migrations`. Propagado para `bounce_signals.time_to_migrate_sec` e HotMonitor state.
 
 **Endpoint de análise:** `/analise/migration-quality` — rec75 por trending TRUE/FALSE/NULL + buckets de velocidade.

@@ -546,7 +546,7 @@ class HotMonitor:
 
         symbol = mint_state.get("symbol", mint[:8])
         time_to_migrate_sec = mint_state.get("time_to_migrate_sec")
-        # trending_at_bounce = valor coletado no momento da migração (pump.fun 5m trending)
+        # trending_at_bounce = valor coletado no momento da migração (pump.fun 1m trending)
         trending_at_bounce = mint_state.get("trending_at_migration")
 
         try:
@@ -1813,7 +1813,7 @@ class Scanner:
         }
 
         # H27 — trending check: set coletado 1x por tick em _tick() com interval=1m.
-        # pump.fun 5m trending inclui tokens pequenos ativos durante a bonding curve.
+        # pump.fun 1m captura momentum dos últimos 60s — hype imediato no momento da graduação.
         trending_at_migration = (mint in trending_mints) if trending_mints else None
         if trending_at_migration:
             logger.info("Migracao %s (%s) — trending=TRUE no pump.fun 1m", symbol, mint[:8])
