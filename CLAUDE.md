@@ -412,6 +412,8 @@ get_sol_usd() [gmgn_client.py]
 | `trade_absorption_ticks` | Snapshots contínuos de absorção Helius (+30s/+60s pós-bounce) por trade em monitoramento. |
 | `micro_absorption_snapshots` | **V2 Fase 1** — série temporal de microdados de fluxo por token, capturados a cada 2s durante os 60s após o fundo. ~97 colunas: janelas PRE/RISE/LIVE. Research-only. |
 | `sell_exhaustion_candidates` | Snapshots de sell velocity a cada 5s por token durante 120s pós-fundo. Research-only. |
+| `gmgn_scanner_trending_labels` | **Filtered Trending (research-only)** — 1 linha por aparição de um mint do scanner no GMGN Trending filtrado (profile/timeframe/rank/MC/liq/fee/volume/txs/holders + derivados). Dedup por mint+profile/10min. Ver `docs/gmgn_filtered_trending.md`. |
+| `gmgn_scanner_trending_outcomes` | Outcome por label via token_ticks (runup/drawdown janelas 5/15/30/60/120m, hit flags, tempos, relação trending vs bounce). `no_ticks` ≠ loss. |
 
 ### HeapScheduler
 - Thread única com heap de eventos futuros
@@ -555,6 +557,7 @@ RETENTION_DRY_RUN=true       # simular sem deletar
 | `/debug/sell-exhaustion` | Sell exhaustion detector — ratio sell_5s/sell_5_15s por token |
 | `/debug/test-swap` | Teste manual de swap. `?mint=<mint>&amount=<usd>`. Com TRADING_ENABLED=false simula. |
 | `/analise/migration-quality` | H27/H28 — trending_at_migration (pump.fun 5m) + velocidade de migração vs rec75. `?since=YYYY-MM-DD&min_ticks=N` |
+| `/debug/gmgn-filtered-trending` | H30 (research-only) — scanner ∩ GMGN Trending filtrado (faixa 25-35k/liq>5k/fee>1SOL, tf 5m+1h). Grupo A vs controle B. `?since=YYYY-MM-DD&days=N&format=json` |
 | `/export/csv` | Export completo do banco |
 | `/health` | Health check |
 

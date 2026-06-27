@@ -15,6 +15,7 @@ from scheduler import HeapScheduler
 from scanner import Scanner, HotMonitor
 from executor import TradeExecutor, TradeMonitor
 from trending_radar_routes import trending_radar_bp
+from gmgn_filtered_trending_routes import gmgn_filtered_trending_bp
 from drop_real_routes import drop_real_bp
 
 logging.basicConfig(
@@ -27,6 +28,7 @@ init_sentry()
 
 app = Flask(__name__)
 app.register_blueprint(trending_radar_bp)
+app.register_blueprint(gmgn_filtered_trending_bp)
 app.register_blueprint(drop_real_bp)
 BRT = timedelta(hours=-3)
 
@@ -6482,6 +6484,19 @@ def _start_services():
             _tr_thread = _threading.Thread(target=_tr.start, daemon=True, name="trending-radar")
             _tr_thread.start()
             logger.info("TrendingRadar iniciado (poll=%ds)", _tr.poll_sec)
+    if os.getenv("GMGN_FILTERED_TRENDING_ENABLED", "false").lower() == "true":
+        import threading as _threading
+        from gmgn_filtered_trending import FilteredTrendingCollector
+        import gmgn_filtered_trending_store as _ft_store
+        try:
+            _ft_store.ensure_schema()
+        except Exception as _e:
+            logger.warning("FilteredTrending schema indisponível (DB em recovery?): %s — coletor desativado", _e)
+        else:
+            _ft = FilteredTrendingCollector(gmgn_scanner)
+            _ft_thread = _threading.Thread(target=_ft.start, daemon=True, name="gmgn-filtered-trending")
+            _ft_thread.start()
+            logger.info("FilteredTrendingCollector iniciado (poll=%ds)", _ft.poll_sec)
     # Retenção automática de dados — roda a cada 6h, alerta no Telegram antes de deletar
     from db_retention import run_retention, INTERVAL_SEC as _RETENTION_INTERVAL
     scheduler.schedule(_RETENTION_INTERVAL, run_retention, scheduler)
