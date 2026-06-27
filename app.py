@@ -30940,18 +30940,15 @@ def _analise_grid_search_inner():
 @app.route("/analise/quality-grid")
 def analise_quality_grid():
     """
-    Para cada combinação de thresholds de qualidade (bundler, sniper, rug, bot, top10, smart),
-    calcula WR real usando bounce_signals + token_ticks (TP+75%/SL-25%, janela 60min).
-
-    Responde: vale relaxar BUNDLER_MAX de 0.20 para 0.60? O WR cai ou mantém?
-    Se o grupo que entra com bundler 0.20-0.60 tem WR similar ao grupo <0.20 → relaxar faz sentido.
-    Se WR cai → filtro está protegendo tokens ruins, manter restritivo.
+    Seção 1 — Curva marginal por filtro (0→100%) com os demais desativados.
+    Seção 2 — Grid combinado (5 níveis por dim) com deduplicação por subconjunto.
 
     Params:
       since=YYYY-MM-DD  (padrão: 2026-05-26)
       min_n=5           mínimo de bounces no subconjunto
       min_dec=3         mínimo de decididos (TP ou SL)
-      top=300           linhas a mostrar
+      top=300           linhas a mostrar no grid combinado
+      tp=0.75           TP pct para exibir na curva marginal (0.75 ou 1.00)
     """
     import itertools, time as _time
     import psycopg2.extras
@@ -30960,15 +30957,26 @@ def analise_quality_grid():
     MIN_N   = int(request.args.get("min_n",   5))
     MIN_DEC = int(request.args.get("min_dec", 3))
     TOP     = int(request.args.get("top",   300))
+    MARG_TP = float(request.args.get("tp", 0.75))  # TP para seção marginal
 
-    # ── Dimensões do grid ─────────────────────────────────────────────────────
-    BUNDLER_VALUES = [0.20, 0.40, 0.60, 0.80]
-    SNIPER_VALUES  = [0.10, 0.25, 0.50, 0.75]
-    RUG_VALUES     = [0.15, 0.30, 0.50]
-    BOT_VALUES     = [0.60, 0.80, 1.00]
-    TOP10_VALUES   = [0.60, 0.70, 0.80, 0.90]
+    # ── Grid combinado — 5 níveis por dim (0→100%) ───────────────────────────
+    BUNDLER_VALUES = [0.10, 0.25, 0.50, 0.75, 1.00]
+    SNIPER_VALUES  = [0.10, 0.25, 0.50, 0.75, 1.00]
+    RUG_VALUES     = [0.10, 0.25, 0.50, 0.75, 1.00]
+    BOT_VALUES     = [0.25, 0.50, 0.75, 1.00]
+    TOP10_VALUES   = [0.50, 0.70, 0.90, 1.00]
     SMART_VALUES   = [0, 1, 2, 3]
     TP_SL_VALUES   = [(0.75, 0.25), (1.00, 0.25)]
+
+    # ── Curva marginal — varre 0→100% num filtro, desliga os demais ──────────
+    MARG_THRESHOLDS = {
+        "bundler": [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00],
+        "sniper":  [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60, 0.75, 0.90, 1.00],
+        "rug":     [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.70, 1.00],
+        "bot":     [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00],
+        "top10":   [0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00],
+        "smart":   [0, 1, 2, 3, 4, 5],
+    }
 
     # Ler config atual do worker (via heartbeat) para destacar linha equivalente
     cur_bundler = 0.20; cur_sniper = 0.10; cur_rug = 0.15
@@ -31036,17 +31044,29 @@ def analise_quality_grid():
     if N == 0:
         return "<p>Sem dados suficientes para o período selecionado.</p>", 200
 
-    # ── Pré-computar máscaras ─────────────────────────────────────────────────
+    # ── Pré-computar todas as máscaras usadas ─────────────────────────────────
     # NULL em qualidade → passa o filtro (mesma lógica do scanner)
     def q_mask(field, max_val):
         return [(r[field] is None or r[field] <= max_val) for r in rows]
 
-    bundler_masks = {b: q_mask("bundler", b) for b in BUNDLER_VALUES}
-    sniper_masks  = {s: q_mask("sniper",  s) for s in SNIPER_VALUES}
-    rug_masks     = {r: q_mask("rug",     r) for r in RUG_VALUES}
-    bot_masks     = {b: q_mask("bot",     b) for b in BOT_VALUES}
-    top10_masks   = {t: q_mask("top10",   t) for t in TOP10_VALUES}
-    smart_masks   = {s: [(r["smart"] or 0) >= s for r in rows] for s in SMART_VALUES}
+    def smart_mask(min_val):
+        return [(r["smart"] or 0) >= min_val for r in rows]
+
+    # Máscaras para grid combinado
+    all_bundler = sorted(set(BUNDLER_VALUES) | set(MARG_THRESHOLDS["bundler"]))
+    all_sniper  = sorted(set(SNIPER_VALUES)  | set(MARG_THRESHOLDS["sniper"]))
+    all_rug     = sorted(set(RUG_VALUES)     | set(MARG_THRESHOLDS["rug"]))
+    all_bot     = sorted(set(BOT_VALUES)     | set(MARG_THRESHOLDS["bot"]))
+    all_top10   = sorted(set(TOP10_VALUES)   | set(MARG_THRESHOLDS["top10"]))
+    all_smart   = sorted(set(SMART_VALUES)   | set(MARG_THRESHOLDS["smart"]))
+
+    bundler_masks = {b: q_mask("bundler", b) for b in all_bundler}
+    sniper_masks  = {s: q_mask("sniper",  s) for s in all_sniper}
+    rug_masks     = {r: q_mask("rug",     r) for r in all_rug}
+    bot_masks     = {b: q_mask("bot",     b) for b in all_bot}
+    top10_masks   = {t: q_mask("top10",   t) for t in all_top10}
+    smart_masks   = {s: smart_mask(s)         for s in all_smart}
+    no_mask       = [True] * N  # "filtro desligado" = aceita todos
 
     tp_sl_masks = {}
     for tp, sl in TP_SL_VALUES:
@@ -31056,8 +31076,61 @@ def analise_quality_grid():
             [r["min_mc"] is not None and r["min_mc"] <= r["entry_mc"] * sl_mult for r in rows],
         )
 
-    # ── Grid search com deduplicação ──────────────────────────────────────────
+    def eval_subset(idx, tp, sl):
+        tp_hits, sl_hits = tp_sl_masks[(tp, sl)]
+        n_tp  = sum(1 for i in idx if tp_hits[i])
+        n_sl  = sum(1 for i in idx if sl_hits[i] and not tp_hits[i])
+        n_dec = n_tp + n_sl
+        if n_dec < MIN_DEC:
+            return None
+        wr = n_tp / n_dec
+        ev = wr * tp - (1 - wr) * sl
+        return n_tp, n_sl, n_dec, wr, ev
+
+    # ── SEÇÃO 1: Curva marginal por filtro ───────────────────────────────────
     t1 = _time.time()
+    MARG_SL = 0.25
+    marg_results = {}  # filtro → lista de (threshold, n, n_dec, n_tp, n_sl, wr, ev)
+
+    # Máscaras "sem filtro" por campo (todos os outros campos sem restrição)
+    def and_masks(*mask_lists):
+        result = [True] * N
+        for ml in mask_lists:
+            for i in range(N):
+                if not ml[i]:
+                    result[i] = False
+        return result
+
+    for fname in ("bundler", "sniper", "rug", "bot", "top10", "smart"):
+        curve = []
+        thresh_list = MARG_THRESHOLDS[fname]
+        for thresh in thresh_list:
+            # Apply ONLY this filter; all others disabled (no_mask)
+            if fname == "bundler":
+                base = bundler_masks[thresh]
+            elif fname == "sniper":
+                base = sniper_masks[thresh]
+            elif fname == "rug":
+                base = rug_masks[thresh]
+            elif fname == "bot":
+                base = bot_masks[thresh]
+            elif fname == "top10":
+                base = top10_masks[thresh]
+            else:  # smart
+                base = smart_masks[thresh]
+
+            idx = tuple(i for i, m in enumerate(base) if m)
+            n = len(idx)
+            if n < MIN_N:
+                res = None
+            else:
+                res = eval_subset(idx, MARG_TP, MARG_SL)
+            curve.append((thresh, n, res))
+        marg_results[fname] = curve
+    t_marg = _time.time() - t1
+
+    # ── SEÇÃO 2: Grid combinado com deduplicação ──────────────────────────────
+    t2 = _time.time()
     seen_subsets = {}
 
     for bundler, sniper, rug, bot, top10, smart in itertools.product(
@@ -31080,21 +31153,17 @@ def analise_quality_grid():
         idx_key = frozenset(idx)
 
         for tp, sl in TP_SL_VALUES:
-            tp_hits, sl_hits = tp_sl_masks[(tp, sl)]
-            n_tp  = sum(1 for i in idx if tp_hits[i])
-            n_sl  = sum(1 for i in idx if sl_hits[i] and not tp_hits[i])
-            n_dec = n_tp + n_sl
-            if n_dec < MIN_DEC:
+            res = eval_subset(idx, tp, sl)
+            if res is None:
                 continue
-            wr = n_tp / n_dec
-            ev = wr * tp - (1 - wr) * sl
+            n_tp, n_sl, n_dec, wr, ev = res
             seen_subsets[(idx_key, tp, sl)] = (
                 ev, wr, n_base, n_dec, n_tp, n_sl,
                 bundler, sniper, rug, bot, top10, smart, tp, sl
             )
 
     results = sorted(seen_subsets.values(), key=lambda x: -x[0])
-    t_py = _time.time() - t1
+    t_grid = _time.time() - t2
 
     total_combos = (len(BUNDLER_VALUES) * len(SNIPER_VALUES) * len(RUG_VALUES)
                     * len(BOT_VALUES) * len(TOP10_VALUES) * len(SMART_VALUES) * len(TP_SL_VALUES))
@@ -31102,8 +31171,10 @@ def analise_quality_grid():
     # ── HTML ──────────────────────────────────────────────────────────────────
     CSS = """<style>
     body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px;font-size:12px}
-    h2{color:#58a6ff}p.sub{color:#8b949e;font-size:11px;margin:2px 0 10px}
-    table{border-collapse:collapse;width:100%;margin-bottom:20px}
+    h2{color:#58a6ff}h3{color:#79c0ff;margin:24px 0 6px}
+    p.sub{color:#8b949e;font-size:11px;margin:2px 0 10px}
+    table{border-collapse:collapse;margin-bottom:20px}
+    .wide{width:100%}
     th{background:#161b22;color:#8b949e;padding:5px 8px;border:1px solid #30363d;text-align:right;font-size:11px}
     th:first-child{text-align:left}
     td{padding:3px 8px;border:1px solid #21262d;text-align:right;font-size:11px;white-space:nowrap}
@@ -31115,6 +31186,13 @@ def analise_quality_grid():
     .note{background:#1a1f2e;padding:8px 12px;border-left:3px solid #388bfd;margin:8px 0;font-size:11px}
     nav a{color:#58a6ff;margin-right:12px;font-size:12px;text-decoration:none}
     a{color:#58a6ff}
+    .marg-tables{display:flex;flex-wrap:wrap;gap:20px;margin-bottom:24px}
+    .marg-block{min-width:260px}
+    .marg-block h4{color:#79c0ff;margin:0 0 4px;font-size:12px}
+    .bar{display:inline-block;background:#388bfd;height:8px;vertical-align:middle;margin-left:4px}
+    .bar-tp{background:#3fb950}.bar-sl{background:#f85149}
+    .dim-label{color:#484f58;font-size:10px}
+    .railway{color:#f0e070;font-weight:bold}
     </style>"""
 
     H = CSS
@@ -31127,63 +31205,127 @@ def analise_quality_grid():
     H += "<h2>🔬 Quality Grid — WR real por threshold de filtro de qualidade</h2>"
 
     data_flag = "✅ dados limpos (pós-phantom-fix)" if since_str >= "2026-05-26" else "⚠️ inclui dados anteriores"
-    H += f"<p class='sub'><strong>{data_flag}</strong> · desde {since_str}</p>"
-    H += f"<p class='sub'>{N} bounces · {total_combos:,} combinações · <strong>{len(results)} subconjuntos únicos</strong> · SQL {t_sql:.1f}s · grid {t_py:.1f}s</p>"
+    H += f"<p class='sub'><strong>{data_flag}</strong> · desde {since_str} · {N} bounces</p>"
 
     H += "<div class='note'>"
     H += f"<b>Config atual do worker (Railway):</b> "
     H += f"bundler≤{cur_bundler:.0%} · sniper≤{cur_sniper:.0%} · rug≤{cur_rug:.0%} · "
     H += f"bot≤{cur_bot:.0%} · top10≤{cur_top10:.0%} · smart≥{cur_smart} "
-    H += f"— linha <span style='color:#58a6ff'>destacada em azul</span> = config equivalente mais próxima."
     H += "<br>NULL em qualidade → passa o filtro (igual ao scanner). "
-    H += "Se a linha atual tem EV menor que linhas com filtros mais relaxados → Railway está restritivo demais.</div>"
+    H += "Linha <span class='railway'>amarela</span> = threshold atual no Railway.</div>"
 
-    H += f"<p><a href='?since=2026-05-26&min_n=5&min_dec=3&top=500'>✅ Limpos ≥26/05</a> | "
-    H += f"<a href='?since=2026-06-01&min_n=5&min_dec=3&top=500'>01/jun</a> | "
-    H += f"<a href='?since={since_str}&min_n={MIN_N}&min_dec={MIN_DEC}&top=9999'>Ver tudo</a></p>"
+    H += f"<p><a href='?since=2026-05-26'>✅ ≥26/mai</a> | "
+    H += f"<a href='?since=2026-06-01'>01/jun</a> | "
+    H += f"<a href='?since={since_str}&tp=0.75'>TP75%</a> | "
+    H += f"<a href='?since={since_str}&tp=1.00'>TP100%</a></p>"
+
+    # ── SEÇÃO 1: Curva marginal ───────────────────────────────────────────────
+    H += f"<h3>📈 Curva marginal por filtro — TP{MARG_TP:.0%}/SL25% · outros filtros desativados</h3>"
+    H += f"<p class='sub'>Para cada filtro, threshold varia de 0→100% enquanto os outros são ignorados. "
+    H += f"Mostra o impacto isolado de cada um. Linha <span class='railway'>amarela</span> = Railway atual.</p>"
+
+    be = MARG_SL / (MARG_TP + MARG_SL)  # break-even WR
+    marg_labels = {
+        "bundler": "bundler ≤",
+        "sniper":  "sniper ≤",
+        "rug":     "rug_ratio ≤",
+        "bot":     "bot_rate ≤",
+        "top10":   "top10 ≤",
+        "smart":   "smart ≥",
+    }
+    railway_val = {
+        "bundler": cur_bundler,
+        "sniper":  cur_sniper,
+        "rug":     cur_rug,
+        "bot":     cur_bot,
+        "top10":   cur_top10,
+        "smart":   cur_smart,
+    }
+
+    H += "<div class='marg-tables'>"
+    for fname, curve in marg_results.items():
+        H += f"<div class='marg-block'>"
+        H += f"<h4>{marg_labels[fname]}</h4>"
+        H += "<table>"
+        H += "<tr><th>thresh</th><th>n</th><th>dec</th><th>TP</th><th>SL</th><th>WR</th><th>EV</th></tr>"
+        prev_n = None
+        for thresh, n, res in curve:
+            is_rw = (thresh == railway_val[fname] or
+                     (fname == "smart" and int(thresh) == int(railway_val[fname])))
+            rw_cls = " class='railway'" if is_rw else ""
+            if res is None:
+                n_tp = n_sl = n_dec = 0
+                wr_s = ev_s = "—"
+                wr_cls_c = ev_cls_c = ""
+            else:
+                n_tp, n_sl, n_dec, wr, ev = res
+                wr_cls_c = "tp" if wr >= be else "sl"
+                ev_cls_c = "pos" if ev > 0 else "neg"
+                wr_s = f"{wr:.1%}"
+                ev_s = f"{ev:+.1%}"
+            delta = ""
+            if prev_n is not None:
+                diff = n - prev_n
+                delta = f" <span class='dim-label'>({diff:+d})</span>"
+            prev_n = n
+            lbl = f"{thresh:.0%}" if fname != "smart" else f"≥{int(thresh)}"
+            H += (f"<tr{rw_cls}>"
+                  f"<td>{lbl}</td>"
+                  f"<td>{n}{delta}</td>"
+                  f"<td>{n_dec if res else '—'}</td>"
+                  f"<td class='tp'>{n_tp if res else '—'}</td>"
+                  f"<td class='sl'>{n_sl if res else '—'}</td>"
+                  f"<td class='{wr_cls_c}'>{wr_s}</td>"
+                  f"<td class='{ev_cls_c}'>{ev_s}</td>"
+                  f"</tr>")
+        H += "</table></div>"
+    H += "</div>"  # marg-tables
+
+    # ── SEÇÃO 2: Grid combinado ───────────────────────────────────────────────
+    H += f"<h3>🔲 Grid combinado — {total_combos:,} combinações · {len(results)} subconjuntos únicos · grid {t_grid:.1f}s</h3>"
+    H += f"<p class='sub'>Cada linha = subconjunto único de tokens (deduplicado). Linha <span style='color:#388bfd'>azul</span> = config Railway equivalente mais próxima.</p>"
 
     if not results:
         H += "<p>Nenhuma combinação com dados suficientes.</p>"
-        return H
+    else:
+        top_rows = results[:TOP]
+        H += f"<p>Mostrando <strong>{min(TOP, len(results))}</strong> de <strong>{len(results)}</strong>, por EV decrescente.</p>"
+        H += "<table class='wide'>"
+        H += ("<tr><th>#</th><th>bundler≤</th><th>sniper≤</th><th>rug≤</th>"
+              "<th>bot≤</th><th>top10≤</th><th>smart≥</th><th>TP/SL</th>"
+              "<th>n</th><th>dec</th><th>TP</th><th>SL</th><th>WR</th><th>EV</th></tr>")
 
-    top_rows = results[:TOP]
-    H += f"<p>Mostrando <strong>{min(TOP, len(results))}</strong> de <strong>{len(results)}</strong>, por EV decrescente.</p>"
-    H += "<table>"
-    H += ("<tr><th>#</th><th>bundler≤</th><th>sniper≤</th><th>rug≤</th>"
-          "<th>bot≤</th><th>top10≤</th><th>smart≥</th><th>TP/SL</th>"
-          "<th>n</th><th>dec</th><th>TP</th><th>SL</th><th>WR</th><th>EV</th></tr>")
+        be_map = {(0.75, 0.25): 0.25 / 1.00, (1.00, 0.25): 0.25 / 1.25}
 
-    be_map = {(0.75, 0.25): 0.25 / 1.00, (1.00, 0.25): 0.25 / 1.25}
+        for rank, r in enumerate(top_rows, 1):
+            ev, wr, n, nd, ntp, nsl, bundler, sniper, rug, bot, top10, smart, tp, sl = r
+            be_v = be_map.get((tp, sl), 0.25)
+            ev_cls  = "pos" if ev > 0 else "neg"
+            wr_cls  = "tp"  if wr >= be_v else ("sl" if wr < be_v * 0.8 else "")
+            row_cls = "hi"  if ev >= 0.20 else ("lo" if ev < 0 else "")
+            is_cur = (bundler == cur_bundler and sniper == cur_sniper and rug == cur_rug
+                      and bot == cur_bot and top10 == cur_top10 and smart == cur_smart)
+            if is_cur:
+                row_cls = "cur"
+            H += (f"<tr class='{row_cls}'>"
+                  f"<td>{rank}</td>"
+                  f"<td>{bundler:.0%}</td>"
+                  f"<td>{sniper:.0%}</td>"
+                  f"<td>{rug:.0%}</td>"
+                  f"<td>{bot:.0%}</td>"
+                  f"<td>{top10:.0%}</td>"
+                  f"<td>≥{smart}</td>"
+                  f"<td>{tp:.0%}/{sl:.0%}</td>"
+                  f"<td>{n}</td><td>{nd}</td>"
+                  f"<td class='tp'>{ntp}</td><td class='sl'>{nsl}</td>"
+                  f"<td class='{wr_cls}'>{wr:.1%}</td>"
+                  f"<td class='{ev_cls}'>{ev:+.1%}</td>"
+                  f"</tr>")
+        H += "</table>"
 
-    for rank, r in enumerate(top_rows, 1):
-        ev, wr, n, nd, ntp, nsl, bundler, sniper, rug, bot, top10, smart, tp, sl = r
-        be = be_map.get((tp, sl), 0.25)
-        ev_cls  = "pos" if ev > 0 else "neg"
-        wr_cls  = "tp"  if wr >= be else ("sl" if wr < be * 0.8 else "")
-        row_cls = "hi"  if ev >= 0.20 else ("lo" if ev < 0 else "")
-        # Highlight row matching current Railway config
-        is_cur = (bundler == cur_bundler and sniper == cur_sniper and rug == cur_rug
-                  and bot == cur_bot and top10 == cur_top10 and smart == cur_smart)
-        if is_cur:
-            row_cls = "cur"
-        H += (f"<tr class='{row_cls}'>"
-              f"<td>{rank}</td>"
-              f"<td>{bundler:.0%}</td>"
-              f"<td>{sniper:.0%}</td>"
-              f"<td>{rug:.0%}</td>"
-              f"<td>{bot:.0%}</td>"
-              f"<td>{top10:.0%}</td>"
-              f"<td>≥{smart}</td>"
-              f"<td>{tp:.0%}/{sl:.0%}</td>"
-              f"<td>{n}</td><td>{nd}</td>"
-              f"<td class='tp'>{ntp}</td><td class='sl'>{nsl}</td>"
-              f"<td class='{wr_cls}'>{wr:.1%}</td>"
-              f"<td class='{ev_cls}'>{ev:+.1%}</td>"
-              f"</tr>")
-    H += "</table>"
     H += "<p class='sub'>entry=mc_at_signal · TP e SL simulados com token_ticks 60min · "
     H += "NULL em métricas de qualidade = passa o filtro (igual ao scanner) · "
-    H += "deduplicado por subconjunto real de tokens</p>"
+    H += f"SQL {t_sql:.1f}s · marginal {t_marg:.1f}s · grid {t_grid:.1f}s</p>"
     return H
 
 
