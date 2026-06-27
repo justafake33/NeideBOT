@@ -43934,103 +43934,201 @@ def debug_trending_tokens():
     F_LIQ    = _wf.get("liq_min",     float(os.getenv("FILTER_LIQ_MIN",    "10000")))
     _thresholds_from = "worker heartbeat" if _wf else "web env vars (worker heartbeat indisponível)"
 
-    def get_block_reasons(r):
-        reasons = []
-        def _f(v): return float(v) if v is not None else None
+    def _f(v): return float(v) if v is not None else None
+
+    def get_blocks(r):
+        """Retorna dict {filtro_key: True} para cada filtro que falhou."""
+        blocks = {}
         rug   = _f(r.get("rug_ratio"))
         bund  = _f(r.get("bundler_rate"))
         bot   = _f(r.get("bot_degen_rate"))
         snip  = _f(r.get("top70_sniper_hold_rate"))
         rat   = _f(r.get("rat_trader_rate"))
         top10 = _f(r.get("top10_holder_rate"))
-        smart = r.get("smart_wallets") or 0
+        smart = int(r.get("smart_wallets") or 0)
         mc    = _f(r.get("mc_migration"))
         liq   = _f(r.get("liq_migration"))
         wash  = r.get("is_wash_trading")
-        if rug  is not None and rug  > F_RUG:   reasons.append(f"rug={rug*100:.0f}%>{F_RUG*100:.0f}%")
-        if bund is not None and bund > F_BUND:  reasons.append(f"bundler={bund*100:.0f}%>{F_BUND*100:.0f}%")
-        if bot  is not None and bot  > F_BOT:   reasons.append(f"bot={bot*100:.0f}%>{F_BOT*100:.0f}%")
-        if snip is not None and snip > F_SNIP:  reasons.append(f"sniper={snip*100:.0f}%>{F_SNIP*100:.0f}%")
-        if rat  is not None and rat  > F_RAT:   reasons.append(f"rat={rat*100:.0f}%>{F_RAT*100:.0f}%")
-        if top10 is not None and top10 > F_TOP10: reasons.append(f"top10={top10*100:.0f}%>{F_TOP10*100:.0f}%")
-        if int(smart) < F_SMART:               reasons.append(f"smart={smart}<{F_SMART}")
-        if mc is not None and mc < F_MC_MIN:   reasons.append(f"mc<{F_MC_MIN:,.0f}")
-        if mc is not None and mc > F_MC_MAX:   reasons.append(f"mc>${F_MC_MAX:,.0f}")
-        if liq is not None and liq < F_LIQ:    reasons.append(f"liq<{F_LIQ:,.0f}")
-        if wash:                                reasons.append("wash=TRUE")
-        return reasons
+        if rug  is not None and rug  > F_RUG:    blocks["rug"]     = f"{rug*100:.0f}%"
+        if bund is not None and bund > F_BUND:   blocks["bundler"] = f"{bund*100:.0f}%"
+        if bot  is not None and bot  > F_BOT:    blocks["bot"]     = f"{bot*100:.0f}%"
+        if snip is not None and snip > F_SNIP:   blocks["sniper"]  = f"{snip*100:.0f}%"
+        if rat  is not None and rat  > F_RAT:    blocks["rat"]     = f"{rat*100:.0f}%"
+        if top10 is not None and top10 > F_TOP10: blocks["top10"]  = f"{top10*100:.0f}%"
+        if smart < F_SMART:                      blocks["smart"]   = str(smart)
+        if mc is not None and mc < F_MC_MIN:     blocks["mc_min"]  = fmt_mc(mc)
+        if mc is not None and mc > F_MC_MAX:     blocks["mc_max"]  = fmt_mc(mc)
+        if liq is not None and liq < F_LIQ:      blocks["liq"]     = fmt_mc(liq)
+        if wash:                                  blocks["wash"]    = "TRUE"
+        return blocks
 
-    rows_html = ""
+    # Enrich rows with block info
     for r in rows:
-        reasons = get_block_reasons(r)
-        block_html = ""
-        if reasons:
-            block_html = '<br><span style="color:#f85149;font-size:11px">' + " · ".join(reasons) + '</span>'
-
-        gmgn_link = f'<a href="https://gmgn.ai/sol/token/{r["mint"]}" target="_blank" style="color:#58a6ff;font-size:11px">GMGN</a>'
-        rows_html += f"""<tr>
-            <td style="white-space:nowrap">{str(r['ts_migration'])[:16]}</td>
-            <td><b>{r['symbol'] or '?'}</b>{block_html}</td>
-            <td>{gmgn_link}</td>
-            <td>{passed_badge(r['passed_filters'])}</td>
-            <td>{fmt_mc(r['mc_migration'])}</td>
-            <td>{fmt_mc(r['liq_migration'])}</td>
-            <td>{fmt_pct(r.get('rug_ratio'))}</td>
-            <td>{fmt_pct(r.get('bundler_rate'))}</td>
-            <td>{fmt_pct(r.get('bot_degen_rate'))}</td>
-            <td>{fmt_pct(r.get('top70_sniper_hold_rate'))}</td>
-            <td>{fmt_pct(r.get('rat_trader_rate'))}</td>
-            <td>{fmt_pct(r.get('top10_holder_rate'))}</td>
-            <td style="text-align:center">{r.get('smart_wallets') or '—'}</td>
-            <td style="text-align:center">{bool_badge(r.get('is_wash_trading'), true_bad=True)}</td>
-            <td>{fmt_delta(r.get('dump_pct'))}</td>
-            <td>{fmt_delta(r.get('bounce_pct'))}</td>
-            <td style="text-align:center">{bool_badge(r.get('bounce_fired'))}</td>
-            <td style="text-align:center">{bool_badge(r.get('trade_executed'))}</td>
-        </tr>"""
+        r["_blocks"] = get_blocks(r)
 
     n_passed  = sum(1 for r in rows if r['passed_filters'])
     n_blocked = sum(1 for r in rows if not r['passed_filters'])
     n_bounce  = sum(1 for r in rows if r['bounce_fired'])
     n_trade   = sum(1 for r in rows if r['trade_executed'])
 
+    def token_row(r, highlight_key=None):
+        sym  = r['symbol'] or '?'
+        mint = r['mint']
+        ts   = str(r['ts_migration'])[:16]
+        dump = fmt_delta(r.get('dump_pct'))
+        bnc  = fmt_delta(r.get('bounce_pct'))
+        bf   = '✓' if r.get('bounce_fired') else '—'
+        bf_c = '#3fb950' if r.get('bounce_fired') else '#666'
+        tr   = '✓' if r.get('trade_executed') else '—'
+        tr_c = '#3fb950' if r.get('trade_executed') else '#666'
+        gmgn = f'<a href="https://gmgn.ai/sol/token/{mint}" target="_blank">GMGN</a>'
+        # other blocks besides the highlighted one
+        blk  = r["_blocks"]
+        others = [f'<span style="color:#d29922">{k}={v}</span>'
+                  for k, v in blk.items() if k != highlight_key]
+        others_html = " · ".join(others) if others else '<span style="color:#484f58">único</span>'
+        # highlight value
+        hi_val = f'<b style="color:#f85149">{blk.get(highlight_key,"")}</b>' if highlight_key else ""
+        return f"""<tr>
+          <td style="white-space:nowrap;color:#8b949e;font-size:11px">{ts}</td>
+          <td><b>{sym}</b></td>
+          <td>{gmgn}</td>
+          <td>{hi_val}</td>
+          <td style="font-size:11px;color:#8b949e">{others_html}</td>
+          <td>{dump}</td>
+          <td>{bnc}</td>
+          <td style="color:{bf_c}">{bf}</td>
+          <td style="color:{tr_c}">{tr}</td>
+        </tr>"""
+
+    def section(title, subtitle, key, token_list, threshold_label):
+        if not token_list:
+            return ""
+        n = len(token_list)
+        n_w_bounce = sum(1 for r in token_list if r.get('bounce_pct') is not None)
+        rows_h = "".join(token_row(r, highlight_key=key) for r in token_list)
+        return f"""
+<div style="margin:24px 0;border:1px solid #30363d;border-radius:8px;overflow:hidden">
+  <div style="background:#161b22;padding:10px 16px;display:flex;align-items:center;gap:16px">
+    <span style="font-size:15px;font-weight:bold;color:#f85149">{title}</span>
+    <span style="background:#3d0000;color:#f85149;border-radius:4px;padding:2px 8px;font-size:12px">{n} tokens</span>
+    <span style="color:#8b949e;font-size:12px">{subtitle}</span>
+    <span style="color:#8b949e;font-size:11px;margin-left:auto">{n_w_bounce} com bounce registrado</span>
+  </div>
+  <table style="border-collapse:collapse;width:100%;font-size:12px">
+    <tr style="background:#0d1117">
+      <th style="padding:5px 8px;color:#8b949e;text-align:left">Data</th>
+      <th style="padding:5px 8px;color:#8b949e;text-align:left">Token</th>
+      <th style="padding:5px 8px;color:#8b949e">GMGN</th>
+      <th style="padding:5px 8px;color:#f85149;text-align:left">{threshold_label}</th>
+      <th style="padding:5px 8px;color:#d29922;text-align:left">Outros filtros</th>
+      <th style="padding:5px 8px;color:#8b949e">Dump</th>
+      <th style="padding:5px 8px;color:#8b949e">Bounce</th>
+      <th style="padding:5px 8px;color:#8b949e">↗</th>
+      <th style="padding:5px 8px;color:#8b949e">Trade</th>
+    </tr>
+    {rows_h}
+  </table>
+</div>"""
+
+    def passed_section(token_list):
+        if not token_list:
+            return ""
+        rows_h = ""
+        for r in token_list:
+            sym  = r['symbol'] or '?'
+            mint = r['mint']
+            ts   = str(r['ts_migration'])[:16]
+            dump = fmt_delta(r.get('dump_pct'))
+            bnc  = fmt_delta(r.get('bounce_pct'))
+            bf   = '✓' if r.get('bounce_fired') else '—'
+            bf_c = '#3fb950' if r.get('bounce_fired') else '#666'
+            tr   = '✓' if r.get('trade_executed') else '—'
+            tr_c = '#3fb950' if r.get('trade_executed') else '#666'
+            gmgn = f'<a href="https://gmgn.ai/sol/token/{mint}" target="_blank" style="color:#58a6ff">GMGN</a>'
+            mc   = fmt_mc(r.get('mc_migration'))
+            liq  = fmt_mc(r.get('liq_migration'))
+            rows_h += f"""<tr style="background:#0d1e0d">
+              <td style="white-space:nowrap;font-size:11px;color:#8b949e">{ts}</td>
+              <td><b style="color:#3fb950">{sym}</b></td>
+              <td>{gmgn}</td>
+              <td>{mc}</td><td>{liq}</td>
+              <td>{fmt_pct(r.get('rug_ratio'))}</td>
+              <td>{fmt_pct(r.get('bundler_rate'))}</td>
+              <td>{fmt_pct(r.get('bot_degen_rate'))}</td>
+              <td>{dump}</td><td>{bnc}</td>
+              <td style="color:{bf_c}">{bf}</td>
+              <td style="color:{tr_c}">{tr}</td>
+            </tr>"""
+        return f"""
+<div style="margin:24px 0;border:1px solid #238636;border-radius:8px;overflow:hidden">
+  <div style="background:#0d2818;padding:10px 16px;display:flex;align-items:center;gap:16px">
+    <span style="font-size:15px;font-weight:bold;color:#3fb950">✅ PASSOU TODOS OS FILTROS</span>
+    <span style="background:#0d2818;color:#3fb950;border:1px solid #238636;border-radius:4px;padding:2px 8px;font-size:12px">{len(token_list)} tokens</span>
+  </div>
+  <table style="border-collapse:collapse;width:100%;font-size:12px">
+    <tr style="background:#0d1117">
+      <th style="padding:5px 8px;color:#8b949e">Data</th><th style="padding:5px 8px;color:#8b949e">Token</th>
+      <th style="padding:5px 8px;color:#8b949e">GMGN</th><th style="padding:5px 8px;color:#8b949e">MC</th>
+      <th style="padding:5px 8px;color:#8b949e">Liq</th><th style="padding:5px 8px;color:#8b949e">Rug</th>
+      <th style="padding:5px 8px;color:#8b949e">Bundler</th><th style="padding:5px 8px;color:#8b949e">Bot</th>
+      <th style="padding:5px 8px;color:#8b949e">Dump</th><th style="padding:5px 8px;color:#8b949e">Bounce</th>
+      <th style="padding:5px 8px;color:#8b949e">↗</th><th style="padding:5px 8px;color:#8b949e">Trade</th>
+    </tr>
+    {rows_h}
+  </table>
+</div>"""
+
+    # Build filter sections
+    cats = [
+        ("bundler", f"🔴 BUNDLER > {F_BUND*100:.0f}%",  f"threshold ≤{F_BUND*100:.0f}%", "bundler"),
+        ("bot",     f"🔴 BOT > {F_BOT*100:.0f}%",       f"threshold ≤{F_BOT*100:.0f}%",  "bot"),
+        ("rug",     f"🔴 RUG > {F_RUG*100:.0f}%",       f"threshold ≤{F_RUG*100:.0f}%",  "rug"),
+        ("sniper",  f"🔴 SNIPER > {F_SNIP*100:.0f}%",   f"threshold ≤{F_SNIP*100:.0f}%", "sniper"),
+        ("top10",   f"🔴 TOP10 > {F_TOP10*100:.0f}%",   f"threshold ≤{F_TOP10*100:.0f}%","top10"),
+        ("rat",     f"🔴 RAT > {F_RAT*100:.0f}%",       f"threshold ≤{F_RAT*100:.0f}%",  "rat"),
+        ("smart",   f"🔴 SMART < {F_SMART}",            f"threshold ≥{F_SMART}",          "smart"),
+        ("liq",     f"🔴 LIQUIDEZ < ${F_LIQ:,.0f}",     f"threshold ≥${F_LIQ:,.0f}",     "liq"),
+        ("wash",    "🔴 WASH TRADING",                   "is_wash_trading=TRUE",           "wash"),
+    ]
+
+    sections_html = passed_section([r for r in rows if r['passed_filters']])
+    for key, title, subtitle, highlight in cats:
+        bucket = [r for r in rows if key in r["_blocks"]]
+        sections_html += section(title, subtitle, highlight, bucket, highlight.upper())
+
+    # Nav links for each section
+    nav_links = "".join(
+        f'<a href="#{key}" style="color:#8b949e;font-size:11px;text-decoration:none;border:1px solid #30363d;padding:3px 8px;border-radius:4px;margin:2px">{key.upper()}</a>'
+        for key, *_ in cats
+    )
+
     html = f"""<!DOCTYPE html><html><head>
 <meta charset="utf-8"><title>Trending Tokens</title>
 <style>
 body{{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:20px}}
-h2{{color:#58a6ff}}
-table{{border-collapse:collapse;width:100%;font-size:12px}}
-th{{background:#161b22;color:#8b949e;padding:6px 8px;text-align:left;white-space:nowrap;position:sticky;top:0}}
-td{{padding:5px 8px;border-bottom:1px solid #21262d;vertical-align:top}}
-tr:hover td{{background:#161b22}}
-.stat{{display:inline-block;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px 20px;margin:8px 4px;text-align:center}}
-.stat .n{{font-size:24px;font-weight:bold;color:#58a6ff}}
-.stat .l{{font-size:11px;color:#8b949e}}
 a{{color:#58a6ff}}
+td{{padding:5px 8px;border-bottom:1px solid #21262d;vertical-align:middle}}
+tr:hover td{{background:#161b22}}
+.stat{{display:inline-block;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px 20px;margin:6px 4px;text-align:center}}
+.stat .n{{font-size:24px;font-weight:bold}}
+.stat .l{{font-size:11px;color:#8b949e}}
 </style></head><body>
-<h2>🔥 Tokens Trending na Migração — últimos {days} dias</h2>
-<div>
-  <span class="stat"><div class="n">{len(rows)}</div><div class="l">total trending</div></span>
+<h2 style="color:#58a6ff;margin-bottom:12px">🔥 Tokens Trending na Migração — últimos {days} dias</h2>
+<div style="margin-bottom:12px">
+  <span class="stat"><div class="n" style="color:#58a6ff">{len(rows)}</div><div class="l">total trending</div></span>
   <span class="stat"><div class="n" style="color:#3fb950">{n_passed}</div><div class="l">passou filtros</div></span>
   <span class="stat"><div class="n" style="color:#f85149">{n_blocked}</div><div class="l">bloqueados</div></span>
   <span class="stat"><div class="n">{n_bounce}</div><div class="l">bounce detectado</div></span>
   <span class="stat"><div class="n">{n_trade}</div><div class="l">trade executado</div></span>
 </div>
-<p style="color:#8b949e;font-size:12px">
-  Filtros do <b style="color:#58a6ff">{_thresholds_from}</b>:
-  rug≤{F_RUG*100:.0f}% · bundler≤{F_BUND*100:.0f}% · bot≤{F_BOT*100:.0f}% · sniper≤{F_SNIP*100:.0f}% · rat≤{F_RAT*100:.0f}% · top10≤{F_TOP10*100:.0f}% · smart≥{F_SMART} · MC ${F_MC_MIN:,.0f}–${F_MC_MAX:,.0f} · liq≥${F_LIQ:,.0f}
+<p style="color:#8b949e;font-size:12px;margin-bottom:8px">
+  Fonte dos filtros: <b style="color:#58a6ff">{_thresholds_from}</b> ·
+  rug≤{F_RUG*100:.0f}% · bundler≤{F_BUND*100:.0f}% · bot≤{F_BOT*100:.0f}% · sniper≤{F_SNIP*100:.0f}% · rat≤{F_RAT*100:.0f}% · top10≤{F_TOP10*100:.0f}% · smart≥{F_SMART} · liq≥${F_LIQ:,.0f}
 </p>
-<table>
-<tr>
-  <th>Data</th><th>Token</th><th>GMGN</th><th>Filtro</th>
-  <th>MC migr.</th><th>Liq</th>
-  <th>Rug</th><th>Bundler</th><th>Bot</th><th>Sniper</th><th>Rat</th><th>Top10</th><th>Smart</th><th>Wash</th>
-  <th>Dump</th><th>Bounce</th>
-  <th>Bounce?</th><th>Trade?</th>
-</tr>
-{rows_html}
-</table>
-<p style="color:#666;font-size:11px;margin-top:16px">?days=N para alterar período</p>
+<div style="margin-bottom:20px">{nav_links}</div>
+{sections_html}
+<p style="color:#666;font-size:11px;margin-top:24px">?days=N para alterar período · um token pode aparecer em múltiplos filtros</p>
 </body></html>"""
     return html
 
