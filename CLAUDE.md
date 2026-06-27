@@ -332,7 +332,7 @@ WR: **29%** (9 TPs / 22 SLs) confirmado GMGN · Net P/L: **+$0.12** · Payoff 2.
 | H24 | Seller exhaustion (top-3 > 70% dump_vol) → WR maior | ⏳ | PENDENTE — hipótese central pós H21 |
 | H25 | Pool depth < 20 SOL → SL é ruído de AMM | 🟡 | pool>90 SOL NÃO é sinal positivo (WR=17.5% em decision_entry). Pool<10 SOL = ruído = C3 válido. |
 | H26 | Buy concentration (largest_buy/buy_vol) alta → WR maior | ⏳ | PENDENTE CORRELAÇÃO — campo calculável dos dados existentes |
-| H27 | trending_at_migration=TRUE → recovery ≥15pp maior | ⏳ | DATA COLLECTION — coleta iniciada 2026-06-26 via /v1/market/rank pump.fun 5m no momento da migração |
+| H27 | trending_at_migration=TRUE → recovery ≥15pp maior | ⏳ | DATA COLLECTION — coleta iniciada 2026-06-26 via /v1/market/rank pump.fun 1m no momento da migração |
 | H28 | time_to_migrate_sec < 60 → manipulação ou runner absoluto (WR diferente) | ⏳ | DATA COLLECTION — campo complete_cost_time já em migrations, propagado para bounce_signals |
 
 ---
@@ -554,7 +554,7 @@ RETENTION_DRY_RUN=true       # simular sem deletar
 | `/debug/h23-wr` | H23 WR por faixa de net_sol_flow. `?since=2026-05-26` para dados limpos. |
 | `/debug/sell-exhaustion` | Sell exhaustion detector — ratio sell_5s/sell_5_15s por token |
 | `/debug/test-swap` | Teste manual de swap. `?mint=<mint>&amount=<usd>`. Com TRADING_ENABLED=false simula. |
-| `/analise/migration-quality` | H27/H28 — trending_at_migration (pump.fun 5m) + velocidade de migração vs rec75. `?since=YYYY-MM-DD&min_ticks=N` |
+| `/analise/migration-quality` | H27/H28 — trending_at_migration (pump.fun 1m) + velocidade de migração vs rec75. `?since=YYYY-MM-DD&min_ticks=N` |
 | `/export/csv` | Export completo do banco |
 | `/health` | Health check |
 
