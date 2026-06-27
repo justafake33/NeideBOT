@@ -120,6 +120,18 @@ def _heartbeat_loop():
                     "git_sha": git_sha,
                     "run_bot_services": os.getenv("RUN_BOT_SERVICES", "1"),
                     "scanner_stats": scanner_stats,
+                    "filters": {
+                        "rug_max":     float(os.getenv("FILTER_RUG_MAX",     "0.15")),
+                        "bundler_max": float(os.getenv("FILTER_BUNDLER_MAX", "0.20")),
+                        "bot_max":     float(os.getenv("FILTER_BOT_MAX",     "0.60")),
+                        "sniper_max":  float(os.getenv("FILTER_SNIPER_MAX",  "0.10")),
+                        "rat_max":     float(os.getenv("FILTER_RAT_MAX",     "0.20")),
+                        "top10_max":   float(os.getenv("FILTER_TOP10_MAX",   "0.70")),
+                        "smart_min":   int(os.getenv("FILTER_SMART_MIN",     "1")),
+                        "mc_min":      float(os.getenv("FILTER_MC_MIN",      "5000")),
+                        "mc_max":      float(os.getenv("FILTER_MC_MAX",      "85000")),
+                        "liq_min":     float(os.getenv("FILTER_LIQ_MIN",     "10000")),
+                    },
                 },
                 ws_health=ws_health_snapshot,
             )
