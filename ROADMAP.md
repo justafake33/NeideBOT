@@ -1,6 +1,6 @@
 # NeideBOT — Roadmap
 
-**Atualizado:** 2026-06-26 (sessão 23)
+**Atualizado:** 2026-06-27 (sessão 24)
 **Estado:** Bot ATIVO · `TRADING_ENABLED=true` · branch ativo: `claude/magical-cerf-3wjq5o` · **Modo Helius** (erpc desativado — 0 créditos)
 **Infra Railway:** ~$6/mês (welcoming-miracle + intelligent-spirit PostgreSQL) · Solo desde 2026-06-22
 
@@ -38,6 +38,9 @@
 | Priority lane swap + GMGN_SCANNER_API_KEY | 2026-06-12 | swap/query_order bypass global ban · scanner com key dedicada independente |
 | Análise PRÉ+RISE via token_ticks (n=61) | 2026-06-12 | RISE net<0 → rec75=9%, sl25=91% · RISE gate implementado (RISE_NET_MIN=0) |
 | erpc 401 → Helius fallback | 2026-06-22 | 0 créditos erpc · WS_RPC_URL adicionada · custos ~$80→~$6/mês · sócio saiu |
+| H9 anticorrelado confirmado | 2026-06-27 | n=128 bounces: com H9 WR 6.7%, sem H9 WR 26.7%. H9 prediz FALHA. Descartado como gate positivo. |
+| quality-grid + curvas marginais | 2026-06-27 | Teto WR ~25.3% independente de combinação de filtros. Bundler≤20% = WR 11.1% (pior ponto). Recomendado: 50%. |
+| H27 edge preliminar detectado | 2026-06-27 | trending=TRUE: WR 30.3%, EV +5.3%. TP50 ótimo: WR 50%, EV +12.5%. mig<60s = WR 0%. n=46, 2 dias. |
 
 > ⚠️ **WR REAL (2026-05-14):** banco tinha dados fictícios — TradeMonitor inferia saídas de MC snapshots, não blockchain. Auditoria: WR real = **10.1%** (14/139). `/debug/sell-recovery` aplicado.
 > ⚠️ **DADOS HISTÓRICOS SUSPEITOS:** mc_min de tokens antes do fix (elapsed_sec < 90) corrompido pelo candle de transição bonding curve→pool. Análises de bounce_pct/drop histórico devem ser tratadas com cautela.
@@ -135,7 +138,7 @@ Com n<200, qualquer bucket tem <50 amostras — ruído, não sinal. Prioridade: 
 
 Auditoria manual n=15: 10/15 precisos (≤3%), 3/15 learning window (tradeoff intencional), 2/15 phantoms corrigidos (MILLION, Multipad — bug ALT tx). `mc_min_true` preenchido async via `helius_rpc.get_pool_bottom()`. `bottom_error_pct` e `bottom_quality` persistidos em `migrations`.
 
-### H27/H28 — Qualidade da migração ← DATA COLLECTION (iniciado 2026-06-26)
+### H27/H28 — Trending + Velocidade de Migração ← RESULTADOS PRELIMINARES (2026-06-27)
 
 **H27:** Token estava em trending do Pump.fun (1min) no momento da migração → rec75 ≥15pp maior?
 **H28:** Migração em <60s → manipulação ou runner absoluto → WR diferente?
@@ -144,14 +147,30 @@ Auditoria manual n=15: 10/15 precisos (≤3%), 3/15 learning window (tradeoff in
 - `trending_at_migration`: `/v1/market/rank` com `platform=Pump.fun, interval=1m` chamado NO MOMENTO da migração. Pump.fun 1min captura tokens com hype imediato — momentum dos últimos 60s antes de migrar. Propagado para `bounce_signals.trending_at_bounce`.
 - `time_to_migrate_sec`: campo `complete_cost_time` do trenches. Já em `migrations`. Propagado para `bounce_signals.time_to_migrate_sec` e HotMonitor state.
 
-**Endpoint de análise:** `/analise/migration-quality` — rec75 por trending TRUE/FALSE/NULL + buckets de velocidade.
+**Resultados H27 (sessão 24, n=46 bounces trending, apenas 2 dias de dados):**
+- trending=TRUE: **WR 30.3%**, EV +5.3% (TP75/SL25). trending=FALSE: WR 22.2%, EV -0.3%.
+- TP50/SL25 ótimo para trending: **WR 50%**, EV +12.5% (break-even=33.3%)
+- Dimensões internas (dentro de trending=TRUE):
+  - mig<60s → **WR 0%** (n=7, runners manipulados) ← BLOQUEAR
+  - mig 300-900s → **WR 60%** (n=8) ← SWEET SPOT
+  - smart≥1+trending → WR 33.3%, EV +8.3%
+  - smart≥3+trending → **WR 60%** (n=7)
+  - elapsed<5min → WR 34.5%, EV +9.4%
+  - elapsed<10min → WR 33.3%, EV +8.3%
+- **Best combo**: trending + smart≥1 + elapsed<10min → **WR 38.9%**, EV +13.9% (n=22)
+- Cobertura: 13% das migrações (87% NULL — campo só coleta desde 2026-06-26)
 
-**Gate para decisão:** n≥30 bounces com `trending_at_migration IS NOT NULL` por grupo. Enquanto n insuficiente: apenas coleta, sem gate ativo.
+**Resultados H28 (dentro de trending=TRUE):** mig<60s = WR 0%, mig 300-900s = WR 60%.
 
-**Ação potencial (pós-gate):**
-- Se H27 confirmar: adicionar `trending_at_migration=TRUE` como filtro de qualidade extra (ou peso positivo no sinal).
-- Se H28 confirmar que <60s = runners (WR muito maior): priorizar esses tokens.
-- Se H28 confirmar que <60s = manipulação (WR menor): adicionar filtro `MIN_MIGRATE_SEC=60`.
+**Endpoint de análise:** `/analise/migration-quality` + `/analise/trending-deep`
+
+**Gate para decisão:** n≥100 bounces trending (≈2 semanas de coleta, estimativa ~10 bounces trending/dia).
+
+**Ação planejada (quando n≥100):**
+- Ativar gate `trending_at_migration=TRUE` + `time_to_migrate_sec≥60` como filtro de entrada
+- Mudar TP para 50% (ao invés de 75%) para tokens trending → EV maior
+- Recalibrar `FILTER_BUNDLER_MAX` de 20% → 50% (quality-grid confirma: 20% = WR 11.1%, 50% = WR ~22%)
+- NÃO ativar H9 como gate negativo ainda (investigar mais)
 
 ### Fase 1 — ENTRY_MAX_BOUNCE_PCT ← PRÓXIMO CÓDIGO
 
