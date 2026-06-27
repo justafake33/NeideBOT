@@ -31045,7 +31045,7 @@ def _analise_h9_gate_inner():
             LEFT JOIN migrations m ON m.mint = bs.mint
             WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
               AND bs.ts_signal >= %(since)s::timestamptz
-            GROUP BY bs.mint, bs.mc_at_signal, bs.elapsed_sec, bs.bounce_pct,
+            GROUP BY bs.mint, bs.ts_signal, bs.mc_at_signal, bs.elapsed_sec, bs.bounce_pct,
                      m.trending_at_migration, m.mc_migration
             HAVING COUNT(tt.id) >= %(min_ticks)s
         )
