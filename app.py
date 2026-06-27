@@ -43824,6 +43824,196 @@ a{{color:#0060df}}
     return render_template_string(html)
 
 
+@app.route("/debug/trending-tokens")
+def debug_trending_tokens():
+    """Tokens com trending_at_migration=TRUE — métricas de filtro e outcome."""
+    import psycopg2, psycopg2.extras
+    days = int(request.args.get("days", 14))
+    conn = psycopg2.connect(db.DATABASE_URL)
+    conn.autocommit = True
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT
+                    m.token_nome      AS symbol,
+                    m.mint,
+                    m.ts_migration,
+                    m.passed_filters,
+                    m.mc_migration,
+                    m.liq_migration,
+                    m.rug_ratio,
+                    m.top10_holder_rate,
+                    m.smart_wallets,
+                    m.is_wash_trading,
+                    m.creator_token_status,
+                    m.creator_balance_rate,
+                    m.time_to_migrate_sec,
+                    m.exchange,
+                    -- quality fields
+                    (SELECT bundler_trader_amount_rate FROM migrations WHERE mint = m.mint LIMIT 1) AS bundler_rate,
+                    m.rat_trader_amount_rate,
+                    m.bot_degen_rate,
+                    m.top70_sniper_hold_rate,
+                    -- outcome
+                    m.mc_bottom,
+                    m.mc_peak,
+                    m.mc_1h,
+                    CASE WHEN m.mc_bottom > 0 AND m.mc_migration > 0
+                         THEN ROUND(((m.mc_bottom - m.mc_migration) / m.mc_migration * 100)::numeric, 1)
+                    END AS dump_pct,
+                    CASE WHEN m.mc_peak > 0 AND m.mc_bottom > 0
+                         THEN ROUND(((m.mc_peak - m.mc_bottom) / m.mc_bottom * 100)::numeric, 1)
+                    END AS bounce_pct,
+                    -- bounce fired?
+                    EXISTS(SELECT 1 FROM bounce_signals bs WHERE bs.mint = m.mint) AS bounce_fired,
+                    -- trade executed?
+                    EXISTS(SELECT 1 FROM trades t WHERE t.mint = m.mint) AS trade_executed
+                FROM migrations m
+                WHERE m.trending_at_migration = TRUE
+                  AND m.ts_migration >= NOW() - (%(days)s || ' days')::interval
+                ORDER BY m.ts_migration DESC
+            """, {"days": days})
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    def fmt_mc(v):
+        if v is None: return "—"
+        return f"${float(v):,.0f}"
+
+    def fmt_pct(v):
+        if v is None: return "—"
+        try: return f"{float(v)*100:.1f}%"
+        except: return str(v)
+
+    def fmt_delta(v):
+        if v is None: return "—"
+        try:
+            val = float(v)
+            color = "#3fb950" if val > 0 else "#f85149"
+            return f'<span style="color:{color}">{val:+.1f}%</span>'
+        except: return str(v)
+
+    def passed_badge(v):
+        if v is True:  return '<span style="color:#3fb950;font-weight:bold">✅</span>'
+        if v is False: return '<span style="color:#f85149">✗</span>'
+        return '—'
+
+    def bool_badge(v, true_bad=False):
+        if v is None: return '—'
+        if v:
+            color = "#f85149" if true_bad else "#3fb950"
+            return f'<span style="color:{color}">✓</span>'
+        return '<span style="color:#666">—</span>'
+
+    # Identify which filter is blocking each token
+    F_RUG    = float(os.getenv("FILTER_RUG_MAX",    "0.15"))
+    F_BUND   = float(os.getenv("FILTER_BUNDLER_MAX","0.20"))
+    F_BOT    = float(os.getenv("FILTER_BOT_MAX",    "0.60"))
+    F_SNIP   = float(os.getenv("FILTER_SNIPER_MAX", "0.10"))
+    F_RAT    = float(os.getenv("FILTER_RAT_MAX",    "0.20"))
+    F_TOP10  = float(os.getenv("FILTER_TOP10_MAX",  "0.70"))
+    F_SMART  = int(os.getenv("FILTER_SMART_MIN",    "1"))
+    F_MC_MIN = float(os.getenv("FILTER_MC_MIN",     "5000"))
+    F_MC_MAX = float(os.getenv("FILTER_MC_MAX",     "85000"))
+    F_LIQ    = float(os.getenv("FILTER_LIQ_MIN",    "10000"))
+
+    def get_block_reasons(r):
+        reasons = []
+        def _f(v): return float(v) if v is not None else None
+        rug   = _f(r.get("rug_ratio"))
+        bund  = _f(r.get("bundler_rate"))
+        bot   = _f(r.get("bot_degen_rate"))
+        snip  = _f(r.get("top70_sniper_hold_rate"))
+        rat   = _f(r.get("rat_trader_amount_rate"))
+        top10 = _f(r.get("top10_holder_rate"))
+        smart = r.get("smart_wallets") or 0
+        mc    = _f(r.get("mc_migration"))
+        liq   = _f(r.get("liq_migration"))
+        wash  = r.get("is_wash_trading")
+        if rug  is not None and rug  > F_RUG:   reasons.append(f"rug={rug*100:.0f}%>{F_RUG*100:.0f}%")
+        if bund is not None and bund > F_BUND:  reasons.append(f"bundler={bund*100:.0f}%>{F_BUND*100:.0f}%")
+        if bot  is not None and bot  > F_BOT:   reasons.append(f"bot={bot*100:.0f}%>{F_BOT*100:.0f}%")
+        if snip is not None and snip > F_SNIP:  reasons.append(f"sniper={snip*100:.0f}%>{F_SNIP*100:.0f}%")
+        if rat  is not None and rat  > F_RAT:   reasons.append(f"rat={rat*100:.0f}%>{F_RAT*100:.0f}%")
+        if top10 is not None and top10 > F_TOP10: reasons.append(f"top10={top10*100:.0f}%>{F_TOP10*100:.0f}%")
+        if int(smart) < F_SMART:               reasons.append(f"smart={smart}<{F_SMART}")
+        if mc is not None and mc < F_MC_MIN:   reasons.append(f"mc<{F_MC_MIN:,.0f}")
+        if mc is not None and mc > F_MC_MAX:   reasons.append(f"mc>${F_MC_MAX:,.0f}")
+        if liq is not None and liq < F_LIQ:    reasons.append(f"liq<{F_LIQ:,.0f}")
+        if wash:                                reasons.append("wash=TRUE")
+        return reasons
+
+    rows_html = ""
+    for r in rows:
+        reasons = get_block_reasons(r)
+        block_html = ""
+        if reasons:
+            block_html = '<br><span style="color:#f85149;font-size:11px">' + " · ".join(reasons) + '</span>'
+
+        rows_html += f"""<tr>
+            <td style="white-space:nowrap">{str(r['ts_migration'])[:16]}</td>
+            <td><b>{r['symbol'] or '?'}</b>{block_html}</td>
+            <td>{passed_badge(r['passed_filters'])}</td>
+            <td>{fmt_mc(r['mc_migration'])}</td>
+            <td>{fmt_mc(r['liq_migration'])}</td>
+            <td>{fmt_pct(r.get('rug_ratio'))}</td>
+            <td>{fmt_pct(r.get('bundler_rate'))}</td>
+            <td>{fmt_pct(r.get('bot_degen_rate'))}</td>
+            <td>{fmt_pct(r.get('top70_sniper_hold_rate'))}</td>
+            <td>{fmt_pct(r.get('rat_trader_amount_rate'))}</td>
+            <td>{fmt_pct(r.get('top10_holder_rate'))}</td>
+            <td style="text-align:center">{r.get('smart_wallets') or '—'}</td>
+            <td style="text-align:center">{bool_badge(r.get('is_wash_trading'), true_bad=True)}</td>
+            <td>{fmt_delta(r.get('dump_pct'))}</td>
+            <td>{fmt_delta(r.get('bounce_pct'))}</td>
+            <td style="text-align:center">{bool_badge(r.get('bounce_fired'))}</td>
+            <td style="text-align:center">{bool_badge(r.get('trade_executed'))}</td>
+        </tr>"""
+
+    n_passed  = sum(1 for r in rows if r['passed_filters'])
+    n_blocked = sum(1 for r in rows if not r['passed_filters'])
+    n_bounce  = sum(1 for r in rows if r['bounce_fired'])
+    n_trade   = sum(1 for r in rows if r['trade_executed'])
+
+    html = f"""<!DOCTYPE html><html><head>
+<meta charset="utf-8"><title>Trending Tokens</title>
+<style>
+body{{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:20px}}
+h2{{color:#58a6ff}}
+table{{border-collapse:collapse;width:100%;font-size:12px}}
+th{{background:#161b22;color:#8b949e;padding:6px 8px;text-align:left;white-space:nowrap;position:sticky;top:0}}
+td{{padding:5px 8px;border-bottom:1px solid #21262d;vertical-align:top}}
+tr:hover td{{background:#161b22}}
+.stat{{display:inline-block;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px 20px;margin:8px 4px;text-align:center}}
+.stat .n{{font-size:24px;font-weight:bold;color:#58a6ff}}
+.stat .l{{font-size:11px;color:#8b949e}}
+a{{color:#58a6ff}}
+</style></head><body>
+<h2>🔥 Tokens Trending na Migração — últimos {days} dias</h2>
+<div>
+  <span class="stat"><div class="n">{len(rows)}</div><div class="l">total trending</div></span>
+  <span class="stat"><div class="n" style="color:#3fb950">{n_passed}</div><div class="l">passou filtros</div></span>
+  <span class="stat"><div class="n" style="color:#f85149">{n_blocked}</div><div class="l">bloqueados</div></span>
+  <span class="stat"><div class="n">{n_bounce}</div><div class="l">bounce detectado</div></span>
+  <span class="stat"><div class="n">{n_trade}</div><div class="l">trade executado</div></span>
+</div>
+<p style="color:#8b949e;font-size:12px">Filtros ativos: rug≤{F_RUG*100:.0f}% · bundler≤{F_BUND*100:.0f}% · bot≤{F_BOT*100:.0f}% · sniper≤{F_SNIP*100:.0f}% · rat≤{F_RAT*100:.0f}% · top10≤{F_TOP10*100:.0f}% · smart≥{F_SMART} · MC ${F_MC_MIN:,.0f}–${F_MC_MAX:,.0f} · liq≥${F_LIQ:,.0f}</p>
+<table>
+<tr>
+  <th>Data</th><th>Token</th><th>Filtro</th>
+  <th>MC migr.</th><th>Liq</th>
+  <th>Rug</th><th>Bundler</th><th>Bot</th><th>Sniper</th><th>Rat</th><th>Top10</th><th>Smart</th><th>Wash</th>
+  <th>Dump</th><th>Bounce</th>
+  <th>Bounce?</th><th>Trade?</th>
+</tr>
+{rows_html}
+</table>
+<p style="color:#666;font-size:11px;margin-top:16px">?days=N para alterar período</p>
+</body></html>"""
+    return html
+
+
 @app.route("/debug/sell-exhaustion")
 def debug_sell_exhaustion():
     """Visualiza candidatos de sell exhaustion acumulados."""
