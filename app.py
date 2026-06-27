@@ -43850,8 +43850,8 @@ def debug_trending_tokens():
                     m.time_to_migrate_sec,
                     m.exchange,
                     -- quality fields
-                    (SELECT bundler_trader_amount_rate FROM migrations WHERE mint = m.mint LIMIT 1) AS bundler_rate,
-                    m.rat_trader_amount_rate,
+                    m.bundler_trader_amount_rate AS bundler_rate,
+                    m.rat_trader_rate,
                     m.bot_degen_rate,
                     m.top70_sniper_hold_rate,
                     -- outcome
@@ -43925,7 +43925,7 @@ def debug_trending_tokens():
         bund  = _f(r.get("bundler_rate"))
         bot   = _f(r.get("bot_degen_rate"))
         snip  = _f(r.get("top70_sniper_hold_rate"))
-        rat   = _f(r.get("rat_trader_amount_rate"))
+        rat   = _f(r.get("rat_trader_rate"))
         top10 = _f(r.get("top10_holder_rate"))
         smart = r.get("smart_wallets") or 0
         mc    = _f(r.get("mc_migration"))
@@ -43961,7 +43961,7 @@ def debug_trending_tokens():
             <td>{fmt_pct(r.get('bundler_rate'))}</td>
             <td>{fmt_pct(r.get('bot_degen_rate'))}</td>
             <td>{fmt_pct(r.get('top70_sniper_hold_rate'))}</td>
-            <td>{fmt_pct(r.get('rat_trader_amount_rate'))}</td>
+            <td>{fmt_pct(r.get('rat_trader_rate'))}</td>
             <td>{fmt_pct(r.get('top10_holder_rate'))}</td>
             <td style="text-align:center">{r.get('smart_wallets') or '—'}</td>
             <td style="text-align:center">{bool_badge(r.get('is_wash_trading'), true_bad=True)}</td>
