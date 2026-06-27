@@ -43861,9 +43861,9 @@ def debug_trending_tokens():
                     CASE WHEN m.mc_bottom > 0 AND m.mc_migration > 0
                          THEN ROUND(((m.mc_bottom - m.mc_migration) / m.mc_migration * 100)::numeric, 1)
                     END AS dump_pct,
-                    CASE WHEN m.mc_peak > 0 AND m.mc_bottom > 0
-                         THEN ROUND(((m.mc_peak - m.mc_bottom) / m.mc_bottom * 100)::numeric, 1)
-                    END AS bounce_pct,
+                    CASE WHEN m.mc_peak > 0 AND m.mc_migration > 0
+                         THEN ROUND(((m.mc_peak - m.mc_migration) / m.mc_migration * 100)::numeric, 1)
+                    END AS gain_pct,
                     -- bounce fired?
                     EXISTS(SELECT 1 FROM bounce_signals bs WHERE bs.mint = m.mint) AS bounce_fired,
                     -- trade executed?
@@ -43976,7 +43976,7 @@ def debug_trending_tokens():
         mint = r['mint']
         ts   = str(r['ts_migration'])[:16]
         dump = fmt_delta(r.get('dump_pct'))
-        bnc  = fmt_delta(r.get('bounce_pct'))
+        gain = fmt_delta(r.get('gain_pct'))
         bf   = '✓' if r.get('bounce_fired') else '—'
         bf_c = '#3fb950' if r.get('bounce_fired') else '#666'
         tr   = '✓' if r.get('trade_executed') else '—'
@@ -43996,7 +43996,7 @@ def debug_trending_tokens():
           <td>{hi_val}</td>
           <td style="font-size:11px;color:#8b949e">{others_html}</td>
           <td>{dump}</td>
-          <td>{bnc}</td>
+          <td>{gain}</td>
           <td style="color:{bf_c}">{bf}</td>
           <td style="color:{tr_c}">{tr}</td>
         </tr>"""
@@ -44005,7 +44005,7 @@ def debug_trending_tokens():
         if not token_list:
             return ""
         n = len(token_list)
-        n_w_bounce = sum(1 for r in token_list if r.get('bounce_pct') is not None)
+        n_w_bounce = sum(1 for r in token_list if r.get('gain_pct') is not None)
         rows_h = "".join(token_row(r, highlight_key=key) for r in token_list)
         return f"""
 <div style="margin:24px 0;border:1px solid #30363d;border-radius:8px;overflow:hidden">
@@ -44023,7 +44023,7 @@ def debug_trending_tokens():
       <th style="padding:5px 8px;color:#f85149;text-align:left">{threshold_label}</th>
       <th style="padding:5px 8px;color:#d29922;text-align:left">Outros filtros</th>
       <th style="padding:5px 8px;color:#8b949e">Dump</th>
-      <th style="padding:5px 8px;color:#8b949e">Bounce</th>
+      <th style="padding:5px 8px;color:#8b949e">Gain migr→peak</th>
       <th style="padding:5px 8px;color:#8b949e">↗</th>
       <th style="padding:5px 8px;color:#8b949e">Trade</th>
     </tr>
@@ -44040,7 +44040,7 @@ def debug_trending_tokens():
             mint = r['mint']
             ts   = str(r['ts_migration'])[:16]
             dump = fmt_delta(r.get('dump_pct'))
-            bnc  = fmt_delta(r.get('bounce_pct'))
+            gain = fmt_delta(r.get('gain_pct'))
             bf   = '✓' if r.get('bounce_fired') else '—'
             bf_c = '#3fb950' if r.get('bounce_fired') else '#666'
             tr   = '✓' if r.get('trade_executed') else '—'
@@ -44056,7 +44056,7 @@ def debug_trending_tokens():
               <td>{fmt_pct(r.get('rug_ratio'))}</td>
               <td>{fmt_pct(r.get('bundler_rate'))}</td>
               <td>{fmt_pct(r.get('bot_degen_rate'))}</td>
-              <td>{dump}</td><td>{bnc}</td>
+              <td>{dump}</td><td>{gain}</td>
               <td style="color:{bf_c}">{bf}</td>
               <td style="color:{tr_c}">{tr}</td>
             </tr>"""
@@ -44069,10 +44069,10 @@ def debug_trending_tokens():
   <table style="border-collapse:collapse;width:100%;font-size:12px">
     <tr style="background:#0d1117">
       <th style="padding:5px 8px;color:#8b949e">Data</th><th style="padding:5px 8px;color:#8b949e">Token</th>
-      <th style="padding:5px 8px;color:#8b949e">GMGN</th><th style="padding:5px 8px;color:#8b949e">MC</th>
+      <th style="padding:5px 8px;color:#8b949e">GMGN</th><th style="padding:5px 8px;color:#8b949e">MC migr.</th>
       <th style="padding:5px 8px;color:#8b949e">Liq</th><th style="padding:5px 8px;color:#8b949e">Rug</th>
       <th style="padding:5px 8px;color:#8b949e">Bundler</th><th style="padding:5px 8px;color:#8b949e">Bot</th>
-      <th style="padding:5px 8px;color:#8b949e">Dump</th><th style="padding:5px 8px;color:#8b949e">Bounce</th>
+      <th style="padding:5px 8px;color:#8b949e">Dump</th><th style="padding:5px 8px;color:#8b949e">Gain migr→peak</th>
       <th style="padding:5px 8px;color:#8b949e">↗</th><th style="padding:5px 8px;color:#8b949e">Trade</th>
     </tr>
     {rows_h}
