@@ -1486,12 +1486,23 @@ class Scanner:
         trending_mints: set = set()
         new_completed = [t for t in completed_list
                          if t.get("address") and t["address"] not in self._seen]
+        # trending_rank_map: mint → {hot_level, visiting_count} para tokens em trending
+        trending_rank_map: dict = {}
         if new_completed:
             try:
                 rank_list = self.gmgn.get_market_trending(
                     interval="1m", limit=100, platforms=["Pump.fun"]
                 )
-                trending_mints = {t.get("address") or t.get("mint") for t in rank_list if t}
+                for t in rank_list:
+                    if not t:
+                        continue
+                    addr = t.get("address") or t.get("mint")
+                    if addr:
+                        trending_rank_map[addr] = {
+                            "hot_level":      t.get("hot_level"),
+                            "visiting_count": t.get("visiting_count"),
+                        }
+                trending_mints = set(trending_rank_map.keys())
             except Exception as e:
                 logger.debug("trending tick check: %s", e)
 
@@ -1506,7 +1517,7 @@ class Scanner:
                 if mint and mc:
                     self.hot.push_mc(mint, mc, token)
             else:
-                self._safe(self._handle_completed, token, trending_mints)
+                self._safe(self._handle_completed, token, trending_mints, trending_rank_map)
                 if mint and mc and F_MC_MIN <= mc <= F_MC_MAX:
                     self.hot.push_mc(mint, mc, token)
 
@@ -1653,7 +1664,7 @@ class Scanner:
     # Migração — MC e qualidade do trenches, zero chamadas de API
     # --------------------------------------------------------------------------
 
-    def _handle_completed(self, token: dict, trending_mints: set = None):
+    def _handle_completed(self, token: dict, trending_mints: set = None, trending_rank_map: dict = None):
         mint = token.get("address")
         if not mint:
             return
@@ -1794,6 +1805,7 @@ class Scanner:
             "cto_flag":               bool(token.get("cto_flag")) if token.get("cto_flag") is not None else None,
             "has_social":             bool(token.get("has_at_least_one_social")) if token.get("has_at_least_one_social") is not None else None,
             "x_follower_count":       _int(token.get("x_user_follower")),
+            "tg_call_count":          _int(token.get("tg_call_count")),
             # Campos antes descartados — agora salvos
             "exchange":               token.get("exchange"),
             "rat_trader_rate":        _float(token.get("rat_trader_amount_rate")),
@@ -1829,10 +1841,16 @@ class Scanner:
         # H27 — trending check: set coletado 1x por tick em _tick() com interval=1m.
         # pump.fun 1m captura momentum dos últimos 60s — hype imediato no momento da graduação.
         trending_at_migration = (mint in trending_mints) if trending_mints else None
+        rank_data = (trending_rank_map or {}).get(mint, {})
+        hot_level      = rank_data.get("hot_level")
+        visiting_count = rank_data.get("visiting_count")
         if trending_at_migration:
-            logger.info("Migracao %s (%s) — trending=TRUE no pump.fun 1m", symbol, mint[:8])
+            logger.info("Migracao %s (%s) — trending=TRUE no pump.fun 1m hot_level=%s visiting=%s",
+                        symbol, mint[:8], hot_level, visiting_count)
 
         entry["trending_at_migration"] = trending_at_migration
+        entry["hot_level"]      = hot_level
+        entry["visiting_count"] = visiting_count
         entry["passed_filters"] = passed_filters
         db.upsert_migration(entry)
 

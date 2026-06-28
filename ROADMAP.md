@@ -1,6 +1,6 @@
 # NeideBOT — Roadmap
 
-**Atualizado:** 2026-06-27 (sessão 24)
+**Atualizado:** 2026-06-28 (sessão 24)
 **Estado:** Bot ATIVO · `TRADING_ENABLED=true` · branch ativo: `claude/magical-cerf-3wjq5o` · **Modo Helius** (erpc desativado — 0 créditos)
 **Infra Railway:** ~$6/mês (welcoming-miracle + intelligent-spirit PostgreSQL) · Solo desde 2026-06-22
 
@@ -41,6 +41,9 @@
 | H9 anticorrelado confirmado | 2026-06-27 | n=128 bounces: com H9 WR 6.7%, sem H9 WR 26.7%. H9 prediz FALHA. Descartado como gate positivo. |
 | quality-grid + curvas marginais | 2026-06-27 | Teto WR ~25.3% independente de combinação de filtros. Bundler≤20% = WR 11.1% (pior ponto). Recomendado: 50%. |
 | H27 edge preliminar detectado | 2026-06-27 | trending=TRUE: WR 30.3%, EV +5.3%. TP50 ótimo: WR 50%, EV +12.5%. mig<60s = WR 0%. n=46, 2 dias. |
+| trending-deep dados completos | 2026-06-28 | n=50 bounces trending (99% cobertura). TP50: WR 51.2%, EV +13.4%. elapsed<5min WR 36.4%. mig<60s WR 0% confirmado. smart≥2 → WR 42.9%. |
+| Seção 6 — tokens bloqueados | 2026-06-28 | 19 trending tokens com dump<30% bloqueados. 3/4 com dados recuperaram, avg mc_1h +403%. Love SOL: +803%, Pumpbot: +455%. |
+| BOUNCE_DROP_MIN_TRENDING + TRENDING_BLOCK_FAST_MIG | 2026-06-28 | Código deployado. Aguardando configurar no Railway worker. |
 
 > ⚠️ **WR REAL (2026-05-14):** banco tinha dados fictícios — TradeMonitor inferia saídas de MC snapshots, não blockchain. Auditoria: WR real = **10.1%** (14/139). `/debug/sell-recovery` aplicado.
 > ⚠️ **DADOS HISTÓRICOS SUSPEITOS:** mc_min de tokens antes do fix (elapsed_sec < 90) corrompido pelo candle de transição bonding curve→pool. Análises de bounce_pct/drop histórico devem ser tratadas com cautela.
@@ -50,19 +53,27 @@
 
 ## 🔬 V2 — Reestruturação de Microestrutura
 
-### Estado atual (2026-06-25)
+### Estado atual (2026-06-28, sessão 24)
 
 **Bot ATIVO** · `TRADING_ENABLED=true` · Branch: `claude/magical-cerf-3wjq5o` · **Modo Helius** (erpc desativado)
 
-Filtros recalibrados na sessão 21. Gate H23 (`H23_NET_MIN`) desativado (n=13, insuficiente). RISE gate (`RISE_NET_MIN=0`) ativo — aguardando n≥30 bounces para avaliar impacto. Operação solo desde 2026-06-22.
+Gate H23 desativado (n insuficiente). RISE gate desativado. Operação solo desde 2026-06-22.
+**Foco atual:** acúmulo de dados trending (n≥100 bounces) para validar H27 e definir gates definitivos.
 
 **Implicação do modo Helius**: gap de ~10-30s entre detecção do token e início do feed WS. V-bottoms muito rápidos (<30s) podem ser perdidos antes do subscribe — kline hot-precise (5s) e trenches (5s) cobrem como fallback.
 
-**Filtros ativos (Railway) pós-sessão 21/22:**
-- `BOUNCE_DROP_MIN=0.20` (era 0.30 — bloqueava rec75 de 38-46%)
-- `TRADE_MAX_ELAPSED_SEC=900` (era 300 — bloqueava 74% dos sinais)
-- `BOTTOM_FRESHNESS_SEC=600` (era 180 — cortava zona 3-10min com 33% rec75)
-- `RISE_NET_MIN=0` (sessão 22 — RISE net < 0 → rec75=9%, sl25=91%)
+**Filtros ativos (Railway) pós-sessão 24:**
+- `BOUNCE_DROP_MIN=0.30` (Railway)
+- `TRADE_MAX_ELAPSED_SEC=900`
+- `BOTTOM_FRESHNESS_SEC=600`
+- `TRENDING_BLOCK_FAST_MIG=true` (worker) — bloqueia trending mig<60s
+- `BOUNCE_DROP_MIN_TRENDING` **pendente configurar** no Railway worker
+
+**Próximo marco — quando n≥100 bounces trending:**
+- Ativar `BOUNCE_DROP_MIN_TRENDING=0.15` no worker
+- Mudar `TRAILING_ACTIVATION_PCT` de 75 para 50 (TP50: WR 51.2%, EV +13.4%)
+- Recalibrar `FILTER_BUNDLER_MAX` de 20% para 50%
+- Avaliar se `FILTER_SMART_MIN` sobe de 1 para 2 (smart≥2: WR 42.9% vs smart=1: WR 27.3%)
 
 A ideia central da V2: filtros estáticos entregam no máximo +7pp de WR. O edge real está em **quem comprou o fundo e com que força** — fluxo de ordens em granularidade de segundos via Helius pAMM.
 
@@ -164,13 +175,22 @@ Auditoria manual n=15: 10/15 precisos (≤3%), 3/15 learning window (tradeoff in
 
 **Endpoint de análise:** `/analise/migration-quality` + `/analise/trending-deep`
 
-**Gate para decisão:** n≥100 bounces trending (≈2 semanas de coleta, estimativa ~10 bounces trending/dia).
+**Gate para decisão:** n≥100 bounces trending (estimativa ~10/dia → ≈1 semana com dados de 2 dias já coletados).
+
+**Achados sessão 24 (trending-deep n=50, 99% cobertura):**
+- TP50/SL25 confirmado: **WR 51.2%, EV +13.4%** vs TP75 atual (WR 31.6%, EV +6.6%)
+- mig<60s: **WR 0%** (n=8) — H28 confirmado, TRENDING_BLOCK_FAST_MIG deployado
+- mig 60-300s: WR 60%, EV +35% (n=6) · mig 300-900s: WR 60%, EV +35% (n=8)
+- smart=0: WR 21.4% · smart=1: WR 27.3% · smart=2: WR 42.9% · smart≥3: WR 50%
+- elapsed<5min: WR 36.4%, EV +11.4% (78% dos bounces trending)
+- Tokens bloqueados (dump<30%): 3/4 com mc_1h recuperaram, avg **+403%** (Love SOL +803%, Pumpbot +455%)
 
 **Ação planejada (quando n≥100):**
-- Ativar gate `trending_at_migration=TRUE` + `time_to_migrate_sec≥60` como filtro de entrada
-- Mudar TP para 50% (ao invés de 75%) para tokens trending → EV maior
-- Recalibrar `FILTER_BUNDLER_MAX` de 20% → 50% (quality-grid confirma: 20% = WR 11.1%, 50% = WR ~22%)
-- NÃO ativar H9 como gate negativo ainda (investigar mais)
+- `BOUNCE_DROP_MIN_TRENDING=0.15` no worker (código já deployado, aguarda Railway)
+- `TRAILING_ACTIVATION_PCT=50` → TP50 para todos os tokens
+- `FILTER_BUNDLER_MAX=0.50` (quality-grid: 20% = WR 11.1%, pior ponto)
+- Avaliar `FILTER_SMART_MIN=2` (smart≥2 tem +15pp vs smart=1)
+- NÃO ativar H9 como gate negativo ainda (live n insuficiente)
 
 ### Fase 1 — ENTRY_MAX_BOUNCE_PCT ← PRÓXIMO CÓDIGO
 

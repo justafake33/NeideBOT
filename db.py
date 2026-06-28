@@ -268,6 +268,11 @@ def _do_init_db():
             "ADD COLUMN IF NOT EXISTS trending_at_migration BOOLEAN",
             # Visibilidade vs filtros de trading — passou todos os filtros de qualidade/MC/liq?
             "ADD COLUMN IF NOT EXISTS passed_filters        BOOLEAN",
+            # Dados de ranking pump.fun — hot_level (heat score) e visiting_count (page views)
+            "ADD COLUMN IF NOT EXISTS hot_level             FLOAT",
+            "ADD COLUMN IF NOT EXISTS visiting_count        INT",
+            # Dados sociais adicionais do trenches
+            "ADD COLUMN IF NOT EXISTS tg_call_count         INT",
         ]:
             cur.execute(f"ALTER TABLE migrations {col}")
 
@@ -897,7 +902,8 @@ def upsert_migration(data: dict):
                 cto_flag, has_social, x_follower_count,
                 exchange, rat_trader_rate, total_fee_sol,
                 bc_progress_migration, complete_timestamp,
-                trending_at_migration, passed_filters
+                trending_at_migration, passed_filters,
+                hot_level, visiting_count, tg_call_count
             ) VALUES (
                 %(mint)s, %(token_nome)s, %(ts_detected)s, %(bc_progress_at_detection)s,
                 %(ts_migration)s, %(mc_migration)s,
@@ -913,7 +919,8 @@ def upsert_migration(data: dict):
                 %(cto_flag)s, %(has_social)s, %(x_follower_count)s,
                 %(exchange)s, %(rat_trader_rate)s, %(total_fee_sol)s,
                 %(bc_progress_migration)s, %(complete_timestamp)s,
-                %(trending_at_migration)s, %(passed_filters)s
+                %(trending_at_migration)s, %(passed_filters)s,
+                %(hot_level)s, %(visiting_count)s, %(tg_call_count)s
             )
             ON CONFLICT (mint) DO UPDATE SET
                 ts_migration           = EXCLUDED.ts_migration,
@@ -956,7 +963,10 @@ def upsert_migration(data: dict):
                 has_social             = COALESCE(migrations.has_social, EXCLUDED.has_social),
                 x_follower_count       = COALESCE(migrations.x_follower_count, EXCLUDED.x_follower_count),
                 trending_at_migration  = COALESCE(migrations.trending_at_migration, EXCLUDED.trending_at_migration),
-                passed_filters         = EXCLUDED.passed_filters
+                passed_filters         = EXCLUDED.passed_filters,
+                hot_level              = COALESCE(migrations.hot_level, EXCLUDED.hot_level),
+                visiting_count         = COALESCE(migrations.visiting_count, EXCLUDED.visiting_count),
+                tg_call_count          = COALESCE(migrations.tg_call_count, EXCLUDED.tg_call_count)
         """, {
             "mint":                   data.get("mint"),
             "token_nome":             data.get("token_nome"),
@@ -1003,6 +1013,9 @@ def upsert_migration(data: dict):
             "complete_timestamp":       data.get("complete_timestamp"),
             "trending_at_migration":    data.get("trending_at_migration"),
             "passed_filters":           data.get("passed_filters"),
+            "hot_level":                data.get("hot_level"),
+            "visiting_count":           data.get("visiting_count"),
+            "tg_call_count":            data.get("tg_call_count"),
         })
 
 
