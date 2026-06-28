@@ -144,6 +144,7 @@ class TrendingRadar:
             "dexscr_trending_bar": _bool(item.get("dexscr_trending_bar")),
             "dexscr_boost_fee": _float(item.get("dexscr_boost_fee")),
             "cto_flag": _bool(item.get("cto_flag")),
+            "total_fee": _float(item.get("total_fee")),
             "raw": item,
         }
 
@@ -156,6 +157,11 @@ class TrendingRadar:
            de DEX que nunca passaram pela bonding curve.
         2. TRENDING_FILTER_MIN_BC_SEC (default 120): rejeita tokens que migraram em
            menos de N segundos de vida (flash migration = pump coordenado, candle único).
+        3. TRENDING_RADAR_MIN_MC / TRENDING_RADAR_MAX_MC: faixa de market cap (USD).
+           Default 25000/35000 — faixa de migração pump.fun.
+        4. TRENDING_RADAR_MIN_LIQ: liquidez mínima (USD). Default 5000.
+        5. TRENDING_RADAR_MIN_FEE: fee mínimo em SOL. Default 1.
+           No-op se o campo total_fee não vier no response do market/rank.
         """
         pump_only = os.getenv("TRENDING_FILTER_PUMP_ONLY", "true").lower() == "true"
         min_bc_sec = int(os.getenv("TRENDING_FILTER_MIN_BC_SEC", "120"))
@@ -170,6 +176,24 @@ class TrendingRadar:
             bc_sec = open_ts - create_ts
             if bc_sec < min_bc_sec:
                 return f"flash_migration_{bc_sec}s"
+
+        mc = row.get("market_cap")
+        min_mc = float(os.getenv("TRENDING_RADAR_MIN_MC", "25000"))
+        max_mc = float(os.getenv("TRENDING_RADAR_MAX_MC", "35000"))
+        if min_mc > 0 and mc is not None and mc < min_mc:
+            return "mc_too_low"
+        if max_mc > 0 and mc is not None and mc > max_mc:
+            return "mc_too_high"
+
+        liq = row.get("liquidity")
+        min_liq = float(os.getenv("TRENDING_RADAR_MIN_LIQ", "5000"))
+        if min_liq > 0 and liq is not None and liq < min_liq:
+            return "liq_too_low"
+
+        fee = row.get("total_fee")
+        min_fee = float(os.getenv("TRENDING_RADAR_MIN_FEE", "1"))
+        if min_fee > 0 and fee is not None and fee < min_fee:
+            return "fee_too_low"
 
         return None
 
