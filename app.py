@@ -52872,7 +52872,8 @@ Para fluxo on-chain real (pré-fundo): <a href='/analise/pre-rise-ticks' style='
         swaps_s    = str(r.get("swaps") or "–")
         vol_s      = f"${r['volume']:,.0f}" if r.get("volume") else "–"
         smart_s    = str(r.get("smart_wallets") or "–")
-        mig_s      = str(r.get("time_to_migrate_sec") or "–")
+        _mig_raw   = r.get("time_to_migrate_sec")
+        mig_s      = str(_mig_raw) if (_mig_raw is not None and 0 <= _mig_raw <= 86400) else "–"
         entry_s    = f"${r['entry_mc']:,.0f}" if r.get("entry_mc") else "–"
         max_s      = f"${r['max_mc']:,.0f}" if r.get("max_mc") else "–"
         out        = r.get("_outcome") or "–"
