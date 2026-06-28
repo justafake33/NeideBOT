@@ -52523,6 +52523,389 @@ def _analise_trending_deep_inner():
     return H
 
 
+@app.route("/analise/trending-flow")
+def analise_trending_flow():
+    """
+    Buy/sell imbalance do snapshot GMGN Trending vs outcome TP/SL.
+    Mede pressão compradora do snapshot GMGN — NÃO fluxo on-chain Helius.
+    Para fluxo on-chain real use /analise/pre-rise-ticks (H22/H23/RISE).
+    ?tp=0.75&sl=0.25&since=2026-05-26
+    """
+    import traceback
+    try:
+        return _analise_trending_flow_inner()
+    except Exception:
+        return "<pre style='background:#1a0000;color:#f88;padding:20px'>" + traceback.format_exc() + "</pre>", 500
+
+
+def _analise_trending_flow_inner():
+    import psycopg2, psycopg2.extras, time as _time
+
+    since_str = request.args.get("since", "2026-05-26") or "2026-05-26"
+    TP  = float(request.args.get("tp", 0.75))
+    SL  = float(request.args.get("sl", 0.25))
+    TP_MULT = 1 + TP
+    SL_MULT = 1 - SL
+    BE = SL / (TP + SL)
+
+    t0 = _time.time()
+    conn = psycopg2.connect(db.DATABASE_URL)
+    conn.autocommit = True
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    # ── 0. Cobertura ──────────────────────────────────────────────────────────
+    # Trending bounces com e sem snapshot GMGN com buys/sells preenchidos.
+    # LATERAL JOIN: snapshot mais próximo de ts_migration (±5min), fallback ts_signal (±5min).
+    cur.execute("""
+        WITH trending_bounces AS (
+            SELECT
+                bs.mint,
+                bs.symbol,
+                bs.ts_signal,
+                bs.elapsed_sec,
+                bs.bounce_pct,
+                bs.drop_from_mig,
+                bs.pool_quote_at_signal,
+                bs.mc_at_signal            AS entry_mc,
+                m.ts_migration,
+                m.smart_wallets,
+                m.time_to_migrate_sec
+            FROM bounce_signals bs
+            JOIN migrations m ON m.mint = bs.mint
+            WHERE m.trending_at_migration IS TRUE
+              AND bs.ts_signal >= %(since)s::timestamptz
+              AND bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+        ),
+        snaps AS (
+            SELECT
+                tb.mint,
+                LATERAL_SNAP.id          AS snap_id,
+                LATERAL_SNAP.ts_snapshot,
+                LATERAL_SNAP.interval_label,
+                LATERAL_SNAP.rank_position,
+                LATERAL_SNAP.buys,
+                LATERAL_SNAP.sells,
+                LATERAL_SNAP.swaps,
+                LATERAL_SNAP.volume,
+                LATERAL_SNAP.hot_level,
+                'migration' AS snap_source
+            FROM trending_bounces tb
+            CROSS JOIN LATERAL (
+                SELECT s.id, s.ts_snapshot, s.interval_label, s.rank_position,
+                       s.buys, s.sells, s.swaps, s.volume, s.hot_level
+                FROM gmgn_trending_snapshots s
+                WHERE s.mint = tb.mint
+                  AND ABS(EXTRACT(EPOCH FROM (s.ts_snapshot - tb.ts_migration))) <= 300
+                ORDER BY ABS(EXTRACT(EPOCH FROM (s.ts_snapshot - tb.ts_migration)))
+                LIMIT 1
+            ) LATERAL_SNAP
+        ),
+        snaps_fallback AS (
+            SELECT
+                tb.mint,
+                LATERAL_SNAP.id          AS snap_id,
+                LATERAL_SNAP.ts_snapshot,
+                LATERAL_SNAP.interval_label,
+                LATERAL_SNAP.rank_position,
+                LATERAL_SNAP.buys,
+                LATERAL_SNAP.sells,
+                LATERAL_SNAP.swaps,
+                LATERAL_SNAP.volume,
+                LATERAL_SNAP.hot_level,
+                'signal' AS snap_source
+            FROM trending_bounces tb
+            CROSS JOIN LATERAL (
+                SELECT s.id, s.ts_snapshot, s.interval_label, s.rank_position,
+                       s.buys, s.sells, s.swaps, s.volume, s.hot_level
+                FROM gmgn_trending_snapshots s
+                WHERE s.mint = tb.mint
+                  AND ABS(EXTRACT(EPOCH FROM (s.ts_snapshot - tb.ts_signal))) <= 300
+                ORDER BY ABS(EXTRACT(EPOCH FROM (s.ts_snapshot - tb.ts_signal)))
+                LIMIT 1
+            ) LATERAL_SNAP
+            WHERE tb.mint NOT IN (SELECT mint FROM snaps)
+        ),
+        best_snaps AS (SELECT * FROM snaps UNION ALL SELECT * FROM snaps_fallback)
+        SELECT
+            COUNT(DISTINCT tb.mint)                                          AS total_trending_bounces,
+            COUNT(DISTINCT bs.mint)                                          AS with_any_snap,
+            COUNT(DISTINCT bs.mint) FILTER (WHERE bs.buys IS NOT NULL
+                                             AND  bs.sells IS NOT NULL)      AS with_buys_sells,
+            COUNT(DISTINCT bs.mint) FILTER (WHERE bs.snap_source = 'migration') AS from_migration_snap,
+            COUNT(DISTINCT bs.mint) FILTER (WHERE bs.snap_source = 'signal')    AS from_signal_snap
+        FROM trending_bounces tb
+        LEFT JOIN best_snaps bs ON bs.mint = tb.mint
+    """, {"since": since_str})
+    cov = dict(cur.fetchone())
+
+    total   = cov.get("total_trending_bounces") or 0
+    w_snap  = cov.get("with_any_snap") or 0
+    w_bs    = cov.get("with_buys_sells") or 0
+    snap_pct = round(w_snap / total * 100, 1) if total else 0
+    bs_pct   = round(w_bs   / total * 100, 1) if total else 0
+
+    # ── 1. Dados principais: bounces trending + snapshot + TP/SL ─────────────
+    cur.execute("""
+        WITH trending_bounces AS (
+            SELECT
+                bs.mint,
+                bs.symbol,
+                bs.ts_signal,
+                bs.elapsed_sec,
+                bs.bounce_pct,
+                bs.drop_from_mig,
+                bs.pool_quote_at_signal,
+                bs.mc_at_signal                AS entry_mc,
+                m.ts_migration,
+                m.smart_wallets,
+                m.time_to_migrate_sec,
+                m.trending_at_migration
+            FROM bounce_signals bs
+            JOIN migrations m ON m.mint = bs.mint
+            WHERE m.trending_at_migration IS TRUE
+              AND bs.ts_signal >= %(since)s::timestamptz
+              AND bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+        ),
+        best_snaps AS (
+            SELECT DISTINCT ON (tb.mint)
+                tb.mint,
+                s.buys, s.sells, s.swaps, s.volume,
+                s.rank_position, s.interval_label, s.hot_level,
+                CASE WHEN ABS(EXTRACT(EPOCH FROM (s.ts_snapshot - tb.ts_migration))) <= 300
+                     THEN 'migration' ELSE 'signal' END AS snap_source
+            FROM trending_bounces tb
+            JOIN gmgn_trending_snapshots s ON s.mint = tb.mint
+            WHERE (
+                ABS(EXTRACT(EPOCH FROM (s.ts_snapshot - tb.ts_migration))) <= 300
+                OR ABS(EXTRACT(EPOCH FROM (s.ts_snapshot - tb.ts_signal))) <= 300
+            )
+            ORDER BY tb.mint,
+                     LEAST(
+                         ABS(EXTRACT(EPOCH FROM (s.ts_snapshot - tb.ts_migration))),
+                         ABS(EXTRACT(EPOCH FROM (s.ts_snapshot - tb.ts_signal)))
+                     )
+        ),
+        ticks AS (
+            SELECT
+                tb.mint,
+                MAX(COALESCE(tt.mc_high, tt.mc)) AS max_mc,
+                COUNT(tt.id)                     AS tick_count
+            FROM trending_bounces tb
+            JOIN token_ticks tt ON tt.mint = tb.mint
+                AND tt.tick_ts > tb.ts_signal
+                AND tt.tick_ts < tb.ts_signal + INTERVAL '60 minutes'
+            GROUP BY tb.mint
+        )
+        SELECT
+            tb.mint,
+            tb.symbol,
+            tb.ts_signal,
+            tb.elapsed_sec,
+            tb.bounce_pct,
+            tb.drop_from_mig,
+            tb.pool_quote_at_signal,
+            tb.entry_mc,
+            tb.smart_wallets,
+            tb.time_to_migrate_sec,
+            tk.max_mc,
+            tk.tick_count,
+            sn.buys,
+            sn.sells,
+            sn.swaps,
+            sn.volume,
+            sn.rank_position,
+            sn.interval_label,
+            sn.hot_level,
+            sn.snap_source,
+            sn.buys::float / NULLIF(sn.sells, 0)                            AS buy_sell_ratio,
+            sn.buys::float / NULLIF(sn.buys + sn.sells, 0)                  AS buy_share,
+            (sn.buys - sn.sells)                                             AS buy_pressure
+        FROM trending_bounces tb
+        LEFT JOIN best_snaps sn ON sn.mint = tb.mint
+        LEFT JOIN ticks      tk ON tk.mint = tb.mint
+        ORDER BY tb.ts_signal DESC
+    """, {"since": since_str})
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    t_sql = _time.time() - t0
+
+    # ── 2. Calcular outcomes em Python ───────────────────────────────────────
+    def outcome(r):
+        entry = r.get("entry_mc") or 0
+        mx    = r.get("max_mc") or 0
+        tc    = r.get("tick_count") or 0
+        if not entry or not mx or tc < 3:
+            return None
+        if mx >= entry * TP_MULT:
+            return "TP"
+        if mx < entry * SL_MULT:
+            return "SL"
+        return "SL"   # janela fechou sem TP — SL por expiração
+
+    for r in rows:
+        r["_outcome"] = outcome(r)
+
+    rows_decided = [r for r in rows if r["_outcome"] is not None]
+
+    # ── 3. Buy_share buckets ─────────────────────────────────────────────────
+    def buy_share_bucket(bs):
+        if bs is None:
+            return "sem dados"
+        if bs < 0.45:
+            return "<45%"
+        if bs < 0.50:
+            return "45–50%"
+        if bs < 0.55:
+            return "50–55%"
+        if bs < 0.60:
+            return "55–60%"
+        return ">60%"
+
+    BS_ORDER = ["<45%", "45–50%", "50–55%", "55–60%", ">60%", "sem dados"]
+
+    from collections import defaultdict
+    buckets: dict = defaultdict(lambda: {"n": 0, "tp": 0, "sl": 0})
+    for r in rows_decided:
+        if r.get("buys") is None and r.get("sells") is None:
+            bk = "sem dados"
+        else:
+            bk = buy_share_bucket(r.get("buy_share"))
+        buckets[bk]["n"]  += 1
+        buckets[bk]["tp"] += 1 if r["_outcome"] == "TP" else 0
+        buckets[bk]["sl"] += 1 if r["_outcome"] == "SL" else 0
+
+    # ── 4. HTML ──────────────────────────────────────────────────────────────
+    tp_pct = int(TP * 100)
+    sl_pct = int(SL * 100)
+    be_pct = round(BE * 100, 1)
+
+    H = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>Trending Flow — NeideBOT</title>
+<style>
+  body{{background:#0d0d0d;color:#e0e0e0;font-family:monospace;padding:20px}}
+  h2{{color:#FFD54F}}
+  h3{{color:#80CBC4;margin-top:30px}}
+  table{{border-collapse:collapse;width:100%;margin-bottom:20px}}
+  th{{background:#1a2a1a;color:#80CBC4;padding:6px 10px;text-align:right}}
+  th:first-child{{text-align:left}}
+  td{{padding:5px 10px;border-bottom:1px solid #222;text-align:right}}
+  td:first-child{{text-align:left}}
+  tr:hover td{{background:#1a1a1a}}
+  .tp{{color:#66BB6A}}.sl{{color:#EF5350}}.null{{color:#666}}
+  .cov{{background:#1a1a2a;padding:15px;border-radius:6px;margin-bottom:20px}}
+  .warn{{background:#2a1a00;color:#FFB74D;padding:12px;border-radius:6px;margin:15px 0}}
+  .note{{background:#0d1a0d;color:#80CBC4;padding:12px;border-radius:6px;margin:15px 0;font-size:0.9em}}
+  .links a{{color:#4FC3F7;margin-right:16px;text-decoration:none}}
+  .links a:hover{{text-decoration:underline}}
+  .pos{{color:#66BB6A}}.neg{{color:#EF5350}}
+</style></head><body>
+<h2>📊 Trending Flow — Buy/Sell Pressure vs Outcome</h2>
+<p class='note'>Mede pressão compradora do <b>snapshot GMGN Trending</b> — não fluxo on-chain Helius.<br>
+Para fluxo on-chain real (pré-fundo): <a href='/analise/pre-rise-ticks' style='color:#4FC3F7'>/analise/pre-rise-ticks</a> (H22/H23/RISE).</p>
+
+<div class='links'>
+  TP/SL atual: <b>TP{tp_pct}/SL{sl_pct}</b> &nbsp;|&nbsp;
+  <a href='?tp=0.50&sl=0.25&since={since_str}'>TP50/SL25</a>
+  <a href='?tp=0.75&sl=0.25&since={since_str}'>TP75/SL25</a>
+  <a href='?tp=1.00&sl=0.25&since={since_str}'>TP100/SL25</a>
+  <a href='?tp=0.75&sl=0.25&since=2026-06-01'>desde 2026-06-01</a>
+</div>
+<p style='color:#888;font-size:0.85em'>SQL: {t_sql:.2f}s · since={since_str} · n={len(rows)} bounces trending</p>
+"""
+
+    # Cobertura
+    H += f"<h3>0. Cobertura de snapshots</h3><div class='cov'>"
+    H += f"<table><tr><th>Métrica</th><th>N</th><th>%</th></tr>"
+    H += f"<tr><td>Total bounces trending</td><td>{total}</td><td>100%</td></tr>"
+    H += f"<tr><td>Com snapshot GMGN (±5min)</td><td>{w_snap}</td><td>{snap_pct}%</td></tr>"
+    H += f"<tr><td>Com buys <b>e</b> sells preenchidos</td><td>{w_bs}</td><td>{bs_pct}%</td></tr>"
+    H += f"<tr><td>  ↳ snap de ts_migration</td><td>{cov.get('from_migration_snap', 0)}</td><td></td></tr>"
+    H += f"<tr><td>  ↳ snap de ts_signal (fallback)</td><td>{cov.get('from_signal_snap', 0)}</td><td></td></tr>"
+    H += "</table></div>"
+
+    if w_bs == 0:
+        H += "<div class='warn'>⚠️ <b>Zero bounces com buys/sells preenchidos.</b> Os campos <code>buys</code> e <code>sells</code> existem no schema mas provavelmente a GMGN API não os retorna no endpoint <code>/v1/market/rank?interval=1m</code>. Verificar <code>trending_radar.py</code> para confirmar quais campos chegam no response bruto.</div>"
+    elif bs_pct < 50:
+        H += f"<div class='warn'>⚠️ Cobertura baixa ({bs_pct}%). Análise de buy_share é indicativa — amostra pequena pode distorcer conclusões.</div>"
+
+    # Buy_share buckets
+    H += f"<h3>1. WR por buy_share (TP{tp_pct}/SL{sl_pct} · BE={be_pct}%)</h3>"
+    H += "<p style='color:#888;font-size:0.85em'>buy_share = buys / (buys + sells) do snapshot GMGN Trending mais próximo da migração</p>"
+    H += "<table><tr><th>Buy Share</th><th>N</th><th>TP</th><th>SL</th><th>WR</th><th>EV</th></tr>"
+    for bk in BS_ORDER:
+        b = buckets.get(bk)
+        if not b or b["n"] == 0:
+            continue
+        n, tp, sl = b["n"], b["tp"], b["sl"]
+        wr = tp / n if n else 0
+        ev = wr * TP - (1 - wr) * SL
+        wr_cls = "tp" if wr >= 0.40 else ("null" if wr >= 0.25 else "sl")
+        ev_cls = "pos" if ev >= 0 else "neg"
+        H += (f"<tr><td>{bk}</td><td>{n}</td><td class='tp'>{tp}</td><td class='sl'>{sl}</td>"
+              f"<td class='{wr_cls}'>{wr:.0%}</td><td class='{ev_cls}'>{ev:+.1%}</td></tr>")
+    H += "</table>"
+
+    if not rows_decided:
+        H += "<div class='warn'>Sem bounces com outcome decidido ainda.</div>"
+
+    # Lista detalhada
+    H += f"<h3>2. Lista detalhada ({len(rows)} bounces trending)</h3>"
+    H += """<table><tr>
+      <th>Data</th><th>Token</th><th>Snap</th><th>Rank</th>
+      <th>Elapsed</th><th>Drop</th><th>Bounce</th>
+      <th>Buys</th><th>Sells</th><th>Buy%</th><th>Swaps</th><th>Vol</th>
+      <th>Smart</th><th>Mig(s)</th><th>Entry MC</th><th>Max MC 60min</th><th>P/L sim</th><th>Out</th>
+    </tr>"""
+
+    for r in rows:
+        date_str   = r["ts_signal"].strftime("%m-%d %H:%M") if r.get("ts_signal") else "?"
+        sym        = r.get("symbol") or r["mint"][:8]
+        snap_lbl   = (r.get("interval_label") or "?") + ("*" if r.get("snap_source") == "signal" else "")
+        rank       = r.get("rank_position") or "–"
+        elapsed    = f"{r['elapsed_sec']//60:.0f}m{r['elapsed_sec']%60:02d}s" if r.get("elapsed_sec") is not None else "?"
+        drop_s     = f"{(r.get('drop_from_mig') or 0)*100:.0f}%"
+        bounce_s   = f"{(r.get('bounce_pct') or 0)*100:.0f}%"
+        buys_s     = str(r.get("buys") or "–")
+        sells_s    = str(r.get("sells") or "–")
+        bs_val     = r.get("buy_share")
+        bs_s       = f"{bs_val*100:.0f}%" if bs_val is not None else "–"
+        swaps_s    = str(r.get("swaps") or "–")
+        vol_s      = f"${r['volume']:,.0f}" if r.get("volume") else "–"
+        smart_s    = str(r.get("smart_wallets") or "–")
+        mig_s      = str(r.get("time_to_migrate_sec") or "–")
+        entry_s    = f"${r['entry_mc']:,.0f}" if r.get("entry_mc") else "–"
+        max_s      = f"${r['max_mc']:,.0f}" if r.get("max_mc") else "–"
+        out        = r.get("_outcome") or "–"
+        out_cls    = "tp" if out == "TP" else ("sl" if out == "SL" else "null")
+        pl_pct = None
+        if r.get("entry_mc") and r.get("max_mc"):
+            if out == "TP":
+                pl_pct = TP
+            elif out == "SL":
+                pl_pct = -SL
+        pl_s = f"{pl_pct:+.0%}" if pl_pct is not None else "–"
+        pl_cls = "pos" if (pl_pct or 0) > 0 else ("neg" if (pl_pct or 0) < 0 else "null")
+        mint_url = f"https://gmgn.ai/sol/token/{r['mint']}"
+        H += (f"<tr>"
+              f"<td>{date_str}</td>"
+              f"<td><a href='{mint_url}' target='_blank' style='color:#4FC3F7'>{sym}</a></td>"
+              f"<td>{snap_lbl}</td><td>{rank}</td>"
+              f"<td>{elapsed}</td><td>{drop_s}</td><td>{bounce_s}</td>"
+              f"<td>{buys_s}</td><td>{sells_s}</td>"
+              f"<td>{'<b>'+bs_s+'</b>' if bs_val and bs_val > 0.55 else bs_s}</td>"
+              f"<td>{swaps_s}</td><td>{vol_s}</td>"
+              f"<td>{smart_s}</td><td>{mig_s}</td>"
+              f"<td>{entry_s}</td><td>{max_s}</td>"
+              f"<td class='{pl_cls}'>{pl_s}</td>"
+              f"<td class='{out_cls}'><b>{out}</b></td>"
+              f"</tr>")
+    H += "</table>"
+    H += "<p style='color:#555;font-size:0.8em'>* = snapshot de ts_signal (fallback, sem snapshot no momento da migração)</p>"
+
+    H += "</body></html>"
+    return H
+
+
 @app.route("/analise/migration-quality")
 def analise_migration_quality():
     import traceback
