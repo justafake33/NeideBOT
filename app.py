@@ -9204,7 +9204,9 @@ def _wallet_audit_inner():
     import time as _time
 
     WALLET    = os.getenv("GMGN_WALLET_ADDRESS", "")
-    RPC_URL   = request.args.get("rpc") or os.getenv("HELIUS_RPC_URL") or "https://api.mainnet-beta.solana.com"
+    _rpc_raw  = request.args.get("rpc") or os.getenv("HELIUS_RPC_URL") or "https://api.mainnet-beta.solana.com"
+    # wss:// é WebSocket — wallet-audit precisa de HTTP JSON-RPC. Converte automaticamente.
+    RPC_URL   = _rpc_raw.replace("wss://", "https://").replace("ws://", "http://")
     DAYS_BACK = int(request.args.get("days", "4"))
     sol_usd   = _get_sol_usd() or 94.0
 
@@ -9517,9 +9519,10 @@ def _wallet_tokens_inner():
     import requests as _req
     import time as _time
 
-    WALLET  = os.getenv("GMGN_WALLET_ADDRESS", "")
-    RPC_URL = request.args.get("rpc") or os.getenv("HELIUS_RPC_URL") or "https://api.mainnet-beta.solana.com"
-    sol_usd = _get_sol_usd() or 94.0
+    WALLET   = os.getenv("GMGN_WALLET_ADDRESS", "")
+    _rpc_raw = request.args.get("rpc") or os.getenv("HELIUS_RPC_URL") or "https://api.mainnet-beta.solana.com"
+    RPC_URL  = _rpc_raw.replace("wss://", "https://").replace("ws://", "http://")
+    sol_usd  = _get_sol_usd() or 94.0
 
     if not WALLET:
         return "<pre>GMGN_WALLET_ADDRESS não configurado</pre>", 400
@@ -52872,7 +52875,8 @@ Para fluxo on-chain real (pré-fundo): <a href='/analise/pre-rise-ticks' style='
         swaps_s    = str(r.get("swaps") or "–")
         vol_s      = f"${r['volume']:,.0f}" if r.get("volume") else "–"
         smart_s    = str(r.get("smart_wallets") or "–")
-        mig_s      = str(r.get("time_to_migrate_sec") or "–")
+        _mig_raw   = r.get("time_to_migrate_sec")
+        mig_s      = str(_mig_raw) if (_mig_raw is not None and 0 <= _mig_raw <= 86400) else "–"
         entry_s    = f"${r['entry_mc']:,.0f}" if r.get("entry_mc") else "–"
         max_s      = f"${r['max_mc']:,.0f}" if r.get("max_mc") else "–"
         out        = r.get("_outcome") or "–"
