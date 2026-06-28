@@ -1887,6 +1887,16 @@ class Scanner:
                      trending_at_migration=trending_at_migration,
                      tradeable=passed_filters)
 
+        # Garante subscrição Helius mesmo se o token não passou pela watchlist
+        # (filtrado em near_completion ou migrou antes do poll).
+        # subscribe() é idempotente — retorna imediato se mint já estava subscrito.
+        if self.hot._helius:
+            try:
+                self.hot._helius.subscribe(mint, int(total_supply))
+                logger.debug("HeliusWS subscribe(completed) %s — garante cobertura", mint[:8])
+            except Exception as e:
+                logger.debug("helius.subscribe fallback %s: %s", mint[:8], e)
+
 
 # ==============================================================================
 # Helpers
