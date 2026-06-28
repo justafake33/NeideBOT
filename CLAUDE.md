@@ -236,7 +236,7 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO)
 
 ## 🔍 ESTADO ATUAL
 
-### Bot ATIVO (sessão 23, 2026-06-22)
+### Bot ATIVO (sessão 24, 2026-06-28)
 
 **Branch:** `claude/magical-cerf-3wjq5o`
 **Modo WebSocket:** Helius logsSubscribe per-mint (erpc.global desativado — 0 créditos)
@@ -253,10 +253,16 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO)
 `TRADE_SL_PCT=0.25` · `FILTER_SMART_MIN=1` · `BOUNCE_MIN_PCT=0.10` · `BOUNCE_MAX_PCT=1.00`
 `MIN_POOL_SOL=10` · `BOUNCE_DROP_MIN=0.30` · `TRADE_MAX_ELAPSED_SEC=900` · `BOTTOM_FRESHNESS_SEC=600`
 `POOL_MIN_SOL_BOUNCE=20` · `TRADE_MIN_POOL_SOL=40` · `FILTER_PUMP_ONLY=true`
-`RISE_NET_MIN` **não configurado (gate desativado)** · `GMGN_SCANNER_API_KEY` (pendente configurar no Railway)
+`RISE_NET_MIN` **não configurado (gate desativado)** · `GMGN_SCANNER_API_KEY` configurado
+`TRENDING_BLOCK_FAST_MIG=true` (worker) · `BOUNCE_DROP_MIN_TRENDING` **pendente configurar no Railway**
 
 **Resultado período 2026-05-21 a 2026-05-24 (31 trades, $1/trade):**
 WR: **29%** (9 TPs / 22 SLs) confirmado GMGN · Net P/L: **+$0.12** · Payoff 2.49×
+
+**Estado sessão 24 (2026-06-28):**
+- 1 trade ativo: Alchemist trailing_active +75% ⚡
+- trades recentes: `error` (IP não configurado — corrigido) · `blocked_helius_gate` (Helius sem dados suficientes — gate correto, WOP teria sido SL)
+- Aguardando: n≥100 bounces trending para validar H27 e ativar gates
 
 **Correções críticas deployadas:**
 - ✅ ts_migration usa complete_timestamp on-chain (não datetime.now())
@@ -269,6 +275,8 @@ WR: **29%** (9 TPs / 22 SLs) confirmado GMGN · Net P/L: **+$0.12** · Payoff 2.
 - ✅ C3 pool depth gate no bounce (POOL_MIN_SOL_BOUNCE=10)
 - ✅ Priority lane para swap (bypass global ban)
 - ✅ API key separada para scanner (GMGN_SCANNER_API_KEY)
+- ✅ BOUNCE_DROP_MIN_TRENDING — threshold menor para trending=TRUE (H27 sessão 24)
+- ✅ TRENDING_BLOCK_FAST_MIG — bloqueia trending com mig<60s (H28 confirmado WR 0%)
 
 ### Campos coletados por migração
 
