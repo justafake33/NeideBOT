@@ -9411,6 +9411,13 @@ def _wallet_audit_inner():
                 tx_type = "OTHER"
         totals["n_tx"] += 1
 
+        # Guardar para decomposição P&L
+        tx["_type"]         = tx_type
+        tx["_wallet_delta"] = wallet_delta
+        tx["_jito"]         = jito_lamports
+        tx["_base_fee"]     = base_fee
+        tx["_dt_str"]       = dt_str
+
         # Cor
         color = {"BUY": "#2196F3", "SELL": "#4CAF50", "OTHER": "#888", "—": "#555"}.get(tx_type, "#888")
         err_str = "❌ FAILED" if is_failed else ""
@@ -9443,6 +9450,159 @@ def _wallet_audit_inner():
         pass
 
     bal_str = f"{current_bal:.6f} SOL (${current_bal*sol_usd:.2f})" if current_bal is not None else "—"
+
+    # 5. Decomposição P&L por par BUY-SELL
+    # ATA rent: criação de token account = 2039280 lamports (valor fixo Solana)
+    ATA_RENT_SOL  = 2039280 / SOL
+    NOTIONAL_USD  = float(os.getenv("CALIBRATION_AMOUNT_USD", "1.0"))
+    NOTIONAL_SOL  = NOTIONAL_USD / sol_usd
+
+    # Separar BUY e SELL em ordem cronológica
+    buy_txs  = [t for t in tx_details if t.get("_type") == "BUY"]
+    sell_txs = [t for t in tx_details if t.get("_type") == "SELL"]
+
+    pair_rows = []
+    n_pairs  = min(len(buy_txs), len(sell_txs))
+    total_pnl_wallet   = 0.0
+    total_pnl_notional = 0.0
+    total_ata_locked   = 0.0
+    total_ata_reclaimed = 0.0
+    n_ata_closed = 0
+
+    for i in range(n_pairs):
+        b = buy_txs[i]
+        s = sell_txs[i]
+        buy_sol  =  abs(b["_wallet_delta"]) / SOL   # SOL total saiu (positivo)
+        sell_sol =      s["_wallet_delta"]  / SOL   # SOL total entrou (positivo)
+
+        # Estimar custos fixos dentro do BUY
+        buy_jito     = b["_jito"]     / SOL
+        buy_base_fee = b["_base_fee"] / SOL
+        buy_fixed    = buy_jito + buy_base_fee  # fees on-chain da tx BUY
+
+        # Checar se ATA foi fechado no SELL (GMGN retorna rent na saída)
+        # Se sell_sol > sell esperado + margem, assume ATA foi fechado
+        expected_sell_without_ata = sell_sol - ATA_RENT_SOL
+        # Se buy_sol > notional + fees + ata_rent: ATA foi criado nessa tx
+        ata_created = (buy_sol - NOTIONAL_SOL - buy_fixed) >= (ATA_RENT_SOL * 0.8)
+
+        # ATA fechado: se a diferença sell - notional_esperado > 0.0015 SOL (limiar)
+        # notional na saída = buy_notional × (1 + pnl_estimado)
+        # Proxy: se sell_sol > buy_sol * 0.95 isso seria TP; ATA fechado = sell_sol muito maior
+        # Abordagem simples: se buy_sol > notional + ata_rent (ATA foi criado),
+        # e sell_sol > buy_sol × 0.80 (não é SL enorme), verificar excesso
+        ata_closed = False
+        sell_jito     = s["_jito"]     / SOL
+        sell_base_fee = s["_base_fee"] / SOL
+        sell_fixed    = sell_jito + sell_base_fee
+
+        if ata_created:
+            # notional saindo = sell_sol - sell_fixed
+            # se notional saindo >> esperado sem ata, possivelmente rent devolvido
+            ata_closed = (sell_sol - sell_fixed) > (NOTIONAL_SOL * 0.50 + ATA_RENT_SOL * 0.8)
+            if ata_closed:
+                n_ata_closed += 1
+
+        # P&L wallet: delta bruto da wallet (como o usuário vê na carteira)
+        pnl_wallet   = (sell_sol - buy_sol) / buy_sol if buy_sol > 0 else 0.0
+
+        # P&L notional: excluir ATA rent e fees fixos do denominador
+        # Numerador = sell_sol menos rent devolvido (se ATA foi fechado)
+        sell_notional_part = sell_sol - (ATA_RENT_SOL if ata_closed else 0.0) - sell_fixed
+        buy_notional_part  = buy_sol - (ATA_RENT_SOL if ata_created else 0.0) - buy_fixed
+        pnl_notional = (sell_notional_part - buy_notional_part) / buy_notional_part if buy_notional_part > 0 else 0.0
+
+        # ATA trancado (não reclamado)
+        ata_locked_this = ATA_RENT_SOL if (ata_created and not ata_closed) else 0.0
+        total_ata_locked += ata_locked_this
+        if ata_closed:
+            total_ata_reclaimed += ATA_RENT_SOL
+
+        total_pnl_wallet   += pnl_wallet
+        total_pnl_notional += pnl_notional
+
+        ata_str  = "✅ fechado" if ata_closed else ("⚠️ trancado" if ata_created else "—")
+        ata_sol  = f"{ATA_RENT_SOL:.4f}" if ata_created else "—"
+        pnl_w_cls = "ok" if pnl_wallet >= 0 else "bad"
+        pnl_n_cls = "ok" if pnl_notional >= 0 else "bad"
+
+        outcome_guess = ""
+        if pnl_notional > 0.40:
+            outcome_guess = "TP"
+        elif pnl_notional < -0.35:
+            outcome_guess = "SL"
+        elif pnl_notional > 0:
+            outcome_guess = "TP?"
+        else:
+            outcome_guess = "SL?"
+
+        pair_rows.append(f"""<tr>
+          <td style="font-size:10px">{b.get('_dt_str','—')}<br><span style="color:#888">{s.get('_dt_str','—')}</span></td>
+          <td style="color:#aaa">{outcome_guess}</td>
+          <td class="bad" style="font-size:11px">{buy_sol:.5f} SOL<br><span style="color:#888">${buy_sol*sol_usd:.3f}</span></td>
+          <td class="ok"  style="font-size:11px">{sell_sol:.5f} SOL<br><span style="color:#888">${sell_sol*sol_usd:.3f}</span></td>
+          <td style="font-size:11px;color:#FF9800">{ata_sol} SOL<br><span style="color:#888">${float(ATA_RENT_SOL if ata_created else 0)*sol_usd:.3f}</span></td>
+          <td style="font-size:11px">{ata_str}</td>
+          <td style="font-size:12px;font-weight:bold" class="{pnl_w_cls}">{pnl_wallet*100:+.1f}%</td>
+          <td style="font-size:12px;font-weight:bold" class="{pnl_n_cls}">{pnl_notional*100:+.1f}%</td>
+        </tr>""")
+
+    avg_pnl_wallet   = total_pnl_wallet   / n_pairs if n_pairs else 0.0
+    avg_pnl_notional = total_pnl_notional / n_pairs if n_pairs else 0.0
+
+    # Trades sem par (ainda abertos)
+    unpaired_buys = len(buy_txs) - n_pairs
+    pnl_section_html = ""
+    if n_pairs > 0:
+        pair_rows_html = "\n".join(pair_rows)
+        pnl_section_html = f"""
+<div class="box">
+  <h2>Decomposição P&L por Trade (trade size = ${NOTIONAL_USD:.2f})</h2>
+  <p style="color:#aaa;font-size:12px">
+    <b>P&L wallet</b> = (SELL − BUY total) / BUY total — o que a carteira mostra.<br>
+    <b>P&L notional</b> = excluindo ATA rent (~${ATA_RENT_SOL*sol_usd:.2f}) e fees on-chain do denominador — o que o trade realmente rendeu.<br>
+    A diferença é o custo fixo de ${ATA_RENT_SOL*sol_usd:.2f} que representa
+    <b>{ATA_RENT_SOL/NOTIONAL_SOL*100:.0f}%</b> do trade (${ NOTIONAL_USD:.2f}).
+    A ${NOTIONAL_USD*5:.2f}/trade seria apenas <b>{ATA_RENT_SOL/(NOTIONAL_SOL*5)*100:.0f}%</b>.
+  </p>
+  <table>
+    <tr>
+      <th>Data BUY/SELL</th><th>Outcome</th>
+      <th>BUY (wallet)</th><th>SELL (wallet)</th>
+      <th>ATA rent</th><th>ATA status</th>
+      <th>P&L wallet</th><th>P&L notional</th>
+    </tr>
+    {pair_rows_html}
+    <tr style="background:#222;font-weight:bold">
+      <td colspan="6">Média ({n_pairs} pares)</td>
+      <td class="{'ok' if avg_pnl_wallet >= 0 else 'bad'}">{avg_pnl_wallet*100:+.1f}%</td>
+      <td class="{'ok' if avg_pnl_notional >= 0 else 'bad'}">{avg_pnl_notional*100:+.1f}%</td>
+    </tr>
+  </table>
+  <div style="margin-top:12px;display:flex;gap:24px;flex-wrap:wrap">
+    <div class="box" style="flex:1;min-width:200px">
+      <div style="color:#aaa;font-size:11px">ATA rent trancado (não reclamado)</div>
+      <div class="bad" style="font-size:18px;font-weight:bold">{total_ata_locked:.4f} SOL</div>
+      <div style="color:#888;font-size:11px">${total_ata_locked*sol_usd:.2f} em {n_pairs - n_ata_closed} trades</div>
+    </div>
+    <div class="box" style="flex:1;min-width:200px">
+      <div style="color:#aaa;font-size:11px">ATA rent reclamado (conta fechada)</div>
+      <div class="ok" style="font-size:18px;font-weight:bold">{total_ata_reclaimed:.4f} SOL</div>
+      <div style="color:#888;font-size:11px">${total_ata_reclaimed*sol_usd:.2f} em {n_ata_closed} trades</div>
+    </div>
+    <div class="box" style="flex:1;min-width:200px">
+      <div style="color:#aaa;font-size:11px">Net ajustado (excl. ATA trancado)</div>
+      <div class="{'ok' if net_sol + total_ata_locked >= 0 else 'bad'}" style="font-size:18px;font-weight:bold">{(net_sol + total_ata_locked):+.4f} SOL</div>
+      <div style="color:#888;font-size:11px">${(net_sol + total_ata_locked)*sol_usd:+.2f} — trading P&L sem rent</div>
+    </div>
+  </div>
+  {f'<p class="warn">⚠️ {unpaired_buys} BUY(s) sem SELL correspondente (posição aberta ou período incompleto)</p>' if unpaired_buys > 0 else ''}
+  <p style="color:#555;font-size:10px">
+    ATA rent = 2039280 lamports (~{ATA_RENT_SOL*1000:.2f} mSOL) por criação de token account.
+    P&L notional assume que o custo de rent não compõe o retorno do trade.
+    Pares formados por ordem cronológica — pode misturar trades diferentes se posições se sobrepõem.
+  </p>
+</div>"""
 
     rows_html = "\n".join(tx_rows)
 
@@ -9489,6 +9649,8 @@ def _wallet_audit_inner():
     Friction total = |Net SOL| se negativo + Jito tips.
   </p>
 </div>
+
+{pnl_section_html}
 
 <h2>Todas as {len(tx_details)} transações</h2>
 <table>
