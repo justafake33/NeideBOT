@@ -475,8 +475,10 @@ MIN_POOL_SOL=10              # filtro A.9 — pool mínima para eventos Helius (
 BOUNCE_MIN_PCT=0.10          # bounce mínimo do fundo para disparar sinal
 BOUNCE_MAX_PCT=1.00          # bounce máximo — bloqueia entradas tardias (guard: < 9.99)
 BOUNCE_DROP_MIN=0.30         # drop mínimo da migração para considerar
+BOUNCE_DROP_MIN_TRENDING=0.15  # threshold menor para trending=TRUE (None/ausente = usa BOUNCE_DROP_MIN). Dados: dump 25-30% trending → avg +403% mc_1h
 BOUNCE_TIME_MAX=20.0         # A.5: janela máxima em minutos
 BOTTOM_FRESHNESS_SEC=600     # A.6: máx 10min desde o último mc_min
+TRENDING_BLOCK_FAST_MIG=true  # H28: bloqueia trending tokens com mig<60s (WR 0%, runners)
 POOL_MIN_SOL_BOUNCE=20       # C3: pool depth mínima no momento do bounce
 BOUNCE_RECORD_MIN_POOL_SOL=5 # pool mínima para registrar bounce_signal (menor que C3)
 # RISE_NET_MIN=0             # RISE gate — NÃO configurado no Railway (desativado). Ver /analise/pre-rise-ticks para avaliar.
