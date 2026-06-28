@@ -58,9 +58,14 @@ def ensure_trending_radar_schema() -> None:
                 dexscr_trending_bar        BOOL,
                 dexscr_boost_fee           FLOAT,
                 cto_flag                   BOOL,
+                total_fee                  FLOAT,
                 raw_json                   TEXT,
                 created_at                 TIMESTAMPTZ DEFAULT NOW()
             )
+        """)
+        cur.execute("""
+            ALTER TABLE gmgn_trending_snapshots
+            ADD COLUMN IF NOT EXISTS total_fee FLOAT
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_gmgn_trending_snapshots_mint_ts ON gmgn_trending_snapshots (mint, ts_snapshot)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_gmgn_trending_snapshots_query ON gmgn_trending_snapshots (chain, interval_label, ts_snapshot)")
@@ -143,7 +148,7 @@ def insert_trending_snapshots(rows: list[dict]) -> list[int]:
                 holder_count, smart_degen_count, renowned_count, bluechip_owner_percentage,
                 rug_ratio, is_wash_trading, bundler_rate, rat_trader_amount_rate,
                 top10_holder_rate, top70_sniper_hold_rate, sniper_count, bot_degen_rate,
-                dexscr_ad, dexscr_trending_bar, dexscr_boost_fee, cto_flag, raw_json
+                dexscr_ad, dexscr_trending_bar, dexscr_boost_fee, cto_flag, total_fee, raw_json
             ) VALUES %s
             RETURNING id
         """, payload, template="""(
@@ -154,7 +159,7 @@ def insert_trending_snapshots(rows: list[dict]) -> list[int]:
                 %(holder_count)s, %(smart_degen_count)s, %(renowned_count)s, %(bluechip_owner_percentage)s,
                 %(rug_ratio)s, %(is_wash_trading)s, %(bundler_rate)s, %(rat_trader_amount_rate)s,
                 %(top10_holder_rate)s, %(top70_sniper_hold_rate)s, %(sniper_count)s, %(bot_degen_rate)s,
-                %(dexscr_ad)s, %(dexscr_trending_bar)s, %(dexscr_boost_fee)s, %(cto_flag)s, %(raw_json)s
+                %(dexscr_ad)s, %(dexscr_trending_bar)s, %(dexscr_boost_fee)s, %(cto_flag)s, %(total_fee)s, %(raw_json)s
             )""", fetch=True)
         return [row["id"] for row in inserted]
 
