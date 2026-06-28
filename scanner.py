@@ -288,11 +288,14 @@ class HotMonitor:
     # Bounce detector
     # ------------------------------------------------------------------
 
-    BOUNCE_MIN_PCT       = float(os.getenv("BOUNCE_MIN_PCT",         "0.30"))  # A.7: bounce mínimo 30% (live WR 9.1% abaixo disso)
-    BOUNCE_MAX_PCT       = float(os.getenv("BOUNCE_MAX_PCT",         "9.99"))  # desativado por padrão — sem validação GMGN para threshold máximo (nota 87 CLAUDE.md)
-    BOUNCE_DROP_MIN      = float(os.getenv("BOUNCE_DROP_MIN",        "0.20"))  # queda mínima da migração (sessão 21: drop 10-30% tem rec75 38-46%, melhor quartil)
-    BOUNCE_TIME_MAX      = float(os.getenv("BOUNCE_TIME_MAX",        "20.0"))  # A.5: janela 30→20min (100% TPs em ≤20min)
-    BOTTOM_FRESHNESS_SEC = int(os.getenv(  "BOTTOM_FRESHNESS_SEC",  "600"))   # A.6: máx 10min desde o último mc_min (sessão 21: 180s era muito restritivo)
+    BOUNCE_MIN_PCT           = float(os.getenv("BOUNCE_MIN_PCT",             "0.30"))  # A.7: bounce mínimo 30% (live WR 9.1% abaixo disso)
+    BOUNCE_MAX_PCT           = float(os.getenv("BOUNCE_MAX_PCT",             "9.99"))  # desativado por padrão — sem validação GMGN para threshold máximo (nota 87 CLAUDE.md)
+    BOUNCE_DROP_MIN          = float(os.getenv("BOUNCE_DROP_MIN",            "0.20"))  # queda mínima da migração (sessão 21: drop 10-30% tem rec75 38-46%, melhor quartil)
+    _tdrop_env               = os.getenv("BOUNCE_DROP_MIN_TRENDING")
+    BOUNCE_DROP_MIN_TRENDING = float(_tdrop_env) if _tdrop_env is not None else None  # threshold menor para trending=TRUE (None = usa BOUNCE_DROP_MIN)
+    BOUNCE_TIME_MAX          = float(os.getenv("BOUNCE_TIME_MAX",            "20.0"))  # A.5: janela 30→20min (100% TPs em ≤20min)
+    BOTTOM_FRESHNESS_SEC     = int(os.getenv(  "BOTTOM_FRESHNESS_SEC",      "600"))   # A.6: máx 10min desde o último mc_min (sessão 21: 180s era muito restritivo)
+    TRENDING_BLOCK_FAST_MIG  = os.getenv("TRENDING_BLOCK_FAST_MIG", "true").lower() == "true"  # H28: bloquear mig<60s para trending tokens (WR 0%)
 
     def _check_bounce(self, mint: str, state: dict, mc: float, elapsed_sec: int):
         """Detecta bounce em tempo real. Fase A: filtros A.2, A.3, A.6.
@@ -314,9 +317,11 @@ class HotMonitor:
             if mint_state.get("bounce_fired"):
                 return
             # Snapshot: lê dentro do lock, usa cópia local fora do lock
-            mc_min       = mint_state["mc_min"]
-            mc_migration = mint_state["mc_migration"]
-            ts_min       = mint_state.get("ts_min")
+            mc_min               = mint_state["mc_min"]
+            mc_migration         = mint_state["mc_migration"]
+            ts_min               = mint_state.get("ts_min")
+            is_trending          = mint_state.get("trending_at_migration")
+            time_to_migrate_sec  = mint_state.get("time_to_migrate_sec")
             # Não set bounce_fired aqui — apenas checkpoint. Set só após passar todos os filtros.
 
         elapsed_min  = elapsed_sec / 60
@@ -328,9 +333,18 @@ class HotMonitor:
         if mc_min <= 0 or mc_migration <= 0:
             return
 
+        # H28: tokens trending com mig<60s têm WR 0% (runners/manipulados). Bloquear.
+        if is_trending and self.TRENDING_BLOCK_FAST_MIG and time_to_migrate_sec is not None and time_to_migrate_sec < 60:
+            logger.debug("BOUNCE skip %s — H28 trending+mig=%ds<60s (runner)", mint[:8], time_to_migrate_sec)
+            return
 
         drop_from_mig = (mc_migration - mc_min) / mc_migration
-        if drop_from_mig < self.BOUNCE_DROP_MIN:
+        # Threshold diferenciado por trending: tokens trending com pequeno dump podem ser os melhores
+        # (demanda absorveu parte do dump → WR 100% avg +403% mc_1h para dump 25-30%).
+        _drop_threshold = self.BOUNCE_DROP_MIN
+        if is_trending and self.BOUNCE_DROP_MIN_TRENDING is not None:
+            _drop_threshold = self.BOUNCE_DROP_MIN_TRENDING
+        if drop_from_mig < _drop_threshold:
             return
 
         bounce_pct = (mc - mc_min) / mc_min
