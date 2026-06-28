@@ -1614,6 +1614,52 @@ def debug_signal_live():
     }, 200
 
 
+@app.route("/debug/signal-types")
+def debug_signal_types():
+    """
+    Testa signal types 14 (LargeAmountBuy), 15 (MultiBuy), 16 (MultiLargeBuy).
+    Retorna raw response de cada type para diagnóstico — type=12 como baseline de comparação.
+    ?types=12,14,15,16  (default: todos os 4)
+    """
+    if not gmgn:
+        return {"error": "GmgnClient não inicializado"}, 503
+
+    types_param = request.args.get("types", "12,14,15,16")
+    try:
+        signal_types = [int(t.strip()) for t in types_param.split(",")]
+    except ValueError:
+        return {"error": "types deve ser lista de inteiros separados por vírgula"}, 400
+
+    results = {}
+    for stype in signal_types:
+        body = {"chain": "sol", "groups": [{"signal_type": [stype]}]}
+        try:
+            import time as _time
+            from uuid import uuid4 as _uuid4
+            params = {"timestamp": str(int(_time.time())), "client_id": str(_uuid4())}
+            resp = gmgn.session.post(
+                f"{gmgn.host}/v1/market/token_signal",
+                json=body,
+                params=params,
+                timeout=10,
+            )
+            try:
+                rj = resp.json()
+            except Exception:
+                rj = {}
+            data = rj.get("data") or []
+            results[stype] = {
+                "status_code": resp.status_code,
+                "count":       len(data) if resp.ok else 0,
+                "sample":      data[:3] if resp.ok else None,
+                "error":       resp.text[:400] if not resp.ok else None,
+            }
+        except Exception as e:
+            results[stype] = {"error": str(e)}
+
+    return results, 200
+
+
 class _DummyCtx:
     def __enter__(self): return self
     def __exit__(self, *_): pass
