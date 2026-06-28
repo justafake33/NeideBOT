@@ -52375,6 +52375,105 @@ def _analise_trending_deep_inner():
               f"</tr>")
     H += "</table>"
     H += f"<p class='sub'>entry=mc_at_signal · P/L sim = max_mc/entry - 1 (não considera SL intra-60min) · TP{TP:.0%}/SL{SL:.0%}</p>"
+
+    # ── Seção 6: tokens trending bloqueados pelo BOUNCE_DROP_MIN ─────────────
+    H += "<h3>🚧 Seção 6 — Tokens trending bloqueados pelo BOUNCE_DROP_MIN=0.30</h3>"
+    H += "<p class='sub'>Busca na tabela migrations — tokens trending que dumpearam < 30% NUNCA disparam bounce_signal. Aqui vemos o que estamos perdendo.</p>"
+
+    conn2 = psycopg2.connect(db.DATABASE_URL)
+    conn2.autocommit = True
+    cur2 = conn2.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    # Busca todas as migrações trending com mc_bottom preenchido
+    cur2.execute("""
+        SELECT
+            m.mint,
+            m.token_nome                                    AS symbol,
+            m.ts_migration,
+            m.mc_migration,
+            m.mc_bottom,
+            m.mc_1h,
+            m.mc_peak,
+            m.time_to_bottom,
+            CASE
+                WHEN m.mc_migration > 0 AND m.mc_bottom IS NOT NULL
+                THEN (m.mc_migration - m.mc_bottom) / m.mc_migration
+                ELSE NULL
+            END                                             AS real_dump_pct,
+            CASE
+                WHEN m.mc_migration > 0 AND m.mc_1h IS NOT NULL
+                THEN (m.mc_1h - m.mc_migration) / m.mc_migration
+                ELSE NULL
+            END                                             AS mc_1h_vs_mig
+        FROM migrations m
+        WHERE m.trending_at_migration IS TRUE
+          AND m.ts_migration >= %(since)s::timestamptz
+          AND m.mc_migration IS NOT NULL
+          AND m.mc_migration > 0
+        ORDER BY m.ts_migration DESC
+    """, {"since": since_str})
+    mig_rows = [dict(r) for r in cur2.fetchall()]
+    conn2.close()
+
+    if not mig_rows:
+        H += "<div class='warn'>Sem dados de migrações trending no período.</div>"
+    else:
+        # Distribuição de dump depth real para trending tokens
+        has_dump = [r for r in mig_rows if r["real_dump_pct"] is not None]
+
+        buckets = [
+            ("dump < 15%",    [r for r in has_dump if r["real_dump_pct"] < 0.15]),
+            ("dump 15–25%",   [r for r in has_dump if 0.15 <= r["real_dump_pct"] < 0.25]),
+            ("dump 25–30%",   [r for r in has_dump if 0.25 <= r["real_dump_pct"] < 0.30]),
+            ("🚧 < 30% total (bloqueados)", [r for r in has_dump if r["real_dump_pct"] < 0.30]),
+            ("dump 30–40%",   [r for r in has_dump if 0.30 <= r["real_dump_pct"] < 0.40]),
+            ("dump 40–55%",   [r for r in has_dump if 0.40 <= r["real_dump_pct"] < 0.55]),
+            ("dump 55–70%",   [r for r in has_dump if 0.55 <= r["real_dump_pct"] < 0.70]),
+            ("dump > 70%",    [r for r in has_dump if r["real_dump_pct"] >= 0.70]),
+        ]
+
+        H += "<table class='wide'>"
+        H += ("<tr><th>Faixa de dump</th><th>n tokens</th><th>% do total</th>"
+              "<th>mc_1h > mig (recovery)</th><th>mc_1h avg vs mig</th></tr>")
+
+        for label, bucket in buckets:
+            n_b = len(bucket)
+            pct_total = n_b / len(mig_rows) if mig_rows else 0
+            with_1h = [r for r in bucket if r["mc_1h_vs_mig"] is not None]
+            n_rec = sum(1 for r in with_1h if r["mc_1h_vs_mig"] > 0) if with_1h else 0
+            avg_1h = sum(r["mc_1h_vs_mig"] for r in with_1h) / len(with_1h) if with_1h else None
+            rec_s = f"{n_rec}/{len(with_1h)} ({n_rec/len(with_1h):.0%})" if with_1h else "—"
+            avg_s = f"{avg_1h:+.0%}" if avg_1h is not None else "—"
+            is_blocked = "30% total" in label
+            bg = " style='background:#2f1f0a'" if is_blocked else ""
+            H += (f"<tr{bg}><td>{label}</td><td>{n_b}</td><td>{pct_total:.0%}</td>"
+                  f"<td>{rec_s}</td><td>{avg_s}</td></tr>")
+        H += "</table>"
+
+        # Tokens bloqueados (dump < 30%) — o que teria acontecido?
+        blocked = [r for r in has_dump if r["real_dump_pct"] < 0.30]
+        if blocked:
+            H += f"<div class='warn'>⚠️ <b>{len(blocked)} tokens trending</b> dumpearam < 30% e NUNCA disparariam bounce_signal com BOUNCE_DROP_MIN=0.30. Detalhes abaixo:</div>"
+            H += "<table class='wide'>"
+            H += ("<tr><th>data</th><th>símbolo</th><th>dump real</th><th>time_to_bottom</th>"
+                  "<th>MC mig</th><th>MC 1h</th><th>Δ MC 1h vs mig</th></tr>")
+            for r in sorted(blocked, key=lambda x: x["real_dump_pct"] or 0):
+                dt = r["ts_migration"].strftime("%m/%d %H:%M") if r.get("ts_migration") else "—"
+                sym = r["symbol"] or r["mint"][:8]
+                dump_s = f"{r['real_dump_pct']:.1%}" if r["real_dump_pct"] is not None else "—"
+                ttb_s  = f"{r['time_to_bottom']:.0f}min" if r.get("time_to_bottom") else "—"
+                mig_s  = f"${r['mc_migration']/1000:.0f}k" if r.get("mc_migration") else "—"
+                h1_s   = f"${r['mc_1h']/1000:.0f}k" if r.get("mc_1h") else "—"
+                d1h    = r["mc_1h_vs_mig"]
+                d1h_s  = f"{d1h:+.0%}" if d1h is not None else "—"
+                d1h_cls = "tp" if (d1h or 0) > 0.30 else ("sl" if (d1h or 0) < -0.15 else "")
+                H += (f"<tr><td>{dt}</td><td>{sym}</td><td>{dump_s}</td><td>{ttb_s}</td>"
+                      f"<td>{mig_s}</td><td>{h1_s}</td><td class='{d1h_cls}'>{d1h_s}</td></tr>")
+            H += "</table>"
+            H += "<p class='sub'>Δ MC 1h vs mig = (mc_1h - mc_migration) / mc_migration. Verde se +30%, vermelho se -15%.</p>"
+
+        H += "<div class='note'>💡 <b>Hipótese:</b> tokens trending com dump < 30% podem ter demanda real absorvendo parte do dump. Se mc_1h é positivo para esses tokens, considerar reduzir BOUNCE_DROP_MIN para 0.15–0.20 APENAS para trending=TRUE (threshold diferenciado por contexto).</div>"
+
     return H
 
 
