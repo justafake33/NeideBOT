@@ -52584,6 +52584,77 @@ def _analise_trending_deep_inner():
                    and r["elapsed_sec"] is not None and r["elapsed_sec"] < 600])
     H += "</table>"
 
+    # ── Seção 4.5: buy_share (snapshot GMGN) ─────────────────────────────────
+    H += "<h3>📊 Seção 4.5 — Buy Share do snapshot GMGN vs outcome</h3>"
+    H += "<p class='sub'>buy_share = buys/(buys+sells) do snapshot GMGN ±10min do bounce. Mede pressão compradora no momento do trending.</p>"
+
+    has_snap   = [r for r in trend_t if r.get("buy_share") is not None]
+    no_snap    = [r for r in trend_t if r.get("buy_share") is None]
+    snap_cov   = len(has_snap) / len(trend_t) if trend_t else 0
+
+    H += f"<div class='note'>Cobertura de snapshots: <b>{len(has_snap)}/{len(trend_t)}</b> ({snap_cov:.0%}) · sem snapshot: {len(no_snap)}</div>"
+    if snap_cov < 0.30:
+        H += "<div class='warn'>⚠️ Cobertura < 30% — análise de buy_share é indicativa. TrendingRadar precisa acumular mais snapshots.</div>"
+
+    def bs_bucket(bs):
+        if bs < 0.45: return "<45%"
+        if bs < 0.50: return "45–50%"
+        if bs < 0.55: return "50–55%"
+        if bs < 0.60: return "55–60%"
+        return "≥60%"
+
+    BS_ORDER = ["<45%", "45–50%", "50–55%", "55–60%", "≥60%"]
+    BS_TABLE: dict = {k: [] for k in BS_ORDER}
+    for r in has_snap:
+        BS_TABLE[bs_bucket(r["buy_share"])].append(r)
+
+    H += table_header()
+    H += row_html("trending=TRUE com snapshot (baseline)", has_snap, bold=True)
+    for bk in BS_ORDER:
+        subset = BS_TABLE[bk]
+        if not subset:
+            continue
+        highlight = bk == "≥60%"
+        H += row_html(f"buy_share {bk}", subset, highlight=highlight)
+    H += "</table>"
+
+    # Volume dentro de trending com snapshot
+    H += "<h4>📦 Volume do snapshot (USD) dentro de trending=TRUE</h4>"
+    H += "<p class='sub'>Volume é contínuo — não binário. Pareto pode existir dentro das faixas.</p>"
+    vol_buckets = [
+        ("vol < $3k",         [r for r in has_snap if (r.get("snap_volume") or 0) < 3000]),
+        ("vol $3k–$10k",      [r for r in has_snap if 3000 <= (r.get("snap_volume") or 0) < 10000]),
+        ("vol $10k–$20k",     [r for r in has_snap if 10000 <= (r.get("snap_volume") or 0) < 20000]),
+        ("vol $20k–$50k",     [r for r in has_snap if 20000 <= (r.get("snap_volume") or 0) < 50000]),
+        ("vol > $50k",        [r for r in has_snap if (r.get("snap_volume") or 0) >= 50000]),
+    ]
+    H += table_header()
+    H += row_html("com snapshot (baseline)", has_snap, bold=True)
+    for label, subset in vol_buckets:
+        H += row_html(label, subset)
+    H += "</table>"
+
+    # Combinações buy_share + drop
+    H += "<h4>🔗 Combinações buy_share + drop (dentro de trending+snapshot)</h4>"
+    H += table_header()
+    H += row_html("com snapshot (baseline)", has_snap, bold=True)
+    H += row_html("buy_share ≥60% + drop > 40%",
+                  [r for r in has_snap if r["buy_share"] >= 0.60
+                   and r.get("drop_from_mig") is not None and r["drop_from_mig"] >= 0.40],
+                  highlight=True)
+    H += row_html("buy_share ≥60% + drop < 40%",
+                  [r for r in has_snap if r["buy_share"] >= 0.60
+                   and r.get("drop_from_mig") is not None and r["drop_from_mig"] < 0.40])
+    H += row_html("buy_share <55% + drop > 40%",
+                  [r for r in has_snap if r["buy_share"] < 0.55
+                   and r.get("drop_from_mig") is not None and r["drop_from_mig"] >= 0.40])
+    H += row_html("buy_share ≥60% + mig 60–900s",
+                  [r for r in has_snap if r["buy_share"] >= 0.60
+                   and r.get("time_to_migrate_sec") is not None
+                   and 60 <= r["time_to_migrate_sec"] < 900],
+                  highlight=True)
+    H += "</table>"
+
     # ── Seção 5: tabela individual de trending tokens ─────────────────────────
     H += f"<h3>📋 Seção 5 — Todos os bounces trending=TRUE ({len(trend_t)} tokens)</h3>"
     H += "<p class='sub'>Tabela completa — todos os campos disponíveis por token. Colunas de snapshot GMGN (buys/sells/buy%) aparecem quando existe snapshot ±10min do bounce.</p>"
