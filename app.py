@@ -52301,18 +52301,16 @@ def _analise_trending_deep_inner():
         snaps AS (
             SELECT DISTINCT ON (s_inner.mint)
                 s_inner.mint,
-                s_inner.buys,
-                s_inner.sells,
-                s_inner.swaps,
-                s_inner.volume,
-                s_inner.rank_position,
-                s_inner.interval_label,
-                s_inner.hot_level
+                gs.buys,
+                gs.sells,
+                gs.swaps,
+                gs.volume,
+                gs.rank_position,
+                gs.interval_label,
+                gs.hot_level
             FROM sim s_inner
             JOIN gmgn_trending_snapshots gs ON gs.mint = s_inner.mint
-            WHERE (
-                ABS(EXTRACT(EPOCH FROM (gs.ts_snapshot - s_inner.ts_signal - INTERVAL '0'))) <= 600
-            )
+            WHERE ABS(EXTRACT(EPOCH FROM (gs.ts_snapshot - s_inner.ts_signal))) <= 600
             ORDER BY s_inner.mint,
                      ABS(EXTRACT(EPOCH FROM (gs.ts_snapshot - s_inner.ts_signal)))
         )
