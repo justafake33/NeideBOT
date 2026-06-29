@@ -52277,6 +52277,9 @@ def _analise_trending_deep_inner():
                 m.time_to_bottom,
                 m.time_to_migrate_sec,
                 m.exchange,
+                m.rug_ratio,
+                m.top10_holder_rate,
+                m.creator_token_status,
                 MAX(COALESCE(tt.mc_high, tt.mc))                  AS max_mc,
                 MIN(COALESCE(tt.mc_low,  tt.mc))                  AS min_mc,
                 COUNT(tt.id)                                      AS tick_count
@@ -52291,10 +52294,41 @@ def _analise_trending_deep_inner():
                      bs.bounce_pct, bs.drop_from_mig, bs.pool_quote_at_signal,
                      bs.mc_at_signal, bs.mc_migration,
                      m.trending_at_migration, m.mc_migration, m.liq_migration,
-                     m.smart_wallets, m.time_to_bottom, m.time_to_migrate_sec, m.exchange
+                     m.smart_wallets, m.time_to_bottom, m.time_to_migrate_sec, m.exchange,
+                     m.rug_ratio, m.top10_holder_rate, m.creator_token_status
             HAVING COUNT(tt.id) >= %(min_ticks)s
+        ),
+        snaps AS (
+            SELECT DISTINCT ON (s_inner.mint)
+                s_inner.mint,
+                s_inner.buys,
+                s_inner.sells,
+                s_inner.swaps,
+                s_inner.volume,
+                s_inner.rank_position,
+                s_inner.interval_label,
+                s_inner.hot_level
+            FROM sim s_inner
+            JOIN gmgn_trending_snapshots gs ON gs.mint = s_inner.mint
+            WHERE (
+                ABS(EXTRACT(EPOCH FROM (gs.ts_snapshot - s_inner.ts_signal - INTERVAL '0'))) <= 600
+            )
+            ORDER BY s_inner.mint,
+                     ABS(EXTRACT(EPOCH FROM (gs.ts_snapshot - s_inner.ts_signal)))
         )
-        SELECT * FROM sim ORDER BY ts_signal DESC
+        SELECT
+            sim.*,
+            snaps.buys,
+            snaps.sells,
+            snaps.swaps,
+            snaps.volume       AS snap_volume,
+            snaps.rank_position,
+            snaps.interval_label,
+            snaps.hot_level,
+            snaps.buys::float / NULLIF(snaps.buys + snaps.sells, 0) AS buy_share
+        FROM sim
+        LEFT JOIN snaps ON snaps.mint = sim.mint
+        ORDER BY ts_signal DESC
     """, {"since": since_str, "min_ticks": MIN_TICKS})
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
@@ -52372,6 +52406,7 @@ def _analise_trending_deep_inner():
     H += "<a href='/analise/h9-gate'>H9 Gate</a>"
     H += "<a href='/analise/migration-quality'>Migration Quality</a>"
     H += "<a href='/analise/quality-grid'>Quality Grid</a>"
+    H += "<a href='/analise/trending-flow'>Trending Flow (buy/sell)</a>"
     H += "</nav>"
     H += "<h2>📈 Trending Deep — Análise completa de trending_at_migration</h2>"
     H += f"<p class='sub'>desde {since_str} · TP{TP:.0%}/SL{SL:.0%} · break-even {BE:.1%} · SQL {t_sql:.1f}s</p>"
@@ -52553,10 +52588,16 @@ def _analise_trending_deep_inner():
 
     # ── Seção 5: tabela individual de trending tokens ─────────────────────────
     H += f"<h3>📋 Seção 5 — Todos os bounces trending=TRUE ({len(trend_t)} tokens)</h3>"
-    H += "<table class='wide'>"
-    H += ("<tr><th>data</th><th>símbolo</th><th>elapsed</th><th>drop</th>"
-          "<th>bounce</th><th>pool SOL</th><th>smart</th><th>MC mig</th>"
-          "<th>entry MC</th><th>max MC 60min</th><th>TP75?</th><th>P/L sim</th></tr>")
+    H += "<p class='sub'>Tabela completa — todos os campos disponíveis por token. Colunas de snapshot GMGN (buys/sells/buy%) aparecem quando existe snapshot ±10min do bounce.</p>"
+    H += "<div style='overflow-x:auto'><table class='wide'>"
+    H += ("<tr>"
+          "<th>data</th><th>símbolo</th><th>elapsed</th><th>drop</th>"
+          "<th>bounce</th><th>pool SOL</th><th>smart</th><th>mig(s)</th>"
+          "<th>liq mig</th><th>rug</th><th>top10</th><th>creator</th>"
+          "<th>MC mig</th><th>entry MC</th><th>max 60min</th>"
+          "<th>rank</th><th>buys</th><th>sells</th><th>buy%</th><th>vol</th>"
+          "<th>TP?</th><th>P/L sim</th>"
+          "</tr>")
     for r in trend_t:
         tp_hit  = is_tp(r)
         sl_hit  = is_sl(r)
@@ -52576,16 +52617,38 @@ def _analise_trending_deep_inner():
         en_s    = f"${r['entry_mc']/1000:.0f}k" if r["entry_mc"] else "—"
         mx_s    = f"${max_mc/1000:.0f}k" if max_mc else "—"
         sym     = r["symbol"] or (r["mint"][:8] if r.get("mint") else "—")
+        # migration quality
+        mig_s   = str(int(r["time_to_migrate_sec"])) if r.get("time_to_migrate_sec") is not None else "—"
+        liq_s   = f"${r['liq_migration']/1000:.0f}k" if r.get("liq_migration") else "—"
+        rug_s   = f"{r['rug_ratio']:.0%}" if r.get("rug_ratio") is not None else "—"
+        t10_s   = f"{r['top10_holder_rate']:.0%}" if r.get("top10_holder_rate") is not None else "—"
+        cre_s   = ("hold" if r.get("creator_token_status") == "creator_hold"
+                   else ("close" if r.get("creator_token_status") == "creator_close" else "—"))
+        cre_cls = " class='sl'" if r.get("creator_token_status") == "creator_hold" else ""
+        # snapshot GMGN
+        rank_s  = str(r.get("rank_position") or "—")
+        buys_s  = str(r.get("buys") or "—")
+        sells_s = str(r.get("sells") or "—")
+        bs_val  = r.get("buy_share")
+        bs_s    = f"<b>{bs_val:.0%}</b>" if bs_val and bs_val >= 0.60 else (f"{bs_val:.0%}" if bs_val is not None else "—")
+        bs_cls  = " class='tp'" if bs_val and bs_val >= 0.60 else (" class='sl'" if bs_val and bs_val < 0.45 else "")
+        vol_s   = f"${r['snap_volume']:,.0f}" if r.get("snap_volume") else "—"
+        mint_url = f"https://gmgn.ai/sol/token/{r['mint']}" if r.get("mint") else "#"
         row_bg  = " style='background:#1a2f1a'" if tp_hit else (" style='background:#2f1a1a'" if sl_hit else "")
         H += (f"<tr{row_bg}>"
-              f"<td>{dt}</td><td>{sym}</td>"
+              f"<td>{dt}</td>"
+              f"<td><a href='{mint_url}' target='_blank' style='color:#79c0ff'>{sym}</a></td>"
               f"<td>{el_s}</td><td>{dr_s}</td><td>{bo_s}</td>"
-              f"<td>{po_s}</td><td>{sm_s}</td>"
+              f"<td>{po_s}</td><td>{sm_s}</td><td>{mig_s}</td>"
+              f"<td>{liq_s}</td><td>{rug_s}</td><td>{t10_s}</td>"
+              f"<td{cre_cls}>{cre_s}</td>"
               f"<td>{mc_m_s}</td><td>{en_s}</td><td>{mx_s}</td>"
+              f"<td>{rank_s}</td><td>{buys_s}</td><td>{sells_s}</td>"
+              f"<td{bs_cls}>{bs_s}</td><td>{vol_s}</td>"
               f"<td>{outcome}</td><td class='{pnl_cls}'>{pnl_s}</td>"
               f"</tr>")
-    H += "</table>"
-    H += f"<p class='sub'>entry=mc_at_signal · P/L sim = max_mc/entry - 1 (não considera SL intra-60min) · TP{TP:.0%}/SL{SL:.0%}</p>"
+    H += "</table></div>"
+    H += f"<p class='sub'>entry=mc_at_signal · P/L sim = max_mc/entry - 1 · TP{TP:.0%}/SL{SL:.0%} · buy% verde ≥60%, vermelho <45% · creator=hold em vermelho (dev ainda segura)</p>"
 
     # ── Seção 6: tokens trending bloqueados pelo BOUNCE_DROP_MIN ─────────────
     H += "<h3>🚧 Seção 6 — Tokens trending bloqueados pelo BOUNCE_DROP_MIN=0.30</h3>"
