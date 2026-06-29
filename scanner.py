@@ -647,7 +647,7 @@ class HotMonitor:
                 f"  Fundo:    ${mc_min:,.2f} (-{drop_from_mig:.0%})\n"
                 f"  Agora:    ${mc:,.0f} (+{bounce_pct:.0%} do fundo)\n"
                 f"  Tempo:    {elapsed_min:.1f}min\n"
-                f"  Mint: {mint}"
+                f"  [GMGN](https://gmgn.ai/sol/token/{mint}) | [DEX](https://dexscreener.com/solana/{mint})"
             )
             try:
                 send_alert(msg)
@@ -1866,7 +1866,8 @@ class Scanner:
                 f"\U0001f514 *Migracao: {symbol}*\n"
                 f"MC oficial: ${mc_migration:,.0f} ({src}) | Liq: ${liq:,.0f}\n"
                 f"Exchange: {exch}{trend_str}\n"
-                f"Smart: {smart} | Rug: {rug:.0%}"
+                f"Smart: {smart} | Rug: {rug:.0%}\n"
+                f"[GMGN](https://gmgn.ai/sol/token/{mint}) | [DEX](https://dexscreener.com/solana/{mint})"
             )
 
         delay_str = f" delay={capture_delay_sec}s" if capture_delay_sec is not None else ""
