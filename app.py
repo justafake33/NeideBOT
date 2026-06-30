@@ -11437,6 +11437,12 @@ def debug_bounce_miss():
 
         with db._cursor() as cur:
             cur.execute("""
+                WITH peak20 AS (
+                    SELECT mint, MAX(mc) AS mc_peak_20m
+                    FROM token_ticks
+                    WHERE elapsed_sec BETWEEN 0 AND 1200
+                    GROUP BY mint
+                )
                 SELECT
                     m.mint,
                     m.token_nome         AS symbol,
@@ -11451,6 +11457,7 @@ def debug_bounce_miss():
                     m.rug_ratio,
                     m.liq_migration,
                     m.passed_filters,
+                    p.mc_peak_20m,
                     b.mint               AS bounced,
                     b.elapsed_sec        AS bounce_elapsed,
                     b.drop_from_mig      AS bounce_drop,
@@ -11458,8 +11465,9 @@ def debug_bounce_miss():
                     b.mc_at_signal,
                     t.status             AS trade_status
                 FROM migrations m
-                LEFT JOIN bounce_signals b ON b.mint = m.mint
-                LEFT JOIN trades         t ON t.mint  = m.mint
+                LEFT JOIN peak20          p ON p.mint  = m.mint
+                LEFT JOIN bounce_signals  b ON b.mint  = m.mint
+                LEFT JOIN trades          t ON t.mint  = m.mint
                 WHERE m.ts_migration >= NOW() - %(h)s * INTERVAL '1 hour'
                 ORDER BY m.ts_migration DESC
                 LIMIT 200
@@ -11471,11 +11479,12 @@ def debug_bounce_miss():
             if not r.get("passed_filters"):
                 return "fora_filtro", "Fora filtro (rug/mc/liq/fee)"
 
-            mc_bot  = r.get("mc_bottom")
-            mc_mig  = r.get("mc_migration") or 0
-            ttb     = r.get("time_to_bottom")   # minutos
-            mig_s   = r.get("time_to_migrate_sec")
+            mc_bot   = r.get("mc_bottom")
+            mc_mig   = r.get("mc_migration") or 0
+            ttb      = r.get("time_to_bottom")   # minutos
+            mig_s    = r.get("time_to_migrate_sec")
             is_trend = r.get("trending_at_migration")
+            mc_peak_20m = r.get("mc_peak_20m")
 
             if mc_bot is None:
                 return "no_bottom", "Fundo não capturado (Helius gap ou ainda ativo)"
@@ -11491,13 +11500,27 @@ def debug_bounce_miss():
             if drop < threshold:
                 return "drop_pequeno", f"Drop {drop:.0%} < threshold {threshold:.0%}"
 
+            # H28: mig<60s para trending
+            if is_trend and mig_s is not None and mig_s < 60:
+                return "h28_runner", f"H28: mig={mig_s}s<60s (runner, WR 0%)"
+
+            # TRENDING_MAX_MIG_SEC: lê do env OU usa hardcoded 900 se trending
+            # (env pode não estar setado no web service mesmo que esteja no worker)
+            _tmig_check = TRENDING_MAX_MIG or (900 if is_trend else None)
+            if is_trend and _tmig_check and mig_s is not None and mig_s > _tmig_check:
+                suffix = " (gate não estava ativo no código)" if not TRENDING_MAX_MIG else ""
+                return "mig_lento", f"mig={mig_s}s > {_tmig_check}s{suffix}"
+
+            # Verifica se bounce (10%) foi atingido dentro de 20min
+            # mc_peak_20m: MC máximo nos primeiros 20min (kline close)
+            bounce_needed = mc_bot * (1 + float(_os.getenv("BOUNCE_MIN_PCT", "0.10")))
+            if mc_peak_20m is not None and mc_peak_20m < bounce_needed:
+                return "bounce_insuficiente", f"Peak 20min ${mc_peak_20m:,.0f} < needed ${bounce_needed:,.0f} (+10% do fundo)"
+
             if ttb is not None and ttb > BOUNCE_TIME_MAX:
                 return "elapsed", f"Fundo em {ttb:.1f}min > max {BOUNCE_TIME_MAX:.0f}min (A.5)"
 
-            if is_trend and TRENDING_MAX_MIG and mig_s and mig_s > TRENDING_MAX_MIG:
-                return "mig_lento", f"mig={mig_s}s > TRENDING_MAX_MIG={TRENDING_MAX_MIG}s"
-
-            return "desconhecido", "Passou filtros de preço — verificar logs (pool/H23/RISE)"
+            return "desconhecido", "Passou filtros — pool rasa ou bounce tardio (ver logs)"
 
         # Separa em: bounced, missed
         bounced_list = []
@@ -11524,12 +11547,14 @@ def debug_bounce_miss():
         </style>"""
 
         REASON_COLOR = {
-            "no_bottom":   "#f0883e",
-            "drop_pequeno":"#8b949e",
-            "elapsed":     "#e3b341",
-            "mig_lento":   "#a5d6ff",
-            "fora_filtro": "#6e7681",
-            "desconhecido":"#58a6ff",
+            "no_bottom":          "#f0883e",
+            "drop_pequeno":       "#8b949e",
+            "elapsed":            "#e3b341",
+            "mig_lento":          "#a5d6ff",
+            "h28_runner":         "#a5d6ff",
+            "bounce_insuficiente":"#e3b341",
+            "fora_filtro":        "#6e7681",
+            "desconhecido":       "#58a6ff",
         }
 
         def _mc(v):
@@ -11555,12 +11580,14 @@ def debug_bounce_miss():
             if bot and r.get("mc_migration"):
                 d = (r["mc_migration"] - bot) / r["mc_migration"]
                 drop = f"{d:.0%}"
+            peak20  = _mc(r.get("mc_peak_20m"))
             return f"""<tr>
               <td>{_ts(r['ts_migration'])}</td>
               <td><b>{trend}{sym}</b></td>
               <td>{_mc(r['mc_migration'])}</td>
               <td>{_mc(r.get('mc_bottom'))}</td>
               <td>{drop}</td>
+              <td>{peak20}</td>
               <td>{f"{r['time_to_bottom']:.1f}min" if r.get('time_to_bottom') else "—"}</td>
               <td>{mig_str}</td>
               <td><span class='tag' style='background:{color}22;color:{color}'>{txt}</span></td>
@@ -11635,7 +11662,7 @@ def debug_bounce_miss():
 <table>
   <thead><tr>
     <th>Migração</th><th>Token</th><th>MC mig</th><th>MC fundo</th>
-    <th>Drop</th><th>Time bottom</th><th>Mig speed</th>
+    <th>Drop</th><th>Peak 20min</th><th>Time bottom</th><th>Mig speed</th>
     <th>Motivo provável</th><th>Links</th>
   </tr></thead>
   <tbody>{missed_html or "<tr><td colspan=9 style='color:#3fb950'>Nenhum missed neste período!</td></tr>"}</tbody>
