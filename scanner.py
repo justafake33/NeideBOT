@@ -328,8 +328,13 @@ class HotMonitor:
 
         elapsed_min  = elapsed_sec / 60
 
+        symbol = state.get("symbol", mint[:8])
+
         # ── Boundary checks ─────────────────────────────────────────────────────────
         if elapsed_sec < 0 or elapsed_min > self.BOUNCE_TIME_MAX:
+            if elapsed_min > self.BOUNCE_TIME_MAX:
+                logger.info("BOUNCE skip %s — A.5 elapsed=%.1fmin > max=%.0fmin mc=$%.0f",
+                            symbol, elapsed_min, self.BOUNCE_TIME_MAX, mc)
             return
 
         if mc_min <= 0 or mc_migration <= 0:
@@ -337,14 +342,14 @@ class HotMonitor:
 
         # H28: tokens trending com mig<60s têm WR 0% (runners/manipulados). Bloquear.
         if is_trending and self.TRENDING_BLOCK_FAST_MIG and time_to_migrate_sec is not None and time_to_migrate_sec < 60:
-            logger.debug("BOUNCE skip %s — H28 trending+mig=%ds<60s (runner)", mint[:8], time_to_migrate_sec)
+            logger.info("BOUNCE skip %s — H28 trending+mig=%ds<60s (runner)", symbol, time_to_migrate_sec)
             return
 
         # TRENDING_MAX_MIG_SEC: mig>Xs para trending → WR 38% (ruído). Bloquear.
         # Dados: mig 60-300s → WR 70.8%, mig 300-900s → WR 61.9%, mig>900s → WR 38%.
         if is_trending and self.TRENDING_MAX_MIG_SEC is not None and time_to_migrate_sec is not None and time_to_migrate_sec > self.TRENDING_MAX_MIG_SEC:
-            logger.debug("BOUNCE skip %s — TRENDING_MAX_MIG_SEC trending+mig=%ds>%ds",
-                         mint[:8], time_to_migrate_sec, self.TRENDING_MAX_MIG_SEC)
+            logger.info("BOUNCE skip %s — TRENDING_MAX_MIG_SEC trending+mig=%ds>%ds",
+                        symbol, time_to_migrate_sec, self.TRENDING_MAX_MIG_SEC)
             return
 
         drop_from_mig = (mc_migration - mc_min) / mc_migration
@@ -354,14 +359,16 @@ class HotMonitor:
         if is_trending and self.BOUNCE_DROP_MIN_TRENDING is not None:
             _drop_threshold = self.BOUNCE_DROP_MIN_TRENDING
         if drop_from_mig < _drop_threshold:
+            logger.info("BOUNCE skip %s — drop=%.0f%% < threshold=%.0f%% mc_min=$%.0f mc_mig=$%.0f",
+                        symbol, drop_from_mig * 100, _drop_threshold * 100, mc_min, mc_migration)
             return
 
         bounce_pct = (mc - mc_min) / mc_min
         if bounce_pct < self.BOUNCE_MIN_PCT:
             return
         if self.BOUNCE_MAX_PCT < 9.99 and bounce_pct > self.BOUNCE_MAX_PCT:
-            logger.debug("BOUNCE skip %s — bounce tardio=%.1f%% (max=%.0f%%)",
-                         mint[:8], bounce_pct * 100, self.BOUNCE_MAX_PCT * 100)
+            logger.info("BOUNCE skip %s — bounce tardio=%.1f%% (max=%.0f%%)",
+                        symbol, bounce_pct * 100, self.BOUNCE_MAX_PCT * 100)
             return
 
         # Anti-decline: rejeita se o preço está caindo em relação a um pico REAL pós-migração.
@@ -372,8 +379,8 @@ class HotMonitor:
         # Fix: só aplica se mc_max superou 5% acima da migração (pico real pós-migração).
         mc_max = mint_state["mc_max"]
         if mc_max > mc_migration * 1.05 and mc < mc_max * 0.85:
-            logger.debug("BOUNCE skip %s — declining: $%.0f < pico real $%.0f × 85%%",
-                         mint[:8], mc, mc_max)
+            logger.info("BOUNCE skip %s — declining: $%.0f < pico real $%.0f × 85%%",
+                        symbol, mc, mc_max)
             return
 
         # A.6 — Bottom freshness: sinal deve vir logo após o fundo ser confirmado.
@@ -384,15 +391,15 @@ class HotMonitor:
         if ts_min is not None:
             secs_since_bottom = (datetime.now(timezone.utc) - ts_min).total_seconds()
             if secs_since_bottom > self.BOTTOM_FRESHNESS_SEC:
-                logger.debug(
-                    "BOUNCE skip %s — A.6 bottom stale %.0fs ago (max=%ds)",
-                    mint[:8], secs_since_bottom, self.BOTTOM_FRESHNESS_SEC,
+                logger.info(
+                    "BOUNCE skip %s — A.6 bottom stale %.0fs ago (max=%ds) mc=$%.0f bounce=%.0f%%",
+                    symbol, secs_since_bottom, self.BOTTOM_FRESHNESS_SEC, mc, bounce_pct * 100,
                 )
                 return
 
         # A.8 — Preço acima da migração: sinal é artifact de wick intra-candle, não bounce real.
         if mc >= mc_migration:
-            logger.debug("BOUNCE skip %s — A.8 mc=$%.0f >= mig=$%.0f", mint[:8], mc, mc_migration)
+            logger.info("BOUNCE skip %s — A.8 mc=$%.0f >= mig=$%.0f", symbol, mc, mc_migration)
             return
 
         # B.3 — Backfill retroativo: insere kline completo desde a migração para cobertura de ticks.
@@ -488,6 +495,12 @@ class HotMonitor:
         rise_lb = rise_window.get("largest_buy") or 0
         if rise_bv > 0:
             buy_concentration = round(rise_lb / rise_bv, 4)
+
+        logger.info(
+            "BOUNCE candidate %s — drop=%.0f%% bounce=%.0f%% mc_min=$%.0f mc_now=$%.0f mc_mig=$%.0f elapsed=%.1fmin trending=%s mig=%ss",
+            symbol, drop_from_mig * 100, bounce_pct * 100, mc_min, mc, mc_migration,
+            elapsed_min, is_trending, time_to_migrate_sec,
+        )
 
         # Piso anti-fake para pesquisa: pools extremamente rasas durante migração
         # poluem o dataset. Este piso só descarta fake-pools óbvias; o piso
