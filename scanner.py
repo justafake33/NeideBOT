@@ -296,6 +296,8 @@ class HotMonitor:
     BOUNCE_TIME_MAX          = float(os.getenv("BOUNCE_TIME_MAX",            "20.0"))  # A.5: janela 30→20min (100% TPs em ≤20min)
     BOTTOM_FRESHNESS_SEC     = int(os.getenv(  "BOTTOM_FRESHNESS_SEC",      "600"))   # A.6: máx 10min desde o último mc_min (sessão 21: 180s era muito restritivo)
     TRENDING_BLOCK_FAST_MIG  = os.getenv("TRENDING_BLOCK_FAST_MIG", "true").lower() == "true"  # H28: bloquear mig<60s para trending tokens (WR 0%)
+    _tmig_max_env            = os.getenv("TRENDING_MAX_MIG_SEC")
+    TRENDING_MAX_MIG_SEC     = int(_tmig_max_env) if _tmig_max_env is not None else None  # bloqueia trending+mig>Xs (mig>900s: WR 38%, ruído)
 
     def _check_bounce(self, mint: str, state: dict, mc: float, elapsed_sec: int):
         """Detecta bounce em tempo real. Fase A: filtros A.2, A.3, A.6.
@@ -336,6 +338,13 @@ class HotMonitor:
         # H28: tokens trending com mig<60s têm WR 0% (runners/manipulados). Bloquear.
         if is_trending and self.TRENDING_BLOCK_FAST_MIG and time_to_migrate_sec is not None and time_to_migrate_sec < 60:
             logger.debug("BOUNCE skip %s — H28 trending+mig=%ds<60s (runner)", mint[:8], time_to_migrate_sec)
+            return
+
+        # TRENDING_MAX_MIG_SEC: mig>Xs para trending → WR 38% (ruído). Bloquear.
+        # Dados: mig 60-300s → WR 70.8%, mig 300-900s → WR 61.9%, mig>900s → WR 38%.
+        if is_trending and self.TRENDING_MAX_MIG_SEC is not None and time_to_migrate_sec is not None and time_to_migrate_sec > self.TRENDING_MAX_MIG_SEC:
+            logger.debug("BOUNCE skip %s — TRENDING_MAX_MIG_SEC trending+mig=%ds>%ds",
+                         mint[:8], time_to_migrate_sec, self.TRENDING_MAX_MIG_SEC)
             return
 
         drop_from_mig = (mc_migration - mc_min) / mc_migration
@@ -1146,17 +1155,28 @@ class HotMonitor:
                     elapsed_min = elapsed_sec / 60
                     if elapsed_sec < 0 or elapsed_sec > 3660:
                         continue
-                    # NÃO ignora os primeiros 90s — o gate de 90s foi removido.
-                    # Anteriormente, o low do candle de transição bonding curve → pool era
-                    # escrito em mc_min. Agora o kline NÃO escreve mc_min (erpc é a fonte).
-                    # O candle pode ser inserido em token_ticks normalmente.
-
                     low_price = _float(c.get("low"))
                     mc_low = low_price * state["total_supply"] if (low_price and low_price > 0) else None
 
-                    # mc_min vem exclusivamente do erpc (push_mc com token_data=None).
-                    # O kline NÃO atualiza mc_min — mantém baseline de decisão monotônico
-                    # e auditável apenas por eventos erpc. mc_low aqui é SOMENTE para ticks.
+                    # Kline low → mc_min fallback (elapsed >= 90s).
+                    # Gate 90s evita o candle de transição bonding curve→pool cujo low contém
+                    # preços da bonding curve (~$0) e não da pool pAMM.
+                    # Uso: quando Helius tem gap de 10-30s na subscription após migração,
+                    # o fundo em V-bottom rápido não é capturado pelo erpc. Sem este fallback,
+                    # mc_min fica em mc_migration → drop_from_mig=0% → bounce nunca dispara.
+                    if elapsed_sec >= 90 and mc_low and mc_low < state["mc_min"]:
+                        with self._lock:
+                            inner = self._tokens.get(mint)
+                            if inner and mc_low < inner["mc_min"]:
+                                inner["mc_min"]   = mc_low
+                                inner["time_min"] = elapsed_min
+                                inner["ts_min"]   = datetime.fromtimestamp(candle_ts, tz=timezone.utc)
+                        db.update_bottom(mint, mc_low, elapsed_min)
+                        logger.info("Fundo(kline) %s: $%.2f em %.1fmin (fallback Helius gap)",
+                                    state["symbol"], mc_low, elapsed_min)
+                        state["mc_min"]   = mc_low  # atualiza cópia local
+                        state["time_min"] = elapsed_min
+                        state["ts_min"]   = datetime.fromtimestamp(candle_ts, tz=timezone.utc)
 
                     # 2. Atualiza mc_max com o CLOSE desta vela (não o high).
                     # Kline high captura spikes intra-candle de transações individuais
