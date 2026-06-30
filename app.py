@@ -11411,6 +11411,253 @@ def debug_bounce_list():
         return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
+@app.route("/debug/bounce-miss")
+def debug_bounce_miss():
+    """Migrações recentes sem bounce_signal — diagnóstico de oportunidades perdidas.
+
+    Calcula o motivo provável de cada miss com base nos dados do banco:
+    - mc_bottom não capturado (Helius gap)
+    - drop insuficiente
+    - elapsed > BOUNCE_TIME_MAX
+    - token sem tradeable
+    """
+    import traceback, os as _os
+    try:
+        hours  = int(request.args.get("hours", "12"))
+        only_trending = request.args.get("trending", "0") == "1"
+        only_tradeable = request.args.get("tradeable", "1") == "1"
+
+        # Parâmetros atuais do bot (para calcular o motivo)
+        BOUNCE_DROP_MIN     = float(_os.getenv("BOUNCE_DROP_MIN", "0.30"))
+        BOUNCE_DROP_TRENDING = _os.getenv("BOUNCE_DROP_MIN_TRENDING")
+        BOUNCE_DROP_TRENDING = float(BOUNCE_DROP_TRENDING) if BOUNCE_DROP_TRENDING else None
+        BOUNCE_TIME_MAX     = float(_os.getenv("BOUNCE_TIME_MAX", "20.0"))
+        TRENDING_MAX_MIG    = _os.getenv("TRENDING_MAX_MIG_SEC")
+        TRENDING_MAX_MIG    = int(TRENDING_MAX_MIG) if TRENDING_MAX_MIG else None
+
+        with db._cursor() as cur:
+            cur.execute("""
+                SELECT
+                    m.mint,
+                    m.token_nome         AS symbol,
+                    m.ts_migration,
+                    m.mc_migration,
+                    m.mc_bottom,
+                    m.time_to_bottom,
+                    m.exchange,
+                    m.trending_at_migration,
+                    m.time_to_migrate_sec,
+                    m.smart_wallets,
+                    m.rug_ratio,
+                    m.liq_migration,
+                    m.passed_filters,
+                    b.mint               AS bounced,
+                    b.elapsed_sec        AS bounce_elapsed,
+                    b.drop_from_mig      AS bounce_drop,
+                    b.bounce_pct,
+                    b.mc_at_signal,
+                    t.status             AS trade_status
+                FROM migrations m
+                LEFT JOIN bounce_signals b ON b.mint = m.mint
+                LEFT JOIN trades         t ON t.mint  = m.mint
+                WHERE m.ts_migration >= NOW() - %(h)s * INTERVAL '1 hour'
+                ORDER BY m.ts_migration DESC
+                LIMIT 200
+            """, {"h": hours})
+            rows = [dict(r) for r in cur.fetchall()]
+
+        def _miss_reason(r):
+            """Calcula motivo provável de não ter comprado."""
+            if not r.get("passed_filters"):
+                return "fora_filtro", "Fora filtro (rug/mc/liq/fee)"
+
+            mc_bot  = r.get("mc_bottom")
+            mc_mig  = r.get("mc_migration") or 0
+            ttb     = r.get("time_to_bottom")   # minutos
+            mig_s   = r.get("time_to_migrate_sec")
+            is_trend = r.get("trending_at_migration")
+
+            if mc_bot is None:
+                return "no_bottom", "Fundo não capturado (Helius gap ou ainda ativo)"
+
+            if mc_mig <= 0:
+                return "no_mig_mc", "mc_migration=0"
+
+            drop = (mc_mig - mc_bot) / mc_mig
+            threshold = BOUNCE_DROP_MIN
+            if is_trend and BOUNCE_DROP_TRENDING is not None:
+                threshold = BOUNCE_DROP_TRENDING
+
+            if drop < threshold:
+                return "drop_pequeno", f"Drop {drop:.0%} < threshold {threshold:.0%}"
+
+            if ttb is not None and ttb > BOUNCE_TIME_MAX:
+                return "elapsed", f"Fundo em {ttb:.1f}min > max {BOUNCE_TIME_MAX:.0f}min (A.5)"
+
+            if is_trend and TRENDING_MAX_MIG and mig_s and mig_s > TRENDING_MAX_MIG:
+                return "mig_lento", f"mig={mig_s}s > TRENDING_MAX_MIG={TRENDING_MAX_MIG}s"
+
+            return "desconhecido", "Passou filtros de preço — verificar logs (pool/H23/RISE)"
+
+        # Separa em: bounced, missed
+        bounced_list = []
+        missed_list  = []
+        for r in rows:
+            if only_trending and not r.get("trending_at_migration"):
+                continue
+            if only_tradeable and not r.get("passed_filters"):
+                continue
+            if r.get("bounced"):
+                bounced_list.append(r)
+            else:
+                missed_list.append(r)
+
+        CSS = """<style>
+        body{background:#0d1117;color:#e6edf3;font:13px/1.6 monospace;padding:20px}
+        a{color:#58a6ff;text-decoration:none}
+        table{border-collapse:collapse;width:100%;margin-bottom:32px}
+        th{background:#161b22;padding:6px 10px;text-align:left;font-size:11px;color:#8b949e;white-space:nowrap}
+        td{padding:5px 10px;border-bottom:1px solid #21262d;font-size:12px;white-space:nowrap}
+        .tag{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:bold}
+        .nav a{color:#58a6ff;margin-right:16px;font-size:12px}
+        h3{color:#8b949e;margin-top:28px}
+        </style>"""
+
+        REASON_COLOR = {
+            "no_bottom":   "#f0883e",
+            "drop_pequeno":"#8b949e",
+            "elapsed":     "#e3b341",
+            "mig_lento":   "#a5d6ff",
+            "fora_filtro": "#6e7681",
+            "desconhecido":"#58a6ff",
+        }
+
+        def _mc(v):
+            if v is None: return "—"
+            return f"${float(v):,.0f}"
+        def _pct(v):
+            if v is None: return "—"
+            return f"{float(v)*100:.0f}%"
+        def _ts(v):
+            if v is None: return "—"
+            return v.strftime("%m/%d %H:%M")
+
+        def _miss_row(r):
+            mint    = r["mint"]
+            sym     = r.get("symbol") or mint[:8]
+            code, txt = _miss_reason(r)
+            color   = REASON_COLOR.get(code, "#8b949e")
+            trend   = "🔥" if r.get("trending_at_migration") else ""
+            mig_s   = r.get("time_to_migrate_sec")
+            mig_str = f"{mig_s}s" if mig_s else "—"
+            bot     = r.get("mc_bottom")
+            drop    = ""
+            if bot and r.get("mc_migration"):
+                d = (r["mc_migration"] - bot) / r["mc_migration"]
+                drop = f"{d:.0%}"
+            return f"""<tr>
+              <td>{_ts(r['ts_migration'])}</td>
+              <td><b>{trend}{sym}</b></td>
+              <td>{_mc(r['mc_migration'])}</td>
+              <td>{_mc(r.get('mc_bottom'))}</td>
+              <td>{drop}</td>
+              <td>{f"{r['time_to_bottom']:.1f}min" if r.get('time_to_bottom') else "—"}</td>
+              <td>{mig_str}</td>
+              <td><span class='tag' style='background:{color}22;color:{color}'>{txt}</span></td>
+              <td>
+                <a href='https://gmgn.ai/sol/token/{mint}' target='_blank'>GMGN</a>
+                &nbsp;<a href='https://dexscreener.com/solana/{mint}' target='_blank'>DEX</a>
+              </td>
+            </tr>"""
+
+        def _hit_row(r):
+            mint  = r["mint"]
+            sym   = r.get("symbol") or mint[:8]
+            trend = "🔥" if r.get("trending_at_migration") else ""
+            ts    = r.get("trade_status") or "sem trade"
+            ts_color = {"tp": "#3fb950", "sl": "#f85149", "trailing_active": "#e3b341"}.get(ts, "#8b949e")
+            return f"""<tr>
+              <td>{_ts(r['ts_migration'])}</td>
+              <td><b>{trend}{sym}</b></td>
+              <td>{_mc(r['mc_migration'])}</td>
+              <td>{_pct(r.get('bounce_drop'))}</td>
+              <td>{_pct(r.get('bounce_pct'))}</td>
+              <td>{f"{r['bounce_elapsed']//60}min" if r.get('bounce_elapsed') else "—"}</td>
+              <td><span style='color:{ts_color}'>{ts}</span></td>
+              <td>
+                <a href='https://gmgn.ai/sol/token/{mint}' target='_blank'>GMGN</a>
+                &nbsp;<a href='https://dexscreener.com/solana/{mint}' target='_blank'>DEX</a>
+              </td>
+            </tr>"""
+
+        missed_html  = "".join(_miss_row(r) for r in missed_list)
+        bounced_html = "".join(_hit_row(r)  for r in bounced_list)
+
+        # Resumo de motivos
+        from collections import Counter
+        reason_counts = Counter(_miss_reason(r)[0] for r in missed_list)
+        reason_summary = " &nbsp;|&nbsp; ".join(
+            f"<span style='color:{REASON_COLOR.get(k,'#8b949e')}'>{k}: {v}</span>"
+            for k, v in reason_counts.most_common()
+        )
+
+        nav_trending = "1" if only_trending else "0"
+        nav_tradeable = "1" if only_tradeable else "0"
+
+        html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>Bounce Miss</title>{CSS}
+<meta http-equiv='refresh' content='30'>
+</head><body>
+<h2>Bounce Miss — diagnóstico de oportunidades</h2>
+<div class='nav'>
+  <a href='/debug/bounce-miss?hours=6&trending={nav_trending}&tradeable={nav_tradeable}'>6h</a>
+  <a href='/debug/bounce-miss?hours=12&trending={nav_trending}&tradeable={nav_tradeable}'>12h</a>
+  <a href='/debug/bounce-miss?hours=24&trending={nav_trending}&tradeable={nav_tradeable}'>24h</a>
+  &nbsp;|&nbsp;
+  <a href='/debug/bounce-miss?hours={hours}&trending=1&tradeable={nav_tradeable}'>só trending</a>
+  <a href='/debug/bounce-miss?hours={hours}&trending=0&tradeable={nav_tradeable}'>todos</a>
+  &nbsp;|&nbsp;
+  <a href='/debug/bounce-list'>Bounce List</a>
+  &nbsp;
+  <a href='/analise/trending-deep'>Trending Deep</a>
+</div>
+<p style='color:#8b949e;font-size:11px'>
+  Período: {hours}h &nbsp;|&nbsp;
+  Filtros ativos: BOUNCE_DROP_MIN={BOUNCE_DROP_MIN:.0%}
+  {f" / TRENDING={BOUNCE_DROP_TRENDING:.0%}" if BOUNCE_DROP_TRENDING else ""}
+  &nbsp;|&nbsp; BOUNCE_TIME_MAX={BOUNCE_TIME_MAX:.0f}min
+  {f" / TRENDING_MAX_MIG={TRENDING_MAX_MIG}s" if TRENDING_MAX_MIG else ""}
+  &nbsp;|&nbsp; auto-refresh 30s
+</p>
+
+<h3>❌ Missed ({len(missed_list)} tokens)</h3>
+<p style='font-size:11px'>{reason_summary}</p>
+<table>
+  <thead><tr>
+    <th>Migração</th><th>Token</th><th>MC mig</th><th>MC fundo</th>
+    <th>Drop</th><th>Time bottom</th><th>Mig speed</th>
+    <th>Motivo provável</th><th>Links</th>
+  </tr></thead>
+  <tbody>{missed_html or "<tr><td colspan=9 style='color:#3fb950'>Nenhum missed neste período!</td></tr>"}</tbody>
+</table>
+
+<h3>✅ Bounced ({len(bounced_list)} tokens)</h3>
+<table>
+  <thead><tr>
+    <th>Migração</th><th>Token</th><th>MC mig</th>
+    <th>Drop mig</th><th>Bounce</th><th>Elapsed</th>
+    <th>Trade</th><th>Links</th>
+  </tr></thead>
+  <tbody>{bounced_html or "<tr><td colspan=8 style='color:#8b949e'>Nenhum bounce neste período.</td></tr>"}</tbody>
+</table>
+
+</body></html>"""
+        return html
+
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
+
+
 @app.route("/debug/fix-trailing-outcomes")
 def debug_fix_trailing_outcomes():
     """Corrige outcomes dos 4 trades confirmados como trailing TP pelo usuário,
