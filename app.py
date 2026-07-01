@@ -6890,6 +6890,33 @@ def _executor_status_inner():
     else:
         rows.append(row("Último bounce detectado", "Nenhum no DB", warn))
 
+    # Gate Helius breakdown — últimas 72h
+    gate_rows_html = ""
+    gate_summary = []
+    try:
+        import psycopg2.extras as _pge
+        _conn2 = psycopg2.connect(db.DATABASE_URL)
+        with _conn2.cursor(cursor_factory=_pge.RealDictCursor) as _cur:
+            _cur.execute("""
+                SELECT status, helius_gate_reason, COUNT(*) AS n
+                FROM trades
+                WHERE created_at > NOW() - INTERVAL '72 hours'
+                GROUP BY status, helius_gate_reason
+                ORDER BY n DESC
+            """)
+            gate_data = [dict(r) for r in _cur.fetchall()]
+        _conn2.close()
+
+        if gate_data:
+            blocked_total = sum(r["n"] for r in gate_data if r["status"] == "blocked_helius_gate")
+            for r in gate_data:
+                color = "#f44336" if r["status"] == "blocked_helius_gate" else "#4CAF50" if r["status"] in ("tp","trailing_active") else "#ddd"
+                reason = r["helius_gate_reason"] or "—"
+                gate_rows_html += f"<tr><td style='color:{color}'>{r['status']}</td><td>{reason}</td><td>{r['n']}</td></tr>"
+            gate_summary.append(f"<b>{blocked_total}</b> trades bloqueados pelo Helius gate nas últimas 72h")
+    except Exception as _ge:
+        gate_rows_html = f"<tr><td colspan=3 style='color:#888'>erro: {_ge}</td></tr>"
+
     # Diagnóstico conclusivo
     if not trading_enabled:
         diagnosis = "❌ <b>TRADING_ENABLED=false</b> — bounces disparam mas executor descarta silenciosamente. Logs mostram 'DRY-RUN'. Ative no Railway."
@@ -6897,8 +6924,26 @@ def _executor_status_inner():
         diagnosis = f"❌ <b>Limite de trades atingido</b> ({n_trades}/{cal_max}). Aumente CALIBRATION_MAX_TRADES no Railway (ex: 150)."
     elif hot_count == 0:
         diagnosis = "⚠️ <b>Nenhum token no HotMonitor</b> — scanner não encontrou migrações recentes ou bot acabou de iniciar."
+    elif gate_rows_html and "blocked_helius_gate" in gate_rows_html:
+        diagnosis = "❌ <b>Helius gate está bloqueando trades</b> — veja tabela 'Trades 72h' abaixo. Causas comuns: missing_pool_quote ou missing_net_sol_flow (Helius sem dados) ou net_sol_flow≤TRADE_MIN_NET_SOL_FLOW."
     else:
         diagnosis = "✅ Pipeline parece OK. Se não há trades, provavelmente nenhum bounce passou pelos filtros A.2/A.3/A.5/A.6 ainda."
+
+    # Gate config atual
+    gate_enabled      = os.getenv("TRADE_GATE_ENABLED",          "true").lower() == "true"
+    req_helius        = os.getenv("TRADE_REQUIRE_HELIUS_FEATURES","true").lower() == "true"
+    req_h23           = os.getenv("TRADE_REQUIRE_H23_BOTTOM",     "true").lower() == "true"
+    min_pool_sol      = float(os.getenv("TRADE_MIN_POOL_SOL",    "40"))
+    min_net_sol_flow  = float(os.getenv("TRADE_MIN_NET_SOL_FLOW","-999"))
+    trade_max_elapsed = int(os.getenv("TRADE_MAX_ELAPSED_SEC",   "300"))
+
+    rows.append(row("TRADE_GATE_ENABLED",           "true ✅" if gate_enabled else "false — sem gate", ok if gate_enabled else warn))
+    rows.append(row("TRADE_REQUIRE_HELIUS_FEATURES", "true — exige pool_quote e net_sol_flow" if req_helius else "false — aceita sem dados Helius", warn if req_helius else ok))
+    rows.append(row("TRADE_MIN_POOL_SOL",            f"{min_pool_sol:.0f} SOL mínimo na pool"))
+    rows.append(row("TRADE_MIN_NET_SOL_FLOW",
+                    f"{min_net_sol_flow:g} {'⚠️ -5 bloqueia quase tudo (default errado — use -999)' if min_net_sol_flow == -5 else '(desativado ✅)' if min_net_sol_flow <= -100 else ''}",
+                    bad if min_net_sol_flow == -5 else ok))
+    rows.append(row("TRADE_MAX_ELAPSED_SEC",         f"{trade_max_elapsed}s ({trade_max_elapsed//60}min máx elapsed)"))
 
     h = f"""<!DOCTYPE html><html><head>
 <meta charset="utf-8">
@@ -6924,6 +6969,19 @@ def _executor_status_inner():
 </div>
 
 <div class="box">
+  <h2>Trades 72h — Status e Motivo do Gate</h2>
+  {"<p style='color:#888'>" + " ".join(gate_summary) + "</p>" if gate_summary else ""}
+  <table>
+    <tr><th>Status</th><th>helius_gate_reason</th><th>n</th></tr>
+    {gate_rows_html or "<tr><td colspan=3 style='color:#888'>Nenhum trade nas últimas 72h</td></tr>"}
+  </table>
+  <p style="color:#555;font-size:11px">
+    missing_pool_quote = Helius sem dados de pool | missing_net_sol_flow = Helius sem eventos de absorção |
+    net_sol_flow&lt;=-5 = TRADE_MIN_NET_SOL_FLOW default errado (deve ser -999)
+  </p>
+</div>
+
+<div class="box">
   <h2>HotMonitor — Tokens Ativos ({hot_count})</h2>
   {"<p style='color:#888'>Nenhum token sendo monitorado agora.</p>" if not hot_mints else
    "<p style='color:#888;font-size:11px'>" + " | ".join(f"<code>{m[:12]}…</code>" for m in hot_mints) + "</p>"}
@@ -6936,6 +6994,8 @@ def _executor_status_inner():
     <tr><th>2. Trades abaixo do limite?</th><td>{'✅' if not executor_paused else f'❌ {n_trades}/{cal_max} — aumente CALIBRATION_MAX_TRADES'}</td></tr>
     <tr><th>3. HotMonitor com tokens?</th><td>{'✅' if hot_count > 0 else '⚠️ vazio agora (normal se sem migrações recentes)'}</td></tr>
     <tr><th>4. Algum bounce recente?</th><td>{'✅ ' + ago_str if last_bounce_ts else '⚠️ nenhum ainda'}</td></tr>
+    <tr><th>5. TRADE_MIN_NET_SOL_FLOW seguro?</th><td>{'✅ -999 (desativado)' if min_net_sol_flow <= -100 else f'❌ {min_net_sol_flow:g} — default -5 bloqueia 100% dos trades. Configurar TRADE_MIN_NET_SOL_FLOW=-999 no Railway.'}</td></tr>
+    <tr><th>6. TRADE_REQUIRE_HELIUS_FEATURES</th><td>{'⚠️ true — se Helius sem dados, bloqueia. Ver tabela acima.' if req_helius else '✅ false (aceita sem dados Helius)'}</td></tr>
   </table>
 </div>
 
