@@ -298,6 +298,12 @@ class HotMonitor:
     TRENDING_BLOCK_FAST_MIG  = os.getenv("TRENDING_BLOCK_FAST_MIG", "true").lower() == "true"  # H28: bloquear mig<60s para trending tokens (WR 0%)
     _tmig_max_env            = os.getenv("TRENDING_MAX_MIG_SEC")
     TRENDING_MAX_MIG_SEC     = int(_tmig_max_env) if _tmig_max_env is not None else None  # bloqueia trending+mig>Xs (mig>900s: WR 38%, ruído)
+    # Segunda chamada market/rank filtrada por MC: detecta trending em tokens $15k-$100k
+    # que não aparecem no top-100 global (dominado por tokens de $500k+).
+    _tmc_min_env             = os.getenv("TRENDING_MC_MIN")
+    _tmc_max_env             = os.getenv("TRENDING_MC_MAX")
+    TRENDING_MC_MIN          = float(_tmc_min_env) if _tmc_min_env is not None else 10_000.0
+    TRENDING_MC_MAX          = float(_tmc_max_env) if _tmc_max_env is not None else 100_000.0
 
     def _check_bounce(self, mint: str, state: dict, mc: float, elapsed_sec: int):
         """Detecta bounce em tempo real. Fase A: filtros A.2, A.3, A.6.
@@ -1512,9 +1518,11 @@ class Scanner:
                     continue
             self._safe(self._handle_near_completion, token)
 
-        # H27 — trending check: 1 chamada por tick (peso=1, capacity=20 → custo mínimo).
-        # Pega top-100 pump.fun no último 1min. Tokens ativos durante a graduação da bonding
-        # curve aparecem aqui antes de migrarem — indica hype real no momento da migração.
+        # H27 — trending check: até 2 chamadas por tick (peso=1 cada).
+        # Chamada 1: top-100 pump.fun global (1min) — detecta tokens de alto hype/MC.
+        # Chamada 2: pump.fun filtrada por MC ($TRENDING_MC_MIN-$TRENDING_MC_MAX) — detecta
+        #            tokens de $15k-$100k que nunca aparecem no top-100 global dominado por
+        #            tokens de $500k+. Ambas as listas são mergeadas em trending_mints.
         # Resultado compartilhado entre todos os tokens novos desse tick.
         trending_mints: set = set()
         new_completed = [t for t in completed_list
@@ -1522,22 +1530,43 @@ class Scanner:
         # trending_rank_map: mint → {hot_level, visiting_count} para tokens em trending
         trending_rank_map: dict = {}
         if new_completed:
-            try:
-                rank_list = self.gmgn.get_market_trending(
-                    interval="1m", limit=100, platforms=["Pump.fun"]
-                )
+            def _merge_rank_list(rank_list: list, source: str):
                 for t in rank_list:
                     if not t:
                         continue
                     addr = t.get("address") or t.get("mint")
-                    if addr:
+                    if addr and addr not in trending_rank_map:
                         trending_rank_map[addr] = {
                             "hot_level":      t.get("hot_level"),
                             "visiting_count": t.get("visiting_count"),
+                            "trending_source": source,
                         }
-                trending_mints = set(trending_rank_map.keys())
+
+            # Chamada 1 — top-100 global (sem filtro de MC)
+            try:
+                rank_list = self.gmgn.get_market_trending(
+                    interval="1m", limit=100, platforms=["Pump.fun"]
+                )
+                _merge_rank_list(rank_list, "global")
             except Exception as e:
-                logger.debug("trending tick check: %s", e)
+                logger.debug("trending tick check (global): %s", e)
+
+            # Chamada 2 — filtrada por MC ($TRENDING_MC_MIN–$TRENDING_MC_MAX)
+            # Captura tokens de baixo MC invisíveis no top-100 global.
+            try:
+                rank_list_mc = self.gmgn.get_market_trending(
+                    interval="1m", limit=100, platforms=["Pump.fun"],
+                    mc_min=self.hot.TRENDING_MC_MIN,
+                    mc_max=self.hot.TRENDING_MC_MAX,
+                )
+                _merge_rank_list(rank_list_mc, "mc_range")
+                if rank_list_mc:
+                    logger.debug("trending mc-range: %d tokens ($%.0f-$%.0f)",
+                                 len(rank_list_mc), self.hot.TRENDING_MC_MIN, self.hot.TRENDING_MC_MAX)
+            except Exception as e:
+                logger.debug("trending tick check (mc-range): %s", e)
+
+            trending_mints = set(trending_rank_map.keys())
 
         # completed: tokens já vistos → apenas push_mc (sem sleep)
         #            tokens novos → _safe com stagger normal
@@ -1873,13 +1902,16 @@ class Scanner:
 
         # H27 — trending check: set coletado 1x por tick em _tick() com interval=1m.
         # pump.fun 1m captura momentum dos últimos 60s — hype imediato no momento da graduação.
+        # Inclui chamada mc-range ($TRENDING_MC_MIN-$TRENDING_MC_MAX) para detectar tokens
+        # de baixo MC invisíveis no top-100 global.
         trending_at_migration = (mint in trending_mints) if trending_mints else None
         rank_data = (trending_rank_map or {}).get(mint, {})
-        hot_level      = rank_data.get("hot_level")
-        visiting_count = rank_data.get("visiting_count")
+        hot_level        = rank_data.get("hot_level")
+        visiting_count   = rank_data.get("visiting_count")
+        trending_source  = rank_data.get("trending_source", "global") if trending_at_migration else None
         if trending_at_migration:
-            logger.info("Migracao %s (%s) — trending=TRUE no pump.fun 1m hot_level=%s visiting=%s",
-                        symbol, mint[:8], hot_level, visiting_count)
+            logger.info("Migracao %s (%s) — trending=TRUE source=%s pump.fun 1m hot_level=%s visiting=%s",
+                        symbol, mint[:8], trending_source, hot_level, visiting_count)
 
         entry["trending_at_migration"] = trending_at_migration
         entry["hot_level"]      = hot_level

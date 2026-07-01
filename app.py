@@ -6890,6 +6890,33 @@ def _executor_status_inner():
     else:
         rows.append(row("Último bounce detectado", "Nenhum no DB", warn))
 
+    # Gate Helius breakdown — últimas 72h
+    gate_rows_html = ""
+    gate_summary = []
+    try:
+        import psycopg2.extras as _pge
+        _conn2 = psycopg2.connect(db.DATABASE_URL)
+        with _conn2.cursor(cursor_factory=_pge.RealDictCursor) as _cur:
+            _cur.execute("""
+                SELECT status, helius_gate_reason, COUNT(*) AS n
+                FROM trades
+                WHERE created_at > NOW() - INTERVAL '72 hours'
+                GROUP BY status, helius_gate_reason
+                ORDER BY n DESC
+            """)
+            gate_data = [dict(r) for r in _cur.fetchall()]
+        _conn2.close()
+
+        if gate_data:
+            blocked_total = sum(r["n"] for r in gate_data if r["status"] == "blocked_helius_gate")
+            for r in gate_data:
+                color = "#f44336" if r["status"] == "blocked_helius_gate" else "#4CAF50" if r["status"] in ("tp","trailing_active") else "#ddd"
+                reason = r["helius_gate_reason"] or "—"
+                gate_rows_html += f"<tr><td style='color:{color}'>{r['status']}</td><td>{reason}</td><td>{r['n']}</td></tr>"
+            gate_summary.append(f"<b>{blocked_total}</b> trades bloqueados pelo Helius gate nas últimas 72h")
+    except Exception as _ge:
+        gate_rows_html = f"<tr><td colspan=3 style='color:#888'>erro: {_ge}</td></tr>"
+
     # Diagnóstico conclusivo
     if not trading_enabled:
         diagnosis = "❌ <b>TRADING_ENABLED=false</b> — bounces disparam mas executor descarta silenciosamente. Logs mostram 'DRY-RUN'. Ative no Railway."
@@ -6897,8 +6924,26 @@ def _executor_status_inner():
         diagnosis = f"❌ <b>Limite de trades atingido</b> ({n_trades}/{cal_max}). Aumente CALIBRATION_MAX_TRADES no Railway (ex: 150)."
     elif hot_count == 0:
         diagnosis = "⚠️ <b>Nenhum token no HotMonitor</b> — scanner não encontrou migrações recentes ou bot acabou de iniciar."
+    elif gate_rows_html and "blocked_helius_gate" in gate_rows_html:
+        diagnosis = "❌ <b>Helius gate está bloqueando trades</b> — veja tabela 'Trades 72h' abaixo. Causas comuns: missing_pool_quote ou missing_net_sol_flow (Helius sem dados) ou net_sol_flow≤TRADE_MIN_NET_SOL_FLOW."
     else:
         diagnosis = "✅ Pipeline parece OK. Se não há trades, provavelmente nenhum bounce passou pelos filtros A.2/A.3/A.5/A.6 ainda."
+
+    # Gate config atual
+    gate_enabled      = os.getenv("TRADE_GATE_ENABLED",          "true").lower() == "true"
+    req_helius        = os.getenv("TRADE_REQUIRE_HELIUS_FEATURES","true").lower() == "true"
+    req_h23           = os.getenv("TRADE_REQUIRE_H23_BOTTOM",     "true").lower() == "true"
+    min_pool_sol      = float(os.getenv("TRADE_MIN_POOL_SOL",    "40"))
+    min_net_sol_flow  = float(os.getenv("TRADE_MIN_NET_SOL_FLOW","-999"))
+    trade_max_elapsed = int(os.getenv("TRADE_MAX_ELAPSED_SEC",   "300"))
+
+    rows.append(row("TRADE_GATE_ENABLED",           "true ✅" if gate_enabled else "false — sem gate", ok if gate_enabled else warn))
+    rows.append(row("TRADE_REQUIRE_HELIUS_FEATURES", "true — exige pool_quote e net_sol_flow" if req_helius else "false — aceita sem dados Helius", warn if req_helius else ok))
+    rows.append(row("TRADE_MIN_POOL_SOL",            f"{min_pool_sol:.0f} SOL mínimo na pool"))
+    rows.append(row("TRADE_MIN_NET_SOL_FLOW",
+                    f"{min_net_sol_flow:g} {'⚠️ -5 bloqueia quase tudo (default errado — use -999)' if min_net_sol_flow == -5 else '(desativado ✅)' if min_net_sol_flow <= -100 else ''}",
+                    bad if min_net_sol_flow == -5 else ok))
+    rows.append(row("TRADE_MAX_ELAPSED_SEC",         f"{trade_max_elapsed}s ({trade_max_elapsed//60}min máx elapsed)"))
 
     h = f"""<!DOCTYPE html><html><head>
 <meta charset="utf-8">
@@ -6924,6 +6969,19 @@ def _executor_status_inner():
 </div>
 
 <div class="box">
+  <h2>Trades 72h — Status e Motivo do Gate</h2>
+  {"<p style='color:#888'>" + " ".join(gate_summary) + "</p>" if gate_summary else ""}
+  <table>
+    <tr><th>Status</th><th>helius_gate_reason</th><th>n</th></tr>
+    {gate_rows_html or "<tr><td colspan=3 style='color:#888'>Nenhum trade nas últimas 72h</td></tr>"}
+  </table>
+  <p style="color:#555;font-size:11px">
+    missing_pool_quote = Helius sem dados de pool | missing_net_sol_flow = Helius sem eventos de absorção |
+    net_sol_flow&lt;=-5 = TRADE_MIN_NET_SOL_FLOW default errado (deve ser -999)
+  </p>
+</div>
+
+<div class="box">
   <h2>HotMonitor — Tokens Ativos ({hot_count})</h2>
   {"<p style='color:#888'>Nenhum token sendo monitorado agora.</p>" if not hot_mints else
    "<p style='color:#888;font-size:11px'>" + " | ".join(f"<code>{m[:12]}…</code>" for m in hot_mints) + "</p>"}
@@ -6936,6 +6994,8 @@ def _executor_status_inner():
     <tr><th>2. Trades abaixo do limite?</th><td>{'✅' if not executor_paused else f'❌ {n_trades}/{cal_max} — aumente CALIBRATION_MAX_TRADES'}</td></tr>
     <tr><th>3. HotMonitor com tokens?</th><td>{'✅' if hot_count > 0 else '⚠️ vazio agora (normal se sem migrações recentes)'}</td></tr>
     <tr><th>4. Algum bounce recente?</th><td>{'✅ ' + ago_str if last_bounce_ts else '⚠️ nenhum ainda'}</td></tr>
+    <tr><th>5. TRADE_MIN_NET_SOL_FLOW seguro?</th><td>{'✅ -999 (desativado)' if min_net_sol_flow <= -100 else f'❌ {min_net_sol_flow:g} — default -5 bloqueia 100% dos trades. Configurar TRADE_MIN_NET_SOL_FLOW=-999 no Railway.'}</td></tr>
+    <tr><th>6. TRADE_REQUIRE_HELIUS_FEATURES</th><td>{'⚠️ true — se Helius sem dados, bloqueia. Ver tabela acima.' if req_helius else '✅ false (aceita sem dados Helius)'}</td></tr>
   </table>
 </div>
 
@@ -11437,6 +11497,12 @@ def debug_bounce_miss():
 
         with db._cursor() as cur:
             cur.execute("""
+                WITH peak20 AS (
+                    SELECT mint, MAX(mc) AS mc_peak_20m
+                    FROM token_ticks
+                    WHERE elapsed_sec BETWEEN 0 AND 1200
+                    GROUP BY mint
+                )
                 SELECT
                     m.mint,
                     m.token_nome         AS symbol,
@@ -11451,6 +11517,7 @@ def debug_bounce_miss():
                     m.rug_ratio,
                     m.liq_migration,
                     m.passed_filters,
+                    p.mc_peak_20m,
                     b.mint               AS bounced,
                     b.elapsed_sec        AS bounce_elapsed,
                     b.drop_from_mig      AS bounce_drop,
@@ -11458,8 +11525,9 @@ def debug_bounce_miss():
                     b.mc_at_signal,
                     t.status             AS trade_status
                 FROM migrations m
-                LEFT JOIN bounce_signals b ON b.mint = m.mint
-                LEFT JOIN trades         t ON t.mint  = m.mint
+                LEFT JOIN peak20          p ON p.mint  = m.mint
+                LEFT JOIN bounce_signals  b ON b.mint  = m.mint
+                LEFT JOIN trades          t ON t.mint  = m.mint
                 WHERE m.ts_migration >= NOW() - %(h)s * INTERVAL '1 hour'
                 ORDER BY m.ts_migration DESC
                 LIMIT 200
@@ -11471,11 +11539,12 @@ def debug_bounce_miss():
             if not r.get("passed_filters"):
                 return "fora_filtro", "Fora filtro (rug/mc/liq/fee)"
 
-            mc_bot  = r.get("mc_bottom")
-            mc_mig  = r.get("mc_migration") or 0
-            ttb     = r.get("time_to_bottom")   # minutos
-            mig_s   = r.get("time_to_migrate_sec")
+            mc_bot   = r.get("mc_bottom")
+            mc_mig   = r.get("mc_migration") or 0
+            ttb      = r.get("time_to_bottom")   # minutos
+            mig_s    = r.get("time_to_migrate_sec")
             is_trend = r.get("trending_at_migration")
+            mc_peak_20m = r.get("mc_peak_20m")
 
             if mc_bot is None:
                 return "no_bottom", "Fundo não capturado (Helius gap ou ainda ativo)"
@@ -11491,13 +11560,27 @@ def debug_bounce_miss():
             if drop < threshold:
                 return "drop_pequeno", f"Drop {drop:.0%} < threshold {threshold:.0%}"
 
+            # H28: mig<60s para trending
+            if is_trend and mig_s is not None and mig_s < 60:
+                return "h28_runner", f"H28: mig={mig_s}s<60s (runner, WR 0%)"
+
+            # TRENDING_MAX_MIG_SEC: lê do env OU usa hardcoded 900 se trending
+            # (env pode não estar setado no web service mesmo que esteja no worker)
+            _tmig_check = TRENDING_MAX_MIG or (900 if is_trend else None)
+            if is_trend and _tmig_check and mig_s is not None and mig_s > _tmig_check:
+                suffix = " (gate não estava ativo no código)" if not TRENDING_MAX_MIG else ""
+                return "mig_lento", f"mig={mig_s}s > {_tmig_check}s{suffix}"
+
+            # Verifica se bounce (10%) foi atingido dentro de 20min
+            # mc_peak_20m: MC máximo nos primeiros 20min (kline close)
+            bounce_needed = mc_bot * (1 + float(_os.getenv("BOUNCE_MIN_PCT", "0.10")))
+            if mc_peak_20m is not None and mc_peak_20m < bounce_needed:
+                return "bounce_insuficiente", f"Peak 20min ${mc_peak_20m:,.0f} < needed ${bounce_needed:,.0f} (+10% do fundo)"
+
             if ttb is not None and ttb > BOUNCE_TIME_MAX:
                 return "elapsed", f"Fundo em {ttb:.1f}min > max {BOUNCE_TIME_MAX:.0f}min (A.5)"
 
-            if is_trend and TRENDING_MAX_MIG and mig_s and mig_s > TRENDING_MAX_MIG:
-                return "mig_lento", f"mig={mig_s}s > TRENDING_MAX_MIG={TRENDING_MAX_MIG}s"
-
-            return "desconhecido", "Passou filtros de preço — verificar logs (pool/H23/RISE)"
+            return "desconhecido", "Passou filtros — pool rasa ou bounce tardio (ver logs)"
 
         # Separa em: bounced, missed
         bounced_list = []
@@ -11524,12 +11607,14 @@ def debug_bounce_miss():
         </style>"""
 
         REASON_COLOR = {
-            "no_bottom":   "#f0883e",
-            "drop_pequeno":"#8b949e",
-            "elapsed":     "#e3b341",
-            "mig_lento":   "#a5d6ff",
-            "fora_filtro": "#6e7681",
-            "desconhecido":"#58a6ff",
+            "no_bottom":          "#f0883e",
+            "drop_pequeno":       "#8b949e",
+            "elapsed":            "#e3b341",
+            "mig_lento":          "#a5d6ff",
+            "h28_runner":         "#a5d6ff",
+            "bounce_insuficiente":"#e3b341",
+            "fora_filtro":        "#6e7681",
+            "desconhecido":       "#58a6ff",
         }
 
         def _mc(v):
@@ -11555,12 +11640,14 @@ def debug_bounce_miss():
             if bot and r.get("mc_migration"):
                 d = (r["mc_migration"] - bot) / r["mc_migration"]
                 drop = f"{d:.0%}"
+            peak20  = _mc(r.get("mc_peak_20m"))
             return f"""<tr>
               <td>{_ts(r['ts_migration'])}</td>
               <td><b>{trend}{sym}</b></td>
               <td>{_mc(r['mc_migration'])}</td>
               <td>{_mc(r.get('mc_bottom'))}</td>
               <td>{drop}</td>
+              <td>{peak20}</td>
               <td>{f"{r['time_to_bottom']:.1f}min" if r.get('time_to_bottom') else "—"}</td>
               <td>{mig_str}</td>
               <td><span class='tag' style='background:{color}22;color:{color}'>{txt}</span></td>
@@ -11635,7 +11722,7 @@ def debug_bounce_miss():
 <table>
   <thead><tr>
     <th>Migração</th><th>Token</th><th>MC mig</th><th>MC fundo</th>
-    <th>Drop</th><th>Time bottom</th><th>Mig speed</th>
+    <th>Drop</th><th>Peak 20min</th><th>Time bottom</th><th>Mig speed</th>
     <th>Motivo provável</th><th>Links</th>
   </tr></thead>
   <tbody>{missed_html or "<tr><td colspan=9 style='color:#3fb950'>Nenhum missed neste período!</td></tr>"}</tbody>

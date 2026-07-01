@@ -49,7 +49,7 @@ TRADE_GATE_ENABLED = os.getenv("TRADE_GATE_ENABLED", "true").lower() == "true"
 TRADE_REQUIRE_HELIUS_FEATURES = os.getenv("TRADE_REQUIRE_HELIUS_FEATURES", "true").lower() == "true"
 TRADE_REQUIRE_H23_BOTTOM = os.getenv("TRADE_REQUIRE_H23_BOTTOM", "true").lower() == "true"
 TRADE_MAX_ELAPSED_SEC = int(os.getenv("TRADE_MAX_ELAPSED_SEC", "300"))
-TRADE_MIN_NET_SOL_FLOW = float(os.getenv("TRADE_MIN_NET_SOL_FLOW", "-5"))
+TRADE_MIN_NET_SOL_FLOW = float(os.getenv("TRADE_MIN_NET_SOL_FLOW", "-999"))  # -999 = desativado (default seguro)
 TRADE_MIN_POOL_SOL = float(os.getenv("TRADE_MIN_POOL_SOL", "40"))
 
 # A.4 — Persistência: aguarda N segundos e verifica que os últimos K ticks estão acima do entry.

@@ -487,6 +487,9 @@ BOUNCE_DROP_MIN_TRENDING=0.15  # threshold menor para trending=TRUE (None/ausent
 BOUNCE_TIME_MAX=20.0         # A.5: janela máxima em minutos
 BOTTOM_FRESHNESS_SEC=600     # A.6: máx 10min desde o último mc_min
 TRENDING_BLOCK_FAST_MIG=true  # H28: bloqueia trending tokens com mig<60s (WR 0%, runners)
+TRENDING_MAX_MIG_SEC=900     # bloqueia trending+mig>Xs (mig>900s: WR 38%, ruído). None=desativado
+TRENDING_MC_MIN=10000        # MC mínimo ($) para chamada mc-range do market/rank (default 10k)
+TRENDING_MC_MAX=100000       # MC máximo ($) para chamada mc-range do market/rank (default 100k)
 POOL_MIN_SOL_BOUNCE=20       # C3: pool depth mínima no momento do bounce
 BOUNCE_RECORD_MIN_POOL_SOL=5 # pool mínima para registrar bounce_signal (menor que C3)
 # RISE_NET_MIN=0             # RISE gate — NÃO configurado no Railway (desativado). Ver /analise/pre-rise-ticks para avaliar.
