@@ -236,7 +236,7 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO)
 
 ## 🔍 ESTADO ATUAL
 
-### Bot ATIVO (sessão 24, 2026-06-28)
+### Bot ATIVO (sessão 25, 2026-07-01)
 
 **Branch:** `claude/magical-cerf-3wjq5o`
 **Modo WebSocket:** Helius logsSubscribe per-mint (erpc.global desativado — 0 créditos)
@@ -259,9 +259,9 @@ BOUNCE DETECTOR + FASE 6 — execução real (ATIVO)
 **Resultado período 2026-05-21 a 2026-05-24 (31 trades, $1/trade):**
 WR: **29%** (9 TPs / 22 SLs) confirmado GMGN · Net P/L: **+$0.12** · Payoff 2.49×
 
-**Estado sessão 24 (2026-06-28):**
-- 1 trade ativo: Alchemist trailing_active +75% ⚡
-- trades recentes: `error` (IP não configurado — corrigido) · `blocked_helius_gate` (Helius sem dados suficientes — gate correto, WOP teria sido SL)
+**Estado sessão 25 (2026-07-01):**
+- Trades recentes: `error` (403 Forbidden — IP Railway não whitelistado na GMGN) · `blocked_helius_gate` (Helius sem dados suficientes — gate correto)
+- **⚠️ Swap bloqueado:** 403 Forbidden = IP do worker não está na whitelist GMGN. Fix: verificar IP atual em `/debug/runtime-ips` → re-whitelist no painel GMGN após cada deploy
 - Aguardando: n≥100 bounces trending para validar H27 e ativar gates
 
 **Correções críticas deployadas:**
@@ -277,6 +277,9 @@ WR: **29%** (9 TPs / 22 SLs) confirmado GMGN · Net P/L: **+$0.12** · Payoff 2.
 - ✅ API key separada para scanner (GMGN_SCANNER_API_KEY)
 - ✅ BOUNCE_DROP_MIN_TRENDING — threshold menor para trending=TRUE (H27 sessão 24)
 - ✅ TRENDING_BLOCK_FAST_MIG — bloqueia trending com mig<60s (H28 confirmado WR 0%)
+- ✅ Second market/rank call (mc_range) — detecta trending tokens $20k-$35k invisíveis no global top-100 (sessão 25)
+- ✅ TRADE_MIN_NET_SOL_FLOW default -5 → -999 — default seguro, evita bloquear trades estruturalmente (sessão 25)
+- ✅ /debug/executor-status aprimorado — error_msg 72h, breakdown status/gate, diagnóstico automático 403 (sessão 25)
 
 ### Campos coletados por migração
 
@@ -370,6 +373,10 @@ Scanner (poll 5s)
     │       └─ mc_migration = bonding_curve_ref (MIGRATION_SOL_UNITS × SOL/USD) || kline open || trenches
     │       └─ HotMonitor.add() com ts_migration = datetime.fromtimestamp(complete_timestamp)
     │       └─ push_mc para TODOS os completed já vistos (atualiza _mc_live)
+    │       └─ trending_at_migration: GET /v1/market/rank DUAS vezes:
+    │               (1) global top-100 sem filtro de MC → trending_source="global"
+    │               (2) com min_marketcap=TRENDING_MC_MIN, max_marketcap=TRENDING_MC_MAX → trending_source="mc_range"
+    │               merged via _merge_rank_list() → trending_mints set unificado
     │
     ├─ _poll_signals() — Fase 2 (a cada 5s, apenas se HotMonitor tem tokens ativos)
     │       └─ POST /v1/market/token_signal → feed global type 12 (SmartDegenBuy)
@@ -488,8 +495,11 @@ BOUNCE_TIME_MAX=20.0         # A.5: janela máxima em minutos
 BOTTOM_FRESHNESS_SEC=600     # A.6: máx 10min desde o último mc_min
 TRENDING_BLOCK_FAST_MIG=true  # H28: bloqueia trending tokens com mig<60s (WR 0%, runners)
 TRENDING_MAX_MIG_SEC=900     # bloqueia trending+mig>Xs (mig>900s: WR 38%, ruído). None=desativado
-TRENDING_MC_MIN=10000        # MC mínimo ($) para chamada mc-range do market/rank (default 10k)
-TRENDING_MC_MAX=100000       # MC máximo ($) para chamada mc-range do market/rank (default 100k)
+TRENDING_MC_MIN=20000        # MC mínimo ($) para chamada mc-range do market/rank — Railway: 20000
+TRENDING_MC_MAX=35000        # MC máximo ($) para chamada mc-range do market/rank — Railway: 35000
+# market/rank é chamado DUAS vezes por ciclo: (1) global top-100 sem filtro de MC, (2) com min/max_marketcap
+# Os dois resultados são merged via _merge_rank_list() com campo trending_source="global" ou "mc_range"
+# Default do código: 10k-100k. Railway configurado: 20k-35k (foco no range operacional do bot)
 POOL_MIN_SOL_BOUNCE=20       # C3: pool depth mínima no momento do bounce
 BOUNCE_RECORD_MIN_POOL_SOL=5 # pool mínima para registrar bounce_signal (menor que C3)
 # RISE_NET_MIN=0             # RISE gate — NÃO configurado no Railway (desativado). Ver /analise/pre-rise-ticks para avaliar.
@@ -559,7 +569,7 @@ RETENTION_DRY_RUN=true       # simular sem deletar
 | `/analise/v2-shadow-live` | V2.1 Shadow Live — gate ativo sobre micro_absorption_snapshots. Dry-run only. |
 | `/analise/v2-brain-report` | V2 Brain Report — grid cartesiano. `mode=fast` (padrão) ou `mode=full`. |
 | `/debug/signal-live` | Fase 2 — chama get_token_signal(), mostra matches com HotMonitor |
-| `/debug/executor-status` | Pipeline de trading — TRADING_ENABLED, HotMonitor ativo, último bounce |
+| `/debug/executor-status` | Pipeline de trading — TRADING_ENABLED, HotMonitor ativo, último bounce, breakdown 72h por status/gate, tabela error_msg, diagnóstico automático |
 | `/debug/wallet-audit` | Auditoria on-chain — todas as txs da wallet, BUY/SELL, net SOL. `?rpc=HELIUS_URL` |
 | `/debug/wallet-tokens` | Forense de posições — ATAs vazios (rent bloqueado), tokens presos |
 | `/debug/bounce-list` | Lista bounces ≥ X% com links DexScreener/GMGN. `?bounce=0.50&hours=48`. |
@@ -653,6 +663,10 @@ RETENTION_DRY_RUN=true       # simular sem deletar
 37. **Filtros de qualidade não discriminam WR (confirmado 2026-06-27)**: análise `/analise/quality-grid` com curvas marginais 0→100% mostra teto de WR em ~25.3% independente de combinação de bundler/sniper/rug/bot/top10/smart. Railway `FILTER_BUNDLER_MAX=0.20` é o PIOR ponto da curva (WR 11.1%, n=9). Recomendado: `FILTER_BUNDLER_MAX=0.50`. Sniper/top10 são quase no-ops (maioria NULL no DB).
 
 38. **trending_at_migration é o primeiro sinal com EV positivo (preliminar 2026-06-27)**: cobertura 13% das migrações. WR 30.3%, EV +5.3% (TP75/SL25). TP50/SL25 ótimo: WR 50%, EV +12.5%. mig<60s bloqueia (WR 0%). Dados de apenas 2 dias — aguardar n≥100 bounces trending antes de ativar gate.
+
+39. **GMGN IP whitelist obrigatória após cada redeploy do worker Railway**: swap retorna 403 Forbidden quando o IP de saída do worker não está na whitelist GMGN. O IP muda a cada novo deploy. Fix: acessar `/debug/runtime-ips` para ver o IP atual do worker → re-whitelist no painel GMGN. Opção definitiva: Static IP Railway (~$5/mês). `TRADE_MIN_NET_SOL_FLOW` default era `-5` (bloqueava todos os trades com net≤-5 SOL durante dump — estrutural). Corrigido para `-999`. Railway já tinha `-999` mas código-padrão era perigoso.
+
+40. **market/rank é chamado duas vezes por ciclo de scanner**: (1) global top-100 sem filtro, (2) com `min_marketcap`/`max_marketcap` (params confirmados via gmgn-skills src/commands/market.ts). Merged via `_merge_rank_list()` com campo `trending_source="global"` ou `"mc_range"`. Detecta tokens $20k-$35k invisíveis no top-100 global. `mc_min`/`mc_max` params em `get_market_trending()` → `min_marketcap`/`max_marketcap` na query GMGN.
 
 ---
 
