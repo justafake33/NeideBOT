@@ -6820,9 +6820,11 @@ def _executor_status_inner():
         n_trades = f"erro: {e}"
         executor_paused = False
 
-    # Último bounce signal
+    # Último bounce signal + contagem 72h
     last_bounce = None
     last_bounce_ts = None
+    bounces_72h = 0
+    bounces_tradeable_72h = 0
     try:
         import psycopg2.extras
         conn = psycopg2.connect(db.DATABASE_URL)
@@ -6832,6 +6834,18 @@ def _executor_status_inner():
             if row:
                 last_bounce    = dict(row)
                 last_bounce_ts = row.get("ts_signal")
+            # Contagem 72h — total + por migrations.passed_filters para ver tradeable
+            cur.execute("""
+                SELECT COUNT(*) AS n,
+                       COUNT(CASE WHEN m.passed_filters = true THEN 1 END) AS n_tradeable
+                FROM bounce_signals b
+                LEFT JOIN migrations m ON m.mint = b.mint
+                WHERE b.ts_signal > NOW() - INTERVAL '72 hours'
+            """)
+            cnt = cur.fetchone()
+            if cnt:
+                bounces_72h = int(cnt["n"] or 0)
+                bounces_tradeable_72h = int(cnt["n_tradeable"] or 0)
         conn.close()
     except Exception:
         pass
@@ -6893,6 +6907,7 @@ def _executor_status_inner():
     # Gate Helius breakdown — últimas 72h
     gate_rows_html = ""
     gate_summary = []
+    error_rows_html = ""
     try:
         import psycopg2.extras as _pge
         _conn2 = psycopg2.connect(db.DATABASE_URL)
@@ -6905,15 +6920,32 @@ def _executor_status_inner():
                 ORDER BY n DESC
             """)
             gate_data = [dict(r) for r in _cur.fetchall()]
+
+            # Erros de swap — mostra error_msg para diagnóstico
+            _cur.execute("""
+                SELECT symbol, created_at, error_msg
+                FROM trades
+                WHERE status = 'error'
+                  AND created_at > NOW() - INTERVAL '72 hours'
+                ORDER BY created_at DESC
+                LIMIT 10
+            """)
+            error_trades = [dict(r) for r in _cur.fetchall()]
         _conn2.close()
 
         if gate_data:
             blocked_total = sum(r["n"] for r in gate_data if r["status"] == "blocked_helius_gate")
             for r in gate_data:
-                color = "#f44336" if r["status"] == "blocked_helius_gate" else "#4CAF50" if r["status"] in ("tp","trailing_active") else "#ddd"
+                color = "#f44336" if r["status"] in ("blocked_helius_gate", "error") else "#4CAF50" if r["status"] in ("tp","trailing_active") else "#ddd"
                 reason = r["helius_gate_reason"] or "—"
                 gate_rows_html += f"<tr><td style='color:{color}'>{r['status']}</td><td>{reason}</td><td>{r['n']}</td></tr>"
             gate_summary.append(f"<b>{blocked_total}</b> trades bloqueados pelo Helius gate nas últimas 72h")
+
+        for et in error_trades:
+            ts = et["created_at"].strftime("%m-%d %H:%M") if et.get("created_at") else "?"
+            sym = et.get("symbol") or "?"
+            msg = (et.get("error_msg") or "—")[:120]
+            error_rows_html += f"<tr><td>{ts}</td><td>{sym}</td><td style='color:#f44336'>{msg}</td></tr>"
     except Exception as _ge:
         gate_rows_html = f"<tr><td colspan=3 style='color:#888'>erro: {_ge}</td></tr>"
 
@@ -6924,6 +6956,8 @@ def _executor_status_inner():
         diagnosis = f"❌ <b>Limite de trades atingido</b> ({n_trades}/{cal_max}). Aumente CALIBRATION_MAX_TRADES no Railway (ex: 150)."
     elif hot_count == 0:
         diagnosis = "⚠️ <b>Nenhum token no HotMonitor</b> — scanner não encontrou migrações recentes ou bot acabou de iniciar."
+    elif error_rows_html:
+        diagnosis = "❌ <b>Swap está falhando</b> (status=error, gate=passed) — gate passa mas execução falha. Ver tabela 'Trades com status=error' abaixo. Causas: IP não whitelisted no GMGN, chave inválida, saldo insuficiente."
     elif gate_rows_html and "blocked_helius_gate" in gate_rows_html:
         diagnosis = "❌ <b>Helius gate está bloqueando trades</b> — veja tabela 'Trades 72h' abaixo. Causas comuns: missing_pool_quote ou missing_net_sol_flow (Helius sem dados) ou net_sol_flow≤TRADE_MIN_NET_SOL_FLOW."
     else:
@@ -6981,6 +7015,17 @@ def _executor_status_inner():
   </p>
 </div>
 
+{f'''<div class="box">
+  <h2>Trades com status=error — últimas 72h (swap falhou após gate passar)</h2>
+  <table>
+    <tr><th>Hora</th><th>Token</th><th>error_msg</th></tr>
+    {error_rows_html or "<tr><td colspan=3 style='color:#4CAF50'>Nenhum erro de swap nas últimas 72h ✅</td></tr>"}
+  </table>
+  <p style="color:#555;font-size:11px">
+    Causas comuns: IP não whitelisted no GMGN | chave inválida | saldo insuficiente | timeout de rede
+  </p>
+</div>''' if error_rows_html else ""}
+
 <div class="box">
   <h2>HotMonitor — Tokens Ativos ({hot_count})</h2>
   {"<p style='color:#888'>Nenhum token sendo monitorado agora.</p>" if not hot_mints else
@@ -6994,8 +7039,15 @@ def _executor_status_inner():
     <tr><th>2. Trades abaixo do limite?</th><td>{'✅' if not executor_paused else f'❌ {n_trades}/{cal_max} — aumente CALIBRATION_MAX_TRADES'}</td></tr>
     <tr><th>3. HotMonitor com tokens?</th><td>{'✅' if hot_count > 0 else '⚠️ vazio agora (normal se sem migrações recentes)'}</td></tr>
     <tr><th>4. Algum bounce recente?</th><td>{'✅ ' + ago_str if last_bounce_ts else '⚠️ nenhum ainda'}</td></tr>
-    <tr><th>5. TRADE_MIN_NET_SOL_FLOW seguro?</th><td>{'✅ -999 (desativado)' if min_net_sol_flow <= -100 else f'❌ {min_net_sol_flow:g} — default -5 bloqueia 100% dos trades. Configurar TRADE_MIN_NET_SOL_FLOW=-999 no Railway.'}</td></tr>
-    <tr><th>6. TRADE_REQUIRE_HELIUS_FEATURES</th><td>{'⚠️ true — se Helius sem dados, bloqueia. Ver tabela acima.' if req_helius else '✅ false (aceita sem dados Helius)'}</td></tr>
+    <tr><th>5. Bounces 72h (total / tradeable)</th>
+        <td style="color:{'#4CAF50' if bounces_tradeable_72h > 0 else '#FF9800'}">
+          {bounces_72h} total / <b>{bounces_tradeable_72h} tradeable</b>
+          {' — ⚠️ 0 tradeable: tokens passando filtros mas bounce não chega ao executor' if bounces_tradeable_72h == 0 and bounces_72h > 0 else
+           ' — ⚠️ nenhum bounce detectado: problema no detector ou sem migrações' if bounces_72h == 0 else ' ✅'}
+        </td>
+    </tr>
+    <tr><th>6. TRADE_MIN_NET_SOL_FLOW seguro?</th><td>{'✅ -999 (desativado)' if min_net_sol_flow <= -100 else f'❌ {min_net_sol_flow:g} — default -5 bloqueia 100% dos trades. Configurar TRADE_MIN_NET_SOL_FLOW=-999 no Railway.'}</td></tr>
+    <tr><th>7. TRADE_REQUIRE_HELIUS_FEATURES</th><td>{'⚠️ true — se Helius sem dados, bloqueia. Ver tabela acima.' if req_helius else '✅ false (aceita sem dados Helius)'}</td></tr>
   </table>
 </div>
 
