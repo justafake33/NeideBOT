@@ -6820,9 +6820,11 @@ def _executor_status_inner():
         n_trades = f"erro: {e}"
         executor_paused = False
 
-    # Último bounce signal
+    # Último bounce signal + contagem 72h
     last_bounce = None
     last_bounce_ts = None
+    bounces_72h = 0
+    bounces_tradeable_72h = 0
     try:
         import psycopg2.extras
         conn = psycopg2.connect(db.DATABASE_URL)
@@ -6832,6 +6834,18 @@ def _executor_status_inner():
             if row:
                 last_bounce    = dict(row)
                 last_bounce_ts = row.get("ts_signal")
+            # Contagem 72h — total + por migrations.passed_filters para ver tradeable
+            cur.execute("""
+                SELECT COUNT(*) AS n,
+                       COUNT(CASE WHEN m.passed_filters = true THEN 1 END) AS n_tradeable
+                FROM bounce_signals b
+                LEFT JOIN migrations m ON m.mint = b.mint
+                WHERE b.ts_signal > NOW() - INTERVAL '72 hours'
+            """)
+            cnt = cur.fetchone()
+            if cnt:
+                bounces_72h = int(cnt["n"] or 0)
+                bounces_tradeable_72h = int(cnt["n_tradeable"] or 0)
         conn.close()
     except Exception:
         pass
@@ -6994,8 +7008,15 @@ def _executor_status_inner():
     <tr><th>2. Trades abaixo do limite?</th><td>{'✅' if not executor_paused else f'❌ {n_trades}/{cal_max} — aumente CALIBRATION_MAX_TRADES'}</td></tr>
     <tr><th>3. HotMonitor com tokens?</th><td>{'✅' if hot_count > 0 else '⚠️ vazio agora (normal se sem migrações recentes)'}</td></tr>
     <tr><th>4. Algum bounce recente?</th><td>{'✅ ' + ago_str if last_bounce_ts else '⚠️ nenhum ainda'}</td></tr>
-    <tr><th>5. TRADE_MIN_NET_SOL_FLOW seguro?</th><td>{'✅ -999 (desativado)' if min_net_sol_flow <= -100 else f'❌ {min_net_sol_flow:g} — default -5 bloqueia 100% dos trades. Configurar TRADE_MIN_NET_SOL_FLOW=-999 no Railway.'}</td></tr>
-    <tr><th>6. TRADE_REQUIRE_HELIUS_FEATURES</th><td>{'⚠️ true — se Helius sem dados, bloqueia. Ver tabela acima.' if req_helius else '✅ false (aceita sem dados Helius)'}</td></tr>
+    <tr><th>5. Bounces 72h (total / tradeable)</th>
+        <td style="color:{'#4CAF50' if bounces_tradeable_72h > 0 else '#FF9800'}">
+          {bounces_72h} total / <b>{bounces_tradeable_72h} tradeable</b>
+          {' — ⚠️ 0 tradeable: tokens passando filtros mas bounce não chega ao executor' if bounces_tradeable_72h == 0 and bounces_72h > 0 else
+           ' — ⚠️ nenhum bounce detectado: problema no detector ou sem migrações' if bounces_72h == 0 else ' ✅'}
+        </td>
+    </tr>
+    <tr><th>6. TRADE_MIN_NET_SOL_FLOW seguro?</th><td>{'✅ -999 (desativado)' if min_net_sol_flow <= -100 else f'❌ {min_net_sol_flow:g} — default -5 bloqueia 100% dos trades. Configurar TRADE_MIN_NET_SOL_FLOW=-999 no Railway.'}</td></tr>
+    <tr><th>7. TRADE_REQUIRE_HELIUS_FEATURES</th><td>{'⚠️ true — se Helius sem dados, bloqueia. Ver tabela acima.' if req_helius else '✅ false (aceita sem dados Helius)'}</td></tr>
   </table>
 </div>
 
