@@ -420,13 +420,18 @@ class GmgnClient:
     def get_market_trending(self, chain: str = "sol", interval: str = "5m",
                             limit: int = 100, order_by: str = "default",
                             direction: str = "desc", filters: list[str] | None = None,
-                            platforms: list[str] | None = None) -> list:
+                            platforms: list[str] | None = None,
+                            mc_min: float | None = None,
+                            mc_max: float | None = None) -> list:
         """
         GET /v1/market/rank — ranking/trending GMGN.
 
         Uso inicial do NeideBOT: radar passivo. O método retorna uma lista
         tolerante a pequenas variações de envelope da OpenAPI (`data.rank`,
         `data.list`, `data.items` ou lista direta).
+
+        mc_min / mc_max: filtro server-side por market cap (USD).
+        Parâmetros API: min_marketcap / max_marketcap.
         """
         params = {
             "chain": chain,
@@ -439,6 +444,10 @@ class GmgnClient:
             params["filter"] = filters
         if platforms:
             params["platform"] = platforms
+        if mc_min is not None:
+            params["min_marketcap"] = mc_min
+        if mc_max is not None:
+            params["max_marketcap"] = mc_max
 
         result = self._get("/v1/market/rank", params)
         code = result.get("code")
