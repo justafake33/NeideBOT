@@ -53423,13 +53423,15 @@ def _analise_trending_flow_inner():
         ticks AS (
             SELECT
                 tb.mint,
-                MAX(COALESCE(tt.mc_high, tt.mc)) AS max_mc,
-                COUNT(tt.id)                     AS tick_count
+                MAX(COALESCE(tt.mc_high, tt.mc))                                             AS max_mc,
+                COUNT(tt.id)                                                                  AS tick_count,
+                MIN(tt.tick_ts) FILTER (WHERE COALESCE(tt.mc_high, tt.mc) >= tb.entry_mc * %(tp_mult)s) AS first_tp_ts,
+                MIN(tt.tick_ts) FILTER (WHERE COALESCE(tt.mc_low,  tt.mc) <= tb.entry_mc * %(sl_mult)s) AS first_sl_ts
             FROM trending_bounces tb
             JOIN token_ticks tt ON tt.mint = tb.mint
                 AND tt.tick_ts > tb.ts_signal
                 AND tt.tick_ts < tb.ts_signal + INTERVAL '60 minutes'
-            GROUP BY tb.mint
+            GROUP BY tb.mint, tb.entry_mc
         )
         SELECT
             tb.mint,
@@ -53444,6 +53446,8 @@ def _analise_trending_flow_inner():
             tb.time_to_migrate_sec,
             tk.max_mc,
             tk.tick_count,
+            tk.first_tp_ts,
+            tk.first_sl_ts,
             sn.buys,
             sn.sells,
             sn.swaps,
@@ -53459,23 +53463,27 @@ def _analise_trending_flow_inner():
         LEFT JOIN best_snaps sn ON sn.mint = tb.mint
         LEFT JOIN ticks      tk ON tk.mint = tb.mint
         ORDER BY tb.ts_signal DESC
-    """, {"since": since_str, "min_drop": MIN_DROP, "min_elapsed": MIN_ELAPSED})
+    """, {"since": since_str, "min_drop": MIN_DROP, "min_elapsed": MIN_ELAPSED,
+          "tp_mult": TP_MULT, "sl_mult": SL_MULT})
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     t_sql = _time.time() - t0
 
-    # ── 2. Calcular outcomes em Python ───────────────────────────────────────
+    # ── 2. Calcular outcomes em Python (path-dependent) ──────────────────────
     def outcome(r):
-        entry = r.get("entry_mc") or 0
-        mx    = r.get("max_mc") or 0
-        tc    = r.get("tick_count") or 0
-        if not entry or not mx or tc < 3:
+        tc       = r.get("tick_count") or 0
+        entry    = r.get("entry_mc") or 0
+        if not entry or tc < 3:
             return None
-        if mx >= entry * TP_MULT:
+        tp_ts = r.get("first_tp_ts")
+        sl_ts = r.get("first_sl_ts")
+        if tp_ts and sl_ts:
+            return "TP" if tp_ts < sl_ts else "SL"
+        if tp_ts:
             return "TP"
-        if mx < entry * SL_MULT:
+        if sl_ts:
             return "SL"
-        return "SL"   # janela fechou sem TP — SL por expiração
+        return "SL"   # janela fechou sem TP nem SL explícito — expiração
 
     for r in rows:
         r["_outcome"] = outcome(r)
