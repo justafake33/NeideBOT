@@ -53425,8 +53425,8 @@ def _analise_trending_flow_inner():
                 tb.mint,
                 MAX(COALESCE(tt.mc_high, tt.mc))                                             AS max_mc,
                 COUNT(tt.id)                                                                  AS tick_count,
-                MIN(tt.tick_ts) FILTER (WHERE COALESCE(tt.mc_high, tt.mc) >= tb.entry_mc * %(tp_mult)s) AS first_tp_ts,
-                MIN(tt.tick_ts) FILTER (WHERE COALESCE(tt.mc_low,  tt.mc) <= tb.entry_mc * %(sl_mult)s) AS first_sl_ts
+                MIN(tt.tick_ts) FILTER (WHERE tt.mc >= tb.entry_mc * %(tp_mult)s) AS first_tp_ts,
+                MIN(tt.tick_ts) FILTER (WHERE tt.mc <= tb.entry_mc * %(sl_mult)s) AS first_sl_ts
             FROM trending_bounces tb
             JOIN token_ticks tt ON tt.mint = tb.mint
                 AND tt.tick_ts > tb.ts_signal
