@@ -53270,9 +53270,11 @@ def analise_trending_flow():
 def _analise_trending_flow_inner():
     import psycopg2, psycopg2.extras, time as _time
 
-    since_str = request.args.get("since", "2026-05-26") or "2026-05-26"
-    TP  = float(request.args.get("tp", 0.75))
-    SL  = float(request.args.get("sl", 0.25))
+    since_str   = request.args.get("since", "2026-05-26") or "2026-05-26"
+    TP          = float(request.args.get("tp", 0.75))
+    SL          = float(request.args.get("sl", 0.25))
+    MIN_DROP    = float(request.args.get("min_drop", "0.30"))
+    MIN_ELAPSED = int(request.args.get("min_elapsed", "60"))
     TP_MULT = 1 + TP
     SL_MULT = 1 - SL
     BE = SL / (TP + SL)
@@ -53304,6 +53306,8 @@ def _analise_trending_flow_inner():
             WHERE m.trending_at_migration IS TRUE
               AND bs.ts_signal >= %(since)s::timestamptz
               AND bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+              AND bs.drop_from_mig >= %(min_drop)s
+              AND bs.elapsed_sec >= %(min_elapsed)s
         ),
         snaps AS (
             SELECT
@@ -53364,7 +53368,7 @@ def _analise_trending_flow_inner():
             COUNT(DISTINCT bs.mint) FILTER (WHERE bs.snap_source = 'signal')    AS from_signal_snap
         FROM trending_bounces tb
         LEFT JOIN best_snaps bs ON bs.mint = tb.mint
-    """, {"since": since_str})
+    """, {"since": since_str, "min_drop": MIN_DROP, "min_elapsed": MIN_ELAPSED})
     cov = dict(cur.fetchone())
 
     total   = cov.get("total_trending_bounces") or 0
@@ -53394,6 +53398,8 @@ def _analise_trending_flow_inner():
             WHERE m.trending_at_migration IS TRUE
               AND bs.ts_signal >= %(since)s::timestamptz
               AND bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
+              AND bs.drop_from_mig >= %(min_drop)s
+              AND bs.elapsed_sec >= %(min_elapsed)s
         ),
         best_snaps AS (
             SELECT DISTINCT ON (tb.mint)
@@ -53453,7 +53459,7 @@ def _analise_trending_flow_inner():
         LEFT JOIN best_snaps sn ON sn.mint = tb.mint
         LEFT JOIN ticks      tk ON tk.mint = tb.mint
         ORDER BY tb.ts_signal DESC
-    """, {"since": since_str})
+    """, {"since": since_str, "min_drop": MIN_DROP, "min_elapsed": MIN_ELAPSED})
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     t_sql = _time.time() - t0
@@ -53539,7 +53545,7 @@ Para fluxo on-chain real (pré-fundo): <a href='/analise/pre-rise-ticks' style='
   <a href='?tp=1.00&sl=0.25&since={since_str}'>TP100/SL25</a>
   <a href='?tp=0.75&sl=0.25&since=2026-06-01'>desde 2026-06-01</a>
 </div>
-<p style='color:#888;font-size:0.85em'>SQL: {t_sql:.2f}s · since={since_str} · n={len(rows)} bounces trending</p>
+<p style='color:#888;font-size:0.85em'>SQL: {t_sql:.2f}s · since={since_str} · min_drop={MIN_DROP:.0%} · min_elapsed={MIN_ELAPSED}s · n={len(rows)} bounces trending</p>
 """
 
     # Cobertura
