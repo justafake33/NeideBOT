@@ -52674,6 +52674,15 @@ def _analise_trending_deep_inner():
                 m.creator_token_status,
                 MIN(tt.tick_ts) FILTER (WHERE tt.mc >= bs.mc_at_signal * %(tp_mult)s) AS first_tp_ts,
                 MIN(tt.tick_ts) FILTER (WHERE tt.mc <= bs.mc_at_signal * %(sl_mult)s) AS first_sl_ts,
+                MIN(tt.tick_ts) FILTER (WHERE tt.mc >= bs.mc_at_signal * 1.50) AS first_tp050_ts,
+                MIN(tt.tick_ts) FILTER (WHERE tt.mc >= bs.mc_at_signal * 1.75) AS first_tp075_ts,
+                MIN(tt.tick_ts) FILTER (WHERE tt.mc >= bs.mc_at_signal * 2.00) AS first_tp100_ts,
+                MIN(tt.tick_ts) FILTER (WHERE tt.mc >= bs.mc_at_signal * 2.50) AS first_tp150_ts,
+                MIN(tt.tick_ts) FILTER (WHERE tt.mc >= bs.mc_at_signal * 3.00) AS first_tp200_ts,
+                MIN(tt.tick_ts) FILTER (WHERE tt.mc <= bs.mc_at_signal * 0.75) AS first_sl025_ts,
+                MIN(tt.tick_ts) FILTER (WHERE tt.mc <= bs.mc_at_signal * 0.80) AS first_sl020_ts,
+                MIN(tt.tick_ts) FILTER (WHERE tt.mc <= bs.mc_at_signal * 0.85) AS first_sl015_ts,
+                MAX(tt.mc)                                                      AS max_mc,
                 COUNT(tt.id)                                      AS tick_count
             FROM bounce_signals bs
             JOIN token_ticks tt ON tt.mint = bs.mint
@@ -52850,14 +52859,21 @@ def _analise_trending_deep_inner():
     H += "<p class='sub'>Mesmo grupo trending=TRUE, variando o payoff alvo.</p>"
     H += "<table class='wide'>"
     H += "<tr><th>TP/SL</th><th>n</th><th>dec</th><th>TP</th><th>SL</th><th>WR</th><th>EV</th><th>break-even</th></tr>"
+    _G_TP = {0.50: "first_tp050_ts", 0.75: "first_tp075_ts", 1.00: "first_tp100_ts",
+             1.50: "first_tp150_ts", 2.00: "first_tp200_ts"}
+    _G_SL = {0.25: "first_sl025_ts", 0.20: "first_sl020_ts", 0.15: "first_sl015_ts"}
+    def _gtp(r, tp_v, sl_v):
+        ftp = r[_G_TP[tp_v]]; fsl = r[_G_SL[sl_v]]
+        return ftp is not None and (fsl is None or ftp <= fsl)
+    def _gsl(r, tp_v, sl_v):
+        ftp = r[_G_TP[tp_v]]; fsl = r[_G_SL[sl_v]]
+        return fsl is not None and (ftp is None or fsl < ftp)
     for tp_v, sl_v in [(0.50, 0.25), (0.75, 0.25), (1.00, 0.25), (1.50, 0.25), (2.00, 0.25),
                         (0.75, 0.15), (1.00, 0.15), (0.75, 0.20)]:
         be_v = sl_v / (tp_v + sl_v)
         sub = trend_t
-        n_tp_v = sum(1 for r in sub if r["max_mc"] is not None and r["max_mc"] >= r["entry_mc"] * (1 + tp_v))
-        n_sl_v = sum(1 for r in sub
-                     if r["min_mc"] is not None and r["min_mc"] <= r["entry_mc"] * (1 - sl_v)
-                     and not (r["max_mc"] is not None and r["max_mc"] >= r["entry_mc"] * (1 + tp_v)))
+        n_tp_v = sum(1 for r in sub if _gtp(r, tp_v, sl_v))
+        n_sl_v = sum(1 for r in sub if _gsl(r, tp_v, sl_v))
         nd = n_tp_v + n_sl_v
         if nd == 0:
             continue
