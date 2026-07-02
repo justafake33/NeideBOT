@@ -29257,10 +29257,11 @@ def analise_sinal_puro():
         (a) Não monitoramos tokens abaixo de $5k MC
         (b) Não sabemos se o token bateu nosso SL no meio do caminho antes de recuperar
     """
-    TP_MULT   = 1.75  # +75%
-    SL_MULT   = 0.75  # -25%
-    MIN_TICKS = 3     # ticks mínimos após sinal para considerar o outcome
-    MIN_DROP  = float(request.args.get("min_drop", "0.30"))
+    TP_MULT     = 1.75  # +75%
+    SL_MULT     = 0.75  # -25%
+    MIN_TICKS   = 3     # ticks mínimos após sinal para considerar o outcome
+    MIN_DROP    = float(request.args.get("min_drop", "0.30"))
+    MIN_ELAPSED = int(request.args.get("min_elapsed", "60"))  # seg mínimos até bounce (default 1min)
     # entry = mc_at_signal (preço real no momento do sinal, já inclui o bounce inteiro)
     # mc_min × 1.15 foi REMOVIDO — inflava o WR porque assume compra antes do sinal disparar
 
@@ -29319,6 +29320,7 @@ def analise_sinal_puro():
                   AND bs.mc_at_signal > 0
                   AND bs.bounce_pct IS NOT NULL
                   AND bs.drop_from_mig >= %(min_drop)s
+                  AND bs.elapsed_sec >= %(min_elapsed)s
                 GROUP BY bs.mint, bs.bounce_pct, bs.drop_from_mig, bs.elapsed_sec,
                          bs.absorption_events, bs.mc_min, bs.mc_migration, bs.mc_at_signal,
                          m.smart_wallets, m.renowned_wallets, m.creator_token_status,
@@ -29330,7 +29332,8 @@ def analise_sinal_puro():
                 (first_sl_ts IS NOT NULL AND (first_tp_ts IS NULL OR first_sl_ts < first_tp_ts))  AS sl_hit
             FROM outcomes
             ORDER BY bounce_pct
-        """, {"tp": TP_MULT, "sl": SL_MULT, "min_ticks": MIN_TICKS, "min_drop": MIN_DROP})
+        """, {"tp": TP_MULT, "sl": SL_MULT, "min_ticks": MIN_TICKS, "min_drop": MIN_DROP,
+              "min_elapsed": MIN_ELAPSED})
         primary = cur.fetchall()
 
     # ── Dataset secundário: migrations.recovery ───────────────────────────────
@@ -29355,7 +29358,8 @@ def analise_sinal_puro():
             JOIN bounce_signals bs ON bs.mint = m.mint
             WHERE m.recovery IS NOT NULL
               AND bs.drop_from_mig >= %(min_drop)s
-        """, {"min_drop": MIN_DROP})
+              AND bs.elapsed_sec >= %(min_elapsed)s
+        """, {"min_drop": MIN_DROP, "min_elapsed": MIN_ELAPSED})
         secondary = cur.fetchall()
 
     n_primary   = len(primary)
@@ -31563,10 +31567,11 @@ def _analise_h9_gate_inner():
     import time as _time
     import psycopg2.extras
 
-    since_str = request.args.get("since", "2026-05-26") or "2026-05-26"
-    TP = float(request.args.get("tp", 0.75))
-    SL = float(request.args.get("sl", 0.25))
-    MIN_DROP = float(request.args.get("min_drop", "0.30"))
+    since_str   = request.args.get("since", "2026-05-26") or "2026-05-26"
+    TP          = float(request.args.get("tp", 0.75))
+    SL          = float(request.args.get("sl", 0.25))
+    MIN_DROP    = float(request.args.get("min_drop", "0.30"))
+    MIN_ELAPSED = int(request.args.get("min_elapsed", "60"))
     TP_MULT = 1 + TP
     SL_MULT = 1 - SL
     MIN_TICKS = 3
@@ -31647,13 +31652,14 @@ def _analise_h9_gate_inner():
             WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
               AND bs.ts_signal >= %(since)s::timestamptz
               AND bs.drop_from_mig >= %(min_drop)s
+              AND bs.elapsed_sec >= %(min_elapsed)s
             GROUP BY bs.mint, bs.ts_signal, bs.mc_at_signal, bs.elapsed_sec, bs.bounce_pct,
                      m.trending_at_migration, m.mc_migration
             HAVING COUNT(tt.id) >= %(min_ticks)s
         )
         SELECT * FROM ticks
     """, {"since": since_str, "min_ticks": MIN_TICKS, "tp_mult": TP_MULT, "sl_mult": SL_MULT,
-          "min_drop": MIN_DROP})
+          "min_drop": MIN_DROP, "min_elapsed": MIN_ELAPSED})
     bounces = [dict(r) for r in cur.fetchall()]
     conn.close()
     t_sql = _time.time() - t0
@@ -31872,12 +31878,13 @@ def analise_quality_grid():
     import itertools, time as _time
     import psycopg2.extras
 
-    since_str = request.args.get("since", "2026-05-26") or "2026-05-26"
-    MIN_N   = int(request.args.get("min_n",   5))
-    MIN_DEC = int(request.args.get("min_dec", 3))
-    TOP     = int(request.args.get("top",   300))
-    MARG_TP = float(request.args.get("tp", 0.75))  # TP para seção marginal
-    MIN_DROP = float(request.args.get("min_drop", "0.30"))
+    since_str   = request.args.get("since", "2026-05-26") or "2026-05-26"
+    MIN_N       = int(request.args.get("min_n",   5))
+    MIN_DEC     = int(request.args.get("min_dec", 3))
+    TOP         = int(request.args.get("top",   300))
+    MARG_TP     = float(request.args.get("tp", 0.75))  # TP para seção marginal
+    MIN_DROP    = float(request.args.get("min_drop", "0.30"))
+    MIN_ELAPSED = int(request.args.get("min_elapsed", "60"))
 
     # ── Grid combinado — 5 níveis por dim (0→100%) ───────────────────────────
     BUNDLER_VALUES = [0.10, 0.25, 0.50, 0.75, 1.00]
@@ -31950,6 +31957,7 @@ def analise_quality_grid():
               AND bs.bounce_pct   IS NOT NULL
               AND bs.ts_signal >= %(since)s::timestamptz
               AND bs.drop_from_mig >= %(min_drop)s
+              AND bs.elapsed_sec >= %(min_elapsed)s
             GROUP BY bs.mint, bs.mc_at_signal,
                      m.smart_wallets, m.bundler_trader_amount_rate,
                      m.top70_sniper_hold_rate, m.rug_ratio,
@@ -31957,7 +31965,7 @@ def analise_quality_grid():
             HAVING COUNT(tt.id) >= 3
         )
         SELECT * FROM base
-    """, {"since": since_str, "min_drop": MIN_DROP})
+    """, {"since": since_str, "min_drop": MIN_DROP, "min_elapsed": MIN_ELAPSED})
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     t_sql = _time.time() - t0
@@ -52630,10 +52638,11 @@ def analise_trending_deep():
 def _analise_trending_deep_inner():
     import psycopg2, psycopg2.extras, time as _time
 
-    since_str = request.args.get("since", "2026-05-26") or "2026-05-26"
-    TP  = float(request.args.get("tp", 0.75))
-    SL  = float(request.args.get("sl", 0.25))
-    MIN_DROP = float(request.args.get("min_drop", "0.30"))
+    since_str   = request.args.get("since", "2026-05-26") or "2026-05-26"
+    TP          = float(request.args.get("tp", 0.75))
+    SL          = float(request.args.get("sl", 0.25))
+    MIN_DROP    = float(request.args.get("min_drop", "0.30"))
+    MIN_ELAPSED = int(request.args.get("min_elapsed", "60"))
     TP_MULT = 1 + TP
     SL_MULT = 1 - SL
     BE = SL / (TP + SL)
@@ -52701,6 +52710,7 @@ def _analise_trending_deep_inner():
             WHERE bs.mc_at_signal IS NOT NULL AND bs.mc_at_signal > 0
               AND bs.ts_signal >= %(since)s::timestamptz
               AND bs.drop_from_mig >= %(min_drop)s
+              AND bs.elapsed_sec >= %(min_elapsed)s
             GROUP BY bs.mint, bs.symbol, bs.ts_signal, bs.elapsed_sec,
                      bs.bounce_pct, bs.drop_from_mig, bs.pool_quote_at_signal,
                      bs.mc_at_signal, bs.mc_migration,
@@ -52739,7 +52749,7 @@ def _analise_trending_deep_inner():
         LEFT JOIN snaps ON snaps.mint = sim.mint
         ORDER BY ts_signal DESC
     """, {"since": since_str, "min_ticks": MIN_TICKS, "tp_mult": TP_MULT, "sl_mult": SL_MULT,
-          "min_drop": MIN_DROP})
+          "min_drop": MIN_DROP, "min_elapsed": MIN_ELAPSED})
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     t_sql = _time.time() - t0
