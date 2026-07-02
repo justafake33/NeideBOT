@@ -378,15 +378,14 @@ class HotMonitor:
             return
 
         # Anti-decline: rejeita se o preço está caindo em relação a um pico REAL pós-migração.
-        # Bug original: mc_max é inicializado com mc_migration → a condição mc_max > mc_min
-        # era sempre True após o dump, bloqueando qualquer bounce abaixo de 85% da migração.
-        # Exemplo: mc_migration=$27k, mc_bottom=$5k → anti-decline exigia mc >= $22.95k,
-        # mas com BOUNCE_MAX_PCT=100% o token é bloqueado antes de chegar lá.
-        # Fix: só aplica se mc_max superou 5% acima da migração (pico real pós-migração).
+        # Threshold 2.0: exige que o token tenha dobrado acima da migração antes de aplicar.
+        # Bug: threshold anterior de 1.05 era atingido pelo preço inicial do trenches (que
+        # pode ser 5-15% acima do bc_ref teórico por diferença CoinGecko vs GMGN). Isso
+        # fazia o anti-decline bloquear TODOS os bounces de dump pós-migração normais.
         mc_max = mint_state["mc_max"]
-        if mc_max > mc_migration * 1.05 and mc < mc_max * 0.85:
-            logger.info("BOUNCE skip %s — declining: $%.0f < pico real $%.0f × 85%%",
-                        symbol, mc, mc_max)
+        if mc_max > mc_migration * 2.0 and mc < mc_max * 0.85:
+            logger.info("BOUNCE skip %s — declining: $%.0f < pico real $%.0f × 85%% (mc_mig=$%.0f)",
+                        symbol, mc, mc_max, mc_migration)
             return
 
         # A.6 — Bottom freshness: sinal deve vir logo após o fundo ser confirmado.
