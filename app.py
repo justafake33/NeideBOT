@@ -29304,8 +29304,8 @@ def analise_sinal_puro():
                     m.cto_flag,
                     m.top10_holder_rate,
                     m.rat_trader_rate,
-                    MAX(COALESCE(tt.mc_high, tt.mc))               AS max_mc,
-                    MIN(COALESCE(tt.mc_low,  tt.mc))               AS min_mc,
+                    MIN(tt.tick_ts) FILTER (WHERE tt.mc >= bs.mc_at_signal * %(tp)s) AS first_tp_ts,
+                    MIN(tt.tick_ts) FILTER (WHERE tt.mc <= bs.mc_at_signal * %(sl)s) AS first_sl_ts,
                     COUNT(tt.id)                                   AS tick_count
                 FROM bounce_signals bs
                 JOIN token_ticks tt ON tt.mint = bs.mint
@@ -29324,8 +29324,8 @@ def analise_sinal_puro():
                 HAVING COUNT(tt.id) >= %(min_ticks)s
             )
             SELECT *,
-                (max_mc >= entry_mc * %(tp)s)  AS tp_hit,
-                (min_mc <= entry_mc * %(sl)s)  AS sl_hit
+                (first_tp_ts IS NOT NULL AND (first_sl_ts IS NULL OR first_tp_ts <= first_sl_ts)) AS tp_hit,
+                (first_sl_ts IS NOT NULL AND (first_tp_ts IS NULL OR first_sl_ts < first_tp_ts))  AS sl_hit
             FROM outcomes
             ORDER BY bounce_pct
         """, {"tp": TP_MULT, "sl": SL_MULT, "min_ticks": MIN_TICKS})
@@ -31619,8 +31619,8 @@ def _analise_h9_gate_inner():
                 bs.elapsed_sec / 60.0                                 AS elapsed_min,
                 bs.bounce_pct,
                 m.trending_at_migration,
-                MAX(COALESCE(tt.mc_high, tt.mc))                      AS max_mc,
-                MIN(COALESCE(tt.mc_low,  tt.mc))                      AS min_mc,
+                MIN(tt.tick_ts) FILTER (WHERE tt.mc >= bs.mc_at_signal * %(tp_mult)s) AS first_tp_ts,
+                MIN(tt.tick_ts) FILTER (WHERE tt.mc <= bs.mc_at_signal * %(sl_mult)s) AS first_sl_ts,
                 COUNT(tt.id)                                          AS tick_count,
                 -- melhor sinal H9 antes do bounce
                 (
@@ -31647,7 +31647,7 @@ def _analise_h9_gate_inner():
             HAVING COUNT(tt.id) >= %(min_ticks)s
         )
         SELECT * FROM ticks
-    """, {"since": since_str, "min_ticks": MIN_TICKS})
+    """, {"since": since_str, "min_ticks": MIN_TICKS, "tp_mult": TP_MULT, "sl_mult": SL_MULT})
     bounces = [dict(r) for r in cur.fetchall()]
     conn.close()
     t_sql = _time.time() - t0
@@ -31657,11 +31657,14 @@ def _analise_h9_gate_inner():
     def sim(subset):
         if not subset:
             return 0, 0, 0, None, None
-        n_tp = sum(1 for b in subset
-                   if b["max_mc"] is not None and b["max_mc"] >= b["entry_mc"] * TP_MULT)
-        n_sl = sum(1 for b in subset
-                   if b["min_mc"] is not None and b["min_mc"] <= b["entry_mc"] * SL_MULT
-                   and not (b["max_mc"] is not None and b["max_mc"] >= b["entry_mc"] * TP_MULT))
+        def _tp(b):
+            ftp = b["first_tp_ts"]; fsl = b["first_sl_ts"]
+            return ftp is not None and (fsl is None or ftp <= fsl)
+        def _sl(b):
+            ftp = b["first_tp_ts"]; fsl = b["first_sl_ts"]
+            return fsl is not None and (ftp is None or fsl < ftp)
+        n_tp = sum(1 for b in subset if _tp(b))
+        n_sl = sum(1 for b in subset if _sl(b))
         n_dec = n_tp + n_sl
         if n_dec == 0:
             return len(subset), 0, 0, None, None
@@ -31927,8 +31930,9 @@ def analise_quality_grid():
                 m.rug_ratio                                  AS rug,
                 m.bot_degen_rate                             AS bot,
                 m.top10_holder_rate                          AS top10,
-                MAX(COALESCE(tt.mc_high, tt.mc))             AS max_mc,
-                MIN(COALESCE(tt.mc_low,  tt.mc))             AS min_mc,
+                MIN(tt.tick_ts) FILTER (WHERE tt.mc >= bs.mc_at_signal * 1.75) AS first_tp075_ts,
+                MIN(tt.tick_ts) FILTER (WHERE tt.mc >= bs.mc_at_signal * 2.00) AS first_tp100_ts,
+                MIN(tt.tick_ts) FILTER (WHERE tt.mc <= bs.mc_at_signal * 0.75) AS first_sl025_ts,
                 COUNT(tt.id)                                 AS tick_count
             FROM bounce_signals bs
             JOIN token_ticks tt ON tt.mint = bs.mint
@@ -31978,12 +31982,14 @@ def analise_quality_grid():
     smart_masks   = {s: smart_mask(s)         for s in all_smart}
     no_mask       = [True] * N  # "filtro desligado" = aceita todos
 
+    _TP_TS = {0.75: "first_tp075_ts", 1.00: "first_tp100_ts"}
+    _SL_TS = {0.25: "first_sl025_ts"}
     tp_sl_masks = {}
     for tp, sl in TP_SL_VALUES:
-        tp_mult = 1 + tp; sl_mult = 1 - sl
+        tp_key = _TP_TS[tp]; sl_key = _SL_TS[sl]
         tp_sl_masks[(tp, sl)] = (
-            [r["max_mc"] is not None and r["max_mc"] >= r["entry_mc"] * tp_mult for r in rows],
-            [r["min_mc"] is not None and r["min_mc"] <= r["entry_mc"] * sl_mult for r in rows],
+            [r[tp_key] is not None and (r[sl_key] is None or r[tp_key] <= r[sl_key]) for r in rows],
+            [r[sl_key] is not None and (r[tp_key] is None or r[sl_key] < r[tp_key])  for r in rows],
         )
 
     def eval_subset(idx, tp, sl):
@@ -52666,8 +52672,8 @@ def _analise_trending_deep_inner():
                 m.rug_ratio,
                 m.top10_holder_rate,
                 m.creator_token_status,
-                MAX(COALESCE(tt.mc_high, tt.mc))                  AS max_mc,
-                MIN(COALESCE(tt.mc_low,  tt.mc))                  AS min_mc,
+                MIN(tt.tick_ts) FILTER (WHERE tt.mc >= bs.mc_at_signal * %(tp_mult)s) AS first_tp_ts,
+                MIN(tt.tick_ts) FILTER (WHERE tt.mc <= bs.mc_at_signal * %(sl_mult)s) AS first_sl_ts,
                 COUNT(tt.id)                                      AS tick_count
             FROM bounce_signals bs
             JOIN token_ticks tt ON tt.mint = bs.mint
@@ -52713,7 +52719,7 @@ def _analise_trending_deep_inner():
         FROM sim
         LEFT JOIN snaps ON snaps.mint = sim.mint
         ORDER BY ts_signal DESC
-    """, {"since": since_str, "min_ticks": MIN_TICKS})
+    """, {"since": since_str, "min_ticks": MIN_TICKS, "tp_mult": TP_MULT, "sl_mult": SL_MULT})
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     t_sql = _time.time() - t0
@@ -52722,9 +52728,12 @@ def _analise_trending_deep_inner():
     if N == 0:
         return "<p>Sem dados.</p>"
 
-    def is_tp(r): return r["max_mc"] is not None and r["max_mc"] >= r["entry_mc"] * TP_MULT
-    def is_sl(r): return (r["min_mc"] is not None and r["min_mc"] <= r["entry_mc"] * SL_MULT
-                          and not is_tp(r))
+    def is_tp(r):
+        ftp = r["first_tp_ts"]; fsl = r["first_sl_ts"]
+        return ftp is not None and (fsl is None or ftp <= fsl)
+    def is_sl(r):
+        ftp = r["first_tp_ts"]; fsl = r["first_sl_ts"]
+        return fsl is not None and (ftp is None or fsl < ftp)
 
     def sim(subset):
         if not subset: return 0, 0, 0, None, None
