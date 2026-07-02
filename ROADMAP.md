@@ -1,6 +1,6 @@
 # NeideBOT — Roadmap
 
-**Atualizado:** 2026-06-28 (sessão 24)
+**Atualizado:** 2026-07-01 (sessão 25)
 **Estado:** Bot ATIVO · `TRADING_ENABLED=true` · branch ativo: `claude/magical-cerf-3wjq5o` · **Modo Helius** (erpc desativado — 0 créditos)
 **Infra Railway:** ~$6/mês (welcoming-miracle + intelligent-spirit PostgreSQL) · Solo desde 2026-06-22
 
@@ -44,6 +44,10 @@
 | trending-deep dados completos | 2026-06-28 | n=50 bounces trending (99% cobertura). TP50: WR 51.2%, EV +13.4%. elapsed<5min WR 36.4%. mig<60s WR 0% confirmado. smart≥2 → WR 42.9%. |
 | Seção 6 — tokens bloqueados | 2026-06-28 | 19 trending tokens com dump<30% bloqueados. 3/4 com dados recuperaram, avg mc_1h +403%. Love SOL: +803%, Pumpbot: +455%. |
 | BOUNCE_DROP_MIN_TRENDING + TRENDING_BLOCK_FAST_MIG | 2026-06-28 | Código deployado. Aguardando configurar no Railway worker. |
+| Second market/rank call — MC-range filtered | 2026-07-01 | `get_market_trending(mc_min, mc_max)` → `min_marketcap`/`max_marketcap` params. Dois calls merged via `trending_source` ("global"/"mc_range"). Detecta trending tokens $20k-$35k invisíveis no top-100 global. `TRENDING_MC_MIN=20000` / `TRENDING_MC_MAX=35000` no Railway. |
+| Fix TRADE_MIN_NET_SOL_FLOW default | 2026-07-01 | Default corrigido de `-5` para `-999` em `executor.py`. O `-5` bloqueava TODOS os trades com net_sol_flow≤-5 SOL (estrutural durante dumps). Railway já tinha `-999`, mas o código-padrão era perigoso. |
+| /debug/executor-status aprimorado | 2026-07-01 | Adicionado: breakdown 72h por (status, helius_gate_reason), bounce count 72h (total + tradeable), tabela de error_msg para trades com erro, config do gate executor, checklist items 5-7, diagnóstico automático de padrão `error`. |
+| Root cause 403 Forbidden identificado | 2026-07-01 | Swap falhando com 403 = IP do worker Railway não está na whitelist GMGN. IP muda a cada redeploy. Fix: re-whitelist IP via `/debug/runtime-ips` após cada deploy. Considerar Static IP Railway (~$5/mês). |
 
 > ⚠️ **WR REAL (2026-05-14):** banco tinha dados fictícios — TradeMonitor inferia saídas de MC snapshots, não blockchain. Auditoria: WR real = **10.1%** (14/139). `/debug/sell-recovery` aplicado.
 > ⚠️ **DADOS HISTÓRICOS SUSPEITOS:** mc_min de tokens antes do fix (elapsed_sec < 90) corrompido pelo candle de transição bonding curve→pool. Análises de bounce_pct/drop histórico devem ser tratadas com cautela.
@@ -53,20 +57,23 @@
 
 ## 🔬 V2 — Reestruturação de Microestrutura
 
-### Estado atual (2026-06-28, sessão 24)
+### Estado atual (2026-07-01, sessão 25)
 
 **Bot ATIVO** · `TRADING_ENABLED=true` · Branch: `claude/magical-cerf-3wjq5o` · **Modo Helius** (erpc desativado)
 
 Gate H23 desativado (n insuficiente). RISE gate desativado. Operação solo desde 2026-06-22.
 **Foco atual:** acúmulo de dados trending (n≥100 bounces) para validar H27 e definir gates definitivos.
 
+**⚠️ Problema ativo:** swap retornando 403 Forbidden = IP do worker Railway não está na whitelist GMGN. Após cada redeploy, verificar IP via `/debug/runtime-ips` e re-whitelist no painel GMGN.
+
 **Implicação do modo Helius**: gap de ~10-30s entre detecção do token e início do feed WS. V-bottoms muito rápidos (<30s) podem ser perdidos antes do subscribe — kline hot-precise (5s) e trenches (5s) cobrem como fallback.
 
-**Filtros ativos (Railway) pós-sessão 24:**
+**Filtros ativos (Railway) pós-sessão 25:**
 - `BOUNCE_DROP_MIN=0.30` (Railway)
 - `TRADE_MAX_ELAPSED_SEC=900`
 - `BOTTOM_FRESHNESS_SEC=600`
 - `TRENDING_BLOCK_FAST_MIG=true` (worker) — bloqueia trending mig<60s
+- `TRENDING_MC_MIN=20000` / `TRENDING_MC_MAX=35000` — range da chamada MC-range do market/rank
 - `BOUNCE_DROP_MIN_TRENDING` **pendente configurar** no Railway worker
 
 **Próximo marco — quando n≥100 bounces trending:**
