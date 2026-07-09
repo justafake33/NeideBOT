@@ -6807,10 +6807,14 @@ def _executor_status_inner():
     trading_enabled = os.getenv("TRADING_ENABLED", "false").lower() == "true"
     cal_max         = int(os.getenv("CALIBRATION_MAX_TRADES", "50"))
     cal_amount      = float(os.getenv("CALIBRATION_AMOUNT_USD", "1.0"))
-    bounce_min      = float(os.getenv("BOUNCE_MIN_PCT", "0.15"))
+    # Keep dashboard fallbacks aligned with the live bounce regime used in
+    # shadow/prod: the signal is a ~10% rebound after a configured migration
+    # dump.  Do not silently harden diagnostics to 30% bounce, otherwise the
+    # web UI marks valid production-style bounces as impossible/missed.
+    bounce_min      = float(os.getenv("BOUNCE_MIN_PCT", "0.10"))
     bounce_drop     = float(os.getenv("BOUNCE_DROP_MIN", "0.30"))
     bounce_time_max = float(os.getenv("BOUNCE_TIME_MAX", "20.0"))
-    freshness_sec   = int(os.getenv("BOTTOM_FRESHNESS_SEC", "300"))
+    freshness_sec   = int(os.getenv("BOTTOM_FRESHNESS_SEC", "600"))
 
     # Contagem de trades no DB
     try:
@@ -11550,10 +11554,14 @@ def debug_bounce_miss():
         with db._cursor() as cur:
             cur.execute("""
                 WITH peak20 AS (
-                    SELECT mint, MAX(mc) AS mc_peak_20m
-                    FROM token_ticks
-                    WHERE elapsed_sec BETWEEN 0 AND 1200
-                    GROUP BY mint
+                    SELECT
+                        tt.mint,
+                        MAX(tt.mc) AS mc_peak_20m,
+                        MAX(tt.mc) FILTER (WHERE tt.mc < m.mc_migration) AS mc_peak_below_mig_20m
+                    FROM token_ticks tt
+                    JOIN migrations m ON m.mint = tt.mint
+                    WHERE tt.elapsed_sec BETWEEN 0 AND 1200
+                    GROUP BY tt.mint
                 )
                 SELECT
                     m.mint,
@@ -11570,6 +11578,7 @@ def debug_bounce_miss():
                     m.liq_migration,
                     m.passed_filters,
                     p.mc_peak_20m,
+                    p.mc_peak_below_mig_20m,
                     b.mint               AS bounced,
                     b.elapsed_sec        AS bounce_elapsed,
                     b.drop_from_mig      AS bounce_drop,
@@ -11597,6 +11606,7 @@ def debug_bounce_miss():
             mig_s    = r.get("time_to_migrate_sec")
             is_trend = r.get("trending_at_migration")
             mc_peak_20m = r.get("mc_peak_20m")
+            mc_peak_below_mig_20m = r.get("mc_peak_below_mig_20m")
 
             if mc_bot is None:
                 return "no_bottom", "Fundo não capturado (Helius gap ou ainda ativo)"
@@ -11616,18 +11626,38 @@ def debug_bounce_miss():
             if is_trend and mig_s is not None and mig_s < 60:
                 return "h28_runner", f"H28: mig={mig_s}s<60s (runner, WR 0%)"
 
-            # TRENDING_MAX_MIG_SEC: lê do env OU usa hardcoded 900 se trending
-            # (env pode não estar setado no web service mesmo que esteja no worker)
-            _tmig_check = TRENDING_MAX_MIG or (900 if is_trend else None)
-            if is_trend and _tmig_check and mig_s is not None and mig_s > _tmig_check:
-                suffix = " (gate não estava ativo no código)" if not TRENDING_MAX_MIG else ""
-                return "mig_lento", f"mig={mig_s}s > {_tmig_check}s{suffix}"
+            # TRENDING_MAX_MIG_SEC só é motivo real quando o gate está ativo no ambiente
+            # do serviço que serve este debug. Antes havia fallback hardcoded de 900s,
+            # que classificava misses como mig_lento mesmo quando o scanner não tinha
+            # esse gate ativo (mensagem "gate não estava ativo no código"). Isso
+            # mascarava o diagnóstico verdadeiro do miss.
+            if is_trend and TRENDING_MAX_MIG is not None and mig_s is not None and mig_s > TRENDING_MAX_MIG:
+                return "mig_lento", f"mig={mig_s}s > {TRENDING_MAX_MIG}s"
 
-            # Verifica se bounce (10%) foi atingido dentro de 20min
+            # Verifica se o bounce mínimo real do scanner foi atingido dentro de 20min.
             # mc_peak_20m: MC máximo nos primeiros 20min (kline close)
-            bounce_needed = mc_bot * (1 + float(_os.getenv("BOUNCE_MIN_PCT", "0.10")))
+            # Match the detector's validated live/shadow entry regime.  This
+            # debug endpoint should explain missed buys, not reclassify 10–20%
+            # production bounces as misses by assuming a 30% rebound threshold.
+            bounce_min_pct = float(_os.getenv("BOUNCE_MIN_PCT", "0.10"))
+            bounce_needed = mc_bot * (1 + bounce_min_pct)
             if mc_peak_20m is not None and mc_peak_20m < bounce_needed:
-                return "bounce_insuficiente", f"Peak 20min ${mc_peak_20m:,.0f} < needed ${bounce_needed:,.0f} (+10% do fundo)"
+                return "bounce_insuficiente", f"Peak 20min ${mc_peak_20m:,.0f} < needed ${bounce_needed:,.0f} (+{bounce_min_pct:.0%} do fundo)"
+
+            # A.8 no scanner: mesmo com bounce do fundo, o sinal é bloqueado se
+            # mc_at_signal >= mc_migration. O peak geral pode parecer válido, mas
+            # se o token só atingiu o bounce mínimo depois de voltar à migração,
+            # nunca existiu uma entrada válida abaixo da MC de migração.
+            if (
+                mc_peak_20m is not None
+                and mc_peak_20m >= bounce_needed
+                and mc_peak_below_mig_20m is not None
+                and mc_peak_below_mig_20m < bounce_needed
+            ):
+                return (
+                    "a8_above_mig",
+                    f"Bounce mínimo só acima da migração: peak abaixo mig ${mc_peak_below_mig_20m:,.0f} < needed ${bounce_needed:,.0f}",
+                )
 
             if ttb is not None and ttb > BOUNCE_TIME_MAX:
                 return "elapsed", f"Fundo em {ttb:.1f}min > max {BOUNCE_TIME_MAX:.0f}min (A.5)"
@@ -11665,6 +11695,7 @@ def debug_bounce_miss():
             "mig_lento":          "#a5d6ff",
             "h28_runner":         "#a5d6ff",
             "bounce_insuficiente":"#e3b341",
+            "a8_above_mig":       "#ff7b72",
             "fora_filtro":        "#6e7681",
             "desconhecido":       "#58a6ff",
         }
