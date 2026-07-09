@@ -288,11 +288,11 @@ class HotMonitor:
     # Bounce detector
     # ------------------------------------------------------------------
 
-    BOUNCE_MIN_PCT           = float(os.getenv("BOUNCE_MIN_PCT",             "0.30"))  # A.7: bounce mínimo 30% (live WR 9.1% abaixo disso)
+    BOUNCE_MIN_PCT           = float(os.getenv("BOUNCE_MIN_PCT",             "0.10"))  # live/shadow: sinal em ~10% bounce; 30% perde a faixa 10–20%
     BOUNCE_MAX_PCT           = float(os.getenv("BOUNCE_MAX_PCT",             "9.99"))  # desativado por padrão — sem validação GMGN para threshold máximo (nota 87 CLAUDE.md)
-    BOUNCE_DROP_MIN          = float(os.getenv("BOUNCE_DROP_MIN",            "0.20"))  # queda mínima da migração (sessão 21: drop 10-30% tem rec75 38-46%, melhor quartil)
+    BOUNCE_DROP_MIN          = float(os.getenv("BOUNCE_DROP_MIN",            "0.30"))  # queda mínima da migração; use BOUNCE_DROP_MIN_TRENDING para threshold menor só em trending
     _tdrop_env               = os.getenv("BOUNCE_DROP_MIN_TRENDING")
-    BOUNCE_DROP_MIN_TRENDING = float(_tdrop_env) if _tdrop_env is not None else None  # threshold menor para trending=TRUE (None = usa BOUNCE_DROP_MIN)
+    BOUNCE_DROP_MIN_TRENDING = float(_tdrop_env) if _tdrop_env is not None else 0.20  # trending=TRUE: threshold menor por padrão; use env para ajustar/desativar
     BOUNCE_TIME_MAX          = float(os.getenv("BOUNCE_TIME_MAX",            "20.0"))  # A.5: janela 30→20min (100% TPs em ≤20min)
     BOTTOM_FRESHNESS_SEC     = int(os.getenv(  "BOTTOM_FRESHNESS_SEC",      "600"))   # A.6: máx 10min desde o último mc_min (sessão 21: 180s era muito restritivo)
     TRENDING_BLOCK_FAST_MIG  = os.getenv("TRENDING_BLOCK_FAST_MIG", "true").lower() == "true"  # H28: bloquear mig<60s para trending tokens (WR 0%)
