@@ -11554,14 +11554,10 @@ def debug_bounce_miss():
         with db._cursor() as cur:
             cur.execute("""
                 WITH peak20 AS (
-                    SELECT
-                        tt.mint,
-                        MAX(tt.mc) AS mc_peak_20m,
-                        MAX(tt.mc) FILTER (WHERE tt.mc < m.mc_migration) AS mc_peak_below_mig_20m
-                    FROM token_ticks tt
-                    JOIN migrations m ON m.mint = tt.mint
-                    WHERE tt.elapsed_sec BETWEEN 0 AND 1200
-                    GROUP BY tt.mint
+                    SELECT mint, MAX(mc) AS mc_peak_20m
+                    FROM token_ticks
+                    WHERE elapsed_sec BETWEEN 0 AND 1200
+                    GROUP BY mint
                 )
                 SELECT
                     m.mint,
@@ -11578,7 +11574,6 @@ def debug_bounce_miss():
                     m.liq_migration,
                     m.passed_filters,
                     p.mc_peak_20m,
-                    p.mc_peak_below_mig_20m,
                     b.mint               AS bounced,
                     b.elapsed_sec        AS bounce_elapsed,
                     b.drop_from_mig      AS bounce_drop,
@@ -11606,7 +11601,6 @@ def debug_bounce_miss():
             mig_s    = r.get("time_to_migrate_sec")
             is_trend = r.get("trending_at_migration")
             mc_peak_20m = r.get("mc_peak_20m")
-            mc_peak_below_mig_20m = r.get("mc_peak_below_mig_20m")
 
             if mc_bot is None:
                 return "no_bottom", "Fundo não capturado (Helius gap ou ainda ativo)"
@@ -11644,21 +11638,6 @@ def debug_bounce_miss():
             if mc_peak_20m is not None and mc_peak_20m < bounce_needed:
                 return "bounce_insuficiente", f"Peak 20min ${mc_peak_20m:,.0f} < needed ${bounce_needed:,.0f} (+{bounce_min_pct:.0%} do fundo)"
 
-            # A.8 no scanner: mesmo com bounce do fundo, o sinal é bloqueado se
-            # mc_at_signal >= mc_migration. O peak geral pode parecer válido, mas
-            # se o token só atingiu o bounce mínimo depois de voltar à migração,
-            # nunca existiu uma entrada válida abaixo da MC de migração.
-            if (
-                mc_peak_20m is not None
-                and mc_peak_20m >= bounce_needed
-                and mc_peak_below_mig_20m is not None
-                and mc_peak_below_mig_20m < bounce_needed
-            ):
-                return (
-                    "a8_above_mig",
-                    f"Bounce mínimo só acima da migração: peak abaixo mig ${mc_peak_below_mig_20m:,.0f} < needed ${bounce_needed:,.0f}",
-                )
-
             if ttb is not None and ttb > BOUNCE_TIME_MAX:
                 return "elapsed", f"Fundo em {ttb:.1f}min > max {BOUNCE_TIME_MAX:.0f}min (A.5)"
 
@@ -11695,7 +11674,6 @@ def debug_bounce_miss():
             "mig_lento":          "#a5d6ff",
             "h28_runner":         "#a5d6ff",
             "bounce_insuficiente":"#e3b341",
-            "a8_above_mig":       "#ff7b72",
             "fora_filtro":        "#6e7681",
             "desconhecido":       "#58a6ff",
         }
